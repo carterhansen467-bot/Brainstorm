@@ -20,25 +20,6 @@ local tag_list = {
 	["D6 Tag"] = "tag_d_six",
 }
 
-local voucher_list = {
-	["None"] = "",
-	["Overstock"] = "v_overstock_norm",
-	["Clearance Sale"] = "v_clearance_sale",
-	["Hone"] = "v_hone",
-	["Reroll Surplus"] = "v_reroll_surplus",
-	["Crystal Ball"] = "v_crystal_ball",
-	["Telescope"] = "v_telescope",
-	["Grabber"] = "v_grabber",
-	["Wasteful"] = "v_wasteful",
-	["Tarot Merchant"] = "v_tarot_merchant",
-	["Planet Merchant"] = "v_planet_merchant",
-	["Seed Money"] = "v_seed_money",
-	["Blank"] = "v_blank",
-	["Magic Trick"] = "v_magic_trick",
-	["Hieroglyph"] = "v_hieroglyph",
-	["Director's Cut"] = "v_directors_cut",
-	["Paint Brush"] = "v_paint_brush",
-}
 local pack_list = {
 	["None"] = {},
 	["Normal Arcana"] = {
@@ -79,34 +60,6 @@ local spf_list = {
 }
 
 local spf_keys = { "500", "750", "1000" }
-
-local legendary_list = {
-	["None"] = "",
-	["Perkeo"] = "perkeo",
-	["Observatory"] = "observatory",
-	["Perkeo + Observatory"] = "perkeo_observatory",
-}
-local legendary_keys = { "None", "Perkeo", "Observatory", "Perkeo + Observatory" }
-
-local voucher_keys = {
-	"None",
-	"Overstock",
-	"Clearance Sale",
-	"Hone",
-	"Reroll Surplus",
-	"Crystal Ball",
-	"Telescope",
-	"Grabber",
-	"Wasteful",
-	"Tarot Merchant",
-	"Planet Merchant",
-	"Seed Money",
-	"Blank",
-	"Magic Trick",
-	"Hieroglyph",
-	"Director's Cut",
-	"Paint Brush",
-}
 
 local tag_keys = {
 	"None",
@@ -177,12 +130,6 @@ G.FUNCS.change_active_filter = function(x)
 	Brainstorm.writeConfig()
 end
 
-G.FUNCS.change_target_voucher = function(x)
-	Brainstorm.config.ar_filters.voucher_id = x.to_key
-	Brainstorm.config.ar_filters.voucher_name = voucher_list[x.to_val]
-	Brainstorm.writeConfig()
-end
-
 G.FUNCS.change_target_pack = function(x)
 	Brainstorm.config.ar_filters.pack_id = x.to_key
 	Brainstorm.config.ar_filters.pack = pack_list[x.to_val]
@@ -192,12 +139,6 @@ end
 G.FUNCS.change_target_tag = function(x)
 	Brainstorm.config.ar_filters.tag_id = x.to_key
 	Brainstorm.config.ar_filters.tag_name = tag_list[x.to_val]
-	Brainstorm.writeConfig()
-end
-
-G.FUNCS.change_target_legendary = function(x)
-	Brainstorm.config.ar_filters.legendary_id = x.to_key
-	Brainstorm.config.ar_filters.legendary_choice = legendary_keys[x.to_key] or "None"
 	Brainstorm.writeConfig()
 end
 
@@ -257,14 +198,6 @@ function create_tabs(args)
 									current_option = Brainstorm.config.ar_filters.tag_id or 1,
 								}),
 								create_option_cycle({
-									label = "VOUCHER SEARCH",
-									scale = 0.8,
-									w = 4,
-									options = voucher_keys,
-									opt_callback = "change_target_voucher",
-									current_option = Brainstorm.config.ar_filters.voucher_id or 1,
-								}),
-								create_option_cycle({
 									label = "PACK SEARCH",
 									scale = 0.8,
 									w = 4,
@@ -272,14 +205,6 @@ function create_tabs(args)
 									opt_callback = "change_target_pack",
 									current_option = Brainstorm.config.ar_filters.pack_id or 1,
 								}),
-								create_option_cycle({
-												label = "LEGENDARY",
-												scale = 0.8,
-												w = 4,
-												options = legendary_keys,
-												opt_callback = "change_target_legendary",
-												current_option = Brainstorm.config.ar_filters.legendary_id or 1,
-											}),
 							},
 						},
 						{

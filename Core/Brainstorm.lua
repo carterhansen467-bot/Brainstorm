@@ -19,15 +19,9 @@ Brainstorm.DEFAULT_CONFIG = {
 	ar_filters = {
 		pack = {},
 		pack_id = 1,
-		voucher_name = "",
-		voucher_id = 1,
 		tag_name = "tag_charm",
 		tag_id = 2,
 		soul_skip = 1,
-		inst_observatory = false,
-		inst_perkeo = false,
-		legendary_choice = "None",
-		legendary_id = 1,
 	},
 	ar_prefs = {
 		spf_id = 3,
@@ -78,9 +72,7 @@ local function ensureImmolateLoaded()
 	end
 
 	if not Brainstorm.immolate_cdef then
-		ffi.cdef(
-			[[const char* brainstorm(const char* seed, const char* voucher, const char* pack, const char* tag, double souls, bool observatory, bool perkeo);]]
-		)
+		ffi.cdef([[const char* brainstorm(const char* seed, const char* pack, const char* tag, double souls);]])
 		ffi.cdef([[const char* brainstorm_query(const char* seed, const char* query_json);]])
 		ffi.cdef([[void free_result(const char* result);]])
 		Brainstorm.immolate_cdef = true
@@ -330,29 +322,16 @@ function Brainstorm.autoReroll()
 	local seed_found = random_string(8, entropy)
 
 	local filters = Brainstorm.config.ar_filters
-		local perkeo_flag = filters.inst_perkeo or false
-		if filters.legendary_choice then
-			if filters.legendary_choice == "Perkeo" or filters.legendary_choice == "Perkeo + Observatory" then
-				perkeo_flag = true
-			else
-				perkeo_flag = false
-			end
-		end
-		local pack_key = ""
-		if #filters.pack > 0 then
-			pack_key = filters.pack[1]:match("^(.*)_") or ""
-		end
-		local pack_name = localize({ type = "name_text", set = "Other", key = pack_key }) or ""
-		local tag_name = localize({
-			type = "name_text",
-			set = "Tag",
-			key = filters.tag_name,
-		}) or ""
-		local voucher_name = localize({
-			type = "name_text",
-			set = "Voucher",
-			key = filters.voucher_name,
-		}) or ""
+	local pack_key = ""
+	if #filters.pack > 0 then
+		pack_key = filters.pack[1]:match("^(.*)_") or ""
+	end
+	local pack_name = localize({ type = "name_text", set = "Other", key = pack_key }) or ""
+	local tag_name = localize({
+		type = "name_text",
+		set = "Tag",
+		key = filters.tag_name,
+	}) or ""
 
 	if not ensureImmolateLoaded() or not Brainstorm.immolate.brainstorm then
 		Brainstorm.ar_active = false
@@ -367,12 +346,9 @@ function Brainstorm.autoReroll()
 	else
 		seed_ptr = Brainstorm.immolate.brainstorm(
 			seed_found,
-			voucher_name,
 			pack_name,
 			tag_name,
-			filters.soul_skip,
-			filters.inst_observatory,
-			perkeo_flag
+			filters.soul_skip
 		)
 	end
 	if not seed_ptr then
@@ -400,8 +376,6 @@ function Brainstorm.autoReroll()
 			pack_name,
 			tag_name,
 			filters.soul_skip,
-			filters.inst_observatory,
-				filters.legendary_choice,
 		},
 	}
 	G.GAME.seeded = false
