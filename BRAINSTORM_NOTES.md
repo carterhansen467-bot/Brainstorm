@@ -168,6 +168,68 @@ time the tab re-renders, even though the underlying saved value is untouched.
      — search always stops on a find, then either banks (with a `saveManagerAlert`
      "Seed X banked to slot [N]") or overwrites.
 
+8. **Parallel search + hot-path pool cache + diagnostics** (perf pass):
+   - **Parallel workers**: `startSearchThread` spawns N `love.thread`s (N = `searchThreads`
+     setting, 0 = auto = `getProcessorCount()-1`). They partition ONE seed sequence with no
+     overlap — worker `i` tests `k = (tried-1)*N + i`. Shared result channel, first finder
+     wins, clearing the session stops all. `pollSearchThread` sums per-thread progress.
+     Near-linear speedup. UI: "Search Threads" cycle (replaced "Rerolls per Frame", which
+     only ever throttled the sync fallback).
+   - **`pseudorandom_element` fast path** (worker copy only): our joker/voucher pools are
+     plain string arrays, so the game's sort-by-index is a no-op — it now does
+     `_t[math.random(#_t)]` directly, one `math.random` as before, no keys-table/sort.
+     RNG-identical; Tag pools (sort_id) keep the original path.
+   - **Culled-pool cache**: `buildCulledPools()` precomputes the index-preserving
+     `'UNAVAILABLE'` arrays ONCE per search; `getJokerCulledPool`/`getVoucherCulledPool`
+     read them. Built only in the worker (fresh Lua state per search → no staleness);
+     main thread leaves `Brainstorm.CULLED` nil so its `passesAllFilters` is the untouched
+     inline path. Read-only (voucher blanking copy-on-writes). Kill switch:
+     `SETTINGS.useCulledCache=false` (threaded via snapshot). Eliminates the per-slot pool
+     rebuild that dominated deep multi-ante joker searches.
+   - **SAFETY RAIL — re-verify every hit**: `updateAutoReroll` re-runs
+     `passesAllFilters(res.seed)` on the MAIN thread (trusted inline pools) before accepting
+     a worker result. Agree → accept; disagree → `logSeedMismatch` (writes
+     `brainstorm_mismatch.txt`) and keep searching. So a cache/worker bug can only cost
+     throughput, never start a wrong seed — and it self-reports.
+   - **Diagnostics (Ctrl+D)**: `dumpDiagnostics` → `brainstorm_diagnostics.txt` for the
+     current run's seed: enabled settings + per-filter prediction (tag/pack/voucher/joker
+     shop slots per ante/legendary/soul) + live comparison + overall `passesAllFilters`.
+     `buildDiagnosticsText(seed)` is shared by the mismatch logger. This is the file to
+     collect when a search result looks wrong. (Ctrl+B voucher self-test still exists too.)
+
+8. **Stacked-filter search optimization + multi-target correctness fix** (measured
+   6.9x single-thread on legendary+voucher+pack+2-joker stacked filters; multiplies
+   with worker threads):
+   - **Filter reorder** in `passesAllFilters`: soul/legendary block FIRST (~6 rolls,
+     rejects ~98.5-99.7%), then tag → pack → voucher → multi-ante jokers LAST. Safe
+     because every filter reads its own independent keyed RNG stream — proven by a
+     30k-seed old-vs-new equivalence test (0 mismatches).
+   - **Single-pass ante simulation** (`simulateShopJokers` / `simulatePackJokers` /
+     `getSimulatedPacks`): rolls each ante's shop/pack sequence ONCE and matches all
+     targets against the data. **Fixes a real bug**: the old matcher re-walked the shop
+     per target while `random_state` persisted, so target 2+ checked slots 7-12 instead
+     of 1-6 — old code disagreed with a correct per-target reference on 11% of seeds
+     (15k-seed test); new matcher agrees 100%. Old `checkShopJokerSearch` /
+     `checkAntePacksForJoker` kept as verified single-target references.
+   - **Rarity skip**: pool picks are skipped for rarities outside the target set
+     (each rarity has its own pick stream nothing else reads). `getJokerRarity` memoizes
+     key→rarity. edisho/edibuf still advance per joker (their Nth advance = Nth joker).
+   - **etperpoll dropped**: per real source (common_events.lua:2138) it only feeds
+     eternal/perishable flags no filter reads; streams are independent. 30k-seed
+     negative-mode equivalence test: 0 mismatches.
+   - **Pack filter checks BOTH ante-1 pack slots** via the shared `'shop_pack'..ante`
+     stream (one advance per slot, per vanilla create_card_for_shop). Strict superset:
+     0 seeds lost, ~70% more matches in test pools. The joker-in-pack matcher now uses
+     the same per-(seed,ante)-memoized sim (`Brainstorm._packSim`) — the old per-slot
+     keys `'shop_pack'..slot..ante` were likely wrong. **Verify in-game with Ctrl+P**
+     (`debugPredictPacks` → debug_predict.txt, use on an ante's first shop).
+   - **Found Stake setting** ("Found Stake" cycle: White/Black/Gold → stake 1/4/8,
+     `autoreroll.foundSeedStake`): the stake a found run starts at, for both overwrite
+     and banked slots. Safe at any stake: stake modifiers only gate what etperpoll/ssjr
+     roll VALUES do (game.lua:2055-2059 sets modifiers; common_events.lua:2138-2146
+     rolls unconditionally for jokers), so the streams the filters read are identical
+     across stakes — the same found seed is valid at White, Black, or Gold.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

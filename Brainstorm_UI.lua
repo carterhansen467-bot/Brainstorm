@@ -4,13 +4,14 @@ local nativefs = require("nativefs")
 local searchLegendaryKeys = {"None", "Caino", "Triboulet", "Yorick", "Chicot", "Perkeo"}
 local legendaryKeyByName = {["None"]="", ["Caino"]="j_caino", ["Triboulet"]="j_triboulet", ["Yorick"]="j_yorick", ["Chicot"]="j_chicot", ["Perkeo"]="j_perkeo"}
 
--- Main shade of each legendary, sampled from its soul sprite in Jokers.png.
+-- Each legendary's card-background colour, sampled from its card face in
+-- Jokers.png (the dominant card-face colour, not the character).
 Brainstorm.legendaryColours = {
-	["j_caino"]     = {0.86, 0.85, 0.86, 1}, -- Caino: white
-	["j_triboulet"] = {0.00, 0.55, 0.94, 1}, -- Triboulet: blue
-	["j_yorick"]    = {0.94, 0.63, 0.00, 1}, -- Yorick: gold
-	["j_chicot"]    = {0.94, 0.31, 0.31, 1}, -- Chicot: red
-	["j_perkeo"]    = {0.31, 0.63, 0.47, 1}, -- Perkeo: green
+	["j_caino"]     = {0.75, 0.80, 0.85, 1}, -- Caino: pale blue-grey
+	["j_triboulet"] = {0.56, 0.75, 0.89, 1}, -- Triboulet: light blue
+	["j_yorick"]    = {0.89, 0.71, 0.38, 1}, -- Yorick: gold
+	["j_chicot"]    = {0.89, 0.52, 0.52, 1}, -- Chicot: red
+	["j_perkeo"]    = {0.52, 0.71, 0.66, 1}, -- Perkeo: teal-green
 }
 
 -- Live-mutable colour shared by the "Search Legendary" cycle bar and its arrows.
@@ -25,10 +26,173 @@ function Brainstorm.applyLegendaryBarColour()
 	c[1], c[2], c[3], c[4] = target[1], target[2], target[3], target[4]
 end
 
+local legendaryNameByKey = {[""]="None", ["j_caino"]="Caino", ["j_triboulet"]="Triboulet", ["j_yorick"]="Yorick", ["j_chicot"]="Chicot", ["j_perkeo"]="Perkeo"}
+
+-- Texture layer that sits on the FACE of the (native, still-3D) legendary bar.
+-- Extends Sprite; crops a wide horizontal band of the card's background (matching
+-- the bar's aspect so there's no stretch/distortion) and overlays the name. The
+-- overlay draw is pcall-guarded so it can never break the settings menu.
+local LegendaryTex = Sprite:extend()
+
+function LegendaryTex:init(X, Y, W, H)
+	self.bs_ar = (W or 3) / (H or 0.5)
+	Sprite.init(self, X, Y, W, H, G.ASSET_ATLAS["Joker"], G.P_CENTERS["j_perkeo"].pos)
+	self.bs_label = DynaText({string = {"None"}, colours = {{1, 1, 1, 1}}, shadow = true, scale = 0.4, silent = true})
+	-- A bare DynaText registers itself in G.I.MOVEABLE and the engine draws every
+	-- parentless MOVEABLE each frame (game.lua:2767) -- at its default position,
+	-- i.e. the top-left corner. Parenting it to us makes the engine skip it, so it
+	-- only renders via our positioned draw() below.
+	self.bs_label.parent = self
+	self:bs_apply()
+end
+
+-- The tab teardown calls remove() on UIT.O objects (ui.lua:1010), but the label
+-- is our own child, not a UI node -- without this override it would stay in
+-- G.I.MOVEABLE forever and a new copy would pile up in the corner every time
+-- the tab is opened and closed.
+function LegendaryTex:remove()
+	if self.bs_label then
+		self.bs_label:remove()
+		self.bs_label = nil
+	end
+	Sprite.remove(self)
+end
+
+function LegendaryTex:set_sprite_pos(pos)
+	Sprite.set_sprite_pos(self, pos)
+	-- Crop a wide, undistorted band of the card background (upper area, above the
+	-- character) with the border trimmed, matching the bar's aspect ratio.
+	local px, py = self.atlas.px, self.atlas.py
+	local insetX = 9
+	local cw = px - 2 * insetX
+	local ch = math.max(4, math.floor(cw / (self.bs_ar or 5)))
+	local ax = self.sprite_pos.x * px + insetX
+	local ay = self.sprite_pos.y * py + 8
+	self.sprite = love.graphics.newQuad(ax, ay, cw, ch, self.atlas.image:getDimensions())
+	self.scale = {x = cw, y = ch}
+end
+
+function LegendaryTex:bs_apply()
+	local key = Brainstorm.SETTINGS.autoreroll.searchLegendary or ""
+	local center = key ~= "" and G.P_CENTERS[key]
+	if center then self:set_sprite_pos(center.pos) end
+	self.bs_show = center and true or false
+	if self.bs_label then
+		self.bs_label.config.string = { legendaryNameByKey[key] or "None" }
+		pcall(function() self.bs_label:update_text(true) end)
+	end
+end
+
+function LegendaryTex:draw()
+	local w, h = self.VT.w, self.VT.h
+	-- prep_draw puts us in the sprite's LOCAL space in game units: (0,0) is the
+	-- face's top-left, (w,h) its bottom-right (same transform DynaText uses).
+	prep_draw(self, 1)
+	love.graphics.push("all")
+	if self.bs_show and self.atlas and self.sprite then
+		-- Card-background band, scaled to exactly fill the face. NOTE: no stencil
+		-- clipping here -- the game's canvases are created without stencil buffers
+		-- (main.lua:379/386), so love.graphics.stencil would error. Instead the
+		-- corners are visually rounded below with rim-coloured patches.
+		local qx, qy, qw, qh = self.sprite:getViewport()
+		love.graphics.setColor(1, 1, 1, 1)
+		love.graphics.draw(self.atlas.image, self.sprite, 0, 0, 0, w / qw, h / qh)
+		-- Stepped vertical gradient over the texture = the 3D curvature: lit along
+		-- the top edge, falling into shadow at the bottom lip (reads like the
+		-- vanilla embossed buttons, but in the card's own colours).
+		love.graphics.setColor(1, 1, 1, 0.16)
+		love.graphics.rectangle("fill", 0, 0, w, h * 0.16)
+		love.graphics.setColor(1, 1, 1, 0.07)
+		love.graphics.rectangle("fill", 0, h * 0.16, w, h * 0.18)
+		love.graphics.setColor(0, 0, 0, 0.09)
+		love.graphics.rectangle("fill", 0, h * 0.60, w, h * 0.18)
+		love.graphics.setColor(0, 0, 0, 0.22)
+		love.graphics.rectangle("fill", 0, h * 0.78, w, h * 0.22)
+		-- Round the inlay's corners by painting the corner notches in the bar's
+		-- rim colour (sampled quarter-arc polygons; the bar behind is the same
+		-- colour so the patches blend into the frame seamlessly).
+		local cr = 0.07
+		local bc = Brainstorm.legendaryBarColour
+		love.graphics.setColor(bc[1], bc[2], bc[3], bc[4] or 1)
+		local corners = {
+			{cr, cr, math.pi, 1.5 * math.pi, 0, 0},
+			{w - cr, cr, 1.5 * math.pi, 2 * math.pi, w, 0},
+			{w - cr, h - cr, 0, 0.5 * math.pi, w, h},
+			{cr, h - cr, 0.5 * math.pi, math.pi, 0, h},
+		}
+		for _, c in ipairs(corners) do
+			-- The notch (square corner minus quarter disc) is concave, so fill it
+			-- as a triangle fan from the corner point (the region is star-shaped
+			-- from there), since love's polygon fill assumes convex input.
+			local prevx, prevy
+			for s = 0, 8 do
+				local a = c[3] + (c[4] - c[3]) * s / 8
+				local ax = c[1] + cr * math.cos(a)
+				local ay = c[2] + cr * math.sin(a)
+				if s > 0 then
+					love.graphics.polygon("fill", c[5], c[6], prevx, prevy, ax, ay)
+				end
+				prevx, prevy = ax, ay
+			end
+		end
+		-- Thin dark inner outline for definition against the coloured rim.
+		love.graphics.setColor(0, 0, 0, 0.28)
+		love.graphics.setLineWidth(0.02)
+		love.graphics.rectangle("line", 0.01, 0.01, w - 0.02, h - 0.02, cr, cr)
+	end
+	-- Option pips, drawn by us so they sit ON the texture (bottom-centred).
+	local n = #searchLegendaryKeys
+	local pip, gap = 0.07, 0.06
+	local total = n * pip + (n - 1) * gap
+	local px = (w - total) / 2
+	local py = h - 0.13
+	local cur = Brainstorm.SETTINGS.autoreroll.searchLegendaryID or 1
+	for i = 1, n do
+		-- soft shadow under each pip so they read on any texture
+		love.graphics.setColor(0, 0, 0, 0.35)
+		love.graphics.rectangle("fill", px + (i - 1) * (pip + gap) + 0.012, py + 0.012, pip, pip, 0.035, 0.035)
+		if i == cur then
+			love.graphics.setColor(1, 1, 1, 1)
+		else
+			love.graphics.setColor(0, 0, 0, 0.5)
+		end
+		love.graphics.rectangle("fill", px + (i - 1) * (pip + gap), py, pip, pip, 0.035, 0.035)
+	end
+	love.graphics.setColor(1, 1, 1, 1)
+	love.graphics.pop()
+	love.graphics.pop() -- prep_draw's push
+	-- Name label, truly centred: DynaText measures its text into T.w/T.h, so
+	-- centre that box on the region above the pips row.
+	local lbl = self.bs_label
+	if lbl and self.VT then
+		pcall(function()
+			lbl.VT.x = self.VT.x + (self.VT.w - lbl.T.w) / 2
+			lbl.VT.y = self.VT.y + (self.VT.h - 0.14 - lbl.T.h) / 2
+			lbl.VT.w, lbl.VT.h = lbl.T.w, lbl.T.h
+			lbl.VT.r, lbl.VT.scale = 0, 1
+			lbl:draw()
+		end)
+	end
+end
+
+-- Sized to the vanilla bar's inner content area: the other cycles at scale=0.8,
+-- w=4 build a face of minw 3.2 x minh 0.64 with padding 0.05, so the content
+-- region is 3.1 x 0.54 -- filling exactly that keeps the outer box identical to
+-- every other bar while the coloured rim frames the texture.
+function Brainstorm.makeLegendaryTex()
+	Brainstorm.legendaryTex = LegendaryTex(0, 0, 3.1, 0.54)
+	return Brainstorm.legendaryTex
+end
+
+function Brainstorm.applyLegendaryTex()
+	if Brainstorm.legendaryTex then pcall(function() Brainstorm.legendaryTex:bs_apply() end) end
+end
+
 G.FUNCS.change_search_legendary = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchLegendaryID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchLegendary = legendaryKeyByName[x.to_val]
 	Brainstorm.applyLegendaryBarColour()
+	Brainstorm.applyLegendaryTex()
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
@@ -50,6 +214,44 @@ G.FUNCS.brainstorm_toggle_neg_legendary = function(e)
 	s.searchNegativeLegendary = not s.searchNegativeLegendary
 	Brainstorm.applyNegLegendaryDisplay()
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
+-- Per-frame visual on the negative-search buttons, stealing the collection's
+-- negative-edition badge look: OFF keeps the normal grey button; ON paints the
+-- box dark like a DARK_EDITION badge while its text shimmers bright, shifting
+-- blue/white/lavender (the negative palette). Colour tables are mutated in place,
+-- exactly like the vanilla 'flash' func. Both the box colour and the child text
+-- colour must be dedicated tables (never a global G.C ref).
+G.FUNCS.brainstorm_negative_shimmer = function(e)
+	local rt = e.config.ref_table
+	local on
+	if rt and rt.slotIdx then
+		local slot = Brainstorm.SETTINGS.autoreroll.jokerSlotData[rt.slotIdx]
+		on = slot and slot.requireNegative
+	else
+		on = Brainstorm.SETTINGS.autoreroll.searchNegativeLegendary
+	end
+	local c = e.config.colour
+	local txt = e.children and e.children[1]
+	local tc = txt and txt.config and txt.config.colour
+	if on then
+		-- Shifting blue/white/lavender box = the visible effect.
+		local t = (G.TIMERS and G.TIMERS.REAL) or 0
+		local s = 0.5 + 0.5 * math.sin(t * 3.0)
+		c[1] = 0.65 + 0.35 * s
+		c[2] = 0.70 + 0.30 * (1 - s)
+		c[3] = 1.0
+		c[4] = 1
+		-- White text on top.
+		if tc then tc[1], tc[2], tc[3], tc[4] = 1, 1, 1, 1 end
+	else
+		local src = darken(G.C.GREY, 0.2)
+		c[1], c[2], c[3], c[4] = src[1], src[2], src[3], src[4]
+		if tc then
+			local L = G.C.UI.TEXT_LIGHT
+			tc[1], tc[2], tc[3], tc[4] = L[1], L[2], L[3], L[4]
+		end
+	end
 end
 
 -- Match mode for the 3 joker slots: ALL (AND, default) requires every selected
@@ -100,6 +302,20 @@ Brainstorm.foundSeedSlotValues  = {["Current run"]=0, ["Slot 1"]=1, ["Slot 2"]=2
 G.FUNCS.change_found_seed_slot = function(x)
 	Brainstorm.SETTINGS.autoreroll.foundSeedSlotID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.foundSeedSlot = Brainstorm.foundSeedSlotValues[x.to_val] or 0
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
+-- Stake the found run starts at (applies to both "Current run" overwrite and
+-- banked slots). Only the gameplay-relevant tiers: White (base), Black
+-- (eternals in shop), Gold (all modifiers). Stake never changes the RNG streams
+-- the filters read (stake modifiers only gate what the rolled values DO), so
+-- the same found seed is valid at any of these.
+Brainstorm.foundStakeOptions = {"White Stake", "Black Stake", "Gold Stake"}
+Brainstorm.foundStakeValues  = {["White Stake"]=1, ["Black Stake"]=4, ["Gold Stake"]=8}
+
+G.FUNCS.change_found_seed_stake = function(x)
+	Brainstorm.SETTINGS.autoreroll.foundSeedStakeID = x.to_key
+	Brainstorm.SETTINGS.autoreroll.foundSeedStake = Brainstorm.foundStakeValues[x.to_val] or 1
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
@@ -308,12 +524,15 @@ function Brainstorm.buildJokerSlots()
 			}},
 			{n = G.UIT.R, config = {align = "cm", padding = 0.03}, nodes = {
 				{n = G.UIT.C, config = {
-					align = "cm", colour = negOn and G.C.SECONDARY_SET.Planet or darken(G.C.GREY, 0.2), r = 0.08,
+					-- Fresh per-button colour table (never a global G.C ref) so the
+					-- shimmer func can mutate it in place safely.
+					align = "cm", colour = {0, 0, 0, 1}, r = 0.08,
 					hover = true, shadow = true,
 					button = "brainstorm_toggle_neg_slot", ref_table = {slotIdx = i},
+					func = "brainstorm_negative_shimmer",
 					minw = 1.4, min_h = 0.34, padding = 0.05,
 				}, nodes = {
-					{n = G.UIT.T, config = {text = negOn and "Negative: ON" or "Negative: OFF", scale = 0.26, colour = G.C.UI.TEXT_LIGHT}},
+					{n = G.UIT.T, config = {text = negOn and "Negative: ON" or "Negative: OFF", scale = 0.26, colour = {1, 1, 1, 1}}},
 				}},
 			}},
 		}}
@@ -469,6 +688,14 @@ function create_tabs(args)
 						scale = 0.8,
 						w = 4,
 						colour = Brainstorm.legendaryBarColour,
+						no_pips = true,
+						-- Exact clone of the vanilla cycle bar box (same minw/minh/r/padding/
+						-- emboss as the other bars at scale=0.8, w=4) so size, shape and the 3D
+						-- emboss match; the card-background texture + name + pips render on its
+						-- face via LegendaryTex:draw.
+						mid = {n = G.UIT.C, config = {id = "cycle_main", align = "cm", minw = 3.2, minh = 0.64, r = 0.1, padding = 0.05, colour = Brainstorm.legendaryBarColour, emboss = 0.1, hover = true, can_collide = true}, nodes = {
+							{n = G.UIT.O, config = {object = Brainstorm.makeLegendaryTex(), w = 3.1, h = 0.54}},
+						}},
 						options = searchLegendaryKeys,
 						opt_callback = "change_search_legendary",
 						current_option = Brainstorm.SETTINGS.autoreroll.searchLegendaryID or 1,
@@ -479,9 +706,10 @@ function create_tabs(args)
 							align = "cm", colour = Brainstorm.negLegendaryColour, r = 0.08,
 							hover = true, shadow = true,
 							button = "brainstorm_toggle_neg_legendary", ref_table = {},
+							func = "brainstorm_negative_shimmer",
 							minw = 2.2, min_h = 0.5, padding = 0.08,
 						}, nodes = {
-							{n = G.UIT.T, config = {ref_table = Brainstorm.negLegendaryDisplay, ref_value = "text", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}},
+							{n = G.UIT.T, config = {ref_table = Brainstorm.negLegendaryDisplay, ref_value = "text", scale = 0.35, colour = {1, 1, 1, 1}}},
 						}},
 					}},
 					create_option_cycle({
@@ -500,14 +728,13 @@ function create_tabs(args)
 						opt_callback = "change_found_seed_slot",
 						current_option = Brainstorm.SETTINGS.autoreroll.foundSeedSlotID or 1,
 					}),
-					create_toggle({
-						label = "Debug Mode",
-						ref_table = Brainstorm.SETTINGS,
-						ref_value = "debug_mode",
-						callback = function(_set_toggle)
-							_RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
-							G.F_NO_ACHIEVEMENTS = Brainstorm.SETTINGS.debug_mode
-						end,
+					create_option_cycle({
+						label = "Found Stake",
+						scale = 0.8,
+						w = 4,
+						options = Brainstorm.foundStakeOptions,
+						opt_callback = "change_found_seed_stake",
+						current_option = Brainstorm.SETTINGS.autoreroll.foundSeedStakeID or 1,
 					}),
 				}}
 
@@ -523,6 +750,18 @@ function create_tabs(args)
 						{n = G.UIT.R, config = {align = "cm", padding = 0.1}, nodes = {
 							leftColumn,
 							rightColumn,
+						}},
+						-- Debug Mode centered beneath both columns.
+						{n = G.UIT.R, config = {align = "cm", padding = 0.05}, nodes = {
+							create_toggle({
+								label = "Debug Mode",
+								ref_table = Brainstorm.SETTINGS,
+								ref_value = "debug_mode",
+								callback = function(_set_toggle)
+									_RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
+									G.F_NO_ACHIEVEMENTS = Brainstorm.SETTINGS.debug_mode
+								end,
+							}),
 						}},
 					},
 				}

@@ -61,46 +61,20 @@ end
 -- auto_reroll body so the EXACT same logic can also run on a background
 -- love.thread worker (see Brainstorm.SEARCH_WORKER_SRC). Any RNG fix here is
 -- automatically shared with the worker because the worker loads this file.
+-- Filters run CHEAPEST + MOST SELECTIVE FIRST. Reordering is safe because every
+-- filter reads its own independent RNG stream (each pseudoseed key hashes
+-- key..seed on first use; no filter reads another's stream), so the accept set
+-- is order-independent -- verified by an old-vs-new equivalence test over
+-- synthetic pools. Why this order matters: the soul/legendary check costs ~6
+-- rolls and rejects ~98.5% (soul) to ~99.7% (specific legendary) of seeds,
+-- while the multi-ante joker search costs ~70-200 pool picks -- running soul
+-- first means the expensive joker walk only ever runs on the tiny fraction of
+-- seeds that already have the legendary start.
 function Brainstorm.passesAllFilters(seed_found)
 	Brainstorm.random_state = {
 		hashed_seed = pseudohash(seed_found),
 	}
-	if Brainstorm.SETTINGS.autoreroll.searchTag ~= "" then
-		local _tag = pseudorandom_element(G.P_CENTER_POOLS["Tag"], Brainstorm.pseudoseed("Tag1" .. seed_found)).key
-		if _tag ~= Brainstorm.SETTINGS.autoreroll.searchTag then
-			return false
-		end
-	end
-	if Brainstorm.SETTINGS.autoreroll.searchPack and #Brainstorm.SETTINGS.autoreroll.searchPack > 0 then
-		local cume, it, center = 0, 0, nil
-		for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
-			if (not _type or _type == v.kind) then cume = cume + (v.weight or 1) end
-		end
-		local poll = pseudorandom(Brainstorm.pseudoseed("shop_pack1" .. seed_found)) * cume
-		for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
-			if not _type or _type == v.kind then it = it + (v.weight or 1) end
-			if it >= poll and it - (v.weight or 1) <= poll then center = v; break end
-		end
-		local pack_found = false
-		for i = 1, #Brainstorm.SETTINGS.autoreroll.searchPack do
-			if Brainstorm.SETTINGS.autoreroll.searchPack[i] == center.key then
-				pack_found = true
-				break
-			end
-		end
-		if not pack_found then
-			return false
-		end
-	end
-	if Brainstorm.SETTINGS.autoreroll.searchVoucher and Brainstorm.SETTINGS.autoreroll.searchVoucher ~= "" then
-		local ante_mode = Brainstorm.SETTINGS.autoreroll.searchVoucherAnte or 1
-		if not Brainstorm.checkVoucherSearch(seed_found, Brainstorm.SETTINGS.autoreroll.searchVoucher, ante_mode) then
-			return false
-		end
-	end
-	if not Brainstorm.checkMultiAnteJokerSearch(seed_found) then
-		return false
-	end
+	-- 1) Soul / legendary (cheapest per rejection by far)
 	if (Brainstorm.SETTINGS.autoreroll.searchForSoul and Brainstorm.SETTINGS.autoreroll.searchForSoul > 0) or (Brainstorm.SETTINGS.autoreroll.searchLegendary and Brainstorm.SETTINGS.autoreroll.searchLegendary ~= "") then
 		local needed = math.max(Brainstorm.SETTINGS.autoreroll.searchForSoul or 0, 1)
 		local last_soul_found = false
@@ -121,11 +95,7 @@ function Brainstorm.passesAllFilters(seed_found)
 			if not last_soul_found then
 				return false
 			else
-				local pool = G.P_JOKER_RARITY_POOLS[4]
-				local filtered = {}
-				for k, v in ipairs(pool) do
-					filtered[k] = Brainstorm.joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
-				end
+				local filtered = Brainstorm.getJokerCulledPool(4)
 				local chosen_key = pseudorandom_element(filtered, Brainstorm.pseudoseed("Joker4" .. seed_found))
 				local it = 1
 				while chosen_key == 'UNAVAILABLE' do
@@ -140,6 +110,45 @@ function Brainstorm.passesAllFilters(seed_found)
 				end
 			end
 		end
+	end
+	-- 2) Tag (one pool pick)
+	if Brainstorm.SETTINGS.autoreroll.searchTag ~= "" then
+		local _tag = pseudorandom_element(G.P_CENTER_POOLS["Tag"], Brainstorm.pseudoseed("Tag1" .. seed_found)).key
+		if _tag ~= Brainstorm.SETTINGS.autoreroll.searchTag then
+			return false
+		end
+	end
+	-- 3) Pack: BOTH ante-1 pack slots count (vanilla rolls both from the shared
+	-- 'shop_pack'..ante stream; checking only slot 1 was discarding ~half the
+	-- genuinely matching seeds). Uses the shared per-seed pack simulation so the
+	-- joker-in-pack matcher below reads the SAME packs without double-advancing.
+	if Brainstorm.SETTINGS.autoreroll.searchPack and #Brainstorm.SETTINGS.autoreroll.searchPack > 0 then
+		local packs = Brainstorm.getSimulatedPacks(seed_found, 1)
+		local list = Brainstorm.SETTINGS.autoreroll.searchPack
+		local pack_found = false
+		for slot = 1, 2 do
+			local center = packs[slot]
+			if center then
+				for i = 1, #list do
+					if list[i] == center.key then pack_found = true; break end
+				end
+			end
+			if pack_found then break end
+		end
+		if not pack_found then
+			return false
+		end
+	end
+	-- 4) Voucher
+	if Brainstorm.SETTINGS.autoreroll.searchVoucher and Brainstorm.SETTINGS.autoreroll.searchVoucher ~= "" then
+		local ante_mode = Brainstorm.SETTINGS.autoreroll.searchVoucherAnte or 1
+		if not Brainstorm.checkVoucherSearch(seed_found, Brainstorm.SETTINGS.autoreroll.searchVoucher, ante_mode) then
+			return false
+		end
+	end
+	-- 5) Multi-ante jokers (the expensive walk) last
+	if not Brainstorm.checkMultiAnteJokerSearch(seed_found) then
+		return false
 	end
 	return true
 end
@@ -167,11 +176,37 @@ end
 function Brainstorm.bankFoundSeed(seed_found, slot, jokerFoundAt)
 	local marker = {
 		brainstorm_found_seed = seed_found,
-		stake = (G.GAME and G.GAME.stake) or nil,
+		-- Stake comes from the "Found Stake" setting (White/Black/Gold). Stake is
+		-- safe to choose freely: per the real source (common_events.lua:2138) the
+		-- stake modifiers only gate what the etperpoll/ssjr roll VALUES do, not
+		-- whether the streams the filters read are rolled, so the same seed gives
+		-- identical tags/packs/vouchers/jokers/negatives at any stake.
+		stake = Brainstorm.SETTINGS.autoreroll.foundSeedStake or (G.GAME and G.GAME.stake) or 1,
 		joker = jokerFoundAt,
 		ts = os.time(),
 	}
 	compress_and_save(G.SETTINGS.profile .. "/" .. "saveState" .. slot .. ".jkr", marker)
+end
+
+-- Persist the found joker keyed by seed, so Ctrl+J still resolves after quitting
+-- (lastJokerFoundAt is in-memory only). Survives restart + resume-via-Continue,
+-- not just re-loading a banked slot. Stored in settings so it loads at launch.
+function Brainstorm.recordFoundJoker(seed, joker)
+	if not seed or not joker then return end
+	Brainstorm.SETTINGS.foundJokers = Brainstorm.SETTINGS.foundJokers or {}
+	Brainstorm.SETTINGS.foundJokers[string.upper(seed)] = joker
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
+-- What Ctrl+J should show: the joker recorded for the seed the player is CURRENTLY
+-- on (authoritative across restarts), falling back to the in-session last find.
+function Brainstorm.currentRunJoker()
+	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
+	if seed and Brainstorm.SETTINGS.foundJokers then
+		local j = Brainstorm.SETTINGS.foundJokers[string.upper(seed)]
+		if j then return j end
+	end
+	return Brainstorm.AUTOREROLL.lastJokerFoundAt
 end
 
 -- Synchronous (main-thread) search. Still used as a fallback when the search
@@ -218,11 +253,7 @@ end
 --     offer). We mirror that by blanking prev's slot; ante 1 excludes nothing.
 --     Confirmed live at ante 1 and a couple of ante 2+ spot-checks (Ctrl+B).
 function Brainstorm.rollVoucherSequence(seed_found, max_ante)
-	local base = {}
-	for k, v in ipairs(G.P_CENTER_POOLS['Voucher']) do
-		local eligible = v.unlocked ~= false and not v.requires
-		base[k] = (eligible and not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])) and v.key or 'UNAVAILABLE'
-	end
+	local base = Brainstorm.getVoucherCulledPool()
 	local out = {}
 	local prev = nil
 	for ante = 1, max_ante do
@@ -299,6 +330,220 @@ function Brainstorm.debugPredictVoucher()
 	local lovely = require("lovely")
 	local nativefs = require("nativefs")
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+end
+
+-- Main-thread self-test (Ctrl+P) for the shared-stream pack model. Predicts the
+-- CURRENT run's two pack slots per ante from its seed ('shop_pack'..ante, one
+-- advance per slot) and lists the live shop's packs for comparison. Use on the
+-- FIRST shop of an ante before buying/opening a pack -- predicted A<ante> slots
+-- must equal the live packs, in order. If they don't, the shared-key model is
+-- wrong for the shipped game and the pack filter/matcher need the old per-slot
+-- keys back. Writes to debug_predict.txt.
+function Brainstorm.debugPredictPacks()
+	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
+	local lines = {}
+	if not seed then
+		lines[1] = "No active seed (start a run first)."
+	else
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		Brainstorm._packSim = nil
+		local ante = (G.GAME.round_resets and G.GAME.round_resets.ante) or "?"
+		lines[#lines + 1] = "Seed: " .. tostring(seed)
+		lines[#lines + 1] = "Current ante: " .. tostring(ante)
+		local live = {}
+		if G.shop_booster and G.shop_booster.cards then
+			for i, c in ipairs(G.shop_booster.cards) do
+				live[#live + 1] = (c.config and c.config.center and c.config.center.key) or "?"
+			end
+		end
+		lines[#lines + 1] = "Live shop packs: " .. (next(live) and table.concat(live, ", ") or "(none visible)")
+		lines[#lines + 1] = ""
+		for a = 1, 4 do
+			local packs = Brainstorm.getSimulatedPacks(seed, a)
+			local mark = (tostring(a) == tostring(ante)) and "   <-- compare with live" or ""
+			lines[#lines + 1] = "Predicted A" .. a .. ": "
+				.. tostring(packs[1] and packs[1].key) .. ", " .. tostring(packs[2] and packs[2].key) .. mark
+		end
+	end
+	local lovely = require("lovely")
+	local nativefs = require("nativefs")
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+end
+
+-- ===========================================================================
+-- Diagnostics dump (Ctrl+D) + worker/main mismatch logger
+-- ---------------------------------------------------------------------------
+-- buildDiagnosticsText(seed) predicts every filter for `seed` on the MAIN thread
+-- (trusted inline pools) and lays out: the exact settings that were enabled, the
+-- per-filter prediction, the live game values where the seed matches the current
+-- run, and the overall pass/fail. This is the file to send for troubleshooting a
+-- "the filter didn't match my settings" report -- it shows both what you asked for
+-- and what the search actually computed for that seed.
+-- ===========================================================================
+function Brainstorm.buildDiagnosticsText(seed)
+	local ar = Brainstorm.SETTINGS.autoreroll or {}
+	local ma = Brainstorm.SETTINGS.multiAnteSearch or {}
+	local liveSeed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
+	local sameRun = (seed == liveSeed)
+	local L = {}
+	local function add(s) L[#L + 1] = s end
+
+	add("=== Brainstorm diagnostics ===")
+	add("time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+	add("version: " .. tostring(Brainstorm.VER))
+	add("seed: " .. tostring(seed))
+	add("is current run's seed: " .. tostring(sameRun))
+	if sameRun then
+		add("current ante: " .. tostring(G.GAME.round_resets and G.GAME.round_resets.ante))
+		add("stake: " .. tostring(G.GAME.stake))
+	end
+
+	add("")
+	add("--- enabled filters (settings) ---")
+	add("Tag: " .. (ar.searchTag ~= "" and tostring(ar.searchTag) or "(off)"))
+	add("Pack: " .. ((ar.searchPack and #ar.searchPack > 0) and table.concat(ar.searchPack, ",") or "(off)"))
+	add("Voucher: " .. (ar.searchVoucher ~= "" and tostring(ar.searchVoucher) or "(off)")
+		.. "  ante=" .. tostring(ar.searchVoucherAnte == 0 and "Any(1-4)" or ar.searchVoucherAnte))
+	add("Legendary: " .. (ar.searchLegendary ~= "" and tostring(ar.searchLegendary) or "(off)")
+		.. "  negative=" .. tostring(ar.searchNegativeLegendary and true or false))
+	add("Souls required: " .. tostring(ar.searchForSoul or 0))
+	add("Joker match mode: " .. (ar.jokerSearchMatchAny and "ANY of the 3" or "ALL of the 3"))
+	for i = 1, 3 do
+		local s = ar.jokerSlotData and ar.jokerSlotData[i]
+		if s and s.key and s.key ~= "" then
+			add("Joker slot " .. i .. ": " .. s.key .. "  negative=" .. tostring(s.requireNegative and true or false))
+		end
+	end
+	local anteBits = {}
+	for a = 1, 4 do
+		anteBits[#anteBits + 1] = "A" .. a .. "(slots=" .. tostring(ma["ante" .. a .. "Slots"] or 0)
+			.. ",packs=" .. tostring(ma["ante" .. a .. "Packs"] and true or false) .. ")"
+	end
+	add("Multi-ante: " .. table.concat(anteBits, " "))
+	add("Threads: " .. tostring(ar.searchThreads == 0 and "Auto" or ar.searchThreads)
+		.. "  useSearchThread=" .. tostring(Brainstorm.SETTINGS.useSearchThread ~= false)
+		.. "  useCulledCache=" .. tostring(Brainstorm.SETTINGS.useCulledCache ~= false))
+
+	add("")
+	add("--- predictions for this seed (trusted main-thread path) ---")
+
+	-- Tag
+	if ar.searchTag ~= "" then
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		local tag = pseudorandom_element(G.P_CENTER_POOLS["Tag"], Brainstorm.pseudoseed("Tag1" .. seed)).key
+		add("Tag: predicted " .. tostring(tag) .. " | want " .. tostring(ar.searchTag) .. " | match " .. tostring(tag == ar.searchTag))
+		if sameRun and G.GAME.round_resets and G.GAME.round_resets.blind_tags then
+			add("     live small-blind tag: " .. tostring(G.GAME.round_resets.blind_tags.Small))
+		end
+	end
+
+	-- Voucher
+	if ar.searchVoucher ~= "" then
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		local seq = Brainstorm.rollVoucherSequence(seed, 4)
+		add("Voucher: predicted A1=" .. tostring(seq[1]) .. " A2=" .. tostring(seq[2])
+			.. " A3=" .. tostring(seq[3]) .. " A4=" .. tostring(seq[4]))
+		add("     want " .. tostring(ar.searchVoucher) .. " at ante " .. tostring(ar.searchVoucherAnte))
+		if sameRun and G.GAME.current_round then
+			add("     live current_round.voucher: " .. tostring(G.GAME.current_round.voucher))
+		end
+	end
+
+	-- Jokers: per-ante shop prediction + overall find result
+	local hasJoker = false
+	for i = 1, 3 do
+		local s = ar.jokerSlotData and ar.jokerSlotData[i]
+		if s and s.key and s.key ~= "" then hasJoker = true end
+	end
+	if hasJoker then
+		local function predictShop(ante, num_slots)
+			Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+			local total = 28 -- SHOP_RATES_ANTE1: joker 20 + tarot 4 + planet 4
+			local rname = { "Common", "Uncommon", "Rare" }
+			for slot = 1, num_slots do
+				local ctr = pseudorandom(Brainstorm.pseudoseed("cdt" .. ante .. seed)) * total
+				if ctr < 20 then
+					local rr = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "sho" .. seed))
+					local rarity = rr > 0.95 and 3 or rr > 0.7 and 2 or 1
+					local rkey = "Joker" .. rarity .. "sho" .. ante
+					local pool = Brainstorm.getJokerCulledPool(rarity)
+					local chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed))
+					local it = 1
+					while chosen == 'UNAVAILABLE' do
+						it = it + 1
+						chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. '_resample' .. it .. seed))
+					end
+					add("     A" .. ante .. " shop slot " .. slot .. ": " .. rname[rarity] .. " -> " .. chosen)
+				else
+					add("     A" .. ante .. " shop slot " .. slot .. ": (non-joker)")
+				end
+			end
+		end
+		add("Jokers: shop predictions for active antes --")
+		for ante = 1, 4 do
+			local n = ma["ante" .. ante .. "Slots"] or 0
+			if n > 0 then predictShop(ante, n) end
+		end
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		local found = Brainstorm.checkMultiAnteJokerSearch(seed)
+		add("     multi-ante joker result: pass=" .. tostring(found)
+			.. "  foundAt=" .. tostring(Brainstorm.AUTOREROLL.jokerFoundAt or "(none)"))
+	end
+
+	-- Legendary / soul
+	if ar.searchLegendary ~= "" or (ar.searchForSoul or 0) > 0 then
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		local soul = false
+		for j = 1, 5 do
+			if pseudorandom(Brainstorm.pseudoseed("soul_Tarot1" .. seed)) > 0.997 then soul = true end
+		end
+		add("Soul present in Arcana pack: " .. tostring(soul))
+		if ar.searchLegendary ~= "" then
+			Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+			local filtered = Brainstorm.getJokerCulledPool(4)
+			local chosen = pseudorandom_element(filtered, Brainstorm.pseudoseed("Joker4" .. seed))
+			local it = 1
+			while chosen == 'UNAVAILABLE' do
+				it = it + 1
+				chosen = pseudorandom_element(filtered, Brainstorm.pseudoseed("Joker4" .. '_resample' .. it .. seed))
+			end
+			add("Legendary: predicted " .. tostring(chosen) .. " | want " .. tostring(ar.searchLegendary)
+				.. " | match " .. tostring(chosen == ar.searchLegendary))
+		end
+	end
+
+	add("")
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+	add("OVERALL passesAllFilters(seed) = " .. tostring(Brainstorm.passesAllFilters(seed)))
+	return table.concat(L, "\n")
+end
+
+-- Ctrl+D: dump diagnostics for the seed of the run you're currently in.
+function Brainstorm.dumpDiagnostics()
+	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
+	local text = seed and Brainstorm.buildDiagnosticsText(seed) or "No active run/seed."
+	local lovely = require("lovely")
+	local nativefs = require("nativefs")
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/brainstorm_diagnostics.txt", text)
+end
+
+-- Safety-rail logger: a worker hit failed main-thread re-verification. Records the
+-- worker's claim + the trusted main-thread breakdown so the divergence can be
+-- diagnosed. Appends (timestamped) so repeated mismatches accumulate.
+function Brainstorm.logSeedMismatch(res)
+	local seed = res and res.seed or "(nil)"
+	local parts = {
+		"### WORKER/MAIN MISMATCH @ " .. os.date("%Y-%m-%d %H:%M:%S"),
+		"worker claimed: seed=" .. tostring(seed) .. " jokerFoundAt=" .. tostring(res and res.jokerFoundAt),
+		Brainstorm.buildDiagnosticsText(seed),
+		"",
+	}
+	local lovely = require("lovely")
+	local nativefs = require("nativefs")
+	local path = lovely.mod_dir .. "/Brainstorm/brainstorm_mismatch.txt"
+	local prior = nativefs.read(path) or ""
+	nativefs.write(path, prior .. table.concat(parts, "\n") .. "\n")
+	print("[Brainstorm] SEED MISMATCH logged for " .. tostring(seed) .. " -> brainstorm_mismatch.txt")
 end
 
 function Brainstorm.searchParametersMet()
@@ -544,6 +789,71 @@ function Brainstorm.joker_is_pool_eligible(v)
 	return add and not G.GAME.banned_keys[v.key]
 end
 
+-- ===========================================================================
+-- Precomputed culled pools (hot-path optimization + its safety rails)
+-- ---------------------------------------------------------------------------
+-- The hot joker/voucher filters rebuild an index-preserving, 'UNAVAILABLE'-culled
+-- pool array for every slot of every seed. Eligibility is static for a fresh run
+-- (banned_keys / pool_flags are fixed for the whole search), so that array is
+-- identical every time -- we build it ONCE and reuse it read-only.
+--
+-- SAFETY RAILS:
+--  1. Fallback: the getters build the pool inline whenever the cache is absent,
+--     so a missing/disabled cache degrades to the exact original code, never to a
+--     wrong answer.
+--  2. Worker-only: buildCulledPools() runs only in the worker's fresh Lua state
+--     (rebuilt per search from an immutable snapshot), so there is no cross-search
+--     staleness. The main thread leaves Brainstorm.CULLED nil, so its
+--     passesAllFilters is the untouched inline path -- which is exactly the
+--     trusted reference every worker hit is re-verified against (see
+--     updateAutoReroll). A cache bug can only ever cost throughput, not correctness.
+--  3. Kill switch: Brainstorm.SETTINGS.useCulledCache = false disables it entirely.
+--  4. Read-only: callers only pick/resample from the returned array; the voucher
+--     per-ante blanking copy-on-writes, so the cache is never mutated.
+-- ===========================================================================
+function Brainstorm.buildCulledPools()
+	if Brainstorm.SETTINGS.useCulledCache == false then Brainstorm.CULLED = nil; return end
+	local c = { joker = {} }
+	for r = 1, 4 do
+		local src = G.P_JOKER_RARITY_POOLS[r]
+		if src then
+			local arr = {}
+			for k, v in ipairs(src) do
+				arr[k] = Brainstorm.joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
+			end
+			c.joker[r] = arr
+		end
+	end
+	local vb = {}
+	for k, v in ipairs(G.P_CENTER_POOLS['Voucher']) do
+		local eligible = v.unlocked ~= false and not v.requires
+		vb[k] = (eligible and not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])) and v.key or 'UNAVAILABLE'
+	end
+	c.voucher = vb
+	Brainstorm.CULLED = c
+end
+
+function Brainstorm.getJokerCulledPool(rarity)
+	local c = Brainstorm.CULLED
+	if c and c.joker and c.joker[rarity] then return c.joker[rarity] end
+	local arr = {}
+	for k, v in ipairs(G.P_JOKER_RARITY_POOLS[rarity]) do
+		arr[k] = Brainstorm.joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
+	end
+	return arr
+end
+
+function Brainstorm.getVoucherCulledPool()
+	local c = Brainstorm.CULLED
+	if c and c.voucher then return c.voucher end
+	local base = {}
+	for k, v in ipairs(G.P_CENTER_POOLS['Voucher']) do
+		local eligible = v.unlocked ~= false and not v.requires
+		base[k] = (eligible and not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])) and v.key or 'UNAVAILABLE'
+	end
+	return base
+end
+
 local SHOP_RATES_ANTE1 = { joker = 20, tarot = 4, planet = 4, playing_card = 0, spectral = 0 }
 
 function Brainstorm.checkShopJokerSearch(seed_found, ante, num_slots, target_key, require_negative)
@@ -561,11 +871,7 @@ function Brainstorm.checkShopJokerSearch(seed_found, ante, num_slots, target_key
 			end
 
 			local rkey = "Joker" .. rarity .. "sho" .. ante
-			local source_pool = G.P_JOKER_RARITY_POOLS[rarity]
-			local pool = {}
-			for k, v in ipairs(source_pool) do
-				pool[k] = Brainstorm.joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
-			end
+			local pool = Brainstorm.getJokerCulledPool(rarity)
 
 			local chosen_key = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
 			local it = 1
@@ -611,10 +917,7 @@ function Brainstorm.checkAntePacksForJoker(seed_found, ante, target_key, require
 				local rarity_roll = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "buf" .. seed_found))
 				local rarity = rarity_roll > 0.95 and 3 or rarity_roll > 0.7 and 2 or 1
 				local rkey = "Joker" .. rarity .. "buf" .. ante
-				local pool = {}
-				for k, v in ipairs(G.P_JOKER_RARITY_POOLS[rarity]) do
-					pool[k] = Brainstorm.joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
-				end
+				local pool = Brainstorm.getJokerCulledPool(rarity)
 				local chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
 				local it2 = 1
 				while chosen == 'UNAVAILABLE' do
@@ -638,6 +941,138 @@ function Brainstorm.checkAntePacksForJoker(seed_found, ante, target_key, require
 	end
 	return false
 end
+-- key -> rarity (1-3) map, memoized once (pools are static for a search in both
+-- the main thread and each worker's fresh state).
+function Brainstorm.getJokerRarity(key)
+	local m = Brainstorm._jokerRarityByKey
+	if not m then
+		m = {}
+		for r = 1, 3 do
+			local pool = G.P_JOKER_RARITY_POOLS[r]
+			if pool then
+				for _, v in ipairs(pool) do m[v.key] = r end
+			end
+		end
+		Brainstorm._jokerRarityByKey = m
+	end
+	return m[key]
+end
+
+-- ===========================================================================
+-- Single-pass ante simulation
+-- ---------------------------------------------------------------------------
+-- The old matcher re-walked the shop PER TARGET, but Brainstorm.random_state
+-- persists across the walk -- so target 2's walk continued the cdt/rarity
+-- streams where target 1 left off and effectively checked shop slots 7-12
+-- instead of 1-6. These functions roll each ante's sequence ONCE and return it
+-- as data; all targets are then string-matched against the same (correct)
+-- sequence. Also cheaper: 3 targets cost one walk instead of three.
+--
+-- wanted = set {rarity=true}: pool picks for rarities outside the target set
+-- are skipped -- each rarity has its own pick stream that nothing else reads,
+-- so skipping cannot desync anything (~70% of slots roll Common; skipping them
+-- removes most of the pick cost when hunting uncommons/rares).
+-- needNeg: roll the edisho/edibuf edition stream per joker (its Nth advance is
+-- the Nth joker of that ante/source, so it must advance for every joker even
+-- when the pick was skipped). The old code also advanced etperpoll; per the
+-- real source (common_events.lua:2138) that stream only feeds eternal/perish
+-- flags that no filter reads, and streams are independent -- dropped.
+-- ===========================================================================
+function Brainstorm.simulateShopJokers(seed_found, ante, num_slots, wanted, needNeg)
+	local r = SHOP_RATES_ANTE1
+	local total = r.joker + r.tarot + r.planet + r.playing_card + r.spectral
+	local out = {}
+	for slot = 1, num_slots do
+		local card_type_roll = pseudorandom(Brainstorm.pseudoseed("cdt" .. ante .. seed_found)) * total
+		if card_type_roll < r.joker then
+			local rarity_roll = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "sho" .. seed_found))
+			local rarity = rarity_roll > 0.95 and 3 or rarity_roll > 0.7 and 2 or 1
+			local chosen = nil
+			if wanted[rarity] then
+				local rkey = "Joker" .. rarity .. "sho" .. ante
+				local pool = Brainstorm.getJokerCulledPool(rarity)
+				chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
+				local it = 1
+				while chosen == 'UNAVAILABLE' do
+					it = it + 1
+					chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. '_resample' .. it .. seed_found))
+				end
+			end
+			local neg = false
+			if needNeg then
+				neg = pseudorandom(Brainstorm.pseudoseed("edisho" .. ante .. seed_found)) > 0.997
+			end
+			out[#out + 1] = { key = chosen, neg = neg }
+		end
+	end
+	return out
+end
+
+-- Roll BOTH of an ante's pack slots from the shared 'shop_pack'..ante stream
+-- (one advance per slot -- the model in the vanilla create_card_for_shop path;
+-- verify in-game with Ctrl+P / debugPredictPacks). Memoized per (seed, ante) so
+-- the ante-1 pack filter and the joker-in-pack matcher read the SAME packs
+-- instead of double-advancing the stream. Deterministic per seed, so reusing
+-- the memo on a re-verification pass is safe.
+function Brainstorm.getSimulatedPacks(seed_found, ante)
+	local sim = Brainstorm._packSim
+	if not sim or sim.seed ~= seed_found then
+		sim = { seed = seed_found }
+		Brainstorm._packSim = sim
+	end
+	if sim[ante] then return sim[ante] end
+	local cume = 0
+	for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
+		cume = cume + (v.weight or 1)
+	end
+	local out = {}
+	for slot = 1, 2 do
+		local poll = pseudorandom(Brainstorm.pseudoseed("shop_pack" .. ante .. seed_found)) * cume
+		local it = 0
+		for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
+			it = it + (v.weight or 1)
+			if it >= poll and it - (v.weight or 1) <= poll then out[slot] = v; break end
+		end
+	end
+	sim[ante] = out
+	return out
+end
+
+-- Roll the joker contents of an ante's Buffoon packs (both pack slots, in
+-- order) into one {key, neg} sequence. Non-Buffoon packs consume none of the
+-- buf-joker streams, same as the game.
+function Brainstorm.simulatePackJokers(seed_found, ante, wanted, needNeg)
+	local packs = Brainstorm.getSimulatedPacks(seed_found, ante)
+	local out = {}
+	for slot = 1, 2 do
+		local center = packs[slot]
+		if center and center.kind == 'Buffoon' then
+			local num_cards = center.key:find("mega") and 6 or center.key:find("jumbo") and 4 or 2
+			for card = 1, num_cards do
+				local rarity_roll = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "buf" .. seed_found))
+				local rarity = rarity_roll > 0.95 and 3 or rarity_roll > 0.7 and 2 or 1
+				local chosen = nil
+				if wanted[rarity] then
+					local rkey = "Joker" .. rarity .. "buf" .. ante
+					local pool = Brainstorm.getJokerCulledPool(rarity)
+					chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
+					local it = 1
+					while chosen == 'UNAVAILABLE' do
+						it = it + 1
+						chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. '_resample' .. it .. seed_found))
+					end
+				end
+				local neg = false
+				if needNeg then
+					neg = pseudorandom(Brainstorm.pseudoseed("edibuf" .. ante .. seed_found)) > 0.997
+				end
+				out[#out + 1] = { key = chosen, neg = neg }
+			end
+		end
+	end
+	return out
+end
+
 function Brainstorm.checkMultiAnteJokerSearch(seed_found)
 	Brainstorm.AUTOREROLL.jokerFoundAt = nil
 	local slots = Brainstorm.SETTINGS.autoreroll.jokerSlotData
@@ -667,28 +1102,60 @@ function Brainstorm.checkMultiAnteJokerSearch(seed_found)
 	-- default): every selected joker must be found.
 	local matchAny = Brainstorm.SETTINGS.autoreroll.jokerSearchMatchAny
 
-	local foundAt = {}
-	local anyFound = false
-	for _, target in ipairs(targets) do
-		local found = false
-		for ante = 1, 4 do
-			local ante_slots = cfg["ante"..ante.."Slots"] or 0
-			local packs = cfg["ante"..ante.."Packs"] or false
-			if ante_slots > 0 and Brainstorm.checkShopJokerSearch(seed_found, ante, ante_slots, target.key, target.requireNegative) then
-				foundAt[target.slot] = "A"..ante.."Shop"; found = true; break
-			end
-			if packs and Brainstorm.checkAntePacksForJoker(seed_found, ante, target.key, target.requireNegative) then
-				foundAt[target.slot] = "A"..ante.."Pack"; found = true; break
-			end
+	local wanted, needNeg = {}, false
+	for _, t in ipairs(targets) do
+		local r = Brainstorm.getJokerRarity(t.key)
+		if r then
+			wanted[r] = true
+		else
+			wanted[1], wanted[2], wanted[3] = true, true, true
 		end
-		if found then
-			anyFound = true
-			if matchAny then break end
-		elseif not matchAny then
-			return false
+		if t.requireNegative then needNeg = true end
+	end
+
+	local foundAt = {}
+	local remaining = #targets
+
+	-- Match all still-unfound targets against one simulated {key, neg} sequence.
+	-- The FIRST occurrence of a target's key decides (same semantics as the old
+	-- per-ante check): if requireNegative and that occurrence isn't negative, the
+	-- target stays unfound for this sequence and later sequences keep looking.
+	local function matchSeq(seq, label)
+		for _, t in ipairs(targets) do
+			if not foundAt[t.slot] then
+				for i = 1, #seq do
+					if seq[i].key == t.key then
+						if (not t.requireNegative) or seq[i].neg then
+							foundAt[t.slot] = label
+							remaining = remaining - 1
+						end
+						break
+					end
+				end
+			end
 		end
 	end
-	if matchAny and not anyFound then return false end
+
+	for ante = 1, 4 do
+		local ante_slots = cfg["ante"..ante.."Slots"] or 0
+		local packs = cfg["ante"..ante.."Packs"] or false
+		if ante_slots > 0 then
+			matchSeq(Brainstorm.simulateShopJokers(seed_found, ante, ante_slots, wanted, needNeg), "A"..ante.."Shop")
+			if remaining == 0 or (matchAny and remaining < #targets) then break end
+		end
+		if packs then
+			matchSeq(Brainstorm.simulatePackJokers(seed_found, ante, wanted, needNeg), "A"..ante.."Pack")
+			if remaining == 0 or (matchAny and remaining < #targets) then break end
+		end
+	end
+
+	local ok
+	if matchAny then
+		ok = remaining < #targets
+	else
+		ok = remaining == 0
+	end
+	if not ok then return false end
 
 	local parts = {}
 	for i = 1, 3 do if foundAt[i] then parts[#parts+1] = "J"..i..foundAt[i] end end
@@ -852,6 +1319,7 @@ function Brainstorm.buildSearchSnapshot(session)
 
 	snap.autoreroll = Brainstorm.SETTINGS.autoreroll
 	snap.multiAnteSearch = Brainstorm.SETTINGS.multiAnteSearch
+	snap.useCulledCache = Brainstorm.SETTINGS.useCulledCache
 	snap.entropy = (love.timer and love.timer.getTime() or os.clock()) * 1000
 	return snap
 end
@@ -971,9 +1439,20 @@ function Brainstorm.updateAutoReroll(dt)
 		end
 		local res = Brainstorm.pollSearchThread()
 		if res then
-			seed_found = res.seed
-			jokerFoundAt = res.jokerFoundAt
-			Brainstorm.stopSearchThread()
+			-- SAFETY RAIL: re-verify the worker's hit on the MAIN thread, which uses
+			-- the trusted inline pools (Brainstorm.CULLED is nil here). If it agrees,
+			-- accept and stop; if not, the worker/cache diverged -- log a full
+			-- diagnostic and keep the other threads searching instead of starting a
+			-- wrong seed. Mismatches should never happen (the paths are RNG-identical),
+			-- so this costs one filter pass per find and turns any regression into a
+			-- self-correcting, self-reporting event rather than a silent bad seed.
+			if Brainstorm.passesAllFilters(res.seed) then
+				seed_found = res.seed
+				jokerFoundAt = res.jokerFoundAt
+				Brainstorm.stopSearchThread()
+			else
+				Brainstorm.logSeedMismatch(res)
+			end
 		end
 	else
 		A.rerollTimer = A.rerollTimer + dt
@@ -995,13 +1474,18 @@ function Brainstorm.updateAutoReroll(dt)
 			Brainstorm.bankFoundSeed(seed_found, slot, jokerFoundAt)
 			Brainstorm.showSeedSlotAlert("Seed saved to slot [" .. slot .. "]")
 		else
-			Brainstorm.applyFoundSeed(seed_found)
+			-- Start at the chosen "Found Stake" (nil-safe: applyFoundSeed falls
+			-- back to the current run's stake if the setting is missing).
+			Brainstorm.applyFoundSeed(seed_found, Brainstorm.SETTINGS.autoreroll.foundSeedStake)
 		end
 		if jokerFoundAt then
 			-- Stash it for the Ctrl+J hotkey; don't auto-pop the joker text on a
 			-- find (it clutters/overlaps the "Seed saved" message).
 			A.lastJokerFoundAt = jokerFoundAt
 			A.jokerFoundAt = nil
+			-- Also persist it keyed by the found seed so Ctrl+J survives a restart
+			-- (works whether banked or applied to the current run).
+			Brainstorm.recordFoundJoker(seed_found, jokerFoundAt)
 		end
 		return
 	end
@@ -1161,7 +1645,7 @@ G = {
 }
 
 Brainstorm = {
-	SETTINGS = { autoreroll = config.autoreroll, multiAnteSearch = config.multiAnteSearch },
+	SETTINGS = { autoreroll = config.autoreroll, multiAnteSearch = config.multiAnteSearch, useCulledCache = config.useCulledCache },
 	AUTOREROLL = {},
 	random_state = {},
 }
@@ -1170,6 +1654,12 @@ Brainstorm = {
 -- functions are defined but never called here; its top-level require()s hit the
 -- stubs above; its top-level G.FUNCS assignments hit the mock G.FUNCS table.
 assert(load(rerollSrc, "Brainstorm_reroll_worker"))()
+
+-- Precompute the culled joker/voucher pools once for this worker's whole run
+-- (fresh Lua state => no staleness). The seed loop's filters then reuse them
+-- instead of rebuilding per slot. buildCulledPools honors useCulledCache and is
+-- a no-op that leaves Brainstorm.CULLED nil (=> inline fallback) if disabled.
+pcall(Brainstorm.buildCulledPools)
 
 local sessionChan = love.thread.getChannel("brainstorm_search_session")
 local resultChan = love.thread.getChannel("brainstorm_search_result")

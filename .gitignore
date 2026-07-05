@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Editor / working backups
+*.bak
+*.bak2
+
+# Local debug & diagnostics output
+brainstorm_diagnostics.txt

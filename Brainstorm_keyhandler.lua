@@ -25,6 +25,13 @@ function Brainstorm.key_press_update(key)
 				-- Banked found-seed slot: there's no real save blob, so start a
 				-- fresh run on the stored seed (applyFoundSeed does its own delete_run).
 				Brainstorm.applyFoundSeed(data.brainstorm_found_seed, data.stake)
+				-- Restore the found-joker info from the marker so Ctrl+J works after a
+				-- reload (lastJokerFoundAt is in-memory only and wiped on quit); also
+				-- persist it keyed by seed so it survives a later restart + Continue.
+				Brainstorm.AUTOREROLL.lastJokerFoundAt = data.joker
+				if Brainstorm.recordFoundJoker then
+					Brainstorm.recordFoundJoker(data.brainstorm_found_seed, data.joker)
+				end
 				Brainstorm.showSeedSlotAlert("Seed loaded from slot [" .. k .. "]")
 			else
 				G:delete_run()
@@ -57,13 +64,26 @@ function Brainstorm.key_press_update(key)
 		end
 	end
 	if key == "j" and love.keyboard.isDown("lctrl") then
-		if Brainstorm.AUTOREROLL.lastJokerFoundAt then
-			Brainstorm.showJokerFoundAlert("Joker: " .. Brainstorm.AUTOREROLL.lastJokerFoundAt)
+		local joker = (Brainstorm.currentRunJoker and Brainstorm.currentRunJoker())
+			or Brainstorm.AUTOREROLL.lastJokerFoundAt
+		if joker then
+			Brainstorm.showJokerFoundAlert("Joker: " .. joker)
 		end
 	end
 	-- Voucher prediction self-test: dumps predicted vs live voucher to debug_predict.txt.
 	if key == "b" and love.keyboard.isDown("lctrl") then
 		Brainstorm.debugPredictVoucher()
 		saveManagerAlert("Voucher prediction -> debug_predict.txt")
+	end
+	-- Pack prediction self-test: dumps predicted vs live shop packs to debug_predict.txt.
+	if key == "p" and love.keyboard.isDown("lctrl") then
+		Brainstorm.debugPredictPacks()
+		saveManagerAlert("Pack prediction -> debug_predict.txt")
+	end
+	-- Diagnostics dump: current seed + enabled filters + per-filter predictions.
+	-- Hit this when a search result looks wrong, then share brainstorm_diagnostics.txt.
+	if key == "d" and love.keyboard.isDown("lctrl") then
+		Brainstorm.dumpDiagnostics()
+		saveManagerAlert("Diagnostics -> brainstorm_diagnostics.txt")
 	end
 end

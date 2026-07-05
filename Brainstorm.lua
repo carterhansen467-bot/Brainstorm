@@ -46,11 +46,26 @@ function initBrainstorm()
 		Brainstorm.SETTINGS.autoreroll.searchThreads = 0
 		Brainstorm.SETTINGS.autoreroll.searchThreadsID = 1
 	end
+	-- Precompute culled joker/voucher pools once per search (hot-path speedup).
+	-- Kill switch: set false to force the original inline pool build everywhere.
+	if Brainstorm.SETTINGS.useCulledCache == nil then
+		Brainstorm.SETTINGS.useCulledCache = true
+	end
 	-- Where a found seed goes: 0 = overwrite the current run immediately (old
 	-- behavior); 1-5 = bank the seed into that save slot and keep playing.
 	if Brainstorm.SETTINGS.autoreroll.foundSeedSlot == nil then
 		Brainstorm.SETTINGS.autoreroll.foundSeedSlot = 0
 		Brainstorm.SETTINGS.autoreroll.foundSeedSlotID = 1
+	end
+	-- seed -> found-joker map so Ctrl+J survives quitting the game (see
+	-- Brainstorm.recordFoundJoker / currentRunJoker).
+	if Brainstorm.SETTINGS.foundJokers == nil then
+		Brainstorm.SETTINGS.foundJokers = {}
+	end
+	-- Stake the found run starts at: 1 = White, 4 = Black, 8 = Gold.
+	if Brainstorm.SETTINGS.autoreroll.foundSeedStake == nil then
+		Brainstorm.SETTINGS.autoreroll.foundSeedStake = 1
+		Brainstorm.SETTINGS.autoreroll.foundSeedStakeID = 1
 	end
   _RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
 end
