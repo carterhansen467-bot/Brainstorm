@@ -15,10 +15,31 @@
 
 ### Macos
 
-2. Go to your Balatro Mods dir `/Users/$USER/Library/Application Support/Balatro/Mods`.
-3. Clone the Brainstorm repo `git clone https://github.com/OceanRamen/Brainstorm.git`.
-4. Check that the new directory's name is "Brainstorm".
-5. Reload the game to activate the mod.
+2. Clone this repo into your Balatro Mods folder:
+
+   ```bash
+   mkdir -p ~/Library/Application\ Support/Balatro/Mods && git clone https://github.com/carterhansen467-bot/Brainstorm.git ~/Library/Application\ Support/Balatro/Mods/Brainstorm
+   ```
+
+3. Install the lovely injector into the game folder (downloads the two loader files,
+   `liblovely.dylib` and `run_lovely_macos.sh`, from lovely's official releases):
+
+   ```bash
+   bash ~/Library/Application\ Support/Balatro/Mods/Brainstorm/install_lovely_macos.sh
+   ```
+
+4. **Launch the game from Terminal** — on macOS Steam's Play button does NOT load
+   mods (it skips the injector), so start Balatro with:
+
+   ```bash
+   ~/Library/Application\ Support/Steam/steamapps/common/Balatro/run_lovely_macos.sh
+   ```
+
+5. To update the mod later:
+
+   ```bash
+   git -C ~/Library/Application\ Support/Balatro/Mods/Brainstorm pull
+   ```
 
 ## Features
 ### Save-States
