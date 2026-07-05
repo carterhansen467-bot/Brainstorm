@@ -7,3 +7,8 @@
 
 # Local debug & diagnostics output
 brainstorm_diagnostics.txt
+
+# User state, rewritten by the mod at runtime (never track: tracked copies
+# made every git pull conflict for players)
+settings.lua
+debug_predict.txt

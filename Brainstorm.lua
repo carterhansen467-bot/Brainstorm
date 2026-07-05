@@ -6,6 +6,23 @@ function initBrainstorm()
 	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_UI.lua")))()
 	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_keyhandler.lua")))()
 	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_reroll.lua")))()
+	-- Full defaults for a fresh install. settings.lua is NOT shipped in the repo
+	-- (it's user state, rewritten by the mod on every settings change -- shipping
+	-- it made every `git pull` conflict); it's created on first save. A loaded
+	-- file replaces this wholesale, and the backfills below patch files written
+	-- by older versions.
+	Brainstorm.SETTINGS = {
+		keybinds = { loadState = "x", saveState = "z", rerollSeed = "t", autoReroll = "a" },
+		autoreroll = {
+			searchTag = "", searchTagID = 1,
+			searchPack = {}, searchPackID = 1,
+			searchVoucher = "", searchVoucherID = 1,
+			searchForSoul = 0,
+			searchLegendary = "", searchLegendaryID = 1,
+			seedsPerFrame = 500, seedsPerFrameID = 1,
+		},
+		debug_mode = false,
+	}
 	if nativefs.getInfo(lovely.mod_dir .. "/Brainstorm/settings.lua") then
 		local settings_file = STR_UNPACK(nativefs.read((lovely.mod_dir .. "/Brainstorm/settings.lua")))
 		if settings_file ~= nil then

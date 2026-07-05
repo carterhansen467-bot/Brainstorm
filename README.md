@@ -41,6 +41,15 @@
    git -C ~/Library/Application\ Support/Balatro/Mods/Brainstorm pull
    ```
 
+   > **Updating from an older version?** If `git pull` complains about local
+   > changes to `settings.lua`, run this once (your in-game mod settings reset
+   > to defaults; newer versions store settings outside of git so this never
+   > happens again):
+   >
+   > ```bash
+   > git -C ~/Library/Application\ Support/Balatro/Mods/Brainstorm checkout -- settings.lua && git -C ~/Library/Application\ Support/Balatro/Mods/Brainstorm pull
+   > ```
+
 ## Features
 ### Save-States
 Brainstorm has the capability to save up to 5 save-states through the use of in-game key binds. 
