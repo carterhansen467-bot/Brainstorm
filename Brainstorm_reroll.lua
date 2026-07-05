@@ -111,6 +111,11 @@ break end
 				seed_found = nil
 			end
 		end
+if seed_found and Brainstorm.SETTINGS.autoreroll.searchJoker and Brainstorm.SETTINGS.autoreroll.searchJoker ~= "" then
+		if not Brainstorm.checkShopJokerSearch(seed_found, 1, Brainstorm.SETTINGS.autoreroll.searchJokerSlots or 2, Brainstorm.SETTINGS.autoreroll.searchJoker) then
+			seed_found = nil
+		end
+	end
 		--[[
 		Relevant vanilla pack code
 		    local cume, it, center = 0, 0, nil
@@ -303,4 +308,129 @@ function Brainstorm.remove_attention_text(args)
           end
         end
       }))
+end
+function Brainstorm.debugPredictShop(seed_found, ante, num_slots)
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+	local r = { joker = 20, tarot = 4, planet = 4, playing_card = 0, spectral = 0 }
+	local total = r.joker + r.tarot + r.planet + r.playing_card + r.spectral
+	local lines = { "Seed: " .. seed_found, "Ante: " .. ante }
+
+	for slot = 1, num_slots do
+		local card_type_roll = pseudorandom(Brainstorm.pseudoseed("cdt" .. ante .. seed_found)) * total
+		if card_type_roll < r.joker then
+			local rarity_roll = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "sho" .. seed_found))
+			local rarity, rname
+			if rarity_roll > 0.95 then
+				rarity, rname = 3, "Rare"
+			elseif rarity_roll > 0.7 then
+				rarity, rname = 2, "Uncommon"
+			else
+				rarity, rname = 1, "Common"
+			end
+
+			
+local rkey = "Joker" .. rarity .. "sho" .. ante
+
+			-- Preserve original index positions; ineligible jokers become 'UNAVAILABLE'
+			-- placeholders instead of being removed from the array
+local function joker_is_pool_eligible(v)
+				local add
+if v.enhancement_gate then
+					add = false
+					if G.playing_cards then
+						for kk, vv in pairs(G.playing_cards) do
+							if vv.config.center.key == v.enhancement_gate then
+								add = true
+								break
+							end
+						end
+					end
+				else
+					add = not (G.GAME.used_jokers[v.key] and not next(find_joker("Showman")))
+						and (v.unlocked ~= false or v.rarity == 4)
+				end
+				if v.no_pool_flag and G.GAME.pool_flags[v.no_pool_flag] then add = false end
+				if v.yes_pool_flag and not G.GAME.pool_flags[v.yes_pool_flag] then add = false end
+				return add and not G.GAME.banned_keys[v.key]
+			end
+
+			local source_pool = G.P_JOKER_RARITY_POOLS[rarity]
+			local pool = {}
+			for k, v in ipairs(source_pool) do
+				pool[k] = joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
+			end
+
+			local chosen_key = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
+			local it = 1
+			while chosen_key == 'UNAVAILABLE' do
+				it = it + 1
+				chosen_key = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. '_resample' .. it .. seed_found))
+			end
+			lines[#lines+1] = "Slot " .. slot .. ": JOKER (" .. rname .. ") -> " .. chosen_key
+		else
+			lines[#lines+1] = "Slot " .. slot .. ": non-joker (tarot/planet/etc)"
+		end
+	end
+
+	local lovely = require("lovely")
+	local nativefs = require("nativefs")
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+end
+local function joker_is_pool_eligible(v)
+	local add
+	if v.enhancement_gate then
+		add = false
+		if G.playing_cards then
+			for kk, vv in pairs(G.playing_cards) do
+				if vv.config.center.key == v.enhancement_gate then
+					add = true
+					break
+				end
+			end
+		end
+	else
+		add = not (G.GAME.used_jokers[v.key] and not next(find_joker("Showman")))
+			and (v.unlocked ~= false or v.rarity == 4)
+	end
+	if v.no_pool_flag and G.GAME.pool_flags[v.no_pool_flag] then add = false end
+	if v.yes_pool_flag and not G.GAME.pool_flags[v.yes_pool_flag] then add = false end
+	return add and not G.GAME.banned_keys[v.key]
+end
+
+local SHOP_RATES_ANTE1 = { joker = 20, tarot = 4, planet = 4, playing_card = 0, spectral = 0 }
+
+function Brainstorm.checkShopJokerSearch(seed_found, ante, num_slots, target_key)
+	local r = SHOP_RATES_ANTE1
+	local total = r.joker + r.tarot + r.planet + r.playing_card + r.spectral
+
+	for slot = 1, num_slots do
+		local card_type_roll = pseudorandom(Brainstorm.pseudoseed("cdt" .. ante .. seed_found)) * total
+		if card_type_roll < r.joker then
+			local rarity_roll = pseudorandom(Brainstorm.pseudoseed("rarity" .. ante .. "sho" .. seed_found))
+			local rarity
+			if rarity_roll > 0.95 then rarity = 3
+			elseif rarity_roll > 0.7 then rarity = 2
+			else rarity = 1
+			end
+
+			local rkey = "Joker" .. rarity .. "sho" .. ante
+			local source_pool = G.P_JOKER_RARITY_POOLS[rarity]
+			local pool = {}
+			for k, v in ipairs(source_pool) do
+				pool[k] = joker_is_pool_eligible(v) and v.key or 'UNAVAILABLE'
+			end
+
+			local chosen_key = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. seed_found))
+			local it = 1
+			while chosen_key == 'UNAVAILABLE' do
+				it = it + 1
+				chosen_key = pseudorandom_element(pool, Brainstorm.pseudoseed(rkey .. '_resample' .. it .. seed_found))
+			end
+
+			if chosen_key == target_key then
+				return true
+			end
+		end
+	end
+	return false
 end

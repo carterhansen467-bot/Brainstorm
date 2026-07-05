@@ -50,7 +50,33 @@ Brainstorm.seedsPerFrame = {
     ["750"] = 750,
     ["1000"] = 1000,
 }
+local function buildJokerSearchOptions()
+	local names, keyByName = {"None"}, {["None"] = ""}
+	local list = {}
+	for k, v in pairs(G.P_CENTER_POOLS["Joker"]) do
+		if v.rarity and v.rarity <= 3 then
+			list[#list+1] = {name = v.name or v.key, key = v.key}
+		end
+	end
+	table.sort(list, function(a,b) return a.name < b.name end)
+	for _, item in ipairs(list) do
+		names[#names+1] = item.name
+		keyByName[item.name] = item.key
+	end
+	return names, keyByName
+end
 
+G.FUNCS.change_search_joker = function(x)
+	Brainstorm.SETTINGS.autoreroll.searchJokerID = x.to_key
+	Brainstorm.SETTINGS.autoreroll.searchJoker = Brainstorm.jokerKeyByName[x.to_val]
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
+Brainstorm.jokerSlotOptions = {"2", "4", "6"}
+G.FUNCS.change_search_joker_slots = function(x)
+	Brainstorm.SETTINGS.autoreroll.searchJokerSlots = tonumber(x.to_val)
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
 local searchTagKeys = {"None", "Charm Tag", "Double Tag", "Uncommon Tag", "Rare Tag", "Holographic Tag", "Foil Tag", "Polychrome Tag", "Investment Tag", "Voucher Tag", "Boss Tag", "Juggle Tag", "Coupon Tag", "Economy Tag", "Skip Tag", "D6 Tag"}
 local searchPackKeys = {"None", "Arcana", "Celestial", "Standard", "Buffoon", "Spectral", "Normal Arcana", "Jumbo Arcana", "Mega Arcana", "Normal Celestial", "Jumbo Celestial", "Mega Celestial", "Normal Standard", "Jumbo Standard", "Mega Standard", "Normal Buffoon", "Jumbo Buffoon", "Mega Buffoon", "Normal Spectral", "Jumbo Spectral", "Mega Spectral"}
 local seedsPerFrame = {"500", "750", "1000"}
@@ -65,7 +91,8 @@ function create_tabs(args)
 	if args and args.tab_h == 7.05 then
 		args.tabs[#args.tabs + 1] = {
 			label = "Brainstorm",
-			tab_definition_function = function()
+			tab_definition_function = function()local jokerNames, jokerKeyByName = buildJokerSearchOptions()
+Brainstorm.jokerKeyByName = jokerKeyByName
 				return {
 					n = G.UIT.ROOT,
 					config = {
@@ -115,6 +142,22 @@ function create_tabs(args)
 							opt_callback = "change_seeds_per_frame",
 							current_option = Brainstorm.SETTINGS.autoreroll.seedsPerFrameID or 1,
 						}),
+create_option_cycle({
+	label = "AutoReroll Search Joker",
+	scale = 0.8,
+	w = 4,
+	options = jokerNames,
+	opt_callback = "change_search_joker",
+	current_option = Brainstorm.SETTINGS.autoreroll.searchJokerID or 1,
+}),
+create_option_cycle({
+	label = "Joker Search Shop Slots",
+	scale = 0.8,
+	w = 4,
+	options = Brainstorm.jokerSlotOptions,
+	opt_callback = "change_search_joker_slots",
+	current_option = 1,
+}),
 					},
 				}
 			end,

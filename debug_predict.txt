@@ -1,0 +1,6 @@
+Seed: TESTSEED
+Ante: 1
+Slot 1: JOKER (Common) -> j_raised_fist
+Slot 2: JOKER (Uncommon) -> j_pareidolia
+Slot 3: JOKER (Common) -> j_splash
+Slot 4: JOKER (Uncommon) -> j_smeared

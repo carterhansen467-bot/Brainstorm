@@ -35,4 +35,8 @@ function Brainstorm.key_press_update(key)
 	if key == Brainstorm.SETTINGS.keybinds.autoReroll and love.keyboard.isDown("lctrl") then
 		Brainstorm.AUTOREROLL.autoRerollActive = not Brainstorm.AUTOREROLL.autoRerollActive
 	end
+-- TEMPORARY TEST KEY — remove once verified
+	if key == "p" then
+		Brainstorm.debugPredictShop("TESTSEED", 1, 4)
+	end
 end
