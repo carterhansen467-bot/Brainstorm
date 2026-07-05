@@ -3,24 +3,12 @@ Current ante: 1
 Live current_round.voucher: v_seed_money
 shop_vouchers.cards count: 0
 
-Predicted A1: v_overstock_norm   <-- current ante
-Predicted A2: v_wasteful
-Predicted A3: v_crystal_ball
-Predicted A4: v_clearance_sale
+Predicted A1: v_seed_money   <-- current ante
+Predicted A2: v_tarot_merchant
+Predicted A3: v_overstock_norm
+Predicted A4: v_planet_merchant
 
-MATCH seq[ante]==live: false
+MATCH seq[ante]==live: true
 
 Pool size 32, available 16
 Available: 1:v_overstock_norm, 3:v_clearance_sale, 5:v_hone, 7:v_reroll_surplus, 9:v_crystal_ball, 11:v_telescope, 13:v_grabber, 15:v_wasteful, 17:v_tarot_merchant, 19:v_planet_merchant, 21:v_seed_money, 23:v_blank, 25:v_magic_trick, 27:v_hieroglyph, 29:v_directors_cut, 31:v_paint_brush
-
---- key brute-force (want == live 'v_seed_money') ---
-key 'Voucher' -> v_overstock_norm
-key 'Voucher1' -> v_seed_money   *** MATCH ***
-key 'Voucher2' -> v_tarot_merchant
-key 'Voucher_1' -> v_paint_brush
-key 'voucher' -> v_clearance_sale
-key 'Voucher_ante1' -> v_planet_merchant
-key 'Voucher_fromtag' -> v_clearance_sale
-key 'Voucher1_resample' -> v_planet_merchant
-
-Live pseudorandom voucher-ish keys: Voucher1_resample2, Voucher1_resample4, Voucher1_resample5, Voucher1_resample3, Voucher1

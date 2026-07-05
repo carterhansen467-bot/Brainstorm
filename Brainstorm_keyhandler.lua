@@ -17,15 +17,23 @@ function Brainstorm.key_press_update(key)
 		end
 		--  LoadState
 		if key == k and love.keyboard.isDown(Brainstorm.SETTINGS.keybinds.loadState) then
-			G:delete_run()
-			G.SAVED_GAME = get_compressed(G.SETTINGS.profile .. "/" .. "saveState" .. k .. ".jkr")
-			if G.SAVED_GAME ~= nil then
-				G.SAVED_GAME = STR_UNPACK(G.SAVED_GAME)
+			local data = get_compressed(G.SETTINGS.profile .. "/" .. "saveState" .. k .. ".jkr")
+			if data ~= nil then
+				data = STR_UNPACK(data)
 			end
-			G:start_run({
-				savetext = G.SAVED_GAME,
-			})
-			saveManagerAlert("Loaded save from slot [" .. k .. "]")
+			if type(data) == "table" and data.brainstorm_found_seed then
+				-- Banked found-seed slot: there's no real save blob, so start a
+				-- fresh run on the stored seed (applyFoundSeed does its own delete_run).
+				Brainstorm.applyFoundSeed(data.brainstorm_found_seed, data.stake)
+				Brainstorm.showSeedSlotAlert("Seed loaded from slot [" .. k .. "]")
+			else
+				G:delete_run()
+				G.SAVED_GAME = data
+				G:start_run({
+					savetext = G.SAVED_GAME,
+				})
+				saveManagerAlert("Loaded save from slot [" .. k .. "]")
+			end
 		end
   end
 	--  FastReroll

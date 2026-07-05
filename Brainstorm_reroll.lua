@@ -26,6 +26,12 @@ G.FUNCS.change_seeds_per_frame = function(x)
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
+G.FUNCS.change_search_threads = function(x)
+	Brainstorm.SETTINGS.autoreroll.searchThreadsID = x.to_key
+	Brainstorm.SETTINGS.autoreroll.searchThreads = Brainstorm.searchThreadsValues[x.to_val] or 0
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
 Brainstorm.AUTOREROLL.autoRerollActive = false
 Brainstorm.AUTOREROLL.rerollInterval = 0.01 -- Time interval between rerolls (in seconds)
 Brainstorm.AUTOREROLL.rerollTimer = 0
@@ -138,9 +144,12 @@ function Brainstorm.passesAllFilters(seed_found)
 	return true
 end
 
--- Starts a fresh run on the winning seed. MUST run on the main thread (touches G).
-function Brainstorm.applyFoundSeed(seed_found)
-	_stake = G.GAME.stake
+-- Starts a fresh run on the winning seed, overwriting the current run. MUST run
+-- on the main thread (touches G). `stake` is optional; when nil it inherits the
+-- current run's stake (the live "overwrite current run" path). The banked-seed
+-- load path passes the stake stored at bank time.
+function Brainstorm.applyFoundSeed(seed_found, stake)
+	_stake = stake or (G.GAME and G.GAME.stake) or 1
 	G:delete_run()
 	G:start_run({
 		stake = _stake,
@@ -150,9 +159,25 @@ function Brainstorm.applyFoundSeed(seed_found)
 	G.GAME.seeded = false
 end
 
+-- Writes the found seed into a save slot as a lightweight marker. A real save
+-- blob can't be fabricated for an unplayed seed (save_run serializes the live G),
+-- so we store the seed + stake instead; loading the slot starts a fresh run on it
+-- (see the banked-seed branch of the load handler in Brainstorm_keyhandler.lua).
+-- Never touches the current run, so the player keeps playing uninterrupted.
+function Brainstorm.bankFoundSeed(seed_found, slot, jokerFoundAt)
+	local marker = {
+		brainstorm_found_seed = seed_found,
+		stake = (G.GAME and G.GAME.stake) or nil,
+		joker = jokerFoundAt,
+		ts = os.time(),
+	}
+	compress_and_save(G.SETTINGS.profile .. "/" .. "saveState" .. slot .. ".jkr", marker)
+end
+
 -- Synchronous (main-thread) search. Still used as a fallback when the search
 -- thread is disabled (Brainstorm.SETTINGS.useSearchThread == false) or when
--- love.thread is unavailable.
+-- love.thread is unavailable. Returns the seed WITHOUT acting on it; the caller
+-- (updateAutoReroll) decides whether to overwrite the current run or bank it.
 function Brainstorm.auto_reroll()
 	local rerollsThisFrame = 0
 	-- This part is meant to mimic how Balatro rerolls for Gold Stake
@@ -171,9 +196,6 @@ function Brainstorm.auto_reroll()
 		if not Brainstorm.passesAllFilters(seed_found) then
 			seed_found = nil
 		end
-	end
-	if seed_found then
-		Brainstorm.applyFoundSeed(seed_found)
 	end
 	return seed_found
 end
@@ -194,6 +216,7 @@ end
 --     (G.shop_vouchers) or already redeemed (used_vouchers). Under "redeem
 --     nothing" that means each ante N>=2 excludes ante N-1's voucher (still on
 --     offer). We mirror that by blanking prev's slot; ante 1 excludes nothing.
+--     Confirmed live at ante 1 and a couple of ante 2+ spot-checks (Ctrl+B).
 function Brainstorm.rollVoucherSequence(seed_found, max_ante)
 	local base = {}
 	for k, v in ipairs(G.P_CENTER_POOLS['Voucher']) do
@@ -401,10 +424,13 @@ function Brainstorm.attention_text(args)
           if args.backdrop_colour then
             args.backdrop_colour = copy_table(args.backdrop_colour)
             Particles(args.pos.x,args.pos.y,0,0,{
-              timer_type = 'TOTAL',
-              timer = 5,
-              scale = 2.4*(args.backdrop_scale or 1), 
-              lifespan = 5,
+              -- Defaults preserve the original persistent glow. Callers can pass a
+              -- 'REAL' timer_type + short timer/lifespan for a quick one-shot flash
+              -- that isn't stretched/compressed by the game-speed multiplier.
+              timer_type = args.backdrop_timer_type or 'TOTAL',
+              timer = args.backdrop_timer or 5,
+              scale = 2.4*(args.backdrop_scale or 1),
+              lifespan = args.backdrop_lifespan or 5,
               speed = 0,
               attach = args.AT,
               colours = {args.backdrop_colour}
@@ -830,6 +856,21 @@ function Brainstorm.buildSearchSnapshot(session)
 	return snap
 end
 
+-- Resolve the number of parallel worker threads. 0 (the default) means "auto":
+-- one per core minus one, so the game + render thread keep a core. A saved
+-- positive value overrides. Clamped to >= 1.
+function Brainstorm.getSearchThreadCount()
+	local n = Brainstorm.SETTINGS.autoreroll.searchThreads or 0
+	if n and n > 0 then return n end
+	local cores = (love.system and love.system.getProcessorCount and love.system.getProcessorCount()) or 4
+	return math.max(1, cores - 1)
+end
+
+-- Spawn N worker threads that partition the SAME seed sequence with no overlap:
+-- thread `i` (0-based) of `n` tests global indices i, i+n, i+2n, ... (see the
+-- worker's `k = (tried-1)*n + i`). They share the result/progress/session
+-- channels; the first to find pushes its seed and the others are stopped when
+-- the session channel is cleared. Near-linear speedup with core count.
 function Brainstorm.startSearchThread()
 	local A = Brainstorm.AUTOREROLL
 	A.searchSession = (A.searchSession or 0) + 1
@@ -845,9 +886,16 @@ function Brainstorm.startSearchThread()
 	local configStr = Brainstorm.serializeValue(Brainstorm.buildSearchSnapshot(session))
 	local rerollSrc = Brainstorm.getRerollSource()
 
+	local n = Brainstorm.getSearchThreadCount()
+	A.searchThreads = {}
+	A.searchProgress = {}
 	A.searchTried = 0
-	A.searchThread = love.thread.newThread(Brainstorm.SEARCH_WORKER_SRC)
-	A.searchThread:start(configStr, rerollSrc)
+	A.searchThreadCount = n
+	for i = 0, n - 1 do
+		local t = love.thread.newThread(Brainstorm.SEARCH_WORKER_SRC)
+		t:start(configStr, rerollSrc, i, n)
+		A.searchThreads[#A.searchThreads + 1] = t
+	end
 end
 
 -- Returns the result table {seed, jokerFoundAt, session} once the worker finds a
@@ -855,25 +903,38 @@ end
 -- worker errors (falling back to the synchronous path for the rest of the run).
 function Brainstorm.pollSearchThread()
 	local A = Brainstorm.AUTOREROLL
-	if not A.searchThread then return nil end
+	if not A.searchThreads or #A.searchThreads == 0 then return nil end
 
-	local err = A.searchThread:getError()
-	if err then
-		print("[Brainstorm] search thread error: " .. tostring(err))
-		A.searchThreadFailed = true
-		Brainstorm.stopSearchThread()
-		return nil
+	for _, t in ipairs(A.searchThreads) do
+		local err = t:getError()
+		if err then
+			print("[Brainstorm] search thread error: " .. tostring(err))
+			A.searchThreadFailed = true
+			Brainstorm.stopSearchThread()
+			return nil
+		end
 	end
 
 	local C = Brainstorm.SEARCH_CHANNELS
+	-- Progress is per-thread ({i, n}); keep the latest count for each and sum them
+	-- so A.searchTried reflects total seeds tested across all workers.
 	local progressChan = love.thread.getChannel(C.progress)
-	local p = progressChan:pop()
-	while progressChan:peek() ~= nil do p = progressChan:pop() end
-	if p then A.searchTried = p end
+	A.searchProgress = A.searchProgress or {}
+	local praw = progressChan:pop()
+	while praw ~= nil do
+		local ok, pv = pcall(function() return load("return " .. praw)() end)
+		if ok and type(pv) == "table" and pv.i ~= nil then
+			A.searchProgress[pv.i] = pv.n
+		end
+		praw = progressChan:pop()
+	end
+	local total = 0
+	for _, v in pairs(A.searchProgress) do total = total + v end
+	A.searchTried = total
 
+	-- Any worker's result is acceptable; first one popped wins.
 	local raw = love.thread.getChannel(C.result):pop()
 	if raw then
-		-- Worker serializes the result with the same Lua-literal format as the config.
 		local ok, res = pcall(function() return load("return " .. raw)() end)
 		if ok and res and res.session == A.searchSession then
 			return res
@@ -884,10 +945,11 @@ end
 
 function Brainstorm.stopSearchThread()
 	local A = Brainstorm.AUTOREROLL
-	-- Clearing the session channel makes any live worker's peek() ~= its session,
-	-- so it exits its loop (no forced kill; love threads can't be killed anyway).
+	-- Clearing the session channel makes every live worker's peek() ~= its session,
+	-- so they all exit their loop (no forced kill; love threads can't be killed).
 	love.thread.getChannel(Brainstorm.SEARCH_CHANNELS.session):clear()
-	A.searchThread = nil
+	A.searchThreads = nil
+	A.searchProgress = nil
 end
 
 -- Drives autoreroll each frame. Threaded path polls the worker; fallback path
@@ -904,7 +966,7 @@ function Brainstorm.updateAutoReroll(dt)
 	local seed_found, jokerFoundAt = nil, nil
 
 	if useThread then
-		if not A.searchThread then
+		if not A.searchThreads or #A.searchThreads == 0 then
 			Brainstorm.startSearchThread()
 		end
 		local res = Brainstorm.pollSearchThread()
@@ -912,24 +974,33 @@ function Brainstorm.updateAutoReroll(dt)
 			seed_found = res.seed
 			jokerFoundAt = res.jokerFoundAt
 			Brainstorm.stopSearchThread()
-			Brainstorm.AUTOREROLL.jokerFoundAt = jokerFoundAt
-			Brainstorm.applyFoundSeed(seed_found)
 		end
 	else
 		A.rerollTimer = A.rerollTimer + dt
 		if A.rerollTimer >= A.rerollInterval then
 			A.rerollTimer = A.rerollTimer - A.rerollInterval
-			seed_found = Brainstorm.auto_reroll() -- applies the run internally
+			seed_found = Brainstorm.auto_reroll()
 			jokerFoundAt = A.jokerFoundAt
 		end
 	end
 
 	if seed_found then
+		-- Search always stops after a find. Destination depends on the setting:
+		-- slot 1-5 banks the seed (current run untouched); 0 / "Current run"
+		-- overwrites the live run immediately, as before.
 		A.autoRerollActive = false
 		Brainstorm.resetSearchUI()
+		local slot = Brainstorm.SETTINGS.autoreroll.foundSeedSlot or 0
+		if slot >= 1 and slot <= 5 then
+			Brainstorm.bankFoundSeed(seed_found, slot, jokerFoundAt)
+			Brainstorm.showSeedSlotAlert("Seed saved to slot [" .. slot .. "]")
+		else
+			Brainstorm.applyFoundSeed(seed_found)
+		end
 		if jokerFoundAt then
+			-- Stash it for the Ctrl+J hotkey; don't auto-pop the joker text on a
+			-- find (it clutters/overlaps the "Seed saved" message).
 			A.lastJokerFoundAt = jokerFoundAt
-			Brainstorm.showJokerFoundAlert("Joker: " .. jokerFoundAt)
 			A.jokerFoundAt = nil
 		end
 		return
@@ -1016,7 +1087,9 @@ end
 Brainstorm.SEARCH_WORKER_SRC = [==[
 require("love.thread")
 
-local configStr, rerollSrc = ...
+local configStr, rerollSrc, threadIndex, numThreads = ...
+threadIndex = threadIndex or 0
+numThreads = numThreads or 1
 
 package.preload["lovely"] = function() return { mod_dir = "" } end
 package.preload["nativefs"] = function()
@@ -1033,15 +1106,26 @@ function pseudohash(str)
 	end
 	return num
 end
+-- Hot-path optimized, but RNG-identical to the game's pseudorandom_element.
+-- The joker/voucher pools we pass are plain contiguous arrays with STRING values
+-- ('key' or 'UNAVAILABLE'). For those the original sorts by integer key (a no-op
+-- on a 1..n array) then does ONE math.random(#keys) -- i.e. exactly
+-- _t[math.random(#_t)]. So we skip the per-call keys-table allocation + table.sort
+-- entirely and index directly. These picks run many times per seed (every ante /
+-- slot in the multi-ante joker search), so this removes the search's biggest GC /
+-- sort cost. Same single math.random call after the same seed => identical results.
+-- Only Tag pools have table values with sort_id; those need the real sort, but are
+-- picked at most once per seed, so we keep the original path for them.
 function pseudorandom_element(_t, seed)
 	if seed then math.randomseed(seed) end
+	local first = _t[1]
+	if type(first) ~= 'table' or not first.sort_id then
+		local key = math.random(#_t)
+		return _t[key], key
+	end
 	local keys = {}
 	for k, v in pairs(_t) do keys[#keys + 1] = { k = k, v = v } end
-	if keys[1] and keys[1].v and type(keys[1].v) == 'table' and keys[1].v.sort_id then
-		table.sort(keys, function(a, b) return a.v.sort_id < b.v.sort_id end)
-	else
-		table.sort(keys, function(a, b) return a.k < b.k end)
-	end
+	table.sort(keys, function(a, b) return a.v.sort_id < b.v.sort_id end)
 	local key = keys[math.random(#keys)].k
 	return _t[key], key
 end
@@ -1093,19 +1177,22 @@ local progressChan = love.thread.getChannel("brainstorm_search_progress")
 local mySession = config.session
 local entropy = config.entropy or 0
 
+-- Partition the global seed sequence across the N workers with no overlap: this
+-- thread tests global indices threadIndex, threadIndex+N, threadIndex+2N, ...
 local tried = 0
 while sessionChan:peek() == mySession do
 	for _ = 1, 250 do
 		tried = tried + 1
-		local seed = random_string(8, entropy + tried * 0.561892350821)
+		local k = (tried - 1) * numThreads + threadIndex
+		local seed = random_string(8, entropy + k * 0.561892350821)
 		if Brainstorm.passesAllFilters(seed) then
 			-- Serialize with the same helper the config uses (defined in reroll.lua,
 			-- loaded above) so we never rely on love channels deep-copying tables.
 			resultChan:push(Brainstorm.serializeValue({ seed = seed, jokerFoundAt = Brainstorm.AUTOREROLL.jokerFoundAt, session = mySession }))
-			progressChan:push(tried)
+			progressChan:push(Brainstorm.serializeValue({ i = threadIndex, n = tried }))
 			return
 		end
 	end
-	progressChan:push(tried)
+	progressChan:push(Brainstorm.serializeValue({ i = threadIndex, n = tried }))
 end
 ]==]

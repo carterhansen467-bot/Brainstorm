@@ -42,7 +42,7 @@ in `card.lua` / `functions/UI_definitions.lua`:
   resamples are frequent (ante 1 above resampled 4x). `get_current_pool` also excludes
   vouchers still in the shop / already redeemed; under "redeem nothing" that means ante
   N≥2 excludes ante N-1's voucher, which `rollVoucherSequence` mirrors by blanking prev's
-  slot. (Ante 2+ exclusion is from source, not yet empirically verified past ante 1.)
+  slot. Ante 1 and a couple of ante 2+ spot-checks confirmed live (Ctrl+B self-test).
 - Shop slot type roll: `"cdt" .. ante`
 - Shop joker rarity: `"rarity" .. ante .. "sho"`
 - Buffoon pack joker rarity: `"rarity" .. ante .. "buf"`
@@ -110,14 +110,28 @@ time the tab re-renders, even though the underlying saved value is untouched.
      rebuilds the same index-preserving `'UNAVAILABLE'`-culled arrays itself.
    - `Brainstorm.SEARCH_WORKER_SRC` — the worker chunk. It has its own Lua state (no `G`),
      so it: stubs `require("lovely"/"nativefs")`, defines the game's pure RNG globals
-     (`pseudohash`/`pseudorandom`/`pseudorandom_element` copied verbatim from
-     `misc_functions.lua`), builds a **mock `G`** from the snapshot (needs `G.FUNCS = {}`
+     (`pseudohash`/`pseudorandom` verbatim from `misc_functions.lua`; `pseudorandom_element`
+     is a **hot-path-optimized but RNG-identical** rewrite — for our plain string-valued
+     joker/voucher pools the game's sort-by-index is a no-op, so it skips the per-call
+     keys-table + `table.sort` and does `_t[math.random(#_t)]` directly, one `math.random`
+     call as before; Tag pools with `sort_id` keep the original sort path), builds a
+     **mock `G`** from the snapshot (needs `G.FUNCS = {}`
      because reroll.lua assigns `G.FUNCS.change_*` at load), then `load()`s the passed
      reroll.lua source to get the identical filter code, and loops generating seeds.
-   - Channels: `brainstorm_search_session` (worker runs while its peek == its session id;
-     clearing it stops the worker — love threads can't be force-killed), `..._result`
-     (serialized `{seed,jokerFoundAt,session}`), `..._progress` (seeds-tried count).
+   - Channels: `brainstorm_search_session` (workers run while their peek == the session id;
+     clearing it stops them all — love threads can't be force-killed), `..._result`
+     (serialized `{seed,jokerFoundAt,session}`), `..._progress` (serialized `{i=threadIndex,n=tried}`).
      `startSearchThread`/`pollSearchThread`/`stopSearchThread` + `updateAutoReroll` drive it.
+   - **Parallel workers** (the speed win): `startSearchThread` spawns N workers, not 1.
+     N = `Brainstorm.getSearchThreadCount()` = the `searchThreads` setting, or auto =
+     `love.system.getProcessorCount()-1` when 0. Each worker gets `(configStr, rerollSrc,
+     threadIndex, N)` and partitions the SAME global seed sequence with NO overlap:
+     worker `i` tests indices `k = (tried-1)*N + i` (i = 0..N-1), so together they cover
+     `0,1,2,...` exactly once. Shared result channel; first finder wins; `stopSearchThread`
+     clears the session so all exit. `pollSearchThread` loops all threads for errors and
+     sums per-thread progress into `A.searchTried`. Near-linear speedup with core count.
+     UI: "Search Threads" cycle (Auto/1/2/3/4/6/8/12/16) — it REPLACED "Rerolls per Frame",
+     which only ever throttled the synchronous fallback the threaded path doesn't use.
    - **Why parity holds without in-game testing**: the real worker runs in the SAME LuaJIT
      VM as the game, the game never overrides global `math.random`, and the RNG functions
      are byte-identical. Validated the serialize→reconstruct-`G`→`passesAllFilters` pipeline
@@ -132,6 +146,27 @@ time the tab re-renders, even though the underlying saved value is untouched.
      Phase flags live on `Brainstorm.AUTOREROLL` (`searchElapsed`, `bigTextShown`,
      `bigTextRemoved`, `showSearchIndicator`); `Brainstorm.resetSearchUI()` tears it all down
      and is called on found, on toggle-on, and on toggle-off.
+
+7. **Bank found seed to a save slot** — instead of overwriting the current run,
+   a found seed can be saved into one of the 5 save slots and started later, so you
+   can search while playing. Setting `Brainstorm.SETTINGS.autoreroll.foundSeedSlot`
+   (0 = overwrite current run immediately, old behavior; 1-5 = bank to that slot),
+   surfaced as the "Found Seed" cycle on the main settings tab.
+   - **Key constraint**: `save_run()` (misc_functions.lua) serializes the *live* G, so
+     a real resumable save can't be fabricated for an unplayed seed without transiently
+     loading it (which would disrupt the current run). So we DON'T store a save blob.
+   - `Brainstorm.bankFoundSeed(seed, slot, joker)` writes a lightweight marker table
+     `{brainstorm_found_seed, stake, joker, ts}` to `saveState<slot>.jkr` via the same
+     `compress_and_save` the manual slots use. The current run is never touched.
+   - The load handler (`Brainstorm_keyhandler.lua`) checks for `.brainstorm_found_seed`:
+     if present it starts a FRESH run on that seed via `Brainstorm.applyFoundSeed(seed,
+     stake)` (ante 1); otherwise it loads the save blob as before. Real saves never carry
+     that key, so no false positives.
+   - `applyFoundSeed` now takes an optional `stake` (banked runs restore the stake stored
+     at bank time; the live overwrite path still inherits `G.GAME.stake`). Both search
+     paths (threaded + sync fallback) funnel through ONE decision point in `updateAutoReroll`
+     — search always stops on a find, then either banks (with a `saveManagerAlert`
+     "Seed X banked to slot [N]") or overwrites.
 
 ## Not yet built (next steps)
 

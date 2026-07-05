@@ -41,6 +41,17 @@ function initBrainstorm()
 	if Brainstorm.SETTINGS.useSearchThread == nil then
 		Brainstorm.SETTINGS.useSearchThread = true
 	end
+	-- Number of parallel search worker threads. 0 = auto (cores - 1).
+	if Brainstorm.SETTINGS.autoreroll.searchThreads == nil then
+		Brainstorm.SETTINGS.autoreroll.searchThreads = 0
+		Brainstorm.SETTINGS.autoreroll.searchThreadsID = 1
+	end
+	-- Where a found seed goes: 0 = overwrite the current run immediately (old
+	-- behavior); 1-5 = bank the seed into that save slot and keep playing.
+	if Brainstorm.SETTINGS.autoreroll.foundSeedSlot == nil then
+		Brainstorm.SETTINGS.autoreroll.foundSeedSlot = 0
+		Brainstorm.SETTINGS.autoreroll.foundSeedSlotID = 1
+	end
   _RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
 end
 

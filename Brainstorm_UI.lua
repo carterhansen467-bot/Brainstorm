@@ -91,6 +91,18 @@ G.FUNCS.change_search_voucher_ante = function(x)
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
+-- Where a found seed is delivered. "Current run" overwrites the live run
+-- immediately (old behavior); "Slot N" banks the seed to that save slot and
+-- leaves the current run untouched (load it later with the load keybind).
+Brainstorm.foundSeedSlotOptions = {"Current run", "Slot 1", "Slot 2", "Slot 3", "Slot 4", "Slot 5"}
+Brainstorm.foundSeedSlotValues  = {["Current run"]=0, ["Slot 1"]=1, ["Slot 2"]=2, ["Slot 3"]=3, ["Slot 4"]=4, ["Slot 5"]=5}
+
+G.FUNCS.change_found_seed_slot = function(x)
+	Brainstorm.SETTINGS.autoreroll.foundSeedSlotID = x.to_key
+	Brainstorm.SETTINGS.autoreroll.foundSeedSlot = Brainstorm.foundSeedSlotValues[x.to_val] or 0
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
 Brainstorm.SearchTagList = {
 	["None"]="",
 	["Uncommon Tag"]="tag_uncommon",
@@ -375,6 +387,10 @@ local searchTagKeys = {"None", "Charm Tag", "Double Tag", "Uncommon Tag", "Rare 
 local searchPackKeys = {"None", "Arcana", "Celestial", "Standard", "Buffoon", "Spectral", "Normal Arcana", "Jumbo Arcana", "Mega Arcana", "Normal Celestial", "Jumbo Celestial", "Mega Celestial", "Normal Standard", "Jumbo Standard", "Mega Standard", "Normal Buffoon", "Jumbo Buffoon", "Mega Buffoon", "Normal Spectral", "Jumbo Spectral", "Mega Spectral"}
 local seedsPerFrame = {"500", "750", "1000", "2500", "5000", "10000"}
 
+-- Parallel search worker count. "Auto" (=0) resolves to cores-1 at search start.
+Brainstorm.searchThreadsOptions = {"Auto", "1", "2", "3", "4", "6", "8", "12", "16"}
+Brainstorm.searchThreadsValues  = {["Auto"]=0, ["1"]=1, ["2"]=2, ["3"]=3, ["4"]=4, ["6"]=6, ["8"]=8, ["12"]=12, ["16"]=16}
+
 Brainstorm.G_FUNCS_options_ref = G.FUNCS.options
 G.FUNCS.options = function(e)
 	Brainstorm.G_FUNCS_options_ref(e)
@@ -469,12 +485,20 @@ function create_tabs(args)
 						}},
 					}},
 					create_option_cycle({
-						label = "Rerolls per Frame",
+						label = "Search Threads",
 						scale = 0.8,
 						w = 4,
-						options = seedsPerFrame,
-						opt_callback = "change_seeds_per_frame",
-						current_option = Brainstorm.SETTINGS.autoreroll.seedsPerFrameID or 1,
+						options = Brainstorm.searchThreadsOptions,
+						opt_callback = "change_search_threads",
+						current_option = Brainstorm.SETTINGS.autoreroll.searchThreadsID or 1,
+					}),
+					create_option_cycle({
+						label = "Found Seed",
+						scale = 0.8,
+						w = 4,
+						options = Brainstorm.foundSeedSlotOptions,
+						opt_callback = "change_found_seed_slot",
+						current_option = Brainstorm.SETTINGS.autoreroll.foundSeedSlotID or 1,
 					}),
 					create_toggle({
 						label = "Debug Mode",
@@ -675,7 +699,11 @@ function saveManagerAlert(text)
 			attention_text({
 				text = text,
 				scale = 0.7,
-				hold = 3,
+				-- E_MANAGER delays count in game-time (dt * SPEEDFACTOR), and
+				-- SPEEDFACTOR == GAMESPEED during a run. Scale the hold by it so the
+				-- popup lasts ~3 REAL seconds regardless of game speed (at GAMESPEED
+				-- 32 a fixed hold=3 vanished in ~0.1s).
+				hold = 3 * (G.SPEEDFACTOR or 1),
 				major = G.STAGE == G.STAGES.RUN and G.play or G.title_top,
 				backdrop_colour = G.C.SECONDARY_SET.Tarot,
 				align = "cm",
@@ -721,6 +749,44 @@ function Brainstorm.showJokerFoundAlert(text)
 				blocking = false,
 				func = function()
 					Brainstorm.remove_attention_text(jokerText)
+					return true
+				end,
+			}))
+			return true
+		end,
+	}))
+end
+
+-- Brief notification for a seed slot (banking a found seed, or loading one back).
+-- The purple backdrop flashes once (REAL timer -> ~0.35s at any game speed) and
+-- the text holds ~1.2 real seconds, then fades. Delays are scaled by SPEEDFACTOR
+-- because E_MANAGER counts in game-time (dt * SPEEDFACTOR) during a run.
+function Brainstorm.showSeedSlotAlert(text)
+	G.E_MANAGER:add_event(Event({
+		trigger = "after",
+		delay = 0.4,
+		blockable = false,
+		blocking = false,
+		func = function()
+			local at = Brainstorm.attention_text({
+				scale = 0.7,
+				text = text,
+				align = "cm",
+				offset = {x = 0, y = -3.5},
+				major = G.STAGE == G.STAGES.RUN and G.play or G.title_top,
+				backdrop_colour = G.C.SECONDARY_SET.Tarot,
+				backdrop_timer_type = "REAL",
+				backdrop_timer = 0.35,
+				backdrop_lifespan = 0.35,
+			})
+			play_sound("other1", 0.76, 0.4)
+			G.E_MANAGER:add_event(Event({
+				trigger = "after",
+				delay = 1.2 * (G.SPEEDFACTOR or 1),
+				blockable = false,
+				blocking = false,
+				func = function()
+					Brainstorm.remove_attention_text(at)
 					return true
 				end,
 			}))
