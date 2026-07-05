@@ -33,10 +33,29 @@ function Brainstorm.key_press_update(key)
 		FastReroll()
 	end
 	if key == Brainstorm.SETTINGS.keybinds.autoReroll and love.keyboard.isDown("lctrl") then
-		Brainstorm.AUTOREROLL.autoRerollActive = not Brainstorm.AUTOREROLL.autoRerollActive
+		if Brainstorm.AUTOREROLL.autoRerollActive then
+			Brainstorm.AUTOREROLL.autoRerollActive = false
+			if Brainstorm.stopSearchThread then
+				Brainstorm.stopSearchThread()
+			end
+			if Brainstorm.resetSearchUI then
+				Brainstorm.resetSearchUI()
+			end
+		else
+			if Brainstorm.resetSearchUI then
+				Brainstorm.resetSearchUI()
+			end
+			Brainstorm.AUTOREROLL.autoRerollActive = true
+		end
 	end
--- TEMPORARY TEST KEY — remove once verified
-	if key == "p" then
-		Brainstorm.debugPredictShop("TESTSEED", 1, 4)
+	if key == "j" and love.keyboard.isDown("lctrl") then
+		if Brainstorm.AUTOREROLL.lastJokerFoundAt then
+			Brainstorm.showJokerFoundAlert("Joker: " .. Brainstorm.AUTOREROLL.lastJokerFoundAt)
+		end
+	end
+	-- Voucher prediction self-test: dumps predicted vs live voucher to debug_predict.txt.
+	if key == "b" and love.keyboard.isDown("lctrl") then
+		Brainstorm.debugPredictVoucher()
+		saveManagerAlert("Voucher prediction -> debug_predict.txt")
 	end
 end

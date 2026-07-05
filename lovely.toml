@@ -69,3 +69,14 @@ Brainstorm.update(dt)
 '''
 match_indent = true
 overwrite = false
+
+[[patches]] #   Brainstorm seed-search corner indicator (draw)
+[patches.pattern]
+target = "game.lua"
+pattern = "love.graphics.setCanvas(G.AA_CANVAS)"
+position = "before"
+payload = '''
+if Brainstorm and Brainstorm.draw_search_indicator then Brainstorm.draw_search_indicator() end
+'''
+match_indent = true
+overwrite = false
