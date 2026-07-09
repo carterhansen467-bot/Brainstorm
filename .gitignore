@@ -12,3 +12,12 @@ brainstorm_diagnostics.txt
 # made every git pull conflict for players)
 settings.lua
 debug_predict.txt
+
+# Native search helper: locally built binary + its runtime handshake files
+native/brainstorm_native_search
+native_search.cfg
+native_search.status
+native_search.status.tmp
+native_search.stop
+native_search.hb
+brainstorm_mismatch.txt

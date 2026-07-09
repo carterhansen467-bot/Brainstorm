@@ -230,6 +230,197 @@ time the tab re-renders, even though the underlying saved value is untouched.
      rolls unconditionally for jokers), so the streams the filters read are identical
      across stakes — the same found seed is valid at White, Black, or Gold.
 
+9. **Per-candidate hot-loop pass** (measured per worker thread, LuaJIT built from
+   the same 2.1 branch LOVE embeds: **9.2x** end-to-end worker loop on a tag-first
+   config, jit-on (108k/s → 996k/s); 2.4-3.2x on soul/legendary/joker-walk configs;
+   still 5.3x/~2x with the JIT forced off. Multiplies with worker-thread count):
+   - **`round13` replaces the `string.format("%.13f")` + `tonumber` round-trip** in
+     `pseudoseed` — that sprintf+strtod pair ran on EVERY RNG advance of every
+     candidate. All-arithmetic and bit-identical: for x in [0,1), n/1e13 (n =
+     floor/ceil of x*1e13) is the same double strtod parses from the printed
+     13-digit decimal, because n and 1e13 are exact and IEEE division rounds
+     correctly. fl(x*1e13) carries at most ~0.001 error, so only the band
+     |frac−0.5| ≤ 0.0015 is ambiguous — those ~0.3% of calls fall back to the
+     original string path. Fuzz-verified (10M values incl. constructed near-ties +
+     200k chained advances, 0 mismatches). Exported as `Brainstorm.round13` for the
+     harness.
+   - **Sorted-keys cache for Tag picks** (worker `pseudorandom_element`): tag pools
+     take the sort_id path, which rebuilt a ~24-entry keys table + `table.sort`
+     (Lua comparator) on every candidate seed when a tag filter is first in line.
+     The sorted order is a pure function of the pool table, and the only sort_id
+     pool a worker ever passes is the static tag-pool snapshot — so the keys array
+     is cached per pool table (weak keys). Unique sort_ids ⇒ deterministic order
+     regardless of pairs() order ⇒ same element for the same roll.
+   - **`random_string` without string churn** (worker copy): fills a reused byte
+     buffer and emits ONE `string.char(unpack(...))` instead of 8 per-char
+     concatenations, and drops the `string.upper` (every produced byte is already
+     an uppercase letter or digit). Same math.random consumption, byte-identical
+     seeds.
+   - **`boosterCume` precompute** in `buildCulledPools` (+ inline fallback in
+     `getSimulatedPacks`, same ipairs order ⇒ bit-identical float sum); settings
+     hoisted to a local in `passesAllFilters`; `checkMultiAnteJokerSearch` does its
+     predicate-only early-outs before building any tables; worker loop hoists
+     `passesAllFilters`/`serializeValue` and the RNG functions localize their
+     library lookups.
+   - **Considered and rejected**: passing bare RNG keys + `random_state.seed`
+     (vanilla-style) instead of baking the seed into every key — ~60 call sites of
+     churn for ~0 gain on the dominant workload (first-filter keys are single-use,
+     so the concat count per rejected seed is identical).
+   - **`tests/search_equivalence.lua`** — permanent harness proving old vs new
+     accept/reject EXACTLY the same seeds: it runs each file's real
+     `SEARCH_WORKER_SRC` under a fake `love.thread`, compares 15 filter configs
+     direct (20k seeds each) + full worker loops incl. a multi-thread partition
+     slice, fuzzes round13, and self-checks useCulledCache on vs off. Run:
+     `git show HEAD:Brainstorm_reroll.lua > /tmp/baseline.lua && luajit
+     tests/search_equivalence.lua --old /tmp/baseline.lua --new
+     Brainstorm_reroll.lua [--bench 2]`. All green before shipping any change to
+     the filter/RNG code.
+
+10. **Native search helper** (`native/brainstorm_native_search.c`, macOS/POSIX;
+    measured on the M1 Max: ~10.7M seeds/s single-thread, ~75M seeds/s on 9
+    threads for tag-first rejects, ~30M/s for soul-first stacks — ~8-10x the
+    whole Lua worker farm; full 34^8 seed-space sweep ≈ 6.6h):
+    - **What it is**: a C port of `passesAllFilters` + every helper (tag, pack,
+      voucher incl. per-ante blanking + resamples, soul/legendary + negative,
+      multi-ante joker walk with ALL/ANY + per-slot negative and the matchSeq
+      first-occurrence rule). Pool ELIGIBILITY IS NOT re-derived in C — the mod
+      resolves it with `joker_is_pool_eligible` / the voucher rules and writes
+      resolved avail flags into the config, so C stays dumb.
+    - **RNG replication**: LuaJIT's Tausworthe TW223 `math.random`/`randomseed`
+      ported verbatim from `lj_prng.h`/`lib_math.c`; pseudohash + the round13
+      advance are Lua-level IEEE math, so the C build REQUIRES
+      `-ffp-contract=off` (build.sh). The one binary-dependent detail — whether
+      the game's LuaJIT fused `d*pi+e` in its PRNG seeding — is CALIBRATED AT
+      RUNTIME: the mod writes 64 parity checks computed with the game's own
+      functions (`buildNativeChecks`), and the helper must reproduce every one
+      bit-for-bit before it searches (it picks fma vs plain mode from them;
+      this arm64 LuaJIT is fma). Any check failure -> E status -> Lua fallback.
+    - **Protocol** (`Brainstorm_reroll.lua` native section): mod writes
+      `native_search.cfg` (line format, ends with `end`; helper refuses
+      truncated configs / missing checks so garbage can never degrade into
+      "accept everything"), spawns the binary detached via `os.execute(... &)`,
+      polls `native_search.status` (atomic tmp+rename rewrite: `P tried`,
+      `R seed label`, `E msg`, `D`), stops it via `native_search.stop`, and
+      touches `native_search.hb` every ~2s — the helper exits on a stale
+      heartbeat (>30s) so a crashed game never orphans a CPU burner (also a 6h
+      hard cap). Candidates are a partitioned sequential counter over the
+      no-0/O charset from an entropy-derived start: zero duplicate work.
+    - **Safety rails**, in order: resolved-eligibility config; bit-exact parity
+      checks before searching; main-thread `passesAllFilters` re-verify of
+      every hit (same rail as the thread search); any error / 5s status
+      silence / re-verify mismatch sets `A.nativeFailed` and the love.thread
+      search takes over seamlessly. Kill switch:
+      `Brainstorm.SETTINGS.useNativeSearch = false` (nil-safe, no UI).
+    - **Verification**: `tests/native_equivalence.sh` (uses
+      `tests/dump_native_fixtures.lua`; keep its CASES/pools in sync with
+      search_equivalence.lua) boots the real worker bootstrap, writes configs
+      via the PRODUCTION serializer, and diffs C verdicts+labels against the
+      Lua oracle: 15 cases x 30k seeds, byte-identical. Smoke-tested: find/exit,
+      stop-file, corrupt config -> E, stale heartbeat -> self-exit. Run it
+      before shipping any change to the filters, the config format, or the C.
+    - **Interleaved hashing** (implemented): pseudohash is a serial fdiv chain,
+      so one candidate is latency-bound; the worker hashes 8 candidates in
+      lockstep (`batch_hash_seed`/`batch_hash_key`) and preloads the first
+      active filter's stream init (`Config.fsId/fsKey`, mirrors passes()
+      order). Bit-exact by construction (each candidate's op sequence is
+      unchanged, only temporally interleaved); guarded by an always-on
+      `batch_selftest` against the serial reference, and fixture mode runs the
+      batched pipeline so the equivalence suite validates it end-to-end.
+      Gained +76% (tag path) / +50% (soul-first) over the serial helper.
+
+11. **Deep search phase 1: Anywhere mode + wildcard targets** (antes 1-8 over
+    the already-verified per-ante stream models; all 22 fixture cases Lua==C
+    byte-identical, and anywhere-OFF verdicts proven unchanged vs baseline):
+    - **Anywhere (Antes 1-8)** toggle on the Multi-Ante tab + a Depth cycle
+      (4/6/8/12/16 slots/ante): overrides the per-ante rows with one uniform
+      window -- every ante 1-8, shops to that depth plus first-shop packs.
+      Resolved in ONE place (`Brainstorm.effectiveMultiAnte`) consumed by both
+      the Lua filter and the native config writer, so the helper never knows
+      about UI modes. Antes 5-8 use the same keyed streams
+      (cdt<a>/rarity<a>sho|buf/Joker<r>sho|buf<a>/edisho|edibuf<a>/
+      shop_pack<a>/Voucher<a>) the verified 1-4 models use. Depth is capped
+      modest on purpose: found seeds must be affordable to reach (rerolls).
+    - **Wildcard joker targets**: assign "Any Joker/Common/Uncommon/Rare
+      (wildcard)" from the Jokers tab search (keys `*any/*common/*uncommon/
+      *rare`, rendered as rarity chips); combined with the slot's Negative
+      toggle they search e.g. "any natural negative Rare anywhere". Wildcards
+      match by RARITY so the pool pick is skipped entirely (safe: pick streams
+      are read by nothing else) -- wildcard-only searches never touch the
+      joker pools at all. Matching semantics differ deliberately from specific
+      keys: a specific key keeps the first-occurrence rule (that card is what
+      you'd see); a wildcard matches if ANY entry of the right rarity passes
+      the negative check. Sim sequences now carry `rarity` alongside key/neg.
+    - **Voucher ante options extended**: exact antes 5-8 and "Any (1-8)"
+      (= -1; 0 stays Any 1-4). Same per-ante `Voucher<a>` keys +
+      redeem-nothing blanking, just deeper. Options appended so saved
+      searchVoucherAnteID indices stay valid.
+    - **Conventions unchanged** (they're what makes deep finds real): pool
+      eligibility frozen at fresh-run state -- don't buy pool-affecting items
+      before collecting the target; the foundAt label (e.g. "J1A4Shop") says
+      where to go. Soul/legendary stays the ante-1 charm-tag convention in
+      phase 1. PHASE 2 (needs live-run verification via the Ctrl+B/P/D
+      predictors first): big-blind tag (2nd `Tag<ante>` advance), pack slots
+      3-6 (shops 2-3 of an ante), per-pack-size soul roll counts, 2nd soul ->
+      2nd `Joker4` advance.
+    - Settings: `multiAnteSearch.anywhereMode` / `anywhereSlots` (backfilled
+      in Brainstorm.lua). C: ante arrays widened to [9], RBASES 29->57,
+      NULL-safe token parsing, wildcards parsed only for the four known keys
+      (unknown `*` keys behave like never-matching specific keys, same as Lua).
+
+12. **Deep search phase 2 + three source-verified bug fixes** (models extracted
+    from the CURRENTLY SHIPPED Balatro.love, freshly unzipped from the app
+    bundle -- see scratch notes below; 31 fixture cases Lua==C byte-identical;
+    old-vs-new harness diffs confirmed to be EXACTLY the intended fix set:
+    tag cases + pack-joker cases changed, everything else identical):
+    - **BUG FIX -- tag pool culling** (get_current_pool 'Tag' branch): tags are
+      picked from an index-preserving culled STRING array -- requires-center
+      not DISCOVERED (profile state!) or min_ante > ante (tag_negative has
+      min_ante=2) or banned => 'UNAVAILABLE' + 'Tag'..ante..'_resample'..it.
+      The old raw-pool sorted pick diverged whenever the roll landed on a
+      culled tag (~1/24 of ante-1 rolls hit tag_negative alone).
+      `Brainstorm.rollTag(seed, ante)` + per-ante `CULLED.tag` arrays;
+      snapshot/config carry requiresOk (discovery resolved at search time) +
+      min_ante per tag.
+    - **BUG FIX -- forced first Buffoon** (get_pack first_shop_buffoon): the
+      run's FIRST pack is a forced normal Buffoon consuming NO 'shop_pack1'
+      advance (variant via raw math.random => matched by kind, never key).
+      Ante 1's physical pack slots are [forced, adv1, ...]. getSimulatedPacks
+      models it; the pack filter scans physical slots 1-3 (same accept set as
+      before for non-buffoon targets; normal-buffoon targets now truthfully
+      always match); the pack-joker matcher includes the forced pack's 2 cards
+      (they consume rarity1buf/Joker1buf1/edibuf1 FIRST when opened first).
+    - **BUG FIX -- pack card counts** = config.extra (Card:open uses
+      ability.extra): mega Buffoon is 4 cards, NOT 6 (old model desynced every
+      buf stream after a mega buffoon). Arcana 3/5/5, Spectral 2/4/4,
+      Celestial/Standard 3/5/5. packCardCount() + snapshot .cards.
+    - **Tag: any blind, antes 1-8** (autoreroll.searchTagAnywhere, toggle on
+      the core tab): Small rolls before Big per ante (game.lua reset_blinds,
+      both via get_next_tag_key); label "TagA<n>Sm|Big"; obtain by skipping
+      that blind.
+    - **Legendary: any pack, antes 1-8** (autoreroll.searchLegendaryAnywhere):
+      finds the run's FIRST Soul. Per ante, packs are scanned in physical slot
+      order; Arcana cards roll 'soul_Tarot'..ante once each; Spectral cards
+      roll 'soul_Spectral'..ante TWICE (soul then black hole -- create_card
+      sets forced_key twice, so a black-hole hit OVERWRITES a soul on the same
+      card; after a black hole exists later spectral cards skip the second
+      roll). First Soul's legendary = first bare-'Joker4' advance (source: the
+      pool key gets the ante appended EXCEPT for legendary), edition =
+      'edisou'..ante. Label "LegA<n>P<slot>". CONVENTION: reach the ante with
+      pools untouched, open that ante's Arcana/Spectral packs in slot order,
+      use the Soul in that ante. searchForSoul is ignored in this mode.
+    - Anywhere joker mode now scans all 6 physical pack slots per ante
+      (packslots config, 2 per shop x 3 shops); per-ante rows keep the
+      first-shop window.
+    - **Verify in-game**: Ctrl+P now prints all 6 predicted slots per ante
+      incl. the FORCED marker; Ctrl+D prints Small+Big tags for antes 1-2 and
+      the legendary-anywhere scan result. Run both on a fresh seed before
+      trusting a big hunt (the ante-2+ tag rolls and 6-slot pack list are
+      source-verified but not yet live-confirmed).
+    - NOTE: `tests/search_equivalence.lua` old-vs-new comparisons are now
+      STALE for tag/pack-joker cases against pre-phase-2 baselines (intended
+      model fixes). After these changes are committed, HEAD is the valid
+      baseline again.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

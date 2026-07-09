@@ -66,3 +66,38 @@ Brainstorm allows for super-fast rerolling through the use of an in-game key bin
 Brainstorm can automatically reroll for parameters as specified by the user.
 You can edit the Auto-Reroll parameters in the Brainstorm in-game settings page.
 > To Auto-Reroll:	Press `Ctrl + a`
+
+### Deep search: tags and legendaries anywhere (antes 1-8)
+Two more toggles on the main Brainstorm tab: **Tag: any blind, antes 1-8**
+matches the searched tag on any Small/Big blind up to ante 8 (labels like
+`TagA3Big` -- skip that blind to take the tag). **Legendary: any pack, antes
+1-8** finds the run's first Soul in any Arcana/Spectral pack up to ante 8
+(labels like `LegA7P5` = ante 7, pack slot 5; open that ante's Arcana/Spectral
+packs in slot order and use the Soul there). Combine with the Negative toggle
+to hunt natural negative legendaries.
+
+### Deep search: Anywhere mode + wildcards
+On the **Multi-Ante** tab, toggle **Anywhere (Antes 1-8)** to search every ante
+1-8 at one uniform shop depth (packs included) instead of configuring antes
+individually. On the **Jokers** tab, search for "wildcard" to pick **Any
+Common/Uncommon/Rare/Joker** targets -- combine with a slot's **Negative**
+toggle to hunt e.g. a natural negative Rare anywhere in the first 8 antes. The
+Voucher Ante cycle likewise gains antes 5-8 and **Any (1-8)**. Found seeds
+report where the target appears (e.g. `J1A4Shop` = slot-1 joker in ante 4's
+shop); reach it by playing to that ante without buying pool-affecting items
+first, and reroll the shop to reveal the configured depth.
+
+### Native search accelerator (macOS, optional)
+Filtered searches normally run on background Lua threads. On macOS you can
+additionally build a small native helper that searches ~8x faster across all
+CPU cores (~75M seeds/sec on an M1 Max). Build it once:
+
+```bash
+sh ~/Library/Application\ Support/Balatro/Mods/Brainstorm/native/build.sh
+```
+
+The mod detects the binary automatically on the next launch and uses it for
+`Ctrl + a` searches; every hit is still re-verified in-game before a run
+starts, and the mod falls back to the Lua search if the helper is missing or
+disagrees. Remove the binary (or set `useNativeSearch = false` in
+settings.lua) to go back to pure-Lua searching.

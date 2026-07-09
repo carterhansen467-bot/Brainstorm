@@ -84,6 +84,23 @@ function initBrainstorm()
 		Brainstorm.SETTINGS.autoreroll.foundSeedStake = 1
 		Brainstorm.SETTINGS.autoreroll.foundSeedStakeID = 1
 	end
+	-- "Anywhere" joker search: one uniform shop depth across antes 1-8 with
+	-- packs on, overriding the per-ante Multi-Ante rows while enabled.
+	if Brainstorm.SETTINGS.multiAnteSearch.anywhereMode == nil then
+		Brainstorm.SETTINGS.multiAnteSearch.anywhereMode = false
+	end
+	if Brainstorm.SETTINGS.multiAnteSearch.anywhereSlots == nil then
+		Brainstorm.SETTINGS.multiAnteSearch.anywhereSlots = 8
+		Brainstorm.SETTINGS.multiAnteSearch.anywhereSlotsID = 3
+	end
+	-- Deep-search phase 2: tag search across both blinds of antes 1-8, and
+	-- legendary search across every Arcana/Spectral pack of antes 1-8.
+	if Brainstorm.SETTINGS.autoreroll.searchTagAnywhere == nil then
+		Brainstorm.SETTINGS.autoreroll.searchTagAnywhere = false
+	end
+	if Brainstorm.SETTINGS.autoreroll.searchLegendaryAnywhere == nil then
+		Brainstorm.SETTINGS.autoreroll.searchLegendaryAnywhere = false
+	end
   _RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
 end
 

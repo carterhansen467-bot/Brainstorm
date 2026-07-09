@@ -284,8 +284,12 @@ end
 
 -- Which ante the searched voucher must be offered at. Vouchers roll from one
 -- shared RNG stream advanced once per ante, so "Ante N" means the Nth voucher.
-Brainstorm.voucherAnteOptions = {"Ante 1", "Ante 2", "Ante 3", "Ante 4", "Any (1-4)"}
-Brainstorm.voucherAnteValues  = {["Ante 1"]=1, ["Ante 2"]=2, ["Ante 3"]=3, ["Ante 4"]=4, ["Any (1-4)"]=0}
+-- New options are appended so saved searchVoucherAnteID indices stay valid.
+-- -1 = any of antes 1-8 (deep-search companion to the Anywhere joker mode).
+Brainstorm.voucherAnteOptions = {"Ante 1", "Ante 2", "Ante 3", "Ante 4", "Any (1-4)",
+	"Ante 5", "Ante 6", "Ante 7", "Ante 8", "Any (1-8)"}
+Brainstorm.voucherAnteValues  = {["Ante 1"]=1, ["Ante 2"]=2, ["Ante 3"]=3, ["Ante 4"]=4, ["Any (1-4)"]=0,
+	["Ante 5"]=5, ["Ante 6"]=6, ["Ante 7"]=7, ["Ante 8"]=8, ["Any (1-8)"]=-1}
 
 G.FUNCS.change_search_voucher_ante = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchVoucherAnteID = x.to_key
@@ -375,8 +379,17 @@ Brainstorm.seedsPerFrame = {
 -- ============================================================================
 
 -- Build a node that renders an actual joker card sprite (or an empty
--- placeholder box when key == "").
+-- placeholder box when key == ""). Wildcard keys ("*rare" etc., no center to
+-- draw) render as a rarity-coloured chip instead.
 function Brainstorm.jokerSprite(key, w, h)
+	local wild = key ~= "" and Brainstorm.WILDCARD_RARITY and Brainstorm.WILDCARD_RARITY[key]
+	if wild then
+		local label = ({[0] = "ANY", [1] = "C", [2] = "U", [3] = "R"})[wild] or "?"
+		local col = (wild >= 1 and G.C.RARITY and G.C.RARITY[wild]) or G.C.BLUE
+		return {n = G.UIT.C, config = {align = "cm", minw = w, minh = h, r = 0.1, colour = darken(G.C.BLACK, 0.05)}, nodes = {
+			{n = G.UIT.T, config = {text = label, scale = 0.34, colour = col}},
+		}}
+	end
 	local center = key ~= "" and G.P_CENTERS[key]
 	if not center then
 		return {n = G.UIT.B, config = {w = w, h = h, r = 0.1, colour = darken(G.C.BLACK, 0.05)}}
@@ -602,6 +615,18 @@ for ante = 1, 4 do
 	end
 end
 
+-- "Anywhere" mode: search every ante 1-8 at one uniform shop depth with packs
+-- on, ignoring the per-ante rows below. Depth stays modest by design so found
+-- seeds are affordable to actually reach (rerolls cost money).
+local anywhereSlotOptions = {"4", "6", "8", "12", "16"}
+local anywhereSlotValues  = {["4"]=4, ["6"]=6, ["8"]=8, ["12"]=12, ["16"]=16}
+
+G.FUNCS.change_anywhere_slots = function(x)
+	Brainstorm.SETTINGS.multiAnteSearch.anywhereSlotsID = x.to_key
+	Brainstorm.SETTINGS.multiAnteSearch.anywhereSlots = anywhereSlotValues[x.to_val] or 8
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
 local searchTagKeys = {"None", "Charm Tag", "Double Tag", "Uncommon Tag", "Rare Tag", "Holographic Tag", "Foil Tag", "Polychrome Tag", "Investment Tag", "Voucher Tag", "Boss Tag", "Juggle Tag", "Coupon Tag", "Economy Tag", "Skip Tag", "D6 Tag"}
 local searchPackKeys = {"None", "Arcana", "Celestial", "Standard", "Buffoon", "Spectral", "Normal Arcana", "Jumbo Arcana", "Mega Arcana", "Normal Celestial", "Jumbo Celestial", "Mega Celestial", "Normal Standard", "Jumbo Standard", "Mega Standard", "Normal Buffoon", "Jumbo Buffoon", "Mega Buffoon", "Normal Spectral", "Jumbo Spectral", "Mega Spectral"}
 local seedsPerFrame = {"500", "750", "1000", "2500", "5000", "10000"}
@@ -676,6 +701,16 @@ function create_tabs(args)
 						opt_callback = "change_search_voucher_ante",
 						current_option = Brainstorm.SETTINGS.autoreroll.searchVoucherAnteID or 1,
 					}),
+					{n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+						create_toggle({
+							label = "Tag: any blind, antes 1-8",
+							label_scale = 0.32,
+							w = 1.2,
+							ref_table = Brainstorm.SETTINGS.autoreroll,
+							ref_value = "searchTagAnywhere",
+							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+						}),
+					}},
 				}}
 
 				-- Right column: legendary + misc settings. The legendary cycle bar
@@ -711,6 +746,16 @@ function create_tabs(args)
 						}, nodes = {
 							{n = G.UIT.T, config = {ref_table = Brainstorm.negLegendaryDisplay, ref_value = "text", scale = 0.35, colour = {1, 1, 1, 1}}},
 						}},
+					}},
+					{n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+						create_toggle({
+							label = "Legendary: any pack, antes 1-8",
+							label_scale = 0.32,
+							w = 1.2,
+							ref_table = Brainstorm.SETTINGS.autoreroll,
+							ref_value = "searchLegendaryAnywhere",
+							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+						}),
 					}},
 					create_option_cycle({
 						label = "Search Threads",
@@ -773,6 +818,19 @@ function create_tabs(args)
 			tab_definition_function = function()
 				Brainstorm.allJokerNames = {"None"}
 				Brainstorm.allJokerKeys  = {""}
+				-- Wildcard entries first (type "any" to see them): match by rarity
+				-- instead of a specific joker. Combined with a slot's Negative
+				-- toggle they search e.g. "any natural negative Rare".
+				local wildcards = {
+					{name = "Any Joker (wildcard)",    key = "*any"},
+					{name = "Any Common (wildcard)",   key = "*common"},
+					{name = "Any Uncommon (wildcard)", key = "*uncommon"},
+					{name = "Any Rare (wildcard)",     key = "*rare"},
+				}
+				for _, w in ipairs(wildcards) do
+					Brainstorm.allJokerNames[#Brainstorm.allJokerNames+1] = w.name
+					Brainstorm.allJokerKeys[#Brainstorm.allJokerKeys+1]  = w.key
+				end
 				local allJokers = {}
 				for _, v in pairs(G.P_CENTER_POOLS["Joker"]) do
 					-- Legendaries have their own search on the Brainstorm tab.
@@ -880,14 +938,44 @@ function create_tabs(args)
 			label = "Brainstorm: Multi-Ante",
 			tab_definition_function = function()
 				local cfg = Brainstorm.SETTINGS.multiAnteSearch or {}
+				-- Header: the Anywhere toggle + its depth cycle, above the per-ante rows.
+				local anywhereRow = {n = G.UIT.R, config = {align = "cm", padding = 0.03}, nodes = {
+					{n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
+						create_toggle({
+							label = "Anywhere (Antes 1-8)",
+							ref_table = Brainstorm.SETTINGS.multiAnteSearch,
+							ref_value = "anywhereMode",
+							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+						}),
+					}},
+					{n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
+						{n = G.UIT.R, config = {align = "cm"}, nodes = {
+							{n = G.UIT.T, config = {text = "Depth (slots/ante)", scale = 0.36, colour = G.C.UI.TEXT_LIGHT}},
+						}},
+						{n = G.UIT.R, config = {align = "cm"}, nodes = {
+							create_option_cycle({
+								scale = 0.7,
+								w = 2.6,
+								options = anywhereSlotOptions,
+								opt_callback = "change_anywhere_slots",
+								current_option = cfg.anywhereSlotsID or 3,
+							}),
+						}},
+					}},
+				}}
+				local anywhereNote = {n = G.UIT.R, config = {align = "cm", padding = 0.01}, nodes = {
+					{n = G.UIT.T, config = {text = "ON: searches shops + packs in every ante 1-8; the per-ante rows below are ignored.", scale = 0.26, colour = G.C.UI.TEXT_INACTIVE}},
+				}}
 				-- One row per ante: shop-slot cycle on the left, its pack toggle on the right.
 				local anteRows = {}
+				anteRows[#anteRows + 1] = anywhereRow
+				anteRows[#anteRows + 1] = anywhereNote
 				for ante = 1, 4 do
 					-- Label sits directly above the bar (shared column) so it stays centred
 					-- on the bar. The toggle column uses an invisible label of the same size
 					-- so the Packs toggle drops to the bar's vertical middle.
 					local shopLabel = "Ante " .. ante .. " Shop Slots"
-					anteRows[ante] = {n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+					anteRows[#anteRows + 1] = {n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
 						{n = G.UIT.C, config = {align = "cm"}, nodes = {
 							{n = G.UIT.R, config = {align = "cm"}, nodes = {
 								{n = G.UIT.T, config = {text = shopLabel, scale = 0.4, colour = G.C.UI.TEXT_LIGHT}},
