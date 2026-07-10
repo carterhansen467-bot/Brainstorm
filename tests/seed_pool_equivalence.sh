@@ -13,14 +13,16 @@ COUNT="${2:-1000000}"
 OUT="${TMPDIR:-/tmp}/brainstorm_seed_pool_equivalence"
 mkdir -p "$OUT"
 
-sh native/build.sh
+[ -n "${SKIP_NATIVE_BUILD:-}" ] || sh native/build.sh
 
 # The snapshot on disk may predate the current config protocol; the catalog
 # data (pools/checks) is version-independent, so rewrite only the handshake.
 sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
 SNAPSHOT="$OUT/snapshot.cfg"
-clang -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread \
-	-o "$OUT/seed_pool_compat" tests/seed_pool_compat.c -lm
+# Overridable so Windows CI can build the compat harness with zig cc (no
+# -pthread there; threads come from the Win32 shim). EXE=.exe on Windows.
+${SEED_POOL_COMPAT_CC:-clang -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread} \
+	-o "$OUT/seed_pool_compat${EXE:-}" tests/seed_pool_compat.c -lm
 
 {
 	echo "poolver 1"
@@ -37,4 +39,4 @@ clang -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread \
 	echo "end"
 } > "$OUT/criteria.cfg"
 
-"$OUT/seed_pool_compat" "$SNAPSHOT" "$OUT/criteria.cfg" "$COUNT"
+"$OUT/seed_pool_compat${EXE:-}" "$SNAPSHOT" "$OUT/criteria.cfg" "$COUNT"

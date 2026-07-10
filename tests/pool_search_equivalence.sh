@@ -19,7 +19,11 @@ OUT="${TMPDIR:-/tmp}/brainstorm_pool_search_equivalence"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-sh native/build.sh
+# Windows CI runs this same script under bash against the prebuilt .exes:
+# NATIVE_BIN/POOL_BIN point at them and SKIP_NATIVE_BUILD=1 skips build.sh.
+NATIVE_BIN="${NATIVE_BIN:-./native/brainstorm_native_search}"
+POOL_BIN="${POOL_BIN:-./native/brainstorm_seed_pool}"
+[ -n "${SKIP_NATIVE_BUILD:-}" ] || sh native/build.sh
 
 # The snapshot on disk may predate the current config protocol; the catalog
 # data (pools/checks) is version-independent, so rewrite only the handshake.
@@ -40,8 +44,8 @@ sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
 	echo "end"
 } > "$OUT/criteria.cfg"
 
-./native/brainstorm_seed_pool scan "$OUT/snapshot.cfg" "$OUT/criteria.cfg" "$OUT/pool.bspool"
-./native/brainstorm_seed_pool export "$OUT/pool.bspool" "$OUT/pool.txt"
+"$POOL_BIN" scan "$OUT/snapshot.cfg" "$OUT/criteria.cfg" "$OUT/pool.bspool"
+"$POOL_BIN" export "$OUT/pool.bspool" "$OUT/pool.txt"
 RECORDS=$(wc -l < "$OUT/pool.txt" | tr -d ' ')
 [ "$RECORDS" -gt 0 ] || { echo "FAIL: pool is empty; grow seed-count"; exit 1; }
 
@@ -80,13 +84,13 @@ write_search_cfg() {
 write_search_cfg j_perkeo "$OUT/search_hit.cfg"
 date +%s > "$OUT/hb"
 rm -f "$OUT/status" "$OUT/stop"
-./native/brainstorm_native_search search "$OUT/search_hit.cfg" \
+"$NATIVE_BIN" search "$OUT/search_hit.cfg" \
 	"$OUT/status" "$OUT/stop" "$OUT/hb"
 SEED=$(sed -n 's/^R \([A-Z0-9]*\) .*/\1/p' "$OUT/status")
 [ -n "$SEED" ] || { echo "FAIL: pool search found nothing"; cat "$OUT/status"; exit 1; }
 grep -qx "$SEED" "$OUT/pool.txt" || { echo "FAIL: hit $SEED is not a pool member"; exit 1; }
 echo "$SEED" > "$OUT/hit.seed"
-FIX=$(./native/brainstorm_native_search fixture "$OUT/search_hit.cfg" "$OUT/hit.seed")
+FIX=$("$NATIVE_BIN" fixture "$OUT/search_hit.cfg" "$OUT/hit.seed")
 case "$FIX" in
 	"$SEED 1"*) ;;
 	*) echo "FAIL: fixture rejects the pool hit: $FIX"; exit 1 ;;
@@ -98,7 +102,7 @@ write_search_cfg j_triboulet "$OUT/search_none.cfg"
 date +%s > "$OUT/hb"
 rm -f "$OUT/status" "$OUT/stop"
 rc=0
-./native/brainstorm_native_search search "$OUT/search_none.cfg" \
+"$NATIVE_BIN" search "$OUT/search_none.cfg" \
 	"$OUT/status" "$OUT/stop" "$OUT/hb" || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: expected exhaustion exit 3, got $rc"; cat "$OUT/status"; exit 1; }
 grep -q "^E pool: no seed in the pool matches" "$OUT/status" \

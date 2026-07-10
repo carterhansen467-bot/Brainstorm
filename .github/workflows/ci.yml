@@ -1,0 +1,158 @@
+# Native helper CI: bit-exactness on real Windows + regression cover on macOS.
+#
+# The Windows job is the port's actual proof: the Lua oracle fixtures are
+# generated WITH that machine's own LuaJIT build, so the fixture diff is a
+# true bit-exactness check of the .exe helpers against LuaJIT-on-Windows
+# (the helper still runtime-calibrates fma vs plain from the check_* lines).
+#
+# Both jobs generate the pool-harness catalog snapshot with
+# tests/dump_pool_snapshot.lua because no game runs here (in-game the mod
+# writes native_search.cfg itself).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.13.0
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        shell: bash
+        run: |
+          curl -sSL -o zig.zip "https://ziglang.org/download/${ZIG_VERSION}/zig-windows-x86_64-${ZIG_VERSION}.zip"
+          unzip -q zig.zip
+          echo "ZIG=$PWD/zig-windows-x86_64-${ZIG_VERSION}/zig.exe" >> "$GITHUB_ENV"
+
+      - name: Build Windows helpers
+        shell: bash
+        run: ZIG="$ZIG" sh native/build_windows.sh
+
+      - name: Build LuaJIT (MSVC)
+        shell: cmd
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT.git
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          cd LuaJIT\src
+          msvcbuild.bat
+
+      - name: Oracle equivalence (Windows LuaJIT fixtures vs .exe)
+        shell: bash
+        run: |
+          LUAJIT="$PWD/LuaJIT/src/luajit.exe" \
+          NATIVE_BIN=./native/brainstorm_native_search.exe \
+          SKIP_NATIVE_BUILD=1 \
+          sh tests/native_equivalence.sh
+
+      - name: Pool engine equivalence
+        shell: bash
+        run: |
+          "$PWD/LuaJIT/src/luajit.exe" tests/dump_pool_snapshot.lua Brainstorm_reroll.lua snapshot.cfg
+          SEED_POOL_COMPAT_CC="$ZIG cc -target x86_64-windows-gnu -O3 -Wall -Wno-unused-function -ffp-contract=off" \
+          EXE=.exe \
+          SKIP_NATIVE_BUILD=1 \
+          sh tests/seed_pool_equivalence.sh snapshot.cfg
+
+      - name: Pool build -> restricted search -> exhaustion
+        shell: bash
+        run: |
+          NATIVE_BIN=./native/brainstorm_native_search.exe \
+          POOL_BIN=./native/brainstorm_seed_pool.exe \
+          SKIP_NATIVE_BUILD=1 \
+          sh tests/pool_search_equivalence.sh snapshot.cfg
+
+      - name: Upload helper binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-helpers
+          path: |
+            native/brainstorm_native_search.exe
+            native/brainstorm_seed_pool.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build LuaJIT
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT.git /tmp/LuaJIT
+          make -C /tmp/LuaJIT -j4 MACOSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Oracle equivalence
+        run: LUAJIT=/tmp/LuaJIT/src/luajit sh tests/native_equivalence.sh
+
+      - name: Pool engine equivalence
+        run: |
+          /tmp/LuaJIT/src/luajit tests/dump_pool_snapshot.lua Brainstorm_reroll.lua snapshot.cfg
+          sh tests/seed_pool_equivalence.sh snapshot.cfg
+
+      - name: Pool build -> restricted search -> exhaustion
+        run: sh tests/pool_search_equivalence.sh snapshot.cfg
+
+      - name: Cross-compile Windows helpers (zig)
+        run: |
+          curl -sSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-macos-aarch64-${ZIG_VERSION}.tar.xz"
+          tar -C /tmp -xf /tmp/zig.tar.xz
+          ZIG=/tmp/zig-macos-aarch64-${ZIG_VERSION}/zig sh native/build_windows.sh
+
+  release:
+    # Tag a commit vX.Y.Z to publish the Windows zip. The exes are unsigned;
+    # the install notes cover the SmartScreen/Defender unblock steps.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        shell: bash
+        run: |
+          curl -sSL -o zig.zip "https://ziglang.org/download/${ZIG_VERSION}/zig-windows-x86_64-${ZIG_VERSION}.zip"
+          unzip -q zig.zip
+          echo "ZIG=$PWD/zig-windows-x86_64-${ZIG_VERSION}/zig.exe" >> "$GITHUB_ENV"
+
+      - name: Build Windows helpers
+        shell: bash
+        run: ZIG="$ZIG" sh native/build_windows.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Seed Pool Builder.exe (PyInstaller)
+        shell: bash
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name "Seed Pool Builder" tools/pool_builder_web.py
+
+      - name: Assemble release zip
+        shell: bash
+        run: |
+          STAGE="Brainstorm-windows-${GITHUB_REF_NAME}"
+          mkdir -p "$STAGE/native"
+          cp native/brainstorm_native_search.exe native/brainstorm_seed_pool.exe "$STAGE/native/"
+          cp "dist/Seed Pool Builder.exe" "$STAGE/"
+          cp "Seed Pool Builder.bat" "$STAGE/"
+          cp docs/WINDOWS_INSTALL.txt "$STAGE/INSTALL.txt"
+          7z a "${STAGE}.zip" "$STAGE"
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "Brainstorm-windows-${GITHUB_REF_NAME}.zip" \
+            --title "Brainstorm $GITHUB_REF_NAME (Windows native helpers)" \
+            --notes-file docs/WINDOWS_RELEASE_NOTES.md

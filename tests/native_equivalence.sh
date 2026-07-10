@@ -2,19 +2,22 @@
 # Prove the native searcher accepts/rejects EXACTLY the seeds the Lua filter
 # suite does, across every filter case, using the Lua implementation as oracle.
 #   LUAJIT=/path/to/luajit tests/native_equivalence.sh   [NSEEDS=30000]
+# On Windows CI the same script runs under bash against the prebuilt .exe:
+#   NATIVE_BIN=./native/brainstorm_native_search.exe SKIP_NATIVE_BUILD=1 ...
 set -e
 cd "$(dirname "$0")/.."
 LUAJIT="${LUAJIT:-luajit}"
+NATIVE_BIN="${NATIVE_BIN:-./native/brainstorm_native_search}"
 OUT="${TMPDIR:-/tmp}/brainstorm_native_fixtures"
 rm -rf "$OUT"
 mkdir -p "$OUT"
-sh native/build.sh
+[ -n "${SKIP_NATIVE_BUILD:-}" ] || sh native/build.sh
 "$LUAJIT" tests/dump_native_fixtures.lua Brainstorm_reroll.lua "$OUT" "${NSEEDS:-30000}"
 fail=0
 for cfg in "$OUT"/case*.cfg; do
 	base="${cfg%.cfg}"
-	./native/brainstorm_native_search verifychecks "$cfg" || { echo "FAIL verifychecks $(basename "$base")"; fail=1; continue; }
-	./native/brainstorm_native_search fixture "$cfg" "$base.seeds" > "$base.got"
+	"$NATIVE_BIN" verifychecks "$cfg" || { echo "FAIL verifychecks $(basename "$base")"; fail=1; continue; }
+	"$NATIVE_BIN" fixture "$cfg" "$base.seeds" > "$base.got"
 	if diff -q "$base.expected" "$base.got" >/dev/null 2>&1; then
 		echo "PASS $(basename "$base")"
 	else
