@@ -972,6 +972,7 @@ static void pool_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+	bs_stdio_binary(); /* `export -` to stdout must stay LF on every platform */
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
 	if (argc != 5 || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture"))) {
 		pool_usage(argv[0]);

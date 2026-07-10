@@ -37,12 +37,21 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <fcntl.h>
 #include <io.h>
 #include <process.h>
 
 #ifndef F_OK
 #define F_OK 0
 #endif
+
+/* The CRT opens stdout/stderr in text mode and would turn every \n into
+ * \r\n -- fixture output and stdout pool exports must stay byte-identical
+ * LF across platforms (the equivalence harness literally diffs them). */
+static inline void bs_stdio_binary(void) {
+	_setmode(_fileno(stdout), _O_BINARY);
+	_setmode(_fileno(stderr), _O_BINARY);
+}
 #ifdef _MSC_VER
 #define access _access
 #define dup _dup
@@ -203,6 +212,8 @@ static inline void bs_install_stop_handler(bs_stop_fn fn) {
 typedef struct stat bs_stat_t;
 #define bs_stat stat
 #define bs_fstat fstat
+
+static inline void bs_stdio_binary(void) {} /* POSIX stdio is already byte-clean */
 
 static inline int64_t bs_pread(int fd, void *buf, uint64_t n, uint64_t off) {
 	return (int64_t)pread(fd, buf, (size_t)n, (off_t)off);

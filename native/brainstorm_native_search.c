@@ -1601,6 +1601,7 @@ static int mode_bench(const Config *g0, int seconds) {
 }
 
 int main(int argc, char **argv) {
+	bs_stdio_binary(); /* fixture output is diffed byte-for-byte cross-platform */
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s search <cfg> <status> <stop> <hb> | fixture <cfg> <seeds> | verifychecks <cfg> | bench <cfg> <secs>\n", argv[0]);
 		return 2;
