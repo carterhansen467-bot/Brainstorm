@@ -190,6 +190,34 @@ simulation before Souls are checked. `observe` requires the tags but assumes
 their blinds are played. The legendary rule intentionally means the run's
 **first Soul**; later-Soul pool mutation has not yet been source-verified.
 
+### Seed Pool Builder app (no terminal knowledge needed)
+
+Double-click **`Seed Pool Builder.command`** in the mod folder. It opens a
+point-and-click page in your browser (running only on your computer --
+nothing is installed and nothing leaves the machine) where you can:
+
+- pick a legendary (first Soul) with an ante window and optional Negative,
+  plus any tag requirements, with dropdowns instead of config files;
+- press **Estimate** to sample 100M seeds and see the projected pool size
+  and how long the full scan would take on your machine;
+- press **Build pool** and watch live progress. Closing the window (or
+  pressing **Pause scan**) stops at a checkpoint; pressing Build again with
+  the same name resumes exactly where it left off -- safe across reboots,
+  so a days-long full-space scan can be done in sittings;
+- see every finished pool with its embedded criteria. Finished pools land
+  in `seed_pools/` and appear in the in-game Seed Pool selector
+  automatically; sharing a pool = sending someone that one `.bspool` file
+  to drop into their own `seed_pools/` folder.
+
+First-run notes: macOS may ask to install the Command Line Developer Tools
+(the app compiles the scanner once, and `python3` ships with those tools) --
+accept and re-run. If macOS blocks the double-click because the file came
+from the internet, right-click it and choose **Open** the first time. The
+app also needs `native_search.cfg`, which Brainstorm writes the first time
+you toggle an auto-reroll in-game (Ctrl+A on, then off); the page will tell
+you if it's missing. Prefer a terminal UI? The same tool exists as
+`python3 tools/brainstorm_pool_builder.py` (arrow-key menus, curses).
+
 ### Using a seed pool in-game (phase 2)
 
 Drop the finished `.bspool` into `Mods/Brainstorm/seed_pools/` (the folder is

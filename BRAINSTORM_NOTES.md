@@ -578,6 +578,27 @@ time the tab re-renders, even though the underlying saved value is untouched.
       export, and pool-restricted search; both preexisting harnesses still
       pass (1M-seed pool/Model-3 compat, 36-case Lua oracle).
 
+16. **Seed Pool Builder front ends** (`tools/`, 2026-07-10): the "many
+    people, no terminal" entry point for the exhaustive scanner.
+    - `tools/brainstorm_pool_builder.py` holds the shared engine (Snapshot
+      catalog parser, Criteria -> criteria-file text + auto-naming, Runner
+      subprocess wrapper parsing the scanner's stderr progress lines,
+      manifest/state readers) AND a curses TUI. `--headless-criteria` /
+      `--headless-estimate` exercise the engine without a terminal UI.
+    - `tools/pool_builder_web.py` is the primary UI: stdlib-only local web
+      server (127.0.0.1:8917, fallback ephemeral) + single-page browser app
+      with dropdown criteria, estimate (projected size/time from a 100M
+      sample), live build progress/ETA, pause (SIGINT -> checkpoint, rc 130)
+      and resume, plus a pool list read from the .bspool headers. Launched
+      by double-clicking `Seed Pool Builder.command`. One job at a time;
+      quit-while-running is safe by design (checkpoint resume).
+    - Both UIs normalize an old modelver-3 snapshot the same way the test
+      suite does (catalog data is protocol-independent) and auto-run
+      native/build.sh if the scanner binary is missing.
+    - Verified via the HTTP API: 3M estimate, 100M build reproducing the
+      documented 403,012-match reference sample, already-complete guard,
+      pause at rank 33,554,432 and resume from that exact rank.
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip
