@@ -1,0 +1,49 @@
+Brainstorm native helpers for Windows
+=====================================
+
+This zip adds the fast native seed search, in-game seed pools, and the Seed
+Pool Builder app to the Brainstorm mod on Windows. The mod itself installs
+separately (see the repo README): get the Brainstorm repo into
+  %AppData%\Balatro\Mods\Brainstorm
+with the Lovely injector installed.
+
+What's in the zip
+-----------------
+  native\brainstorm_native_search.exe   in-game fast search helper
+  native\brainstorm_seed_pool.exe       exhaustive seed-pool scanner
+  Seed Pool Builder.exe                 point-and-click pool builder (browser UI)
+  Seed Pool Builder.bat                 same UI for from-source users with Python 3
+  INSTALL.txt                           this file
+
+Install
+-------
+1. Copy the two files from this zip's native\ folder into
+     %AppData%\Balatro\Mods\Brainstorm\native\
+2. (Optional, for building seed pools) Copy "Seed Pool Builder.exe" into
+     %AppData%\Balatro\Mods\Brainstorm\
+3. Start the game. Ctrl+A auto-rerolls now use the native helper
+   automatically -- it runs hidden, with every found seed re-verified
+   in-game before the run starts. If the helper is missing or fails, the
+   mod silently falls back to its (slower) Lua search.
+
+Building seed pools
+-------------------
+1. In the game, toggle an auto-reroll once (Ctrl+A on, then off). That
+   writes native_search.cfg -- a snapshot of YOUR unlocks the scanner needs.
+2. Double-click "Seed Pool Builder.exe" (in the mod folder). Your browser
+   opens the builder page: pick criteria, Estimate, then Build.
+3. Finished pools land in seed_pools\ and appear in the in-game Seed Pool
+   selector automatically. Closing the builder window mid-scan is safe: the
+   scan pauses at a checkpoint and resumes next time you press Build.
+
+If Windows blocks an exe
+------------------------
+The exes are unsigned, so SmartScreen or Defender may object the first time:
+  - SmartScreen dialog: "More info" -> "Run anyway", or
+  - right-click the exe -> Properties -> check "Unblock" -> OK.
+
+Known limitation
+----------------
+Install paths containing non-ASCII characters (for example a non-Latin
+Windows user name) can keep the helpers from finding their files; the mod
+then falls back to the Lua search automatically.

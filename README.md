@@ -9,9 +9,26 @@
 
 ### Windows
 
-2. Download the [latest release](https://github.com/OceanRamen/Brainstorm/releases/) of Brainstorm.
-3. Unzip the file, and place it in `.../%appdata%/balatro/mods` -- Make sure the Mod's directory name is 'Brainstorm' [^1]
+2. Get this repo into your Mods folder: either `git clone` it, or use the
+   green **Code → Download ZIP** button and unzip it, so it ends up at
+   `%AppData%\Balatro\Mods\Brainstorm` -- make sure the mod's directory name
+   is exactly 'Brainstorm' [^1]
+3. *(Recommended)* Download the latest `Brainstorm-windows-*.zip` from this
+   repo's [releases page](https://github.com/carterhansen467-bot/Brainstorm/releases)
+   and copy its `native\*.exe` files into `Mods\Brainstorm\native\`. This
+   enables the fast native search and in-game seed pools -- no compiler or
+   Python needed; see the zip's `INSTALL.txt`. Without the exes the mod still
+   works fully, just with the slower Lua search and no pool support.
 4. Reload the game to activate the mod.
+
+> **Windows SmartScreen/Defender:** the helper exes are unsigned. If Windows
+> blocks one, right-click the file → Properties → check **Unblock** → OK (or
+> pick "More info → Run anyway" in the SmartScreen dialog). Antivirus false
+> positives can be resolved by whitelisting the mod folder.
+>
+> Known limitation: install paths with non-ASCII characters (e.g. a
+> non-Latin Windows user name) can keep the helpers from finding their
+> files; the mod then falls back to the Lua search automatically.
 
 ### Macos
 
@@ -100,20 +117,28 @@ in the shops you'll actually see. Play everything else without skipping, or
 later pack predictions for that ante shift. `Ctrl+P` prints the exact
 shop-by-shop layout (with the assumed skips) for your current seed.
 
-### Native search accelerator (macOS, optional)
-Filtered searches normally run on background Lua threads. On macOS you can
-additionally build a small native helper that searches ~8x faster across all
-CPU cores (~75M seeds/sec on an M1 Max). Build it once:
+### Native search accelerator (optional)
+Filtered searches normally run on background Lua threads. You can additionally
+install a small native helper that searches ~8x faster across all CPU cores
+(~75M seeds/sec on an M1 Max). Get it once:
 
-```bash
-sh ~/Library/Application\ Support/Balatro/Mods/Brainstorm/native/build.sh
-```
+- **macOS** -- build it (Command Line Developer Tools):
+
+  ```bash
+  sh ~/Library/Application\ Support/Balatro/Mods/Brainstorm/native/build.sh
+  ```
+
+- **Windows** -- copy the prebuilt `native\*.exe` files from the release zip
+  into `Mods\Brainstorm\native\` (see Installation above), or build them
+  yourself with `sh native/build_windows.sh` (needs only
+  [Zig](https://ziglang.org/download/); works from Windows, macOS, or Linux).
 
 The mod detects the binary automatically on the next launch and uses it for
 `Ctrl + a` searches; every hit is still re-verified in-game before a run
 starts, and the mod falls back to the Lua search if the helper is missing or
-disagrees. Remove the binary (or set `useNativeSearch = false` in
-settings.lua) to go back to pure-Lua searching.
+disagrees. On Windows the helper is launched with no console window (via
+`CreateProcess`), so nothing flashes over the game. Remove the binary (or set
+`useNativeSearch = false` in settings.lua) to go back to pure-Lua searching.
 
 ### Exhaustive external seed-pool builder (phase 1)
 
@@ -192,9 +217,11 @@ their blinds are played. The legendary rule intentionally means the run's
 
 ### Seed Pool Builder app (no terminal knowledge needed)
 
-Double-click **`Seed Pool Builder.command`** in the mod folder. It opens a
-point-and-click page in your browser (running only on your computer --
-nothing is installed and nothing leaves the machine) where you can:
+Double-click **`Seed Pool Builder.command`** (macOS) or, on Windows,
+**`Seed Pool Builder.exe`** from the release zip (or `Seed Pool Builder.bat`
+if you have Python 3 installed). It opens a point-and-click page in your
+browser (running only on your computer -- nothing is installed and nothing
+leaves the machine) where you can:
 
 - pick a legendary (first Soul) with an ante window and optional Negative,
   plus any tag requirements, with dropdowns instead of config files;
@@ -212,11 +239,14 @@ nothing is installed and nothing leaves the machine) where you can:
 First-run notes: macOS may ask to install the Command Line Developer Tools
 (the app compiles the scanner once, and `python3` ships with those tools) --
 accept and re-run. If macOS blocks the double-click because the file came
-from the internet, right-click it and choose **Open** the first time. The
-app also needs `native_search.cfg`, which Brainstorm writes the first time
-you toggle an auto-reroll in-game (Ctrl+A on, then off); the page will tell
-you if it's missing. Prefer a terminal UI? The same tool exists as
-`python3 tools/brainstorm_pool_builder.py` (arrow-key menus, curses).
+from the internet, right-click it and choose **Open** the first time. On
+Windows the scanner ships prebuilt in the release zip (put its `native\*.exe`
+files in the mod's `native\` folder; unblock via right-click → Properties if
+SmartScreen objects). The app also needs `native_search.cfg`, which
+Brainstorm writes the first time you toggle an auto-reroll in-game (Ctrl+A
+on, then off); the page will tell you if it's missing. Prefer a terminal UI?
+The same tool exists as `python3 tools/brainstorm_pool_builder.py`
+(arrow-key menus, curses; macOS/Linux only).
 
 ### Using a seed pool in-game (phase 2)
 
@@ -232,8 +262,8 @@ Because the pool file is the complete match set, a pool search that covers
 every record without a hit is a definitive verdict: the mod stops and reports
 that no seed in the pool matches the current filters (instead of silently
 searching the full seed space). For the same reason, pool searches never fall
-back to the Lua thread search -- they need the native helper built from
-`native/build.sh`.
+back to the Lua thread search -- they need the native helper (built from
+`native/build.sh` on macOS, or the release zip's exes on Windows).
 
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
 their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model

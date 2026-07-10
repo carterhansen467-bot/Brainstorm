@@ -599,6 +599,81 @@ time the tab re-renders, even though the underlying saved value is untouched.
       documented 403,012-match reference sample, already-complete guard,
       pause at rank 33,554,432 and resume from that exact rank.
 
+17. **Windows port, Tier 3** (2026-07-10, `windows-port` branch; plan was
+    WINDOWS_PORT_PLAN.md): Windows users get the native search, in-game
+    seed pools, and the Seed Pool Builder as a release zip with prebuilt
+    binaries. One codebase; platform differences live in
+    `native/platform.h` + runtime checks, never a parallel branch.
+    - **C shim** (`native/platform.h`): pthread create/join/mutex ->
+      `_beginthreadex` + SRWLOCK; `pread` -> overlapped `ReadFile`
+      (positional + thread-safe); `fsync` -> `FlushFileBuffers`;
+      ftello/fseeko/ftruncate -> `_ftelli64`/`_fseeki64`/`_chsize_s`;
+      stat/fstat -> `_stat64` (default Windows `st_size` is 32-bit and
+      pools exceed 2 GiB); **`rename` does not overwrite on Windows** ->
+      `MoveFileEx(REPLACE_EXISTING)` for the status/state commit protocol;
+      `sysconf` -> `GetSystemInfo`; SIGINT/SIGTERM ->
+      `SetConsoleCtrlHandler` (Ctrl+C, Ctrl+Break, console-close all take
+      the checkpointed-stop path); strsep fallback. Status/state/manifest/
+      export files are opened `"wb"` so outputs stay byte-identical LF
+      everywhere. NO arithmetic was touched: bit-exactness remains
+      -ffp-contract=off + the runtime fma calibration (never hardcode an
+      fp mode; MSVC equivalent is /fp:precise).
+    - **Builds**: `native/build.sh` unchanged (macOS/Linux);
+      `native/build_windows.sh` produces both `.exe`s with
+      `zig cc -target x86_64-windows-gnu` -- cross-compiles from this Mac
+      (zig is a single tarball, no Homebrew needed) and builds natively on
+      the CI runner with the same command.
+    - **Lua launch** (`Brainstorm_reroll.lua`): `Brainstorm.isWindows()`
+      via `love.system.getOS()` (false in worker bootstraps);
+      `nativePaths().bin` gains `.exe`. Spawn: os.execute/io.popen on
+      Windows go through cmd.exe and FLASH A CONSOLE over the game (GUI
+      app), so `spawnHelperDetached` uses LuaJIT ffi `CreateProcessA` with
+      `CREATE_NO_WINDOW` -- the DECISION from the plan's option list: no
+      window by construction, no cmd quoting, detached child still reaped
+      by the heartbeat. Fallback if ffi is unavailable: `start "" /b` via
+      cmd (may flash briefly). Spawn failure returns false -> nativeFailed
+      -> Lua threads, or the pool-abort alert when a pool is selected.
+    - **CI** (`.github/workflows/ci.yml`): windows-latest builds the exes
+      (zig) + LuaJIT (MSVC `msvcbuild.bat` via vswhere/vcvars64) and runs
+      the SAME harness scripts under the runner's bash -- the oracle
+      fixtures are generated with that machine's own LuaJIT, so the diff
+      is a true Windows bit-exactness proof -- plus the pool
+      build->restricted-search->exhaustion flow and
+      `tests/windows_spawn_check.lua`, which drives the production ffi
+      spawn against the real `.exe` (detached launch -> R/D status).
+      macos-latest runs all three harnesses and cross-compiles the exes.
+      Harness scripts grew env overrides (NATIVE_BIN/POOL_BIN/
+      SKIP_NATIVE_BUILD/SEED_POOL_COMPAT_CC/EXE); defaults unchanged.
+      Because CI has no game, `tests/dump_pool_snapshot.lua` generates the
+      pool harnesses' catalog snapshot via the same worker bootstrap as
+      the fixture dumper (tag_rare/tag_negative carry their real names so
+      the stock criteria resolve). A `v*` tag runs the release job: zip of
+      both exes + PyInstaller `Seed Pool Builder.exe` +
+      `Seed Pool Builder.bat` + `docs/WINDOWS_INSTALL.txt`, published with
+      `gh release create`.
+    - **Tools**: `brainstorm_pool_builder.py` imports curses optionally
+      (TUI stays macOS/Linux-only), resolves MOD_DIR from `sys.executable`
+      when PyInstaller-frozen, appends `.exe` to POOL_BIN on Windows, and
+      pauses the scanner with `CTRL_BREAK_EVENT` +
+      `CREATE_NEW_PROCESS_GROUP` (Windows can't deliver SIGINT; the C
+      handler maps Ctrl+Break to the same checkpointed stop).
+      `preflight()` on Windows verifies the prebuilt exe exists and points
+      at the release zip instead of shelling `sh native/build.sh`.
+      `Seed Pool Builder.bat` = the `.command` for from-source Windows
+      users (`py -3`/`python` fallback).
+    - **Known limitations**: paths go through the ANSI code page
+      (fopen/MoveFileExA), so non-ASCII install paths may break the
+      helpers -- mod falls back to Lua search; documented in README and
+      INSTALL.txt. Console-close during a pool scan gets ~5s of grace, so
+      a mid-epoch kill can lose uncommitted work -- the resume-truncate
+      logic already makes that safe.
+    - **Verification**: all three macOS harnesses pass after every step;
+      windows-latest CI green = oracle equivalence + pool e2e + spawn
+      check on real Windows. STILL OPEN: one human Windows smoke test
+      in-game (install branch + exes, Ctrl+A on/off, confirm
+      native_search.status appears, select a shared .bspool, search;
+      watch for SmartScreen).
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip
