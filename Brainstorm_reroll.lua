@@ -2089,11 +2089,19 @@ end
 -- Opt out with Brainstorm.SETTINGS.useNativeSearch = false.
 -- ===========================================================================
 
+-- False in the search worker's bootstrap (its fake love has no .system),
+-- which is correct: workers never touch the spawn/path plumbing.
+function Brainstorm.isWindows()
+	return (love and love.system and love.system.getOS
+		and love.system.getOS() == "Windows") or false
+end
+
 function Brainstorm.nativePaths()
 	local lovely = require("lovely")
 	local base = lovely.mod_dir .. "/Brainstorm/native_search"
 	return {
-		bin = lovely.mod_dir .. "/Brainstorm/native/brainstorm_native_search",
+		bin = lovely.mod_dir .. "/Brainstorm/native/brainstorm_native_search"
+			.. (Brainstorm.isWindows() and ".exe" or ""),
 		cfg = base .. ".cfg",
 		status = base .. ".status",
 		stop = base .. ".stop",
@@ -2260,6 +2268,73 @@ function Brainstorm.buildNativeConfigText(session)
 	return table.concat(L, "\n") .. "\n"
 end
 
+-- Spawn the helper detached, no visible window, never blocking the game.
+-- POSIX: single-quoted `sh -c '... &'` (the original path, unchanged).
+-- Windows: os.execute/io.popen run through cmd.exe, and a GUI app spawning
+-- the console cmd.exe flashes a black window over the game -- so the primary
+-- path calls CreateProcessA with CREATE_NO_WINDOW through LuaJIT's ffi
+-- (kernel32 is in ffi.C's default namespace): no window, no cmd quoting
+-- rules, child outlives the game (heartbeat still reaps orphans). If ffi is
+-- unavailable the fallback is `start "" /b` via cmd.exe, which works but may
+-- flash briefly. Verified end-to-end by tests/windows_spawn_check.lua on CI.
+-- Returns false when nothing could be spawned; callers treat that exactly
+-- like an unserializable config (nativeFailed -> Lua threads or pool abort).
+function Brainstorm.spawnHelperDetached(bin, args)
+	if not Brainstorm.isWindows() then
+		local function shq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+		local cmd = shq(bin)
+		for _, a in ipairs(args) do cmd = cmd .. " " .. shq(a) end
+		os.execute(cmd .. " >/dev/null 2>&1 &")
+		return true
+	end
+	local parts = { bin }
+	for _, a in ipairs(args) do parts[#parts + 1] = a end
+	for _, s in ipairs(parts) do
+		-- Windows argv quoting can't carry embedded quotes safely; none of our
+		-- paths ever contain one unless something is very wrong.
+		if s:find('"') then return false end
+	end
+	local cmdline = '"' .. table.concat(parts, '" "') .. '"'
+	local okffi, err = pcall(function()
+		local ffi = require("ffi")
+		if not Brainstorm.NATIVE_FFI_SPAWN then
+			ffi.cdef([[
+			typedef struct {
+				uint32_t cb; char *lpReserved; char *lpDesktop; char *lpTitle;
+				uint32_t dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars,
+					dwFillAttribute, dwFlags;
+				uint16_t wShowWindow, cbReserved2; uint8_t *lpReserved2;
+				void *hStdInput, *hStdOutput, *hStdError;
+			} BS_STARTUPINFOA;
+			typedef struct {
+				void *hProcess, *hThread; uint32_t dwProcessId, dwThreadId;
+			} BS_PROCESS_INFORMATION;
+			int CreateProcessA(const char *app, char *cmdline, void *pa, void *ta,
+				int inherit, uint32_t flags, void *env, const char *cwd,
+				BS_STARTUPINFOA *si, BS_PROCESS_INFORMATION *pi);
+			int CloseHandle(void *h);
+			]])
+			Brainstorm.NATIVE_FFI_SPAWN = true
+		end
+		local si = ffi.new("BS_STARTUPINFOA")
+		si.cb = ffi.sizeof("BS_STARTUPINFOA")
+		local pi = ffi.new("BS_PROCESS_INFORMATION")
+		local buf = ffi.new("char[?]", #cmdline + 1, cmdline)
+		local CREATE_NO_WINDOW = 0x08000000
+		if ffi.C.CreateProcessA(nil, buf, nil, nil, 0, CREATE_NO_WINDOW,
+				nil, nil, si, pi) == 0 then
+			error("CreateProcessA failed")
+		end
+		ffi.C.CloseHandle(pi.hProcess)
+		ffi.C.CloseHandle(pi.hThread)
+	end)
+	if okffi then return true end
+	print("[Brainstorm] ffi spawn unavailable (" .. tostring(err) .. "); using cmd start")
+	local cmd = 'start "" /b ' .. cmdline .. " >NUL 2>&1"
+	local r = os.execute(cmd)
+	return r == 0 or r == true -- plain 5.1 returns a status number, 5.2-compat a boolean
+end
+
 function Brainstorm.startNativeSearch()
 	local A = Brainstorm.AUTOREROLL
 	local nativefs = require("nativefs")
@@ -2271,9 +2346,9 @@ function Brainstorm.startNativeSearch()
 	os.remove(p.stop)
 	nativefs.write(p.hb, tostring(os.time()))
 	nativefs.write(p.cfg, cfg)
-	local function shq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
-	os.execute(shq(p.bin) .. " search " .. shq(p.cfg) .. " " .. shq(p.status)
-		.. " " .. shq(p.stop) .. " " .. shq(p.hb) .. " >/dev/null 2>&1 &")
+	if not Brainstorm.spawnHelperDetached(p.bin, { "search", p.cfg, p.status, p.stop, p.hb }) then
+		return false
+	end
 	A.nativeActive = true
 	A.nativeStartedAt = love.timer and love.timer.getTime and love.timer.getTime() or os.clock()
 	A.nativeHbFrame = 0

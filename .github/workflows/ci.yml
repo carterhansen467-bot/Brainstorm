@@ -70,6 +70,16 @@ jobs:
           SKIP_NATIVE_BUILD=1 \
           sh tests/pool_search_equivalence.sh snapshot.cfg
 
+      - name: In-game spawn path (ffi CreateProcessA, detached)
+        shell: bash
+        run: |
+          mkdir -p spawn_out
+          "$PWD/LuaJIT/src/luajit.exe" tests/windows_spawn_check.lua \
+            Brainstorm_reroll.lua \
+            "$PWD/native/brainstorm_native_search.exe" \
+            "$PWD/snapshot.cfg" \
+            "$PWD/spawn_out"
+
       - name: Upload helper binaries
         uses: actions/upload-artifact@v4
         with:
