@@ -421,6 +421,59 @@ time the tab re-renders, even though the underlying saved value is untouched.
       model fixes). After these changes are committed, HEAD is the valid
       baseline again.
 
+13. **Model 3: skip-aware physical shop layout** (found by a LIVE FAILURE, then
+    source-verified; supersedes the "2 per shop x 3 shops = 6 slots/ante" and
+    "pack filter scans slots 1-3" claims in item 12; 35 fixture cases Lua==C
+    byte-identical; old-vs-new harness diff = the `pack` case only):
+    - **The failure**: filter = ante-1 `tag_coupon` + `p_spectral_mega_1` +
+      negative `j_gift` in packs, seed `3W9R7L3Y`. In game: forced Buffoon
+      (gift card inside) + `p_celestial_normal_2` in the first shop -- both
+      predicted -- but the mega Spectral (predicted "slot 3") never spawned.
+    - **ROOT CAUSE 1 -- ease_ante timing** (state_events.lua end_round: `if
+      Boss then ... ease_ante(1)`): the ante counter ticks when the Boss DIES,
+      BEFORE its shop opens. The post-boss shop draws from the NEXT ante's
+      streams (its 2 `get_pack('shop_pack')` picks, 'buf' contents, vouchers,
+      'sho' jokers -- everything keyed `G.GAME.round_resets.ante`) and shows
+      that ante on the HUD. So ante 1 physically has TWO shops (Small, Big =
+      forced + 3 picks, 4 slots max -- 'shop_pack1' picks 4-5 NEVER roll), and
+      antes 2+ have THREE: the post-boss "entry" shop (picks 1-2), Small
+      (3-4), Big (5-6). The pick VALUES per key never changed -- only which
+      shop shows them and that ante 1's tail was phantom.
+    - **ROOT CAUSE 2 -- blind skips remove shops** (skip_blind just advances
+      blind_on_deck: no round, no shop, no picks). Filtering a tag MEANS the
+      player skips that blind -- that's how you take a tag -- so the search
+      must assume it: the matched blind's shop drops off that ante's layout
+      (classic tag = ante-1 Small; anywhere = this seed's TagA<n>Sm|Big;
+      classic soul/legendary = ante-1 Small too, the charm-tag convention).
+      On `3W9R7L3Y` the skip left ante 1 = [forced Buffoon, pick1] -- the mega
+      Spectral at pick 2 was never drawn. Exactly what the user saw.
+    - **Implementation**: `skipsFromFilters(tagLoc)` (pure) +
+      `setPackSkipAssumption(seed, sm, big)` install a per-seed assumption
+      BEFORE any pack consumer (passesAllFilters step 2.4, after the tag roll
+      since anywhere-mode skips depend on where THIS seed matched);
+      `getSimulatedPacks` builds per-ante physical slot lists (2 x opened
+      shops, forced Buffoon leads the run's FIRST opened shop -- it cascades
+      to ante 2's entry shop if both ante-1 blinds are skipped) and its memo
+      is keyed to the `Brainstorm.random_state` TABLE IDENTITY so a fresh
+      evaluation can never extend picks cached under a dead stream state.
+      C mirror: `Ctx.skipSm/skipBig/forcedAnte` + `pack_max_slots`, consumers
+      read `packs_n[a]` capped by their own window. Shop-JOKER depths are NOT
+      truncated by skips (purchases/rerolls restock those streams; pack slots
+      can't restock).
+    - **Config handshake**: `modelver 3` line, REQUIRED by the helper (`E
+      config modelver X != helper model Y`) so a stale binary refuses to
+      search instead of silently using the old model. Bump it on every future
+      model-semantics change.
+    - **Ctrl+P** now prints shop-segmented layouts (`ENTRY[..] SMALL[..]
+      BIG[..]`, "Assumed skips: ..." line, anywhere mode prints antes 1-8) and
+      installs the same skip assumption the search uses; Ctrl+D installs it
+      before the joker/legendary sections. LIVE CHECK for any seed: the shop
+      right after beating the ante-N boss must equal `A(N+1) ENTRY[..]`.
+    - Semantics note: a pack filter "at ante 1" now means the Small/Big shops
+      of ante 1 ONLY (2 free slots without a tag filter, 1 with). The very
+      next shop after the ante-1 boss is A2's ENTRY -- players who'd accept it
+      should use anywhere/multi-ante pack search instead of the ante-1 filter.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

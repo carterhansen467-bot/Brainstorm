@@ -146,6 +146,12 @@ function Brainstorm.passesAllFilters(seed_found)
 			end
 		end
 	end
+	-- 2.4) Install this seed's blind-skip assumption BEFORE any pack consumer
+	-- (legendary-anywhere scan, pack filter, joker-in-pack matcher). Taking a
+	-- filtered tag/soul means SKIPPING that blind, and a skipped blind's shop
+	-- never opens (skip_blind goes straight to the next blind select), so its
+	-- two get_pack picks are never drawn. See skipsFromFilters.
+	Brainstorm.setPackSkipAssumption(seed_found, Brainstorm.skipsFromFilters(tagLoc))
 	-- 2.5) Legendary ANYWHERE (antes 1-8): scan each ante's spawned Arcana /
 	-- Spectral packs for the run's FIRST Soul (see checkLegendaryAnywhere).
 	local legLoc = nil
@@ -154,20 +160,18 @@ function Brainstorm.passesAllFilters(seed_found)
 		if not ok then return false end
 		legLoc = loc
 	end
-	-- 3) Pack: BOTH ante-1 pack slots count (vanilla rolls both from the shared
-	-- 'shop_pack'..ante stream; checking only slot 1 was discarding ~half the
-	-- genuinely matching seeds). Uses the shared per-seed pack simulation so the
-	-- joker-in-pack matcher below reads the SAME packs without double-advancing.
-	-- SOURCE-VERIFIED FIX (get_pack): the run's FIRST pack is a forced normal
-	-- Buffoon that consumes no stream advance, so ante 1's physical slots are
-	-- [forced buffoon, adv1, adv2, ...]. Checking physical slots 1-3 keeps the
-	-- old accept set for non-buffoon targets (advances 1-2, i.e. shop 1 slot 2
-	-- + shop 2 slot 1) and truthfully always-matches normal-buffoon targets.
+	-- 3) Pack: scan ALL of ante 1's PHYSICAL slots. SOURCE-VERIFIED SHOP MODEL
+	-- (ease_ante fires on boss death, before its shop): ante 1 has only the
+	-- Small- and Big-blind shops -- the post-boss shop already draws from
+	-- 'shop_pack2' -- so at most [forced buffoon, adv1 | adv2, adv3] exist,
+	-- minus 2 per assumed-skipped blind. Slots that can never spawn must not
+	-- match (the old fixed 1-3 window let phantom picks pass the filter).
+	-- The forced normal Buffoon truthfully always-matches buffoon targets.
 	if ar.searchPack and #ar.searchPack > 0 then
-		local packs = Brainstorm.getSimulatedPacks(seed_found, 1, 3)
+		local packs = Brainstorm.getSimulatedPacks(seed_found, 1, 6)
 		local list = ar.searchPack
 		local pack_found = false
-		for slot = 1, 3 do
+		for slot = 1, #packs do
 			local center = packs[slot]
 			if center then
 				if center.forced then
@@ -392,13 +396,14 @@ function Brainstorm.debugPredictVoucher()
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
 end
 
--- Main-thread self-test (Ctrl+P) for the shared-stream pack model. Predicts the
--- CURRENT run's two pack slots per ante from its seed ('shop_pack'..ante, one
--- advance per slot) and lists the live shop's packs for comparison. Use on the
--- FIRST shop of an ante before buying/opening a pack -- predicted A<ante> slots
--- must equal the live packs, in order. If they don't, the shared-key model is
--- wrong for the shipped game and the pack filter/matcher need the old per-slot
--- keys back. Writes to debug_predict.txt.
+-- Main-thread self-test (Ctrl+P) for the physical pack model. Predicts the
+-- CURRENT run's shops per ante from its seed and lists the live shop's packs
+-- for comparison. Layout is shop-by-shop: ENTRY is the shop right after the
+-- previous boss (ease_ante has already ticked, so it draws from THIS ante's
+-- streams and shows this ante on the HUD); a skipped blind's shop never opens.
+-- The printed layout uses the same skip assumption the seed search uses.
+-- Compare each shop you enter against its bracket, in order; on the current
+-- run's found seed they must match exactly. Writes to debug_predict.txt.
 function Brainstorm.debugPredictPacks()
 	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
 	local lines = {}
@@ -406,7 +411,7 @@ function Brainstorm.debugPredictPacks()
 		lines[1] = "No active seed (start a run first)."
 	else
 		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
-		Brainstorm._packSim = nil
+		local sm, big = Brainstorm.installSkipAssumptionFresh(seed)
 		local ante = (G.GAME.round_resets and G.GAME.round_resets.ante) or "?"
 		lines[#lines + 1] = "Seed: " .. tostring(seed)
 		lines[#lines + 1] = "Current ante: " .. tostring(ante)
@@ -418,17 +423,39 @@ function Brainstorm.debugPredictPacks()
 		end
 		lines[#lines + 1] = "Live shop packs: " .. (next(live) and table.concat(live, ", ") or "(none visible)")
 		lines[#lines + 1] = ""
-		lines[#lines + 1] = "(slot 1 of ante 1 is the game's FORCED normal Buffoon; 2 slots per shop,"
-		lines[#lines + 1] = " 3 shops per ante -- compare shop N against slots 2N-1..2N of its ante)"
-		for a = 1, 4 do
+		lines[#lines + 1] = "(ENTRY = the shop right after the previous boss -- the ante has already"
+		lines[#lines + 1] = " ticked up, so it belongs to THIS row. Slot 1 of the run's first shop is"
+		lines[#lines + 1] = " the game's FORCED normal Buffoon. 'skip' = that blind's shop never opens;"
+		lines[#lines + 1] = " assumed from your filters: tag/soul filters mean you skip for the reward.)"
+		local skipNote = {}
+		for a = 1, 8 do
+			if sm and sm[a] then skipNote[#skipNote + 1] = "A" .. a .. " Small" end
+			if big and big[a] then skipNote[#skipNote + 1] = "A" .. a .. " Big" end
+		end
+		lines[#lines + 1] = "Assumed skips: " .. (next(skipNote) and table.concat(skipNote, ", ") or "(none)")
+		local maxA = (Brainstorm.SETTINGS.multiAnteSearch and Brainstorm.SETTINGS.multiAnteSearch.anywhereMode) and 8 or 4
+		for a = 1, maxA do
 			local packs = Brainstorm.getSimulatedPacks(seed, a, 6)
-			local parts = {}
-			for s = 1, 6 do
-				local c = packs[s]
-				parts[s] = c and (c.forced and "FORCED-buffoon-normal" or c.key) or "?"
+			local shopNames = {}
+			if a >= 2 then shopNames[#shopNames + 1] = "ENTRY" end
+			if not (sm and sm[a]) then shopNames[#shopNames + 1] = "SMALL" end
+			if not (big and big[a]) then shopNames[#shopNames + 1] = "BIG" end
+			local parts, s = {}, 1
+			for _, name in ipairs(shopNames) do
+				local two = {}
+				for i = 1, 2 do
+					local c = packs[s]
+					two[i] = c and (c.forced and "FORCED-buffoon-normal" or c.key) or "?"
+					s = s + 1
+				end
+				parts[#parts + 1] = name .. "[" .. table.concat(two, ", ") .. "]"
 			end
+			local skipped = {}
+			if sm and sm[a] then skipped[#skipped + 1] = "SMALL skipped" end
+			if big and big[a] then skipped[#skipped + 1] = "BIG skipped" end
+			local note = next(skipped) and ("  (" .. table.concat(skipped, ", ") .. ")") or ""
 			local mark = (tostring(a) == tostring(ante)) and "   <-- compare with live" or ""
-			lines[#lines + 1] = "Predicted A" .. a .. ": " .. table.concat(parts, ", ") .. mark
+			lines[#lines + 1] = "Predicted A" .. a .. ": " .. table.concat(parts, " ") .. note .. mark
 		end
 	end
 	local lovely = require("lovely")
@@ -556,6 +583,7 @@ function Brainstorm.buildDiagnosticsText(seed)
 			if n > 0 then predictShop(ante, n) end
 		end
 		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
+		Brainstorm.installSkipAssumptionFresh(seed)
 		local found = Brainstorm.checkMultiAnteJokerSearch(seed)
 		add("     multi-ante joker result: pass=" .. tostring(found)
 			.. "  foundAt=" .. tostring(Brainstorm.AUTOREROLL.jokerFoundAt or "(none)"))
@@ -583,7 +611,7 @@ function Brainstorm.buildDiagnosticsText(seed)
 		end
 		if ar.searchLegendaryAnywhere and ar.searchLegendary ~= "" then
 			Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
-			Brainstorm._packSim = nil
+			Brainstorm.installSkipAssumptionFresh(seed)
 			local ok, loc = Brainstorm.checkLegendaryAnywhere(seed, ar.searchLegendary, ar.searchNegativeLegendary)
 			add("Legendary ANYWHERE: pass=" .. tostring(ok) .. "  at=" .. tostring(loc or "(none)"))
 		end
@@ -1025,8 +1053,10 @@ end
 -- ===========================================================================
 -- Legendary ANYWHERE (antes 1-8): the run's FIRST Soul, source-verified.
 -- ---------------------------------------------------------------------------
--- Per ante, scan the 6 physical pack slots (2 per shop x 3 shops; ante 1 slot
--- 1 is the forced Buffoon) in order. Opening an Arcana pack rolls
+-- Per ante, scan the PHYSICAL pack slots in order (2 per opened shop: ante 1
+-- has Small+Big = up to 4, antes 2+ add the post-boss entry shop = up to 6,
+-- fewer under assumed blind skips; the run's first shop leads with the forced
+-- Buffoon). Opening an Arcana pack rolls
 -- 'soul_Tarot'..ante once per card (config.extra cards); a Spectral pack
 -- rolls 'soul_Spectral'..ante TWICE per card -- soul roll then black-hole
 -- roll -- and a black-hole hit OVERWRITES a soul hit on the same card
@@ -1043,7 +1073,7 @@ function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negat
 	local bh_found = false
 	for ante = 1, 8 do
 		local packs = Brainstorm.getSimulatedPacks(seed_found, ante, 6)
-		for slot = 1, 6 do
+		for slot = 1, #packs do
 			local center = packs[slot]
 			local kind = center and not center.forced and center.kind or nil
 			if kind == 'Arcana' or kind == 'Spectral' then
@@ -1235,33 +1265,135 @@ function Brainstorm.simulateShopJokers(seed_found, ante, num_slots, wanted, need
 	return out
 end
 
--- Roll BOTH of an ante's pack slots from the shared 'shop_pack'..ante stream
--- (one advance per slot -- the model in the vanilla create_card_for_shop path;
--- verify in-game with Ctrl+P / debugPredictPacks). Memoized per (seed, ante) so
--- the ante-1 pack filter and the joker-in-pack matcher read the SAME packs
--- instead of double-advancing the stream. Deterministic per seed, so reusing
--- the memo on a re-verification pass is safe.
 -- The run's forced first pack (source: get_pack's first_shop_buffoon branch).
 -- Its variant (normal_1 vs _2) comes from raw math.random, so it's matched by
--- kind, never by key. It consumes NO 'shop_pack1' advance.
+-- kind, never by key. It consumes NO 'shop_pack' advance and rides with the
+-- run's FIRST OPENED shop, whichever ante that lands on.
 Brainstorm.FORCED_BUFFOON = { key = "p_buffoon_normal_?", kind = "Buffoon", forced = true, cards = 2 }
 
--- Rolls an ante's physical pack slots (2 per shop x 3 shops = up to 6).
--- SOURCE-VERIFIED FIX: ante 1 slot 1 is the forced normal Buffoon; stream
--- advances fill the slots after it. Memoized per (seed, ante) and extended on
--- demand -- the stream is sequential, so appending later slots yields exactly
--- what rolling them upfront would have.
+-- Blind-skip assumption implied by the active filters. A skipped blind's shop
+-- never opens (source: skip_blind just advances blind_on_deck -- no round, no
+-- shop state), so its two get_pack picks are never drawn. Assumed skips:
+--   * classic soul/legendary filter: the charm-tag convention skips ante-1
+--     Small for the mega Arcana;
+--   * the tag filter: you skip the matched blind to take the tag (classic =
+--     ante-1 Small; anywhere = this seed's match, from its TagA<n>Sm|Big).
+-- Everything else is assumed played -- unfiltered skips are on the player.
+-- Pure given settings + tagLoc (no RNG). Returns skipSm, skipBig arrays.
+function Brainstorm.skipsFromFilters(tagLoc)
+	local ar = Brainstorm.SETTINGS.autoreroll
+	local sm, big = nil, nil
+	local legAnywhere = ar.searchLegendaryAnywhere and ar.searchLegendary and ar.searchLegendary ~= ""
+	if not legAnywhere and ((ar.searchForSoul and ar.searchForSoul > 0) or (ar.searchLegendary and ar.searchLegendary ~= "")) then
+		sm = { [1] = true }
+	end
+	if ar.searchTag and ar.searchTag ~= "" then
+		if not ar.searchTagAnywhere then
+			sm = sm or {}
+			sm[1] = true
+		elseif tagLoc then
+			local a = tonumber(tagLoc:match("^TagA(%d+)"))
+			if a then
+				if tagLoc:sub(-2) == "Sm" then
+					sm = sm or {}
+					sm[a] = true
+				else
+					big = big or {}
+					big[a] = true
+				end
+			end
+		end
+	end
+	return sm, big
+end
+
+-- How many shops open at this ante: ante 1 has Small + Big; antes 2+ add the
+-- post-boss "entry" shop first (SOURCE-VERIFIED: ease_ante fires when the
+-- Boss dies, BEFORE its shop, so that shop belongs to the NEXT ante's streams
+-- and HUD ante). Minus one per assumed-skipped blind.
+local function anteShopCount(ante, skipSm, skipBig)
+	return (ante >= 2 and 3 or 2)
+		- ((skipSm and skipSm[ante]) and 1 or 0)
+		- ((skipBig and skipBig[ante]) and 1 or 0)
+end
+
+-- Install the per-seed skip assumption. MUST run before any pack consumer in
+-- an evaluation: the pack memo bakes the slot layout in. Idempotent for the
+-- same (random_state, seed, assumption) so a repeated call inside one
+-- evaluation never re-rolls (and so never double-advances) the pack streams;
+-- a fresh Brainstorm.random_state table invalidates the memo, because cached
+-- picks may not be extended under a stream state they didn't come from.
+function Brainstorm.setPackSkipAssumption(seed_found, skipSm, skipBig)
+	local sig = ""
+	if skipSm then
+		for a = 1, 8 do if skipSm[a] then sig = sig .. "s" .. a end end
+	end
+	if skipBig then
+		for a = 1, 8 do if skipBig[a] then sig = sig .. "b" .. a end end
+	end
+	local sim = Brainstorm._packSim
+	if sim and sim.seed == seed_found and sim.sig == sig and sim.rs == Brainstorm.random_state then
+		return
+	end
+	local forcedAnte = 1
+	for a = 1, 8 do
+		if anteShopCount(a, skipSm, skipBig) > 0 then
+			forcedAnte = a
+			break
+		end
+	end
+	Brainstorm._packSim = {
+		seed = seed_found, sig = sig, rs = Brainstorm.random_state,
+		skipSm = skipSm or false, skipBig = skipBig or false, forcedAnte = forcedAnte,
+	}
+end
+
+-- Derive + install the skip assumption for `seed_found` from scratch, rolling
+-- the anywhere-tag match if needed (tag streams only -- pack streams are
+-- untouched). For prediction/debug paths; passesAllFilters installs from its
+-- own in-flight tag result instead.
+function Brainstorm.installSkipAssumptionFresh(seed_found)
+	local ar = Brainstorm.SETTINGS.autoreroll
+	local tagLoc = nil
+	if ar.searchTag and ar.searchTag ~= "" and ar.searchTagAnywhere then
+		for a = 1, 8 do
+			if Brainstorm.rollTag(seed_found, a) == ar.searchTag then
+				tagLoc = "TagA" .. a .. "Sm"
+				break
+			end
+			if Brainstorm.rollTag(seed_found, a) == ar.searchTag then
+				tagLoc = "TagA" .. a .. "Big"
+				break
+			end
+		end
+	end
+	local sm, big = Brainstorm.skipsFromFilters(tagLoc)
+	Brainstorm.setPackSkipAssumption(seed_found, sm, big)
+	return sm, big
+end
+
+-- Rolls an ante's PHYSICAL pack slots (2 per opened shop; see anteShopCount:
+-- ante 1 up to 4 slots, antes 2+ up to 6, fewer under assumed skips). The
+-- run's first opened shop gets the forced normal Buffoon at its slot 1; every
+-- other slot consumes one sequential 'shop_pack'..ante advance. Memoized per
+-- (random_state, seed, skip signature) and extended on demand -- the stream is
+-- sequential, so appending later slots yields exactly what rolling them
+-- upfront would have. `count` is a cap: the returned list never exceeds the
+-- physical slot count, and callers must iterate #list.
 function Brainstorm.getSimulatedPacks(seed_found, ante, count)
 	count = count or 2
 	local sim = Brainstorm._packSim
-	if not sim or sim.seed ~= seed_found then
-		sim = { seed = seed_found }
+	if not sim or sim.seed ~= seed_found or sim.rs ~= Brainstorm.random_state then
+		sim = { seed = seed_found, sig = "", rs = Brainstorm.random_state,
+			skipSm = false, skipBig = false, forcedAnte = 1 }
 		Brainstorm._packSim = sim
 	end
+	local maxSlots = 2 * anteShopCount(ante, sim.skipSm, sim.skipBig)
+	if count > maxSlots then count = maxSlots end
 	local out = sim[ante]
 	if not out then
 		out = {}
-		if ante == 1 then out[1] = Brainstorm.FORCED_BUFFOON end
+		if ante == sim.forcedAnte and maxSlots > 0 then out[1] = Brainstorm.FORCED_BUFFOON end
 		sim[ante] = out
 	end
 	if #out >= count then return out end
@@ -1290,10 +1422,12 @@ end
 
 -- Roll the joker contents of an ante's Buffoon packs (physical slots, in
 -- order) into one {key, neg, rarity} sequence. Non-Buffoon packs consume none
--- of the buf-joker streams, same as the game. Includes ante 1's forced
--- Buffoon (2 cards -- opened first by convention, its jokers consume the
--- rarity1buf/Joker1buf1 streams before any stream-rolled pack's). Card counts
--- come from config.extra via packCardCount (fixes mega Buffoon: 4, not 6).
+-- of the buf-joker streams, same as the game. Includes the run's forced
+-- Buffoon (2 cards -- opened first by convention, its jokers consume that
+-- ante's rarity/Joker buf streams before any stream-rolled pack's). Card
+-- counts come from config.extra via packCardCount (mega Buffoon: 4, not 6).
+-- `nslots` is this consumer's window; slots beyond the ante's physical list
+-- are nil and skipped.
 function Brainstorm.simulatePackJokers(seed_found, ante, wanted, needNeg, nslots)
 	local packs = Brainstorm.getSimulatedPacks(seed_found, ante, nslots or 2)
 	local out = {}
@@ -1346,8 +1480,10 @@ function Brainstorm.effectiveMultiAnte()
 			slots[a] = depth
 			packs[a] = true
 		end
-		-- Anywhere mode scans all 6 physical pack slots per ante (2 per shop
-		-- x 3 shops); per-ante rows keep the first-shop window (2 slots).
+		-- Anywhere mode scans every physical pack slot per ante (the 6 here is
+		-- a CAP -- getSimulatedPacks stops at the ante's real slot count: 4 at
+		-- ante 1, 6 at antes 2+, fewer under assumed blind skips); per-ante
+		-- rows keep the first-shop window (2 slots).
 		return slots, packs, 8, 6
 	end
 	for a = 1, 4 do
@@ -1989,6 +2125,11 @@ function Brainstorm.buildNativeConfigText(session)
 
 	add("session", tostring(session))
 	add("threads", tostring(Brainstorm.getSearchThreadCount()))
+	-- Bumped whenever the RNG/shop MODEL changes (not just the format): a
+	-- helper binary built from older sources must refuse the config instead of
+	-- silently searching with the outdated model. 3 = skip-aware physical
+	-- shop layout (ease_ante boss-shop fix).
+	add("modelver", "3")
 	add("entropy", g17((love.timer and love.timer.getTime and love.timer.getTime() or os.clock()) * 1000))
 	add("soul", tostring(ar.searchForSoul or 0))
 	add("legendary", (ar.searchLegendary and ar.searchLegendary ~= "") and ck(ar.searchLegendary) or "-")

@@ -87,6 +87,19 @@ report where the target appears (e.g. `J1A4Shop` = slot-1 joker in ante 4's
 shop); reach it by playing to that ante without buying pool-affecting items
 first, and reroll the shop to reveal the configured depth.
 
+### How pack predictions map to shops (and blind skips)
+The ante counter ticks the moment a Boss dies, so the shop right after a boss
+already belongs to the NEXT ante. Per ante that means: ante 1 has two shops
+(after Small, after Big); antes 2+ have three (the post-boss "entry" shop,
+then after Small, after Big), two pack slots each. The run's very first shop
+leads with the game's forced normal Buffoon pack. **Skipping a blind removes
+its shop entirely** -- and taking a tag means skipping -- so when your filter
+includes a tag (or the classic Soul/legendary filter, which relies on the
+charm-tag skip), the search assumes you skip that blind and only matches packs
+in the shops you'll actually see. Play everything else without skipping, or
+later pack predictions for that ante shift. `Ctrl+P` prints the exact
+shop-by-shop layout (with the assumed skips) for your current seed.
+
 ### Native search accelerator (macOS, optional)
 Filtered searches normally run on background Lua threads. On macOS you can
 additionally build a small native helper that searches ~8x faster across all

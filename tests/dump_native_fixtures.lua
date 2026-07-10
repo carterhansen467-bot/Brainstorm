@@ -198,6 +198,26 @@ local CASES = {
 	{ name = "pack jokers mega count", ar = { jokerSlotData = {
 			{ key = "j_r3_2", index = 1 }, { key = "", index = 2 }, { key = "", index = 3 } } },
 		ma = { ante1Packs = true, ante2Packs = true, ante3Packs = true } },
+	-- Model-3: skip-aware physical shop layout (ease_ante fires before the
+	-- boss shop; a filtered tag/soul implies skipping that blind's shop)
+	{ name = "tag + pack (skip Small A1)", ar = { searchTag = "tag_charm", searchPack = { "p_spectral_mega_1" } } },
+	{ name = "soul + pack (charm-skip A1)", ar = { searchForSoul = 1, searchPack = { "p_arcana_mega_1" } } },
+	{ name = "tag anywhere + anywhere packs", ar = { searchTag = "tag_3", searchTagAnywhere = true, jokerSlotData = {
+			{ key = "j_r1_3", index = 1 }, { key = "", index = 2 }, { key = "", index = 3 } } },
+		ma = { anywhereMode = true, anywhereSlots = 4 } },
+	{ name = "pack alone (4-slot ante 1)", ar = { searchPack = { "p_standard_jumbo_1" } } },
+	{ name = "tagAny + legAny + pack jokers", ar = { searchTag = "tag_charm", searchTagAnywhere = true,
+			searchLegendary = "j_perkeo", searchLegendaryAnywhere = true, jokerSearchMatchAny = true,
+			jokerSlotData = {
+			{ key = "j_r2_7", index = 1 }, { key = "j_r1_9", index = 2 }, { key = "", index = 3 } } },
+		ma = { ante1Packs = true, ante2Packs = true, ante2Slots = 4 } },
+	-- soul-skip (Sm A1) + anywhere tag that CAN also match A1 Big: seeds where
+	-- both ante-1 blinds are skipped exercise the forced-Buffoon cascade to
+	-- ante 2's entry shop (forcedAnte = 2)
+	{ name = "soul + tagAny (forced cascade)", ar = { searchForSoul = 1, searchTag = "tag_charm",
+			searchTagAnywhere = true, searchPack = { "p_buffoon_normal_1" }, jokerSlotData = {
+			{ key = "j_r1_3", index = 1 }, { key = "", index = 2 }, { key = "", index = 3 } } },
+		ma = { ante1Packs = true, ante2Packs = true } },
 }
 
 -- ---- worker-style bootstrap (fake love.thread, stale session => no loop) ----

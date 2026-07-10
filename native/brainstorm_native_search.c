@@ -161,11 +161,14 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
 }
 
 /* ----------------------------------------------------------------- config */
+#define MODELVER 3 /* RNG/shop model version; must match the config's modelver */
+
 typedef struct {
 	int threads;
 	double entropy;
 	long session;
 	int sawEnd; /* config must terminate with "end" (guards truncation) */
+	int modelver; /* mod<->helper model handshake (stale binary => hard error) */
 	/* filters */
 	int soulCount;
 	char legendary[MAX_KEY]; int negLegendary;
@@ -251,6 +254,11 @@ typedef struct {
 	Stream joker_sho[4][9], joker_buf[4][9];
 	Stream resample[RBASES][MAX_RESAMPLE];
 	uint32_t packs_gen[9]; int packs_n[9]; int pack_idx[9][6];
+	/* per-candidate blind-skip assumption (mirrors skipsFromFilters /
+	 * setPackSkipAssumption): a skipped blind's shop never opens, so its two
+	 * get_pack picks never roll. forcedAnte = first ante that still opens a
+	 * shop; that shop's slot 1 is the run's forced normal Buffoon. */
+	uint8_t skipSm[9], skipBig[9]; int forcedAnte;
 	char label[64];
 	char legloc[16];
 } Ctx;
@@ -349,21 +357,32 @@ static int pick_culled(Ctx *c, Stream *first, const char *firstKey, int rbase,
 	return idx > 0 ? idx - 1 : -1;
 }
 
-/* getSimulatedPacks: an ante's physical pack slots (up to 6 = 2 per shop x 3
- * shops) from the shared shop_pack stream, extended on demand. SOURCE-
- * VERIFIED: ante 1's first physical slot is the run's forced normal Buffoon
- * (get_pack first_shop_buffoon), which consumes NO stream advance. */
+/* getSimulatedPacks: an ante's PHYSICAL pack slots from the shared shop_pack
+ * stream, extended on demand. SOURCE-VERIFIED SHOP MODEL: ease_ante fires on
+ * boss death BEFORE its shop, so the post-boss shop draws from the NEXT
+ * ante's streams -- ante 1 opens Small+Big (up to 4 slots), antes 2+ lead
+ * with that post-boss "entry" shop (up to 6), and an assumed-skipped blind
+ * removes its shop's 2 slots. The run's first opened shop leads with the
+ * forced normal Buffoon (get_pack first_shop_buffoon), which consumes NO
+ * stream advance. `count` is a cap; consumers must read c->packs_n[a] (and
+ * never past their own cap). */
+static int pack_max_slots(const Ctx *c, int a) {
+	int shops = (a >= 2 ? 3 : 2) - (c->skipSm[a] ? 1 : 0) - (c->skipBig[a] ? 1 : 0);
+	return 2 * shops;
+}
+
 static void sim_packs(Ctx *c, int a, int count) {
 	const Config *g = c->g;
 	if (c->packs_gen[a] != c->gen) {
 		c->packs_gen[a] = c->gen;
 		c->packs_n[a] = 0;
-		if (a == 1) {
-			c->pack_idx[1][0] = PACK_FORCED;
-			c->packs_n[1] = 1;
+		if (a == c->forcedAnte) {
+			c->pack_idx[a][0] = PACK_FORCED;
+			c->packs_n[a] = 1;
 		}
 	}
-	if (count > 6) count = 6;
+	int max = pack_max_slots(c, a);
+	if (count > max) count = max;
 	while (c->packs_n[a] < count) {
 		double poll = psr(c, stream_next(c, &c->shop_pack[a], K_SHOPPACK[a])) * g->boostCume;
 		double it = 0.0;
@@ -408,6 +427,9 @@ static int sim_pack_jokers(Ctx *c, int a, SeqEnt *seq) {
 	const Config *g = c->g;
 	int nslots = g->packSlots > 0 ? g->packSlots : 2;
 	sim_packs(c, a, nslots);
+	/* the memo may hold MORE slots than this consumer's window (filled by the
+	 * legendary-anywhere scan) and the ante may physically have FEWER */
+	if (nslots > c->packs_n[a]) nslots = c->packs_n[a];
 	int m = 0;
 	for (int slot = 0; slot < nslots; slot++) {
 		int pi = c->pack_idx[a][slot];
@@ -482,7 +504,7 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	bool bh_found = false;
 	for (int a = 1; a <= 8; a++) {
 		sim_packs(c, a, 6);
-		for (int slot = 0; slot < 6; slot++) {
+		for (int slot = 0; slot < c->packs_n[a]; slot++) {
 			int pi = c->pack_idx[a][slot];
 			if (pi < 0) continue; /* forced buffoon / none: not soulable */
 			int sk = g->boostSoul[pi];
@@ -645,16 +667,41 @@ static bool passes_prepared(Ctx *c) {
 			if (strcmp(g->tagKey[idx], g->tag)) return false;
 		}
 	}
+	/* 2.4) this seed's blind-skip assumption, BEFORE any pack consumer
+	 * (mirrors Brainstorm.skipsFromFilters + setPackSkipAssumption): taking a
+	 * filtered tag/soul means skipping that blind, and a skipped blind's shop
+	 * never rolls its two get_pack picks. Classic soul/legendary implies the
+	 * ante-1 Small skip (charm-tag convention); the tag filter implies
+	 * skipping the matched blind. */
+	memset(c->skipSm, 0, sizeof c->skipSm);
+	memset(c->skipBig, 0, sizeof c->skipBig);
+	if (!legAnywhere && (g->soulCount > 0 || g->legendary[0])) c->skipSm[1] = 1;
+	if (g->tag[0]) {
+		if (g->tagAnywhere) {
+			int a = atoi(tagLoc + 4); /* "TagA<n>Sm|Big" */
+			if (a >= 1 && a <= 8) {
+				if (tagLoc[strlen(tagLoc) - 1] == 'm') c->skipSm[a] = 1;
+				else c->skipBig[a] = 1;
+			}
+		} else {
+			c->skipSm[1] = 1;
+		}
+	}
+	c->forcedAnte = 1;
+	for (int a = 1; a <= 8; a++) {
+		if (pack_max_slots(c, a) > 0) { c->forcedAnte = a; break; }
+	}
 	/* 2.5) legendary ANYWHERE: first Soul across antes 1-8 */
 	if (legAnywhere) {
 		if (!check_legendary_anywhere(c, &legLoc)) return false;
 	}
-	/* 3) pack: ante 1's first THREE physical slots (forced buffoon + two
-	 * stream advances); forced matches any normal-buffoon target */
+	/* 3) pack: ALL of ante 1's physical slots (Small+Big shops only -- the
+	 * post-boss shop is ante 2's -- minus assumed skips; the forced buffoon
+	 * matches any normal-buffoon target) */
 	if (g->npack > 0) {
-		sim_packs(c, 1, 3);
+		sim_packs(c, 1, 6);
 		bool found = false;
-		for (int slot = 0; slot < 3 && !found; slot++) {
+		for (int slot = 0; slot < c->packs_n[1] && !found; slot++) {
 			int pi = c->pack_idx[1][slot];
 			if (pi == PACK_FORCED) {
 				for (int i = 0; i < g->npack; i++) {
@@ -805,6 +852,7 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 		char *d = next_tok(&sp);
 		if (!d) continue;
 		if (!strcmp(d, "threads")) g->threads = atoi(next_tok(&sp));
+		else if (!strcmp(d, "modelver")) g->modelver = tok_int(&sp);
 		else if (!strcmp(d, "entropy")) g->entropy = strtod(next_tok(&sp), NULL);
 		else if (!strcmp(d, "session")) g->session = atol(next_tok(&sp));
 		else if (!strcmp(d, "soul")) g->soulCount = atoi(next_tok(&sp));
@@ -895,6 +943,11 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	 * mod always writes. */
 	if (!g->sawEnd) { snprintf(err, errsz, "config truncated (no end marker)"); return false; }
 	if (g->nchecks < 8) { snprintf(err, errsz, "config has no parity checks"); return false; }
+	if (g->modelver != MODELVER) {
+		snprintf(err, errsz, "config modelver %d != helper model %d (rebuild native/brainstorm_native_search via native/build.sh)",
+				g->modelver, MODELVER);
+		return false;
+	}
 
 	/* booster cume (array order, matches the Lua float sum); card counts come
 	 * from config.extra via the config -- name fallback is source-corrected
