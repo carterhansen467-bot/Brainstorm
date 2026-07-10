@@ -1051,6 +1051,11 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
 	return false;
 }
 
+/* The external seed-pool builder includes this file as a core implementation
+ * so both programs execute the exact same RNG/config/parity code.  Keep the
+ * interactive first-hit modes out of that translation unit. */
+#ifndef BRAINSTORM_NATIVE_CORE_ONLY
+
 /* ------------------------------------------------------------- searching */
 static _Atomic bool g_stop;
 static _Atomic unsigned long long g_tried;
@@ -1274,3 +1279,5 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "bad arguments\n");
 	return 2;
 }
+
+#endif /* !BRAINSTORM_NATIVE_CORE_ONLY */

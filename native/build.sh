@@ -9,3 +9,6 @@ set -e
 cd "$(dirname "$0")"
 clang -O2 -Wall -ffp-contract=off -pthread -o brainstorm_native_search brainstorm_native_search.c -lm
 echo "built: $(pwd)/brainstorm_native_search"
+clang -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread \
+	-o brainstorm_seed_pool brainstorm_seed_pool.c -lm
+echo "built: $(pwd)/brainstorm_seed_pool"

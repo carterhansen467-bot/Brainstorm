@@ -15,9 +15,16 @@ debug_predict.txt
 
 # Native search helper: locally built binary + its runtime handshake files
 native/brainstorm_native_search
+native/brainstorm_seed_pool
 native_search.cfg
 native_search.status
 native_search.status.tmp
 native_search.stop
 native_search.hb
 brainstorm_mismatch.txt
+
+# External exhaustive seed-pool output (can be tens of gigabytes)
+seed_pools/
+*.bspool
+*.bspool.state
+*.bspool.manifest

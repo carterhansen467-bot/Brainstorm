@@ -474,16 +474,65 @@ time the tab re-renders, even though the underlying saved value is untouched.
       next shop after the ante-1 boss is A2's ENTRY -- players who'd accept it
       should use anywhere/multi-ante pack search instead of the ante-1 filter.
 
+14. **External exhaustive seed-pool builder, phase 1**
+    (`native/brainstorm_seed_pool.c`):
+    - Built as a separate CLI, but includes `brainstorm_native_search.c` in
+      core-only mode. RNG, config parsing, runtime FMA calibration, ordered
+      pools, round13, resamples, interleaved hashing, charset/rank mapping,
+      and Model-3 pack behavior therefore have one implementation.
+    - Deterministically covers an exact half-open numeric range inside all
+      `34^8 = 1,785,793,904,896` seeds. Atomic chunk assignment plus bounded
+      epochs gives all workers balanced work without duplicates. A checkpoint
+      is committed only after every chunk in the epoch finishes and output is
+      fsynced; state records both the next rank and output byte boundary, so
+      resume first truncates any crash tail.
+    - Query schema 1 compiles multiple ANDed
+      `tag key minAnte maxAnte minCount` rules in one tag walk, plus one
+      `legendary key minAnte maxAnte [negative]` rule. Ante arrays/keys extend
+      through 39, so A9 is real rather than aliasing/out-of-bounds. Ranges are
+      inclusive. The legendary predicate is deliberately the verified FIRST
+      Soul only.
+    - Route semantics are explicit: `tag_route collect` selects the first
+      required tag occurrences as blind skips before pack/Soul simulation;
+      `observe` assumes those blinds are played. A specific first legendary
+      is prechecked through bare `Joker4` before the expensive tag/pack walk,
+      rejecting about 80% of vanilla candidates cheaply while preserving
+      stream equivalence.
+    - Output modes: `count` (prevalence/storage sample), `text` (8-char seed
+      per line), and canonical `binary` (512-byte versioned/fingerprinted
+      header + u64le ranks). `.state` and `.manifest` are sidecars. `export`
+      converts a binary pool to text. Binary record order is intentionally
+      unspecified because workers flush buffered hit blocks independently.
+    - Validation: both helpers build cleanly; ASan+UBSan pass; 100,000 example
+      candidates produce identical 408 records in text and binary/export;
+      `tests/seed_pool_equivalence.sh` compares one million candidates against
+      the old Model-3 path on their overlapping single-tag + first-Soul A1-A8
+      semantics with zero verdict differences.
+    - Current 100M example sample (Rare + Negative tags A3-A9, collected;
+      first Soul Perkeo A1-A6): 403,012 matches = 0.403012%, ~12.3M seeds/sec,
+      projected 7.20B u64 records / 57.6GB. Do NOT start broad full scans
+      before running count-only mode.
+    - Phase-2 integration is intentionally not faked: the game does not read
+      `.bspool` yet. The native helper should stream ranks and apply active
+      filters; Lua must not load billions. Composition must merge/re-evaluate
+      skip routes, since new tag/Soul filters can change which shops/packs
+      physically exist. Manifest catalog/query fingerprints are the safety
+      contract for that work.
+
 ## Not yet built (next steps)
 
-1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
+1. **Seed-pool in-game integration** — select a `.bspool`, validate its
+   model/catalog/query fingerprints, and have the native helper stream only
+   its ranks while compiling the active Brainstorm overlay filters with the
+   pool's route effects.
+2. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
    ante (e.g. Ante 1 Depth, Ante 2 Depth, Ante 3 Depth, Ante 4 Depth, each 0-8, 0 = skip
    that ante). Loop `checkShopJokerSearch`/`checkPackJokerSearch` over each ante with
    its own depth instead of hardcoding ante=1.
-2. **Shop-vs-Pack match indicator** — use the mod's existing `Brainstorm.attention_text()`
+3. **Shop-vs-Pack match indicator** — use the mod's existing `Brainstorm.attention_text()`
    helper to flash "Found in Shop!" or "Found in Pack!" when `auto_reroll` succeeds,
    instead of silently starting the run.
-3. **Multi-joker OR search** (discussed, deprioritized) — currently only one joker can be
+4. **Multi-joker OR search** (discussed, deprioritized) — currently only one joker can be
    searched at a time since all 3 rarity dropdowns write to the same single
    `Brainstorm.SETTINGS.autoreroll.searchJoker` field. Would need to become a list.
 

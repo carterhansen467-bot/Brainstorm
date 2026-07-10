@@ -114,3 +114,90 @@ The mod detects the binary automatically on the next launch and uses it for
 starts, and the mod falls back to the Lua search if the helper is missing or
 disagrees. Remove the binary (or set `useNativeSearch = false` in
 settings.lua) to go back to pure-Lua searching.
+
+### Exhaustive external seed-pool builder (phase 1)
+
+`native/build.sh` also builds `native/brainstorm_seed_pool`, a standalone
+program for exhaustively scanning an exact numeric range of Balatro's full
+`34^8 = 1,785,793,904,896` eight-character seed space. Unlike the in-game
+first-hit search, it never samples, wraps, or stops after one match. It can
+combine multiple ranged tag constraints with a first-Soul legendary
+constraint and write every match.
+
+The scanner reads two inputs:
+
+1. `native_search.cfg`, Brainstorm's runtime snapshot of ordered pools,
+   unlock/discovery state, bans, pack definitions, and game-computed RNG
+   parity checks. Build the native helpers, launch the game, and briefly start
+   a native auto-search to refresh this file for the profile you intend to
+   scan.
+2. A pool criteria file. [`native/seed_pool.example.cfg`](native/seed_pool.example.cfg)
+   expresses: Rare Tag and Negative Tag, each at least once during antes 3-9,
+   plus the run's first Soul yielding Perkeo before ante 7 (the inclusive
+   range is written explicitly as antes 1-6).
+
+Run its checked-in 100-million-seed count-only sample from the repository
+root:
+
+```bash
+mkdir -p seed_pools
+./native/brainstorm_seed_pool scan native_search.cfg \
+  native/seed_pool.example.cfg seed_pools/rare-negative-perkeo-count
+```
+
+The `.manifest` reports the observed match rate, throughput, projected
+full-space record count, and projected binary size. On the current development
+machine, that sample found 403,012 matches (0.403012%) at about 12.3 million
+seeds/second, projecting roughly 7.20 billion records and 57.6 GB before the
+512-byte header. Treat that as an estimate; the active pool/profile snapshot
+can change it.
+
+For the exhaustive run, copy the example criteria and change:
+
+```text
+count all
+format binary
+```
+
+Then run the same command with an output name ending in `.bspool`. The
+canonical pool stores each match as an eight-byte little-endian numeric seed
+rank. Its 512-byte header includes schema/model versions, the scanned range,
+record count, completion flag, alphabet, and catalog/criteria fingerprints.
+The adjacent `.state` is an atomic checkpoint containing the committed cursor
+and byte boundary; rerun the identical command to resume safely after Ctrl+C
+or a crash. The adjacent `.manifest` records the criteria and final statistics.
+
+Small pools can instead use `format text` for one seed per line. A completed
+binary pool can be exported later with:
+
+```bash
+./native/brainstorm_seed_pool export seed_pools/example.bspool \
+  seed_pools/example.txt
+```
+
+Criteria directives currently supported are:
+
+```text
+tag <key> <inclusive-min-ante> <inclusive-max-ante> <minimum-count>
+legendary <key> <inclusive-min-ante> <inclusive-max-ante> [require-negative]
+tag_route collect|observe
+```
+
+`tag_route collect` selects the first required matching tag occurrences as
+actual blind skips. Those missing shops are fed into the Model-3 physical pack
+simulation before Souls are checked. `observe` requires the tags but assumes
+their blinds are played. The legendary rule intentionally means the run's
+**first Soul**; later-Soul pool mutation has not yet been source-verified.
+
+This is phase 1: the external builder and versioned pool contract are present,
+but the in-game UI does not consume `.bspool` files yet. That integration
+should stream ranks through the native helper instead of loading billions of
+seeds into Lua. It must also combine route-changing in-game filters with the
+base pool's recorded tag route before re-verification.
+
+To compare the generalized engine with the established Model-3 path over
+their overlapping A1-A8 semantics:
+
+```bash
+tests/seed_pool_equivalence.sh native_search.cfg 1000000
+```
