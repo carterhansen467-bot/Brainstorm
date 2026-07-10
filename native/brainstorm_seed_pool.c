@@ -266,8 +266,8 @@ bad_value:
 	if (p->countAll) p->count = SEEDSPACE - p->start;
 	if (!p->count || p->count > SEEDSPACE - p->start) { snprintf(err, errsz, "count extends outside the 34^8 seed space"); return false; }
 	if (p->threads == 0) {
-		long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-		p->threads = ncpu > 1 ? (int)ncpu - 1 : 1;
+		int ncpu = bs_ncpu();
+		p->threads = ncpu > 1 ? ncpu - 1 : 1;
 	}
 	if (p->threads < 1 || p->threads > 64) { snprintf(err, errsz, "threads must be 0..64"); return false; }
 	if (p->chunk < ILV || p->chunk > UINT64_C(1073741824)) { snprintf(err, errsz, "chunk must be between %d and 1073741824", ILV); return false; }
@@ -673,9 +673,9 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			records, complete, POOL_HEADER_SIZE);
 	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 	n += w;
-	off_t at = ftello(f);
-	if (fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
-			|| fflush(f) != 0 || fsync(fileno(f)) != 0 || fseeko(f, at, SEEK_SET) != 0) {
+	int64_t at = ftello(f);
+	if (at < 0 || fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
+			|| fflush(f) != 0 || bs_fsync(fileno(f)) != 0 || fseeko(f, at, SEEK_SET) != 0) {
 		snprintf(err, errsz, "cannot update binary header: %s", strerror(errno));
 		return false;
 	}
@@ -688,7 +688,7 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
 		snprintf(err, errsz, "state path is too long"); return false;
 	}
-	FILE *f = fopen(tmp, "w");
+	FILE *f = fopen(tmp, "wb"); /* LF on every platform */
 	if (!f) { snprintf(err, errsz, "cannot write state: %s", strerror(errno)); return false; }
 	fprintf(f, "BRAINSTORM_SEED_POOL_STATE %d\n", POOL_SCHEMA);
 	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n", p->catalogHash, p->criteriaHash);
@@ -696,7 +696,7 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	fprintf(f, "cursor %" PRIu64 "\noutput_bytes %" PRIu64 "\n", s->cursor, s->outputBytes);
 	fprintf(f, "matched %" PRIu64 "\nscanned %" PRIu64 "\nelapsed_seconds %.9f\ndone %d\nend\n",
 			s->matched, s->scanned, s->elapsed, s->done);
-	if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0 || rename(tmp, path) != 0) {
+	if (fflush(f) != 0 || bs_fsync(fileno(f)) != 0 || fclose(f) != 0 || bs_rename(tmp, path) != 0) {
 		snprintf(err, errsz, "cannot commit state: %s", strerror(errno));
 		return false;
 	}
@@ -743,7 +743,7 @@ bad:
 
 static bool pool_write_manifest(const char *path, const Config *g, const PoolPlan *p,
 		const PoolState *s, char *err, size_t errsz) {
-	FILE *f = fopen(path, "w");
+	FILE *f = fopen(path, "wb"); /* LF on every platform */
 	if (!f) { snprintf(err, errsz, "cannot write manifest: %s", strerror(errno)); return false; }
 	double rate = s->scanned ? (double)s->matched / (double)s->scanned : 0.0;
 	double projected = rate * (double)SEEDSPACE;
@@ -770,9 +770,7 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 }
 
 static double pool_now(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+	return bs_monotonic_seconds();
 }
 
 static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output) {
@@ -796,8 +794,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		if (p->format != POOL_COUNT) {
 			out = fopen(output, "r+b");
 			if (!out) { fprintf(stderr, "cannot open output for resume: %s\n", strerror(errno)); return 1; }
-			if (ftruncate(fileno(out), (off_t)state.outputBytes) != 0
-					|| fseeko(out, (off_t)state.outputBytes, SEEK_SET) != 0) {
+			if (bs_ftruncate(fileno(out), (int64_t)state.outputBytes) != 0
+					|| fseeko(out, (int64_t)state.outputBytes, SEEK_SET) != 0) {
 				fprintf(stderr, "cannot restore committed output boundary: %s\n", strerror(errno)); fclose(out); return 1;
 			}
 		}
@@ -825,8 +823,9 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		return 0;
 	}
 
-	signal(SIGINT, pool_signal_handler);
-	signal(SIGTERM, pool_signal_handler);
+	/* SIGINT/SIGTERM on POSIX; Ctrl+C / console-close via SetConsoleCtrlHandler
+	 * on Windows. Either way the run stops at the next epoch checkpoint. */
+	bs_install_stop_handler(pool_signal_handler);
 	double priorElapsed = state.elapsed;
 	double started = pool_now();
 	while (state.cursor < p->start + p->count && !poolSignalStop) {
@@ -866,10 +865,10 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		state.matched += epochMatched;
 		state.elapsed = priorElapsed + (pool_now() - started);
 		if (out) {
-			if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+			if (fflush(out) != 0 || bs_fsync(fileno(out)) != 0) {
 				fprintf(stderr, "cannot commit output: %s\n", strerror(errno)); fclose(out); return 1;
 			}
-			off_t pos = ftello(out);
+			int64_t pos = ftello(out);
 			if (pos < 0) { fprintf(stderr, "cannot read output position\n"); fclose(out); return 1; }
 			state.outputBytes = (uint64_t)pos;
 			if (!pool_write_header(out, p, state.matched, 0, err, sizeof err)) {
@@ -939,7 +938,7 @@ static int pool_mode_export(const char *input, const char *output) {
 	if (fseeko(in, h.headerBytes, SEEK_SET) != 0) {
 		fprintf(stderr, "cannot seek past pool header\n"); fclose(in); return 1;
 	}
-	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "w");
+	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "wb"); /* LF everywhere */
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); fclose(in); return 1; }
 	for (uint64_t record = 0; record < records; record++) {
 		unsigned char raw[8];

@@ -34,12 +34,8 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <time.h>
+#include "platform.h" /* threads, positional IO, signals: POSIX or Win32 */
 
 /* ---------------------------------------------------------------- limits */
 #define MAX_KEY 48
@@ -1252,8 +1248,8 @@ typedef struct {
 } WorkerArgs;
 
 /* Read `count` consecutive pool records starting at rotated index `first`
- * (wrapping at the record count) into ranks[]. pread keeps this thread-safe
- * without a shared file position. */
+ * (wrapping at the record count) into ranks[]. bs_pread (pread / overlapped
+ * ReadFile) keeps this thread-safe without a shared file position. */
 static bool pool_read_ranks(uint64_t first, uint64_t count, uint64_t *ranks,
 		unsigned char *raw) {
 	uint64_t done = 0;
@@ -1261,10 +1257,9 @@ static bool pool_read_ranks(uint64_t first, uint64_t count, uint64_t *ranks,
 		uint64_t at = (first + done) % g_pool.records;
 		uint64_t run = count - done;
 		if (at + run > g_pool.records) run = g_pool.records - at;
-		size_t bytes = (size_t)run * 8;
-		off_t off = (off_t)(g_pool.dataOff + at * 8);
-		ssize_t got = pread(g_pool.fd, raw, bytes, off);
-		if (got != (ssize_t)bytes) return false;
+		uint64_t bytes = run * 8;
+		int64_t got = bs_pread(g_pool.fd, raw, bytes, g_pool.dataOff + at * 8);
+		if (got != (int64_t)bytes) return false;
 		for (uint64_t i = 0; i < run; i++) {
 			uint64_t rank = 0;
 			for (int b = 0; b < 8; b++) rank |= (uint64_t)raw[i * 8 + b] << (8 * b);
@@ -1382,8 +1377,11 @@ static void *worker(void *vp) {
 	return NULL;
 }
 
+/* "wb" + bs_rename: byte-identical LF status on every platform (the CRT
+ * would write \r\n in text mode) committed atomically (plain rename does not
+ * overwrite on Windows). */
 static void write_status(const char *path, const char *tmp, bool done, const char *emsg) {
-	FILE *f = fopen(tmp, "w");
+	FILE *f = fopen(tmp, "wb");
 	if (!f) return;
 	fprintf(f, "P %llu\n", (unsigned long long)atomic_load(&g_tried));
 	if (g_warn[0]) fprintf(f, "W %s\n", g_warn);
@@ -1391,12 +1389,12 @@ static void write_status(const char *path, const char *tmp, bool done, const cha
 	if (g_found) fprintf(f, "R %s %s\n", g_found_seed, g_found_label[0] ? g_found_label : "-");
 	if (done) fprintf(f, "D\n");
 	fclose(f);
-	rename(tmp, path);
+	bs_rename(tmp, path);
 }
 
 static double file_age_seconds(const char *path) {
-	struct stat st;
-	if (stat(path, &st) != 0) return 1e9;
+	bs_stat_t st;
+	if (bs_stat(path, &st) != 0) return 1e9;
 	return difftime(time(NULL), st.st_mtime);
 }
 
@@ -1419,8 +1417,8 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 		fclose(f);
 		return false;
 	}
-	struct stat st;
-	if (fstat(fileno(f), &st) != 0) {
+	bs_stat_t st; /* 64-bit st_size: pools grow past 2 GiB */
+	if (bs_fstat(fileno(f), &st) != 0) {
 		snprintf(err, errsz, "pool: cannot stat %s", g->poolFile);
 		fclose(f);
 		return false;
@@ -1487,8 +1485,7 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 	time_t t0 = time(NULL);
 	bool joined = false;
 	while (!atomic_load(&g_stop)) {
-		struct timespec ts = { 0, 200 * 1000 * 1000 };
-		nanosleep(&ts, NULL);
+		bs_sleep_ms(200);
 		if (access(stopPath, F_OK) == 0) atomic_store(&g_stop, true);
 		/* a fully dealt pool with no hit is a definitive verdict, not a retry */
 		if (g_pool_active && atomic_load(&g_pool.live) == 0) {
@@ -1595,7 +1592,7 @@ static int mode_bench(const Config *g0, int seconds) {
 			wa[i].g = &gb; wa[i].tid = i; wa[i].start = 12345;
 			pthread_create(&th[i], NULL, worker, &wa[i]);
 		}
-		sleep((unsigned)seconds);
+		bs_sleep_ms((unsigned)seconds * 1000u);
 		atomic_store(&g_stop, true);
 		for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
 		printf("threads=%d seeds/sec=%.0f\n", n, (double)atomic_load(&g_tried) / seconds);

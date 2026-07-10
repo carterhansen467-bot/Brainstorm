@@ -28,3 +28,5 @@ seed_pools/
 *.bspool
 *.bspool.state
 *.bspool.manifest
+native/*.exe
+native/*.pdb
