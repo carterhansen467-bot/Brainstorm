@@ -46,6 +46,11 @@ sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
 
 "$POOL_BIN" scan "$OUT/snapshot.cfg" "$OUT/criteria.cfg" "$OUT/pool.bspool"
 "$POOL_BIN" export "$OUT/pool.bspool" "$OUT/pool.txt"
+
+# Git Bash auto-converts /tmp-style paths in ARGUMENTS for native exes, but
+# the poolfile line is file CONTENT read by the helper's fopen -- embed a
+# native path there (cygpath ships with Git Bash; no-op elsewhere).
+POOL_PATH=$(cygpath -m "$OUT/pool.bspool" 2>/dev/null || echo "$OUT/pool.bspool")
 RECORDS=$(wc -l < "$OUT/pool.txt" | tr -d ' ')
 [ "$RECORDS" -gt 0 ] || { echo "FAIL: pool is empty; grow seed-count"; exit 1; }
 
@@ -74,7 +79,7 @@ write_search_cfg() {
 		echo "maslots 0 0 0 0 0 0 0 0"
 		echo "mapacks 0 0 0 0 0 0 0 0"
 		echo "packslots 2"
-		echo "poolfile $OUT/pool.bspool"
+		echo "poolfile $POOL_PATH"
 		grep -E '^(tagdef|vouchdef|jokerdef|boostdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
 		echo "end"
 	} > "$out"
