@@ -24,11 +24,14 @@
 #include <signal.h>
 #include <stdarg.h>
 
-#define POOL_SCHEMA 1
+/* Schema, header size, and header parsing live in the shared core
+ * (.bspool contract section of brainstorm_native_search.c) because the
+ * interactive searcher consumes these files too. */
+#define POOL_SCHEMA BSPOOL_SCHEMA
 #define POOL_MAX_ANTE 39
-#define POOL_MAX_TAG_RULES 16
+#define POOL_MAX_TAG_RULES BSPOOL_MAX_TAG_RULES
 #define POOL_LABEL 512
-#define POOL_HEADER_SIZE 512
+#define POOL_HEADER_SIZE BSPOOL_HEADER_SIZE
 #define POOL_OUTPUT_BUFFER (64 * 1024)
 
 typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
@@ -106,17 +109,6 @@ static void pool_signal_handler(int sig) {
 	poolSignalStop = 1;
 }
 
-static char *pool_tok(char **sp) {
-	char *s = *sp;
-	while (*s && isspace((unsigned char)*s)) s++;
-	if (!*s) { *sp = s; return NULL; }
-	char *out = s;
-	while (*s && !isspace((unsigned char)*s)) s++;
-	if (*s) *s++ = 0;
-	*sp = s;
-	return out;
-}
-
 static bool pool_parse_u64(const char *s, uint64_t *out) {
 	if (!s || !*s || *s == '-') return false;
 	errno = 0;
@@ -134,49 +126,6 @@ static bool pool_parse_int(const char *s, int *out) {
 	long v = strtol(s, &end, 10);
 	if (errno || !end || *end || v < INT32_MIN || v > INT32_MAX) return false;
 	*out = (int)v;
-	return true;
-}
-
-static uint64_t pool_hash_update(uint64_t h, const void *data, size_t n) {
-	const unsigned char *p = data;
-	for (size_t i = 0; i < n; i++) {
-		h ^= (uint64_t)p[i];
-		h *= UINT64_C(1099511628211);
-	}
-	return h;
-}
-
-static bool pool_catalog_directive(const char *d) {
-	return !strcmp(d, "modelver") || !strcmp(d, "tagdef")
-		|| !strcmp(d, "vouchdef") || !strcmp(d, "jokerdef")
-		|| !strcmp(d, "boostdef") || !strncmp(d, "check_", 6);
-}
-
-/* Fingerprint only model/pool/check data. Session entropy, current UI filters,
- * thread count, and other search-launch details do not affect pool truth and
- * must not invalidate a pool when Brainstorm refreshes the snapshot. */
-static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
-	FILE *f = fopen(path, "r");
-	if (!f) return false;
-	uint64_t h = UINT64_C(1469598103934665603);
-	char line[512];
-	while (fgets(line, sizeof line, f)) {
-		char copy[512];
-		snprintf(copy, sizeof copy, "%s", line);
-		char *sp = copy;
-		char *d = pool_tok(&sp);
-		if (!d || !pool_catalog_directive(d)) continue;
-		for (char *t = d; t; t = pool_tok(&sp)) {
-			h = pool_hash_update(h, t, strlen(t));
-			const unsigned char separator = 0;
-			h = pool_hash_update(h, &separator, 1);
-		}
-		const unsigned char newline = '\n';
-		h = pool_hash_update(h, &newline, 1);
-	}
-	if (ferror(f)) { fclose(f); return false; }
-	fclose(f);
-	*out = h;
 	return true;
 }
 
@@ -692,16 +641,38 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	if (p->format != POOL_BINARY) return true;
 	unsigned char buf[POOL_HEADER_SIZE];
 	memset(buf, 0, sizeof buf);
+	/* The header embeds the criteria that built the pool so a shared .bspool
+	 * is self-describing without its .manifest sidecar, and so the in-game
+	 * consumer can later compose the pool's tag route with overlay filters. */
 	int n = snprintf((char *)buf, sizeof buf,
 			"BRAINSTORM_SEED_POOL %d\n"
 			"modelver %d\nencoding u64le\ncharset %s\nseedspace %" PRIu64 "\n"
 			"range_start %" PRIu64 "\nrange_end %" PRIu64 "\n"
 			"catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n"
-			"records %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
+			"tag_route %s\n",
 			POOL_SCHEMA, MODELVER, CHARSET, (uint64_t)SEEDSPACE,
 			p->start, p->start + p->count, p->catalogHash, p->criteriaHash,
-			records, complete, POOL_HEADER_SIZE);
+			p->collectTags ? "collect" : "observe");
 	if (n < 0 || n >= (int)sizeof buf) { snprintf(err, errsz, "binary header overflow"); return false; }
+	for (int i = 0; i < p->ntagRules; i++) {
+		const PoolTagRule *r = &p->tagRules[i];
+		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "tag %s %d %d %d\n",
+				r->key, r->minAnte, r->maxAnte, r->minCount);
+		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		n += w;
+	}
+	if (p->legendary.used) {
+		const PoolLegendaryRule *r = &p->legendary;
+		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "legendary %s %d %d %d\n",
+				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		n += w;
+	}
+	int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+			"records %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
+			records, complete, POOL_HEADER_SIZE);
+	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+	n += w;
 	off_t at = ftello(f);
 	if (fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
 			|| fflush(f) != 0 || fsync(fileno(f)) != 0 || fseeko(f, at, SEEK_SET) != 0) {
@@ -955,19 +926,19 @@ static int pool_mode_fixture(const Config *g, const PoolPlan *p, const char *see
 static int pool_mode_export(const char *input, const char *output) {
 	FILE *in = fopen(input, "rb");
 	if (!in) { fprintf(stderr, "cannot open %s: %s\n", input, strerror(errno)); return 1; }
-	char header[POOL_HEADER_SIZE + 1];
-	if (fread(header, 1, POOL_HEADER_SIZE, in) != POOL_HEADER_SIZE) {
-		fprintf(stderr, "truncated pool header\n"); fclose(in); return 1;
+	BspoolHeader h;
+	char err[192];
+	if (!bspool_read_header(in, &h, err, sizeof err)) {
+		fprintf(stderr, "%s\n", err); fclose(in); return 1;
 	}
-	header[POOL_HEADER_SIZE] = 0;
-	if (strncmp(header, "BRAINSTORM_SEED_POOL 1\n", 23)) {
-		fprintf(stderr, "not a schema-1 Brainstorm seed pool\n"); fclose(in); return 1;
+	if (h.modelver != MODELVER) {
+		fprintf(stderr, "warning: pool model %d, this tool is model %d\n", h.modelver, MODELVER);
 	}
-	char *recordsAt = strstr(header, "\nrecords ");
-	char *completeAt = strstr(header, "\ncomplete ");
-	if (!recordsAt || !completeAt) { fprintf(stderr, "malformed pool header\n"); fclose(in); return 1; }
-	uint64_t records = strtoull(recordsAt + 9, NULL, 10);
-	int complete = atoi(completeAt + 10);
+	uint64_t records = h.records;
+	int complete = h.complete;
+	if (fseeko(in, h.headerBytes, SEEK_SET) != 0) {
+		fprintf(stderr, "cannot seek past pool header\n"); fclose(in); return 1;
+	}
 	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "w");
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); fclose(in); return 1; }
 	for (uint64_t record = 0; record < records; record++) {

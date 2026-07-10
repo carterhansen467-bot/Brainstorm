@@ -499,10 +499,11 @@ time the tab re-renders, even though the underlying saved value is untouched.
       rejecting about 80% of vanilla candidates cheaply while preserving
       stream equivalence.
     - Output modes: `count` (prevalence/storage sample), `text` (8-char seed
-      per line), and canonical `binary` (512-byte versioned/fingerprinted
-      header + u64le ranks). `.state` and `.manifest` are sidecars. `export`
-      converts a binary pool to text. Binary record order is intentionally
-      unspecified because workers flush buffered hit blocks independently.
+      per line), and canonical `binary` (versioned/fingerprinted fixed-size
+      header + u64le ranks; 1 KiB with embedded criteria since phase 2).
+      `.state` and `.manifest` are sidecars. `export` converts a binary pool
+      to text. Binary record order is intentionally unspecified because
+      workers flush buffered hit blocks independently.
     - Validation: both helpers build cleanly; ASan+UBSan pass; 100,000 example
       candidates produce identical 408 records in text and binary/export;
       `tests/seed_pool_equivalence.sh` compares one million candidates against
@@ -519,12 +520,70 @@ time the tab re-renders, even though the underlying saved value is untouched.
       physically exist. Manifest catalog/query fingerprints are the safety
       contract for that work.
 
+15. **Seed-pool in-game integration, phase 2** (native `poolfile` +
+    `seed_pools/` UI):
+    - The `.bspool` contract moved into the shared core
+      (`brainstorm_native_search.c`): schema/header-size constants, the
+      catalog fingerprint, and a header parser shared by builder, exporter,
+      and searcher. The header grew to 1 KiB and now EMBEDS the criteria
+      (`tag_route`/`tag`/`legendary` lines), so a shared pool is
+      self-describing without its `.manifest` and future route composition
+      has the data it needs in the one file people actually share.
+    - `modelver` bumped 3 -> 4: `load_config` silently ignores unknown
+      directives, so an older helper binary would have accepted a config with
+      `poolfile` and searched the FULL space. The handshake bump turns that
+      into a loud refusal (rebuild via `native/build.sh`). The equivalence
+      harnesses normalize older snapshots' modelver with sed, since catalog
+      data is protocol-independent.
+    - `poolfile <rest-of-line>` (mod paths contain spaces) switches
+      `mode_search` to `pool_worker`: an atomic record cursor deals
+      16384-record chunks, `pread` keeps reads thread-safe without a shared
+      file position, iteration starts at an entropy-derived rotation and
+      wraps so every record is dealt exactly once, then the same ILV batched
+      evaluation pipeline runs. Corrupt out-of-space ranks are dropped, the
+      committed record count is clamped to the real file size (crash tails),
+      and a fully dealt pool without a hit exits 3 with `E pool: no seed in
+      the pool matches the active filters` -- a DEFINITIVE verdict, since the
+      pool is the complete match set for its criteria.
+    - Pool errors are prefixed `pool:` in the status file on purpose: the Lua
+      side must NOT degrade a pool search into a full-space search (thread
+      fallback would return non-members). `pollNativeSearch` routes `pool:`
+      errors to `A.poolAbort`; `updateAutoReroll` stops the search with an
+      attention-text alert. Non-pool errors keep the old Lua-thread fallback.
+      The keyhandler clears `poolAbort` on each fresh search toggle so a
+      stale verdict can't kill the next search. A `W <msg>` status line
+      carries non-fatal warnings printed once to the console (catalog
+      fingerprint differs = pool built on another unlock snapshot; pool scan
+      incomplete; partial read).
+    - Lua/UI: `seedPoolDir()` = `Mods/Brainstorm/seed_pools/` (created when
+      the settings tab opens), `seedPoolPath()` re-checks existence on every
+      call (dropping a file in while the game runs works). The "Seed Pool"
+      cycler stores the FILENAME, not the index; a selected-but-missing file
+      stays listed and selected so a temporarily absent pool never silently
+      widens the search to full space. `buildNativeConfigText` appends
+      `poolfile` as a raw line (bypasses `ck()`; only a newline rejects).
+    - The safety rail is unchanged: every pool hit is still re-verified by
+      `passesAllFilters` on the main thread against the CURRENT profile.
+      Pool membership itself is trusted from the native reader (records are
+      unordered, so a Lua-side membership check would be O(n)).
+    - NOT yet done (also flagged in README): merging the pool's
+      collected-tag skip route into overlay pack/joker filter predictions.
+      Doing it only in C would produce hits the Lua rail rejects; it must
+      land in the C searcher and the Lua filter suite together, keyed off
+      the criteria now embedded in the pool header.
+    - Validation: `tests/pool_search_equivalence.sh` builds a 3M-seed pool
+      (44,847 records), requires the restricted search's hit to be a pool
+      member that fixture mode also accepts, and requires a contradictory
+      filter to exhaust the pool with exit 3. ASan+UBSan clean on scan,
+      export, and pool-restricted search; both preexisting harnesses still
+      pass (1M-seed pool/Model-3 compat, 36-case Lua oracle).
+
 ## Not yet built (next steps)
 
-1. **Seed-pool in-game integration** — select a `.bspool`, validate its
-   model/catalog/query fingerprints, and have the native helper stream only
-   its ranks while compiling the active Brainstorm overlay filters with the
-   pool's route effects.
+1. **Pool route composition** — merge a selected pool's collected-tag skip
+   route (now embedded in the `.bspool` header) into the overlay filters'
+   pack/joker predictions, simultaneously in the C searcher and the Lua
+   filter suite so the safety rail keeps agreeing.
 2. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
    ante (e.g. Ante 1 Depth, Ante 2 Depth, Ante 3 Depth, Ante 4 Depth, each 0-8, 0 = skip
    that ante). Loop `checkShopJokerSearch`/`checkPackJokerSearch` over each ante with

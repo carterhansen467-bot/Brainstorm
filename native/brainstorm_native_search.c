@@ -32,10 +32,12 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -161,7 +163,10 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
 }
 
 /* ----------------------------------------------------------------- config */
-#define MODELVER 3 /* RNG/shop model version; must match the config's modelver */
+#define MODELVER 4 /* RNG/shop model + config protocol version; must match the
+                    * config's modelver. 4 adds the poolfile directive -- an
+                    * older binary would silently IGNORE it and search the full
+                    * space, so the handshake must reject, not degrade. */
 
 typedef struct {
 	int threads;
@@ -197,6 +202,9 @@ typedef struct {
 	struct { int kind; char str[MAX_KEY]; double x; int n; double expect; } checks[MAX_CHECKS];
 	/* first RNG stream the active filter chain touches (batched-hash preload) */
 	int fsId; int fsAnte; const char *fsKey;
+	/* optional .bspool restricting search to a prebuilt seed set (may contain
+	 * spaces: the directive consumes the rest of its config line) */
+	char poolFile[1024];
 } Config;
 
 enum { CK_PH = 1, CK_R13, CK_PR, CK_PRN };
@@ -865,6 +873,13 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 		else if (!strcmp(d, "leganywhere")) g->legAnywhere = atoi(next_tok(&sp));
 		else if (!strcmp(d, "packslots")) g->packSlots = atoi(next_tok(&sp));
 		else if (!strcmp(d, "matchany")) g->matchAny = atoi(next_tok(&sp));
+		else if (!strcmp(d, "poolfile")) {
+			/* rest of the line verbatim: mod paths contain spaces */
+			char *v = sp;
+			while (v && (*v == ' ' || *v == '\t')) v++;
+			if (v && *v) snprintf(g->poolFile, sizeof g->poolFile, "%s", v);
+			sp = NULL;
+		}
 		else if (!strcmp(d, "jslot")) {
 			int i = atoi(next_tok(&sp)) - 1;
 			char *k = next_tok(&sp);
@@ -1051,6 +1066,159 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
 	return false;
 }
 
+/* ----------------------------------------------------- .bspool contract --
+ * Shared between the exhaustive pool builder (which writes pools) and the
+ * interactive searcher (which can restrict a search to one). The header is a
+ * fixed-size zero-padded text block so a shared pool is self-describing:
+ * versions, scanned range, fingerprints, AND the criteria that built it. */
+#define BSPOOL_SCHEMA 1
+#define BSPOOL_HEADER_SIZE 1024
+#define BSPOOL_MAX_TAG_RULES 16
+
+typedef struct {
+	int schema, modelver, complete, headerBytes;
+	uint64_t seedspace, rangeStart, rangeEnd, records;
+	uint64_t catalogHash, criteriaHash;
+	char charset[64];
+	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
+	int ntagRules;
+	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
+	struct { int used; char key[MAX_KEY]; int minAnte, maxAnte, neg; } legendary;
+} BspoolHeader;
+
+static char *pool_tok(char **sp) {
+	char *s = *sp;
+	while (*s && isspace((unsigned char)*s)) s++;
+	if (!*s) { *sp = s; return NULL; }
+	char *out = s;
+	while (*s && !isspace((unsigned char)*s)) s++;
+	if (*s) *s++ = 0;
+	*sp = s;
+	return out;
+}
+
+static uint64_t pool_hash_update(uint64_t h, const void *data, size_t n) {
+	const unsigned char *p = data;
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint64_t)p[i];
+		h *= UINT64_C(1099511628211);
+	}
+	return h;
+}
+
+static bool pool_catalog_directive(const char *d) {
+	return !strcmp(d, "modelver") || !strcmp(d, "tagdef")
+		|| !strcmp(d, "vouchdef") || !strcmp(d, "jokerdef")
+		|| !strcmp(d, "boostdef") || !strncmp(d, "check_", 6);
+}
+
+/* Fingerprint only model/pool/check data. Session entropy, current UI filters,
+ * thread count, and other search-launch details do not affect pool truth and
+ * must not invalidate a pool when Brainstorm refreshes the snapshot. */
+static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+	uint64_t h = UINT64_C(1469598103934665603);
+	char line[512];
+	while (fgets(line, sizeof line, f)) {
+		char copy[512];
+		snprintf(copy, sizeof copy, "%s", line);
+		char *sp = copy;
+		char *d = pool_tok(&sp);
+		if (!d || !pool_catalog_directive(d)) continue;
+		for (char *t = d; t; t = pool_tok(&sp)) {
+			h = pool_hash_update(h, t, strlen(t));
+			const unsigned char separator = 0;
+			h = pool_hash_update(h, &separator, 1);
+		}
+		const unsigned char newline = '\n';
+		h = pool_hash_update(h, &newline, 1);
+	}
+	if (ferror(f)) { fclose(f); return false; }
+	fclose(f);
+	*out = h;
+	return true;
+}
+
+/* Parse a .bspool header from an already-open file (rewinds to 0). Verifies
+ * shape, schema, encoding, charset, and seed space here; callers add their
+ * own model/records policy on top. */
+static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz) {
+	memset(h, 0, sizeof *h);
+	h->route = 1;
+	char buf[BSPOOL_HEADER_SIZE + 1];
+	if (fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
+	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
+	if (got < 64) { snprintf(err, errsz, "pool header is truncated"); return false; }
+	buf[got] = 0;
+	char *cur = buf;
+	int sawMagic = 0, sawEnd = 0;
+	char encoding[32] = "";
+	while (cur && *cur && !sawEnd) {
+		char *nl = strchr(cur, '\n');
+		if (!nl) break;
+		*nl = 0;
+		char *sp = cur;
+		cur = nl + 1;
+		char *d = pool_tok(&sp);
+		if (!d) continue;
+		char *v = NULL;
+		if (!strcmp(d, "BRAINSTORM_SEED_POOL")) {
+			v = pool_tok(&sp);
+			h->schema = v ? atoi(v) : 0;
+			sawMagic = 1;
+		}
+		else if (!strcmp(d, "modelver")) { v = pool_tok(&sp); h->modelver = v ? atoi(v) : 0; }
+		else if (!strcmp(d, "encoding")) { v = pool_tok(&sp); if (v) snprintf(encoding, sizeof encoding, "%s", v); }
+		else if (!strcmp(d, "charset")) { v = pool_tok(&sp); if (v) snprintf(h->charset, sizeof h->charset, "%s", v); }
+		else if (!strcmp(d, "seedspace")) { v = pool_tok(&sp); h->seedspace = v ? strtoull(v, NULL, 10) : 0; }
+		else if (!strcmp(d, "range_start")) { v = pool_tok(&sp); h->rangeStart = v ? strtoull(v, NULL, 10) : 0; }
+		else if (!strcmp(d, "range_end")) { v = pool_tok(&sp); h->rangeEnd = v ? strtoull(v, NULL, 10) : 0; }
+		else if (!strcmp(d, "catalog_hash")) { v = pool_tok(&sp); h->catalogHash = v ? strtoull(v, NULL, 16) : 0; }
+		else if (!strcmp(d, "criteria_hash")) { v = pool_tok(&sp); h->criteriaHash = v ? strtoull(v, NULL, 16) : 0; }
+		else if (!strcmp(d, "records")) { v = pool_tok(&sp); h->records = v ? strtoull(v, NULL, 10) : 0; }
+		else if (!strcmp(d, "complete")) { v = pool_tok(&sp); h->complete = v ? atoi(v) : 0; }
+		else if (!strcmp(d, "header_bytes")) { v = pool_tok(&sp); h->headerBytes = v ? atoi(v) : 0; }
+		else if (!strcmp(d, "tag_route")) { v = pool_tok(&sp); h->route = (v && !strcmp(v, "observe")) ? 0 : 1; }
+		else if (!strcmp(d, "tag")) {
+			if (h->ntagRules < BSPOOL_MAX_TAG_RULES) {
+				char *k = pool_tok(&sp);
+				char *a = pool_tok(&sp), *b = pool_tok(&sp), *c = pool_tok(&sp);
+				if (k && a && b && c) {
+					snprintf(h->tagRules[h->ntagRules].key, MAX_KEY, "%s", k);
+					h->tagRules[h->ntagRules].minAnte = atoi(a);
+					h->tagRules[h->ntagRules].maxAnte = atoi(b);
+					h->tagRules[h->ntagRules].minCount = atoi(c);
+					h->ntagRules++;
+				}
+			}
+		}
+		else if (!strcmp(d, "legendary")) {
+			char *k = pool_tok(&sp);
+			char *a = pool_tok(&sp), *b = pool_tok(&sp), *n = pool_tok(&sp);
+			if (k && a && b) {
+				h->legendary.used = 1;
+				snprintf(h->legendary.key, MAX_KEY, "%s", k);
+				h->legendary.minAnte = atoi(a);
+				h->legendary.maxAnte = atoi(b);
+				h->legendary.neg = n ? atoi(n) : 0;
+			}
+		}
+		else if (!strcmp(d, "end")) sawEnd = 1;
+	}
+	if (!sawMagic) { snprintf(err, errsz, "not a Brainstorm seed pool"); return false; }
+	if (h->schema != BSPOOL_SCHEMA) { snprintf(err, errsz, "pool schema %d unsupported (want %d)", h->schema, BSPOOL_SCHEMA); return false; }
+	if (!sawEnd) { snprintf(err, errsz, "pool header has no end marker"); return false; }
+	if (strcmp(encoding, "u64le")) { snprintf(err, errsz, "pool encoding is not u64le"); return false; }
+	if (strcmp(h->charset, CHARSET)) { snprintf(err, errsz, "pool charset differs"); return false; }
+	if (h->seedspace != SEEDSPACE) { snprintf(err, errsz, "pool seed space differs"); return false; }
+	if (h->headerBytes < 64 || h->headerBytes > BSPOOL_HEADER_SIZE) {
+		snprintf(err, errsz, "pool header_bytes %d is invalid", h->headerBytes);
+		return false;
+	}
+	return true;
+}
+
 /* The external seed-pool builder includes this file as a core implementation
  * so both programs execute the exact same RNG/config/parity code.  Keep the
  * interactive first-hit modes out of that translation unit. */
@@ -1062,12 +1230,117 @@ static _Atomic unsigned long long g_tried;
 static pthread_mutex_t g_found_mtx = PTHREAD_MUTEX_INITIALIZER;
 static bool g_found;
 static char g_found_seed[9], g_found_label[64];
+static char g_warn[256];
+
+/* Active .bspool restriction: candidates come from the pool's u64le rank
+ * records instead of the sequential full-space counter. Iteration starts at
+ * an entropy-derived rotation and covers every record exactly once, so a
+ * finished scan with no hit is a DEFINITIVE "nothing in this pool matches". */
+typedef struct {
+	int fd;
+	uint64_t records, rot, dataOff;
+	_Atomic uint64_t next;    /* rotated record index dealt to workers */
+	_Atomic int live;         /* workers still scanning (exhaustion detect) */
+} PoolRun;
+static PoolRun g_pool;
+static bool g_pool_active;
 
 typedef struct {
 	const Config *g;
 	int tid;
 	uint64_t start;
 } WorkerArgs;
+
+/* Read `count` consecutive pool records starting at rotated index `first`
+ * (wrapping at the record count) into ranks[]. pread keeps this thread-safe
+ * without a shared file position. */
+static bool pool_read_ranks(uint64_t first, uint64_t count, uint64_t *ranks,
+		unsigned char *raw) {
+	uint64_t done = 0;
+	while (done < count) {
+		uint64_t at = (first + done) % g_pool.records;
+		uint64_t run = count - done;
+		if (at + run > g_pool.records) run = g_pool.records - at;
+		size_t bytes = (size_t)run * 8;
+		off_t off = (off_t)(g_pool.dataOff + at * 8);
+		ssize_t got = pread(g_pool.fd, raw, bytes, off);
+		if (got != (ssize_t)bytes) return false;
+		for (uint64_t i = 0; i < run; i++) {
+			uint64_t rank = 0;
+			for (int b = 0; b < 8; b++) rank |= (uint64_t)raw[i * 8 + b] << (8 * b);
+			ranks[done + i] = rank;
+		}
+		done += run;
+	}
+	return true;
+}
+
+static void record_hit(Ctx *c) {
+	pthread_mutex_lock(&g_found_mtx);
+	if (!g_found) {
+		g_found = true;
+		memcpy(g_found_seed, c->seed, 9);
+		snprintf(g_found_label, sizeof g_found_label, "%s", c->label);
+	}
+	pthread_mutex_unlock(&g_found_mtx);
+	atomic_store(&g_stop, true);
+}
+
+/* Pool-restricted worker: same batched evaluation pipeline as the full-space
+ * worker, fed from pool records. Exits when the pool is fully dealt. */
+static void *pool_worker(void *vp) {
+	WorkerArgs *w = (WorkerArgs *)vp;
+	const Config *g = w->g;
+	const uint64_t PCHUNK = 16384;
+	Ctx *c = calloc(1, sizeof(Ctx));
+	uint64_t *ranks = malloc(PCHUNK * sizeof *ranks);
+	unsigned char *raw = malloc(PCHUNK * 8);
+	if (!c || !ranks || !raw) {
+		free(c); free(ranks); free(raw);
+		atomic_fetch_sub(&g_pool.live, 1);
+		return NULL;
+	}
+	c->g = g;
+	char seeds[ILV][9];
+	double hseed[ILV], hfirst[ILV];
+	while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+		uint64_t i0 = atomic_fetch_add(&g_pool.next, PCHUNK);
+		if (i0 >= g_pool.records) break;
+		uint64_t n = PCHUNK;
+		if (i0 + n > g_pool.records) n = g_pool.records - i0;
+		if (!pool_read_ranks(g_pool.rot + i0, n, ranks, raw)) {
+			if (!g_warn[0]) snprintf(g_warn, sizeof g_warn, "pool record read failed; scan is partial");
+			break;
+		}
+		/* drop corrupt out-of-space ranks instead of trusting them */
+		uint64_t m = 0;
+		for (uint64_t i = 0; i < n; i++) {
+			if (ranks[i] < SEEDSPACE) ranks[m++] = ranks[i];
+		}
+		uint64_t i = 0;
+		for (; i + ILV <= m && !atomic_load_explicit(&g_stop, memory_order_relaxed); i += ILV) {
+			for (int j = 0; j < ILV; j++) make_seed(ranks[i + (uint64_t)j], seeds[j]);
+			batch_hash_seed(seeds, hseed);
+			if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
+			for (int j = 0; j < ILV; j++) {
+				if (passes_pre(c, seeds[j], hseed[j], g->fsKey ? hfirst[j] : 0.0)) {
+					record_hit(c);
+					break;
+				}
+			}
+		}
+		for (; i < m && !atomic_load_explicit(&g_stop, memory_order_relaxed); i++) {
+			make_seed(ranks[i], c->seed);
+			if (passes(c)) record_hit(c);
+		}
+		atomic_fetch_add_explicit(&g_tried, (unsigned long long)m, memory_order_relaxed);
+	}
+	free(raw);
+	free(ranks);
+	free(c);
+	atomic_fetch_sub(&g_pool.live, 1);
+	return NULL;
+}
 
 static void *worker(void *vp) {
 	WorkerArgs *w = (WorkerArgs *)vp;
@@ -1113,6 +1386,7 @@ static void write_status(const char *path, const char *tmp, bool done, const cha
 	FILE *f = fopen(tmp, "w");
 	if (!f) return;
 	fprintf(f, "P %llu\n", (unsigned long long)atomic_load(&g_tried));
+	if (g_warn[0]) fprintf(f, "W %s\n", g_warn);
 	if (emsg) fprintf(f, "E %s\n", emsg);
 	if (g_found) fprintf(f, "R %s %s\n", g_found_seed, g_found_label[0] ? g_found_label : "-");
 	if (done) fprintf(f, "D\n");
@@ -1126,7 +1400,57 @@ static double file_age_seconds(const char *path) {
 	return difftime(time(NULL), st.st_mtime);
 }
 
-static int mode_search(const Config *g, const char *statusPath, const char *stopPath, const char *hbPath) {
+/* Open + validate the config's .bspool. Fatal problems come back as an error
+ * message (the mod stops a pool search rather than degrading to a full-space
+ * search); a catalog fingerprint difference is only a warning because every
+ * hit is still re-verified against the CURRENT profile's filters. */
+static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t errsz) {
+	FILE *f = fopen(g->poolFile, "rb");
+	if (!f) { snprintf(err, errsz, "pool: cannot open %s", g->poolFile); return false; }
+	BspoolHeader h;
+	char herr[192];
+	if (!bspool_read_header(f, &h, herr, sizeof herr)) {
+		snprintf(err, errsz, "pool: %s", herr);
+		fclose(f);
+		return false;
+	}
+	if (h.modelver != MODELVER) {
+		snprintf(err, errsz, "pool: built with model %d, this helper is model %d", h.modelver, MODELVER);
+		fclose(f);
+		return false;
+	}
+	struct stat st;
+	if (fstat(fileno(f), &st) != 0) {
+		snprintf(err, errsz, "pool: cannot stat %s", g->poolFile);
+		fclose(f);
+		return false;
+	}
+	/* trust the committed record count, clamped to what the file really holds
+	 * (a crash tail past the last checkpoint is not committed data) */
+	uint64_t avail = st.st_size > h.headerBytes ? ((uint64_t)st.st_size - (uint64_t)h.headerBytes) / 8 : 0;
+	uint64_t records = h.records < avail ? h.records : avail;
+	if (records == 0) { snprintf(err, errsz, "pool: no seed records"); fclose(f); return false; }
+	uint64_t cfgHash = 0;
+	if (pool_hash_catalog_file(cfgPath, &cfgHash) && cfgHash != h.catalogHash) {
+		snprintf(g_warn, sizeof g_warn,
+				"pool was built on a different pool/unlock snapshot; hits are re-verified in-game");
+	}
+	if (!h.complete) {
+		snprintf(g_warn, sizeof g_warn, "pool scan is incomplete (%llu records committed)",
+				(unsigned long long)records);
+	}
+	int fd = dup(fileno(f));
+	fclose(f);
+	if (fd < 0) { snprintf(err, errsz, "pool: cannot keep %s open", g->poolFile); return false; }
+	g_pool.fd = fd;
+	g_pool.records = records;
+	g_pool.dataOff = (uint64_t)h.headerBytes;
+	g_pool_active = true;
+	return true;
+}
+
+static int mode_search(const Config *g, const char *cfgPath, const char *statusPath,
+		const char *stopPath, const char *hbPath) {
 	char tmp[1024];
 	snprintf(tmp, sizeof tmp, "%s.tmp", statusPath);
 	char err[256];
@@ -1139,21 +1463,42 @@ static int mode_search(const Config *g, const char *statusPath, const char *stop
 		write_status(statusPath, tmp, true, "batch hash self-test failed");
 		return 1;
 	}
-	uint64_t start = splitmix64((uint64_t)(g->entropy * 4096.0) ^ 0xB5A7A7EDULL ^ (uint64_t)g->session) % SEEDSPACE;
+	if (g->poolFile[0] && !pool_open(g, cfgPath, err, sizeof err)) {
+		fprintf(stderr, "%s\n", err);
+		write_status(statusPath, tmp, true, err);
+		return 1;
+	}
+	uint64_t entropy = splitmix64((uint64_t)(g->entropy * 4096.0) ^ 0xB5A7A7EDULL ^ (uint64_t)g->session);
+	uint64_t start = entropy % SEEDSPACE;
 	int n = g->threads < 1 ? 1 : (g->threads > 64 ? 64 : g->threads);
+	if (g_pool_active) {
+		g_pool.rot = entropy % g_pool.records;
+		atomic_init(&g_pool.next, 0);
+		atomic_init(&g_pool.live, n);
+	}
 	pthread_t th[64];
 	WorkerArgs wa[64];
 	for (int i = 0; i < n; i++) {
 		wa[i].g = g;
 		wa[i].tid = i;
 		wa[i].start = start;
-		pthread_create(&th[i], NULL, worker, &wa[i]);
+		pthread_create(&th[i], NULL, g_pool_active ? pool_worker : worker, &wa[i]);
 	}
 	time_t t0 = time(NULL);
+	bool joined = false;
 	while (!atomic_load(&g_stop)) {
 		struct timespec ts = { 0, 200 * 1000 * 1000 };
 		nanosleep(&ts, NULL);
 		if (access(stopPath, F_OK) == 0) atomic_store(&g_stop, true);
+		/* a fully dealt pool with no hit is a definitive verdict, not a retry */
+		if (g_pool_active && atomic_load(&g_pool.live) == 0) {
+			for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+			joined = true;
+			if (g_found) break;
+			write_status(statusPath, tmp, true,
+					"pool: no seed in the pool matches the active filters");
+			return 3;
+		}
 		/* heartbeat: the mod touches hbPath every ~2s while searching; if the
 		 * game died without writing the stop file, exit instead of orphaning. */
 		if (difftime(time(NULL), t0) > 20 && file_age_seconds(hbPath) > 30.0) {
@@ -1165,7 +1510,9 @@ static int mode_search(const Config *g, const char *statusPath, const char *stop
 		if (difftime(time(NULL), t0) > 6 * 3600) atomic_store(&g_stop, true); /* hard cap */
 		write_status(statusPath, tmp, false, NULL);
 	}
-	for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+	if (!joined) {
+		for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+	}
 	write_status(statusPath, tmp, true, NULL);
 	return 0;
 }
@@ -1272,7 +1619,7 @@ int main(int argc, char **argv) {
 		}
 		return 1;
 	}
-	if (!strcmp(argv[1], "search") && argc == 6) return mode_search(&g, argv[3], argv[4], argv[5]);
+	if (!strcmp(argv[1], "search") && argc == 6) return mode_search(&g, argv[2], argv[3], argv[4], argv[5]);
 	if (!strcmp(argv[1], "fixture") && argc == 4) return mode_fixture(&g, argv[3]);
 	if (!strcmp(argv[1], "verifychecks")) return mode_verifychecks(&g);
 	if (!strcmp(argv[1], "bench") && argc == 4) return mode_bench(&g, atoi(argv[3]));

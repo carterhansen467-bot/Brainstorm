@@ -1884,6 +1884,33 @@ function Brainstorm.updateAutoReroll(dt)
 		and love and love.thread and not A.searchThreadFailed
 	local useNative = Brainstorm.nativeAvailable() and not A.nativeFailed
 
+	-- Seed-pool searches are native-only and definitive. If the helper can't
+	-- run (missing binary/pool, failed session) or reported a pool problem
+	-- (bad file, model mismatch, or NO pool seed passing the filters), stop
+	-- the search with a message: degrading to the full-space Lua search would
+	-- return seeds outside the selected pool.
+	local arS = Brainstorm.SETTINGS.autoreroll
+	if arS.seedPoolFile and arS.seedPoolFile ~= "" then
+		local reason = nil
+		if A.poolAbort then
+			reason = A.poolAbort:find("no seed in the pool")
+					and "No seed in the pool matches these filters"
+				or "Seed pool error (see console/log)"
+		elseif not Brainstorm.seedPoolPath() then
+			reason = "Seed pool file is missing"
+		elseif not useNative then
+			reason = "Seed pools need the native helper (see README)"
+		end
+		if reason then
+			A.poolAbort = nil
+			A.autoRerollActive = false
+			Brainstorm.stopSearchThread()
+			Brainstorm.resetSearchUI()
+			Brainstorm.showSeedSlotAlert(reason)
+			return
+		end
+	end
+
 	local seed_found, jokerFoundAt = nil, nil
 
 	if useNative then
@@ -2085,6 +2112,32 @@ function Brainstorm.nativeAvailable()
 	return N.binPresent
 end
 
+-- ---------------------------------------------------------------------------
+-- Seed pools (.bspool): exhaustive match sets built by the external
+-- native/brainstorm_seed_pool scanner (see README). Selecting one restricts
+-- the native search to seeds recorded in the pool; the file lives in
+-- <mod>/seed_pools/ so pools can be shared by copying that one file.
+-- The Lua fallback search CANNOT honor a pool (it would need the native
+-- binary's streaming rank reader), so pool searches never degrade to it --
+-- they stop with an alert instead.
+-- ---------------------------------------------------------------------------
+function Brainstorm.seedPoolDir()
+	local lovely = require("lovely")
+	return lovely.mod_dir .. "/Brainstorm/seed_pools"
+end
+
+-- Selected pool's full path, or nil when no pool is selected. Existence is
+-- intentionally NOT cached: the user may drop a file in while the game runs.
+function Brainstorm.seedPoolPath()
+	local ar = Brainstorm.SETTINGS.autoreroll
+	local name = ar and ar.seedPoolFile
+	if not name or name == "" then return nil end
+	local nativefs = require("nativefs")
+	local p = Brainstorm.seedPoolDir() .. "/" .. name
+	if not nativefs.getInfo(p) then return nil end
+	return p
+end
+
 -- Parity checks: values computed with the GAME's own pseudohash /
 -- math.randomseed / math.random / round13. The helper refuses to search
 -- unless it reproduces every one bit-for-bit. The 16 pr/prn pairs double as
@@ -2125,11 +2178,11 @@ function Brainstorm.buildNativeConfigText(session)
 
 	add("session", tostring(session))
 	add("threads", tostring(Brainstorm.getSearchThreadCount()))
-	-- Bumped whenever the RNG/shop MODEL changes (not just the format): a
-	-- helper binary built from older sources must refuse the config instead of
-	-- silently searching with the outdated model. 3 = skip-aware physical
-	-- shop layout (ease_ante boss-shop fix).
-	add("modelver", "3")
+	-- Bumped whenever the RNG/shop MODEL changes OR a directive appears that an
+	-- older binary would silently ignore: the helper must refuse the config
+	-- instead of degrading. 3 = skip-aware physical shop layout (ease_ante
+	-- boss-shop fix); 4 = seed-pool restriction (poolfile) support.
+	add("modelver", "4")
 	add("entropy", g17((love.timer and love.timer.getTime and love.timer.getTime() or os.clock()) * 1000))
 	add("soul", tostring(ar.searchForSoul or 0))
 	add("legendary", (ar.searchLegendary and ar.searchLegendary ~= "") and ck(ar.searchLegendary) or "-")
@@ -2158,6 +2211,14 @@ function Brainstorm.buildNativeConfigText(session)
 	add("packslots", tostring(packSlots))
 	if ar.searchPack then
 		for _, k in ipairs(ar.searchPack) do add("pack", ck(k)) end
+	end
+	-- Seed-pool restriction: the helper only considers seeds recorded in this
+	-- .bspool. The directive consumes the rest of the line (mod paths contain
+	-- spaces), so it bypasses ck(); only a newline could break the format.
+	local poolPath = Brainstorm.seedPoolPath and Brainstorm.seedPoolPath()
+	if poolPath then
+		if poolPath:find("\n") then return nil end
+		L[#L + 1] = "poolfile " .. poolPath
 	end
 
 	-- Pools, eligibility resolved with the exact rules the Lua filters use.
@@ -2244,11 +2305,24 @@ function Brainstorm.pollNativeSearch()
 	end
 	local tried = txt:match("P (%d+)")
 	if tried then A.searchTried = tonumber(tried) end
+	local wmsg = txt:match("W ([^\n]+)")
+	if wmsg and wmsg ~= A.nativeWarned then
+		A.nativeWarned = wmsg
+		print("[Brainstorm] native search: " .. wmsg)
+	end
 	local emsg = txt:match("E ([^\n]+)")
 	if emsg then
-		print("[Brainstorm] native search: " .. emsg .. " -- using Lua threads instead")
 		Brainstorm.stopNativeSearch()
-		A.nativeFailed = true
+		if emsg:find("^pool") then
+			-- Pool problems (bad/missing/exhausted .bspool) must NOT degrade to
+			-- the full-space Lua search: that would return seeds outside the
+			-- pool. updateAutoReroll stops the search and shows this message.
+			print("[Brainstorm] native search: " .. emsg)
+			A.poolAbort = emsg
+		else
+			print("[Brainstorm] native search: " .. emsg .. " -- using Lua threads instead")
+			A.nativeFailed = true
+		end
 		return nil
 	end
 	local seed, label = txt:match("R (%S+) ([^\n]+)")

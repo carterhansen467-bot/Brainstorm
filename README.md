@@ -149,7 +149,7 @@ The `.manifest` reports the observed match rate, throughput, projected
 full-space record count, and projected binary size. On the current development
 machine, that sample found 403,012 matches (0.403012%) at about 12.3 million
 seeds/second, projecting roughly 7.20 billion records and 57.6 GB before the
-512-byte header. Treat that as an estimate; the active pool/profile snapshot
+1 KiB header. Treat that as an estimate; the active pool/profile snapshot
 can change it.
 
 For the exhaustive run, copy the example criteria and change:
@@ -161,8 +161,9 @@ format binary
 
 Then run the same command with an output name ending in `.bspool`. The
 canonical pool stores each match as an eight-byte little-endian numeric seed
-rank. Its 512-byte header includes schema/model versions, the scanned range,
-record count, completion flag, alphabet, and catalog/criteria fingerprints.
+rank. Its 1 KiB header includes schema/model versions, the scanned range,
+record count, completion flag, alphabet, catalog/criteria fingerprints, and
+the criteria themselves, so a shared `.bspool` is self-describing.
 The adjacent `.state` is an atomic checkpoint containing the committed cursor
 and byte boundary; rerun the identical command to resume safely after Ctrl+C
 or a crash. The adjacent `.manifest` records the criteria and final statistics.
@@ -189,15 +190,42 @@ simulation before Souls are checked. `observe` requires the tags but assumes
 their blinds are played. The legendary rule intentionally means the run's
 **first Soul**; later-Soul pool mutation has not yet been source-verified.
 
-This is phase 1: the external builder and versioned pool contract are present,
-but the in-game UI does not consume `.bspool` files yet. That integration
-should stream ranks through the native helper instead of loading billions of
-seeds into Lua. It must also combine route-changing in-game filters with the
-base pool's recorded tag route before re-verification.
+### Using a seed pool in-game (phase 2)
+
+Drop the finished `.bspool` into `Mods/Brainstorm/seed_pools/` (the folder is
+created the first time the Brainstorm settings tab opens). A **Seed Pool**
+selector appears in the Brainstorm tab listing every pool in that folder;
+pick one and start an auto-reroll as usual. While a pool is selected, the
+native helper only considers seeds recorded in the pool -- your other active
+Brainstorm filters still apply on top of it, and each search starts at a
+random position in the pool so repeat searches surface different seeds.
+
+Because the pool file is the complete match set, a pool search that covers
+every record without a hit is a definitive verdict: the mod stops and reports
+that no seed in the pool matches the current filters (instead of silently
+searching the full seed space). For the same reason, pool searches never fall
+back to the Lua thread search -- they need the native helper built from
+`native/build.sh`.
+
+**Sharing pools:** send someone the single `.bspool` file; they drop it into
+their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model
+version, the criteria that built it, and a fingerprint of the unlock/pool
+snapshot it was scanned against. If the recipient's unlock state differs, the
+search still runs -- every hit is re-verified against *their* profile before
+being applied -- but the pool's own guarantees (e.g. "Perkeo by ante 6")
+were computed against the builder's snapshot, and the helper logs a warning
+noting the difference.
+
+Overlay-filter caveat: in-game filters are evaluated with the same blind-skip
+conventions the normal search uses; they do not yet merge the pool's own
+collected-tag skip route into pack/joker predictions. Pools carry their
+criteria in the header so that composition can be added later.
 
 To compare the generalized engine with the established Model-3 path over
-their overlapping A1-A8 semantics:
+their overlapping A1-A8 semantics, and to exercise the in-game pool search
+end-to-end (member hit + definitive exhaustion):
 
 ```bash
 tests/seed_pool_equivalence.sh native_search.cfg 1000000
+tests/pool_search_equivalence.sh native_search.cfg 3000000
 ```

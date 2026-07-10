@@ -309,6 +309,15 @@ G.FUNCS.change_found_seed_slot = function(x)
 	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
+-- Seed pool (.bspool) restricting the native search to a prebuilt match set.
+-- Options are rebuilt from <mod>/seed_pools/ every time the tab opens, so a
+-- freshly copied-in pool shows up without a restart. The setting stores the
+-- FILENAME (not the index): the list can change between sessions.
+G.FUNCS.change_seed_pool = function(x)
+	Brainstorm.SETTINGS.autoreroll.seedPoolFile = (x.to_val ~= "None") and x.to_val or ""
+	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+end
+
 -- Stake the found run starts at (applies to both "Current run" overwrite and
 -- banked slots). Only the gameplay-relevant tiers: White (base), Black
 -- (eternals in shop), Gold (all modifiers). Stake never changes the RNG streams
@@ -667,6 +676,32 @@ function create_tabs(args)
 						if voucherKeyByName[n] == savedVoucher then voucherCurrent = i; break end
 					end
 				end
+				-- Seed pools: whatever .bspool files are in <mod>/seed_pools/
+				-- right now (created here so drag-and-drop sharing "just works").
+				local poolDir = Brainstorm.seedPoolDir and Brainstorm.seedPoolDir()
+					or (lovely.mod_dir .. "/Brainstorm/seed_pools")
+				nativefs.createDirectory(poolDir)
+				local poolNames = {"None"}
+				local poolItems = nativefs.getDirectoryItems(poolDir) or {}
+				table.sort(poolItems)
+				for _, fn in ipairs(poolItems) do
+					if fn:match("%.bspool$") then poolNames[#poolNames + 1] = fn end
+				end
+				local savedPool = Brainstorm.SETTINGS.autoreroll.seedPoolFile
+				local poolCurrent = 1
+				if savedPool and savedPool ~= "" then
+					local seen = false
+					for i, n in ipairs(poolNames) do
+						if i > 1 and n == savedPool then poolCurrent = i; seen = true; break end
+					end
+					-- Selected pool no longer on disk: still show (and keep) the
+					-- selection so a temporarily missing drive doesn't silently
+					-- turn a pool search into a full-space search.
+					if not seen then
+						poolNames[#poolNames + 1] = savedPool
+						poolCurrent = #poolNames
+					end
+				end
 				-- Left column: the core search settings
 				local leftColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
 					create_option_cycle({
@@ -711,6 +746,14 @@ function create_tabs(args)
 							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
 						}),
 					}},
+					create_option_cycle({
+						label = "Seed Pool",
+						scale = 0.8,
+						w = 4,
+						options = poolNames,
+						opt_callback = "change_seed_pool",
+						current_option = poolCurrent,
+					}),
 				}}
 
 				-- Right column: legendary + misc settings. The legendary cycle bar

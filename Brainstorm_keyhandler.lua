@@ -60,6 +60,9 @@ function Brainstorm.key_press_update(key)
 			if Brainstorm.resetSearchUI then
 				Brainstorm.resetSearchUI()
 			end
+			-- A fresh search gets a fresh verdict: an earlier "nothing in the
+			-- seed pool matched" abort must not kill this run before it starts.
+			Brainstorm.AUTOREROLL.poolAbort = nil
 			Brainstorm.AUTOREROLL.autoRerollActive = true
 		end
 	end
