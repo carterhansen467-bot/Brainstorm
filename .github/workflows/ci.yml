@@ -1,0 +1,129 @@
+# Brainstorm native-helper CI: bit-exactness proofs on real Windows and
+# macOS, plus a tag-triggered Windows release zip.
+#
+# The oracle fixtures are generated fresh on each runner WITH THAT MACHINE'S
+# LuaJIT (tests/dump_native_fixtures.lua), so a green Windows job is a true
+# Lua-vs-C bit-exactness proof on Windows, not a replay of Mac expectations.
+# CI has no in-game unlock snapshot; the pool harnesses take a synthetic
+# fixture cfg as their snapshot and TAG=tag_charm (a tag that snapshot has).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["win-v*"]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.13.0
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: brew install luajit
+      - name: Oracle equivalence (Lua vs native, this machine's LuaJIT)
+        run: LUAJIT=luajit sh tests/native_equivalence.sh
+      - name: Pool engine vs Model-3 equivalence
+        run: TAG=tag_charm sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
+      - name: Pool build -> restricted search -> exhaustion e2e
+        run: TAG=tag_charm sh tests/pool_search_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: Builder pause/resume smoke (SIGINT path)
+        run: python3 tests/windows_builder_smoke.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: win_spawn quoting rules
+        run: luajit tests/win_spawn_test.lua
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -sL -o "$RUNNER_TEMP/zig.zip" "https://ziglang.org/download/${ZIG_VERSION}/zig-windows-x86_64-${ZIG_VERSION}.zip"
+          unzip -q "$RUNNER_TEMP/zig.zip" -d "$RUNNER_TEMP/zigdist"
+          cygpath -w "$RUNNER_TEMP/zigdist/zig-windows-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: Build LuaJIT with MSVC (same toolchain family as the game's runtime)
+        shell: cmd
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT.git %RUNNER_TEMP%\luajit
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          cd /d %RUNNER_TEMP%\luajit\src
+          call msvcbuild.bat
+      - name: Export tool paths
+        run: |
+          echo "LUAJIT=$(cygpath -u "$RUNNER_TEMP")/luajit/src/luajit.exe" >> "$GITHUB_ENV"
+          echo "CC=zig cc -target x86_64-windows-gnu" >> "$GITHUB_ENV"
+          "$(cygpath -u "$RUNNER_TEMP")/luajit/src/luajit.exe" -v
+      - name: Oracle equivalence (Windows LuaJIT vs .exe) — the bit-exactness proof
+        run: sh tests/native_equivalence.sh
+      - name: Pool engine vs Model-3 equivalence
+        run: TAG=tag_charm sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
+      - name: Pool build -> restricted search -> exhaustion e2e
+        run: TAG=tag_charm sh tests/pool_search_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: In-game launch path (CreateProcessA spawn + status/stop protocol)
+        run: |
+          "$LUAJIT" tests/win_spawn_test.lua "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Builder pause/resume smoke (CTRL_BREAK path)
+        run: python tests/windows_builder_smoke.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Python builder headless check
+        run: python tools/brainstorm_pool_builder.py --headless-criteria
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/win-v')
+    needs: [macos, windows]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -sL -o "$RUNNER_TEMP/zig.zip" "https://ziglang.org/download/${ZIG_VERSION}/zig-windows-x86_64-${ZIG_VERSION}.zip"
+          unzip -q "$RUNNER_TEMP/zig.zip" -d "$RUNNER_TEMP/zigdist"
+          cygpath -w "$RUNNER_TEMP/zigdist/zig-windows-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: Build native helpers
+        run: sh native/build_windows.sh
+      - name: Build standalone Seed Pool Builder.exe
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --console --name "Seed Pool Builder" tools/pool_builder_web.py
+      - name: Assemble release zip
+        run: |
+          mkdir -p out/Brainstorm-windows
+          cp native/brainstorm_native_search.exe native/brainstorm_seed_pool.exe out/Brainstorm-windows/
+          cp "dist/Seed Pool Builder.exe" "Seed Pool Builder.bat" out/Brainstorm-windows/
+          cat > out/Brainstorm-windows/INSTALL.txt <<'EOF'
+          Brainstorm native helpers for Windows (x64)
+          ===========================================
+          These files supplement the Brainstorm mod (joker-search-experiment
+          branch). Install the mod itself first (see the README's Windows
+          section), then:
+
+          1. Copy brainstorm_native_search.exe and brainstorm_seed_pool.exe
+             into  %AppData%\Balatro\Mods\Brainstorm\native\
+          2. Copy "Seed Pool Builder.exe" (and/or the .bat) into
+             %AppData%\Balatro\Mods\Brainstorm\
+          3. Launch Balatro. The fast native search and the Seed Pool
+             selector now work; double-click "Seed Pool Builder.exe" to
+             build .bspool seed pools in your browser.
+
+          Windows may warn about unsigned downloaded programs. If a file is
+          blocked: right-click it -> Properties -> check "Unblock" -> OK,
+          or click "More info" -> "Run anyway" on the SmartScreen prompt.
+          EOF
+          cd out && powershell -Command "Compress-Archive -Path Brainstorm-windows -DestinationPath brainstorm-windows-x64.zip"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/brainstorm-windows-x64.zip \
+            --title "Brainstorm Windows helpers $GITHUB_REF_NAME" \
+            --notes "Prebuilt Windows x64 native helpers + standalone Seed Pool Builder. See INSTALL.txt inside the zip. Built from $GITHUB_SHA after the full bit-exactness CI suite passed on windows-latest and macos-latest."

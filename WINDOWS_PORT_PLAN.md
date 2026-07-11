@@ -1,5 +1,9 @@
 # Windows port plan ("Tier 3" — full experience parity)
 
+> **STATUS: EXECUTED** on the `windows-port` branch (2026-07-11). See
+> BRAINSTORM_NOTES.md item 17 for what was built and how it was verified.
+> The only remaining open item is the human in-game Windows smoke test.
+
 Reprompt target for a future Claude Code session. Goal: Windows users of the
 `joker-search-experiment` branch get the native fast search, in-game seed-pool
 filtering, and the Seed Pool Builder app — as a downloadable release zip with

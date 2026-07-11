@@ -104,8 +104,7 @@ typedef struct {
 
 static volatile sig_atomic_t poolSignalStop = 0;
 
-static void pool_signal_handler(int sig) {
-	(void)sig;
+static void pool_request_stop(void) {
 	poolSignalStop = 1;
 }
 
@@ -266,8 +265,8 @@ bad_value:
 	if (p->countAll) p->count = SEEDSPACE - p->start;
 	if (!p->count || p->count > SEEDSPACE - p->start) { snprintf(err, errsz, "count extends outside the 34^8 seed space"); return false; }
 	if (p->threads == 0) {
-		long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-		p->threads = ncpu > 1 ? (int)ncpu - 1 : 1;
+		int ncpu = bs_cpu_count();
+		p->threads = ncpu > 1 ? ncpu - 1 : 1;
 	}
 	if (p->threads < 1 || p->threads > 64) { snprintf(err, errsz, "threads must be 0..64"); return false; }
 	if (p->chunk < ILV || p->chunk > UINT64_C(1073741824)) { snprintf(err, errsz, "chunk must be between %d and 1073741824", ILV); return false; }
@@ -555,14 +554,14 @@ typedef struct {
 	_Atomic uint64_t scanned, matched;
 	_Atomic bool ioError;
 	FILE *out;
-	pthread_mutex_t outMutex;
+	bs_mutex_t outMutex;
 } PoolScanShared;
 
 static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf, size_t *used) {
 	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
-	pthread_mutex_lock(&s->outMutex);
+	bs_mutex_lock(&s->outMutex);
 	size_t wrote = fwrite(buf, 1, *used, s->out);
-	pthread_mutex_unlock(&s->outMutex);
+	bs_mutex_unlock(&s->outMutex);
 	if (wrote != *used) {
 		atomic_store(&s->ioError, true);
 		return false;
@@ -673,9 +672,9 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			records, complete, POOL_HEADER_SIZE);
 	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 	n += w;
-	off_t at = ftello(f);
-	if (fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
-			|| fflush(f) != 0 || fsync(fileno(f)) != 0 || fseeko(f, at, SEEK_SET) != 0) {
+	int64_t at = bs_ftello(f);
+	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
+			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
 		snprintf(err, errsz, "cannot update binary header: %s", strerror(errno));
 		return false;
 	}
@@ -696,7 +695,7 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	fprintf(f, "cursor %" PRIu64 "\noutput_bytes %" PRIu64 "\n", s->cursor, s->outputBytes);
 	fprintf(f, "matched %" PRIu64 "\nscanned %" PRIu64 "\nelapsed_seconds %.9f\ndone %d\nend\n",
 			s->matched, s->scanned, s->elapsed, s->done);
-	if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0 || rename(tmp, path) != 0) {
+	if (fflush(f) != 0 || bs_fsync_file(f) != 0 || fclose(f) != 0 || bs_rename_overwrite(tmp, path) != 0) {
 		snprintf(err, errsz, "cannot commit state: %s", strerror(errno));
 		return false;
 	}
@@ -770,9 +769,7 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 }
 
 static double pool_now(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+	return bs_monotonic_seconds();
 }
 
 static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output) {
@@ -786,8 +783,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 	}
 	PoolState state = { .cursor = p->start };
 	FILE *out = NULL;
-	bool stateExists = access(statePath, F_OK) == 0;
-	if (p->resume && !stateExists && p->format != POOL_COUNT && access(output, F_OK) == 0) {
+	bool stateExists = bs_file_exists(statePath);
+	if (p->resume && !stateExists && p->format != POOL_COUNT && bs_file_exists(output)) {
 		fprintf(stderr, "output exists without resumable state; set 'resume 0' to replace it\n");
 		return 1;
 	}
@@ -796,8 +793,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		if (p->format != POOL_COUNT) {
 			out = fopen(output, "r+b");
 			if (!out) { fprintf(stderr, "cannot open output for resume: %s\n", strerror(errno)); return 1; }
-			if (ftruncate(fileno(out), (off_t)state.outputBytes) != 0
-					|| fseeko(out, (off_t)state.outputBytes, SEEK_SET) != 0) {
+			if (bs_ftruncate_file(out, (int64_t)state.outputBytes) != 0
+					|| bs_fseeko(out, (int64_t)state.outputBytes, SEEK_SET) != 0) {
 				fprintf(stderr, "cannot restore committed output boundary: %s\n", strerror(errno)); fclose(out); return 1;
 			}
 		}
@@ -809,7 +806,7 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 			if (!out) { fprintf(stderr, "cannot create output: %s\n", strerror(errno)); return 1; }
 			if (p->format == POOL_BINARY) {
 				state.outputBytes = POOL_HEADER_SIZE;
-				if (fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
+				if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
 						|| !pool_write_header(out, p, 0, 0, err, sizeof err)) {
 					fprintf(stderr, "%s\n", err); fclose(out); return 1;
 				}
@@ -825,8 +822,7 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		return 0;
 	}
 
-	signal(SIGINT, pool_signal_handler);
-	signal(SIGTERM, pool_signal_handler);
+	bs_install_stop_handler(pool_request_stop);
 	double priorElapsed = state.elapsed;
 	double started = pool_now();
 	while (state.cursor < p->start + p->count && !poolSignalStop) {
@@ -839,18 +835,18 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		atomic_init(&shared.scanned, 0);
 		atomic_init(&shared.matched, 0);
 		atomic_init(&shared.ioError, false);
-		pthread_mutex_init(&shared.outMutex, NULL);
-		pthread_t threads[64];
+		bs_mutex_init(&shared.outMutex);
+		bs_thread_t threads[64];
 		int made = 0;
 		for (int i = 0; i < p->threads; i++) {
-			if (pthread_create(&threads[i], NULL, pool_scan_worker, &shared) != 0) {
+			if (bs_thread_create(&threads[i], pool_scan_worker, &shared) != 0) {
 				atomic_store(&shared.ioError, true);
 				break;
 			}
 			made++;
 		}
-		for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
-		pthread_mutex_destroy(&shared.outMutex);
+		for (int i = 0; i < made; i++) bs_thread_join(threads[i]);
+		bs_mutex_destroy(&shared.outMutex);
 		if (atomic_load(&shared.ioError)) {
 			fprintf(stderr, "scan aborted because a worker or output write failed\n");
 			if (out) fclose(out);
@@ -866,10 +862,10 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		state.matched += epochMatched;
 		state.elapsed = priorElapsed + (pool_now() - started);
 		if (out) {
-			if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+			if (fflush(out) != 0 || bs_fsync_file(out) != 0) {
 				fprintf(stderr, "cannot commit output: %s\n", strerror(errno)); fclose(out); return 1;
 			}
-			off_t pos = ftello(out);
+			int64_t pos = bs_ftello(out);
 			if (pos < 0) { fprintf(stderr, "cannot read output position\n"); fclose(out); return 1; }
 			state.outputBytes = (uint64_t)pos;
 			if (!pool_write_header(out, p, state.matched, 0, err, sizeof err)) {
@@ -936,10 +932,11 @@ static int pool_mode_export(const char *input, const char *output) {
 	}
 	uint64_t records = h.records;
 	int complete = h.complete;
-	if (fseeko(in, h.headerBytes, SEEK_SET) != 0) {
+	if (bs_fseeko(in, h.headerBytes, SEEK_SET) != 0) {
 		fprintf(stderr, "cannot seek past pool header\n"); fclose(in); return 1;
 	}
-	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "w");
+	/* "wb": exported seed lists are diffed/grepped byte-exactly by the tests */
+	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "wb");
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); fclose(in); return 1; }
 	for (uint64_t record = 0; record < records; record++) {
 		unsigned char raw[8];
@@ -973,6 +970,7 @@ static void pool_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+	bs_platform_init();
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
 	if (argc != 5 || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture"))) {
 		pool_usage(argv[0]);

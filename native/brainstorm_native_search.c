@@ -34,12 +34,9 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <time.h>
+#include "platform.h"
 
 /* ---------------------------------------------------------------- limits */
 #define MAX_KEY 48
@@ -1147,7 +1144,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	memset(h, 0, sizeof *h);
 	h->route = 1;
 	char buf[BSPOOL_HEADER_SIZE + 1];
-	if (fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
+	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
 	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
 	if (got < 64) { snprintf(err, errsz, "pool header is truncated"); return false; }
 	buf[got] = 0;
@@ -1227,7 +1224,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 /* ------------------------------------------------------------- searching */
 static _Atomic bool g_stop;
 static _Atomic unsigned long long g_tried;
-static pthread_mutex_t g_found_mtx = PTHREAD_MUTEX_INITIALIZER;
+static bs_mutex_t g_found_mtx = BS_MUTEX_INIT;
 static bool g_found;
 static char g_found_seed[9], g_found_label[64];
 static char g_warn[256];
@@ -1262,9 +1259,9 @@ static bool pool_read_ranks(uint64_t first, uint64_t count, uint64_t *ranks,
 		uint64_t run = count - done;
 		if (at + run > g_pool.records) run = g_pool.records - at;
 		size_t bytes = (size_t)run * 8;
-		off_t off = (off_t)(g_pool.dataOff + at * 8);
-		ssize_t got = pread(g_pool.fd, raw, bytes, off);
-		if (got != (ssize_t)bytes) return false;
+		int64_t off = (int64_t)(g_pool.dataOff + at * 8);
+		int64_t got = bs_pread(g_pool.fd, raw, bytes, off);
+		if (got != (int64_t)bytes) return false;
 		for (uint64_t i = 0; i < run; i++) {
 			uint64_t rank = 0;
 			for (int b = 0; b < 8; b++) rank |= (uint64_t)raw[i * 8 + b] << (8 * b);
@@ -1276,13 +1273,13 @@ static bool pool_read_ranks(uint64_t first, uint64_t count, uint64_t *ranks,
 }
 
 static void record_hit(Ctx *c) {
-	pthread_mutex_lock(&g_found_mtx);
+	bs_mutex_lock(&g_found_mtx);
 	if (!g_found) {
 		g_found = true;
 		memcpy(g_found_seed, c->seed, 9);
 		snprintf(g_found_label, sizeof g_found_label, "%s", c->label);
 	}
-	pthread_mutex_unlock(&g_found_mtx);
+	bs_mutex_unlock(&g_found_mtx);
 	atomic_store(&g_stop, true);
 }
 
@@ -1363,13 +1360,13 @@ static void *worker(void *vp) {
 			if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
 			for (int i = 0; i < ILV; i++) {
 				if (passes_pre(c, seeds[i], hseed[i], g->fsKey ? hfirst[i] : 0.0)) {
-					pthread_mutex_lock(&g_found_mtx);
+					bs_mutex_lock(&g_found_mtx);
 					if (!g_found) {
 						g_found = true;
 						memcpy(g_found_seed, c->seed, 9);
 						snprintf(g_found_label, sizeof g_found_label, "%s", c->label);
 					}
-					pthread_mutex_unlock(&g_found_mtx);
+					bs_mutex_unlock(&g_found_mtx);
 					atomic_store(&g_stop, true);
 					break;
 				}
@@ -1382,8 +1379,9 @@ static void *worker(void *vp) {
 	return NULL;
 }
 
+/* "wb": the mod parses this file as exact bytes (LF only, all platforms). */
 static void write_status(const char *path, const char *tmp, bool done, const char *emsg) {
-	FILE *f = fopen(tmp, "w");
+	FILE *f = fopen(tmp, "wb");
 	if (!f) return;
 	fprintf(f, "P %llu\n", (unsigned long long)atomic_load(&g_tried));
 	if (g_warn[0]) fprintf(f, "W %s\n", g_warn);
@@ -1391,13 +1389,11 @@ static void write_status(const char *path, const char *tmp, bool done, const cha
 	if (g_found) fprintf(f, "R %s %s\n", g_found_seed, g_found_label[0] ? g_found_label : "-");
 	if (done) fprintf(f, "D\n");
 	fclose(f);
-	rename(tmp, path);
+	bs_rename_overwrite(tmp, path);
 }
 
 static double file_age_seconds(const char *path) {
-	struct stat st;
-	if (stat(path, &st) != 0) return 1e9;
-	return difftime(time(NULL), st.st_mtime);
+	return bs_file_age_seconds(path);
 }
 
 /* Open + validate the config's .bspool. Fatal problems come back as an error
@@ -1419,15 +1415,15 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 		fclose(f);
 		return false;
 	}
-	struct stat st;
-	if (fstat(fileno(f), &st) != 0) {
+	int64_t fsize = bs_file_size(f);
+	if (fsize < 0) {
 		snprintf(err, errsz, "pool: cannot stat %s", g->poolFile);
 		fclose(f);
 		return false;
 	}
 	/* trust the committed record count, clamped to what the file really holds
 	 * (a crash tail past the last checkpoint is not committed data) */
-	uint64_t avail = st.st_size > h.headerBytes ? ((uint64_t)st.st_size - (uint64_t)h.headerBytes) / 8 : 0;
+	uint64_t avail = fsize > h.headerBytes ? ((uint64_t)fsize - (uint64_t)h.headerBytes) / 8 : 0;
 	uint64_t records = h.records < avail ? h.records : avail;
 	if (records == 0) { snprintf(err, errsz, "pool: no seed records"); fclose(f); return false; }
 	uint64_t cfgHash = 0;
@@ -1439,7 +1435,7 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 		snprintf(g_warn, sizeof g_warn, "pool scan is incomplete (%llu records committed)",
 				(unsigned long long)records);
 	}
-	int fd = dup(fileno(f));
+	int fd = bs_dup(fileno(f));
 	fclose(f);
 	if (fd < 0) { snprintf(err, errsz, "pool: cannot keep %s open", g->poolFile); return false; }
 	g_pool.fd = fd;
@@ -1476,23 +1472,22 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 		atomic_init(&g_pool.next, 0);
 		atomic_init(&g_pool.live, n);
 	}
-	pthread_t th[64];
+	bs_thread_t th[64];
 	WorkerArgs wa[64];
 	for (int i = 0; i < n; i++) {
 		wa[i].g = g;
 		wa[i].tid = i;
 		wa[i].start = start;
-		pthread_create(&th[i], NULL, g_pool_active ? pool_worker : worker, &wa[i]);
+		bs_thread_create(&th[i], g_pool_active ? pool_worker : worker, &wa[i]);
 	}
 	time_t t0 = time(NULL);
 	bool joined = false;
 	while (!atomic_load(&g_stop)) {
-		struct timespec ts = { 0, 200 * 1000 * 1000 };
-		nanosleep(&ts, NULL);
-		if (access(stopPath, F_OK) == 0) atomic_store(&g_stop, true);
+		bs_sleep_ms(200);
+		if (bs_file_exists(stopPath)) atomic_store(&g_stop, true);
 		/* a fully dealt pool with no hit is a definitive verdict, not a retry */
 		if (g_pool_active && atomic_load(&g_pool.live) == 0) {
-			for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+			for (int i = 0; i < n; i++) bs_thread_join(th[i]);
 			joined = true;
 			if (g_found) break;
 			write_status(statusPath, tmp, true,
@@ -1504,14 +1499,14 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 		if (difftime(time(NULL), t0) > 20 && file_age_seconds(hbPath) > 30.0) {
 			atomic_store(&g_stop, true);
 			write_status(statusPath, tmp, true, "heartbeat lost");
-			for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+			for (int i = 0; i < n; i++) bs_thread_join(th[i]);
 			return 2;
 		}
 		if (difftime(time(NULL), t0) > 6 * 3600) atomic_store(&g_stop, true); /* hard cap */
 		write_status(statusPath, tmp, false, NULL);
 	}
 	if (!joined) {
-		for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+		for (int i = 0; i < n; i++) bs_thread_join(th[i]);
 	}
 	write_status(statusPath, tmp, true, NULL);
 	return 0;
@@ -1589,21 +1584,22 @@ static int mode_bench(const Config *g0, int seconds) {
 		g_found = false;
 		/* make it unfindable so we measure pure reject throughput */
 		snprintf(gb.tag, MAX_KEY, "tag_bench_impossible");
-		pthread_t th[64];
+		bs_thread_t th[64];
 		WorkerArgs wa[64];
 		for (int i = 0; i < n; i++) {
 			wa[i].g = &gb; wa[i].tid = i; wa[i].start = 12345;
-			pthread_create(&th[i], NULL, worker, &wa[i]);
+			bs_thread_create(&th[i], worker, &wa[i]);
 		}
-		sleep((unsigned)seconds);
+		bs_sleep_ms(1000u * (unsigned)seconds);
 		atomic_store(&g_stop, true);
-		for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+		for (int i = 0; i < n; i++) bs_thread_join(th[i]);
 		printf("threads=%d seeds/sec=%.0f\n", n, (double)atomic_load(&g_tried) / seconds);
 	}
 	return 0;
 }
 
 int main(int argc, char **argv) {
+	bs_platform_init();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s search <cfg> <status> <stop> <hb> | fixture <cfg> <seeds> | verifychecks <cfg> | bench <cfg> <secs>\n", argv[0]);
 		return 2;

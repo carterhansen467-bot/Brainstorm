@@ -28,3 +28,7 @@ seed_pools/
 *.bspool
 *.bspool.state
 *.bspool.manifest
+
+# Windows build outputs (release zips carry the prebuilt exes)
+native/*.exe
+native/*.pdb
