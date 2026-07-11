@@ -21,9 +21,14 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # Windows CI runs this same harness under Git Bash against the .exe builds.
+# MSYS converts POSIX paths in command-line ARGUMENTS automatically, but the
+# poolfile line goes into a cfg FILE the .exe reads, so that one path must be
+# written in native form (cygpath -m: C:/... with fopen-safe forward slashes).
 case "$(uname -s)" in
-	MINGW*|MSYS*|CYGWIN*) EXE=.exe; BUILD=native/build_windows.sh ;;
-	*) EXE=; BUILD=native/build.sh ;;
+	MINGW*|MSYS*|CYGWIN*) EXE=.exe; BUILD=native/build_windows.sh
+		native_path() { cygpath -m "$1"; } ;;
+	*) EXE=; BUILD=native/build.sh
+		native_path() { printf '%s\n' "$1"; } ;;
 esac
 
 sh "$BUILD"
@@ -77,7 +82,7 @@ write_search_cfg() {
 		echo "maslots 0 0 0 0 0 0 0 0"
 		echo "mapacks 0 0 0 0 0 0 0 0"
 		echo "packslots 2"
-		echo "poolfile $OUT/pool.bspool"
+		echo "poolfile $(native_path "$OUT/pool.bspool")"
 		grep -E '^(tagdef|vouchdef|jokerdef|boostdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
 		echo "end"
 	} > "$out"
