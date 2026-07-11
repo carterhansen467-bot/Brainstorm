@@ -2089,11 +2089,22 @@ end
 -- Opt out with Brainstorm.SETTINGS.useNativeSearch = false.
 -- ===========================================================================
 
+-- love.system.getOS() when available (always, in-game); the package.config
+-- fallback (its first byte is the directory separator) keeps this callable
+-- from plain-LuaJIT test harnesses.
+function Brainstorm.isWindows()
+	if love and love.system and love.system.getOS then
+		return love.system.getOS() == "Windows"
+	end
+	return package.config:sub(1, 1) == "\\"
+end
+
 function Brainstorm.nativePaths()
 	local lovely = require("lovely")
 	local base = lovely.mod_dir .. "/Brainstorm/native_search"
 	return {
-		bin = lovely.mod_dir .. "/Brainstorm/native/brainstorm_native_search",
+		bin = lovely.mod_dir .. "/Brainstorm/native/brainstorm_native_search"
+			.. (Brainstorm.isWindows() and ".exe" or ""),
 		cfg = base .. ".cfg",
 		status = base .. ".status",
 		stop = base .. ".stop",
@@ -2271,9 +2282,33 @@ function Brainstorm.startNativeSearch()
 	os.remove(p.stop)
 	nativefs.write(p.hb, tostring(os.time()))
 	nativefs.write(p.cfg, cfg)
-	local function shq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
-	os.execute(shq(p.bin) .. " search " .. shq(p.cfg) .. " " .. shq(p.status)
-		.. " " .. shq(p.stop) .. " " .. shq(p.hb) .. " >/dev/null 2>&1 &")
+	if Brainstorm.isWindows() then
+		-- cmd.exe (os.execute) would flash a console window and re-parse the
+		-- quoting; win_spawn.lua goes straight to CreateProcessA instead.
+		local N = Brainstorm.NATIVE_STATE or {}
+		if N.winSpawn == nil then
+			local lovely = require("lovely")
+			local okLoad, mod = pcall(function()
+				return assert(load(nativefs.read(
+					lovely.mod_dir .. "/Brainstorm/win_spawn.lua"), "win_spawn.lua"))()
+			end)
+			N.winSpawn = okLoad and mod or false
+			Brainstorm.NATIVE_STATE = N
+		end
+		if not N.winSpawn then
+			print("[Brainstorm] win_spawn.lua could not be loaded; native search disabled")
+			return false
+		end
+		local okSpawn, serr = N.winSpawn.spawn({ p.bin, "search", p.cfg, p.status, p.stop, p.hb })
+		if not okSpawn then
+			print("[Brainstorm] native helper spawn failed: " .. tostring(serr))
+			return false
+		end
+	else
+		local function shq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+		os.execute(shq(p.bin) .. " search " .. shq(p.cfg) .. " " .. shq(p.status)
+			.. " " .. shq(p.stop) .. " " .. shq(p.hb) .. " >/dev/null 2>&1 &")
+	end
 	A.nativeActive = true
 	A.nativeStartedAt = love.timer and love.timer.getTime and love.timer.getTime() or os.clock()
 	A.nativeHbFrame = 0

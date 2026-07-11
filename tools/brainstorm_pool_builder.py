@@ -17,9 +17,14 @@ Headless modes (used by the test suite; no curses):
     python3 tools/brainstorm_pool_builder.py --headless-criteria
 
 Only the Python standard library is used (curses ships with macOS python3).
+On Windows there is no stdlib curses, so this file doubles as the engine for
+the browser UI (tools/pool_builder_web.py) and its TUI politely declines.
 """
 
-import curses
+try:
+    import curses
+except ImportError:  # Windows: use tools/pool_builder_web.py instead
+    curses = None
 import os
 import re
 import signal
@@ -30,9 +35,16 @@ import threading
 import time
 from collections import deque
 
-MOD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle ("Seed Pool Builder.exe" in the mod root): __file__
+    # would point into the onefile extraction dir, not the mod folder.
+    MOD_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    MOD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NATIVE_DIR = os.path.join(MOD_DIR, "native")
-POOL_BIN = os.path.join(NATIVE_DIR, "brainstorm_seed_pool")
+IS_WINDOWS = os.name == "nt"
+POOL_BIN = os.path.join(NATIVE_DIR,
+                        "brainstorm_seed_pool" + (".exe" if IS_WINDOWS else ""))
 SNAPSHOT = os.path.join(MOD_DIR, "native_search.cfg")
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 SEEDSPACE = 1785793904896  # 34^8
@@ -194,9 +206,14 @@ class Runner:
         with open(self.criteria_path, "w", encoding="utf-8") as f:
             f.write(criteria_text)
         self.lines = deque(maxlen=200)
+        # Windows: a new process group so stop() can deliver CTRL_BREAK_EVENT
+        # to the scanner alone (the C side turns it into a checkpointed pause,
+        # same contract as SIGINT elsewhere).
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
         self.proc = subprocess.Popen(
             [POOL_BIN, "scan", snapshot_path, self.criteria_path, output],
-            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
+            creationflags=flags)
         self.reader = threading.Thread(target=self._pump, daemon=True)
         self.reader.start()
         # progress
@@ -216,7 +233,8 @@ class Runner:
 
     def stop(self):
         if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
+            self.proc.send_signal(
+                signal.CTRL_BREAK_EVENT if IS_WINDOWS else signal.SIGINT)
 
     def done(self):
         return self.proc.poll() is not None
@@ -634,12 +652,22 @@ class App:
 def preflight():
     problems = []
     if not os.path.exists(POOL_BIN):
-        build = os.path.join(NATIVE_DIR, "build.sh")
-        print("Building native helpers (first run)...")
-        r = subprocess.run(["sh", build], cwd=MOD_DIR)
-        if r.returncode != 0 or not os.path.exists(POOL_BIN):
-            problems.append("Could not build native/brainstorm_seed_pool -- "
-                            "run 'sh native/build.sh' and check for errors.")
+        if IS_WINDOWS:
+            # No compiler assumed on Windows: the prebuilt exes ship in the
+            # release zip (see README's Windows section).
+            problems.append(
+                "native\\brainstorm_seed_pool.exe not found. Download the "
+                "Brainstorm Windows release zip and copy both .exe files "
+                "into the Mods\\Brainstorm\\native\\ folder, then run this "
+                "again. (Building from source instead: see "
+                "native/build_windows.sh.)")
+        else:
+            build = os.path.join(NATIVE_DIR, "build.sh")
+            print("Building native helpers (first run)...")
+            r = subprocess.run(["sh", build], cwd=MOD_DIR)
+            if r.returncode != 0 or not os.path.exists(POOL_BIN):
+                problems.append("Could not build native/brainstorm_seed_pool -- "
+                                "run 'sh native/build.sh' and check for errors.")
     if not os.path.exists(SNAPSHOT):
         problems.append(
             "native_search.cfg not found. Launch Balatro and briefly toggle an\n"
@@ -678,6 +706,12 @@ def main():
         print("rc=%d matched=%s scanned=%s" % (r.returncode(),
                                                m.get("matched"), m.get("scanned")))
         return 0 if r.returncode() == 0 else 1
+    if curses is None:
+        print("This terminal UI needs curses, which Windows Python does not\n"
+              "ship. Use the browser UI instead: double-click\n"
+              "'Seed Pool Builder.bat' (or run: python tools\\pool_builder_web.py).",
+              file=sys.stderr)
+        return 1
     try:
         curses.wrapper(lambda scr: App(scr, snap).loop())
     except KeyboardInterrupt:

@@ -599,6 +599,57 @@ time the tab re-renders, even though the underlying saved value is untouched.
       documented 403,012-match reference sample, already-complete guard,
       pause at rank 33,554,432 and resume from that exact rank.
 
+17. **Windows port, Tier 3** (2026-07-11, `windows-port` branch off
+    `joker-search-experiment`; plan in WINDOWS_PORT_PLAN.md): full
+    experience parity — native fast search, in-game seed pools, and the
+    Seed Pool Builder — on Windows, one codebase, no filter/RNG changes.
+    - `native/platform.h` is the ONLY file that knows the OS: bs_* wrappers
+      for threads (`_beginthreadex` + trampoline; SRWLOCK for the static-init
+      mutex), `pread` (ReadFile + OVERLAPPED offset), `fsync`
+      (FlushFileBuffers), 64-bit seeks (`_fseeki64`), `ftruncate`
+      (`_chsize_s`), **`rename` -> MoveFileEx(MOVEFILE_REPLACE_EXISTING)**
+      (Windows rename does not overwrite — would have silently broken every
+      atomic status/state commit), cpu count, monotonic clock (QPC), sleeps,
+      `strsep`, and the stop hook (SetConsoleCtrlHandler for CTRL_C/BREAK/
+      CLOSE -> same checkpointed pause as SIGINT). Both binaries call
+      `bs_platform_init()` which puts stdout/stderr in binary mode, and the
+      status/export writers use "wb": the wire format is **LF everywhere**
+      (the mod's status parser and the harness diffs compare exact bytes).
+    - Lua launch: `win_spawn.lua` (mod root, standalone, plain-LuaJIT-safe)
+      spawns via FFI **CreateProcessA + CREATE_NO_WINDOW** — no cmd.exe, no
+      console flash, canonical argv quoting. `Brainstorm.isWindows()` via
+      love.system.getOS (package.config fallback); nativePaths appends .exe;
+      spawn failures print + return false -> existing nativeFailed /
+      pool-abort rails. Chosen over `start /b` (flashes) and .vbs shims.
+    - Builder: guarded `import curses` (engine importable on Windows; TUI
+      declines and points at the web UI), POOL_BIN gets .exe, preflight
+      explains the release zip instead of running build.sh, Runner uses
+      CREATE_NEW_PROCESS_GROUP + CTRL_BREAK_EVENT for the pause (rc 130
+      contract unchanged), frozen-exe MOD_DIR from sys.executable
+      (PyInstaller), `Seed Pool Builder.bat` next to the .command.
+    - Builds: `native/build_windows.sh` — zig cc -target x86_64-windows-gnu
+      (cross-compiles from this Mac; zig at ~/.local/bin/zig) or MinGW gcc.
+      -ffp-contract=off everywhere, same as build.sh; the runtime check_*
+      parity + fma calibration carries the per-binary FP differences, so
+      nothing platform-specific was hardcoded.
+    - CI (.github/workflows/ci.yml): windows-latest builds LuaJIT **with
+      MSVC** (same toolchain family as the shipped game) and regenerates the
+      oracle fixtures with it, so green = true Lua-vs-C bit-exactness proof
+      on Windows; then pool equivalence + pool-search e2e (synthetic
+      case1.cfg as snapshot, TAG=tag_charm), the CreateProcessA spawn/status
+      protocol test (tests/win_spawn_test.lua), and the CTRL_BREAK
+      pause/resume smoke (tests/windows_builder_smoke.py). macos-latest runs
+      all the same suites through the POSIX paths. Tags `win-v*` build the
+      release zip (both exes + PyInstaller "Seed Pool Builder.exe" + .bat +
+      INSTALL.txt) via `gh release create`.
+    - All three harnesses re-verified locally on macOS after the port, plus
+      a manual SIGINT pause (rc 130) -> resume-from-checkpoint run.
+    - Still open (the one thing CI can't prove): a human Windows smoke test
+      inside Balatro itself — Ctrl+A on/off writes native_search.cfg and
+      the status file appears, then a pool search against a shared .bspool.
+      Watch for SmartScreen blocking the unsigned exes (README has the
+      unblock steps).
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip
