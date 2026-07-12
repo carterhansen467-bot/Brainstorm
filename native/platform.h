@@ -125,6 +125,18 @@ static inline int64_t bs_file_size(FILE *f) {
 	return (int64_t)st.st_size;
 }
 
+static inline bool bs_same_file(FILE *a, FILE *b) {
+	BY_HANDLE_FILE_INFORMATION ai, bi;
+	HANDLE ah = (HANDLE)_get_osfhandle(_fileno(a));
+	HANDLE bh = (HANDLE)_get_osfhandle(_fileno(b));
+	if (ah == INVALID_HANDLE_VALUE || bh == INVALID_HANDLE_VALUE
+			|| !GetFileInformationByHandle(ah, &ai)
+			|| !GetFileInformationByHandle(bh, &bi)) return false;
+	return ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber
+		&& ai.nFileIndexHigh == bi.nFileIndexHigh
+		&& ai.nFileIndexLow == bi.nFileIndexLow;
+}
+
 static inline double bs_file_age_seconds(const char *path) {
 	struct _stat64 st;
 	if (_stat64(path, &st) != 0) return 1e9;
@@ -229,6 +241,12 @@ static inline int64_t bs_file_size(FILE *f) {
 	struct stat st;
 	if (fstat(fileno(f), &st) != 0) return -1;
 	return (int64_t)st.st_size;
+}
+
+static inline bool bs_same_file(FILE *a, FILE *b) {
+	struct stat as, bs;
+	if (fstat(fileno(a), &as) != 0 || fstat(fileno(b), &bs) != 0) return false;
+	return as.st_dev == bs.st_dev && as.st_ino == bs.st_ino;
 }
 
 static inline double bs_file_age_seconds(const char *path) {

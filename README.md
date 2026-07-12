@@ -204,6 +204,26 @@ canonical pool stores each match as an eight-byte little-endian numeric seed
 rank. Its 1 KiB header includes schema/model versions, the scanned range,
 record count, completion flag, alphabet, catalog/criteria fingerprints, and
 the criteria themselves, so a shared `.bspool` is self-describing.
+
+#### Filtering an existing pool again
+
+The builder can use any finished `.bspool` as its input instead of scanning
+an entire seed space. Under **Input seeds**, choose a pool, set the next
+requirements, and build with a new name. Every result satisfies both the
+source pool's guarantees and the new criteria; the process can be repeated
+to make progressively smaller pools before applying aggressive in-game
+filters such as exact joker positions.
+
+```sh
+./native/brainstorm_seed_pool refilter native_search.cfg \
+  next-filter.cfg seed_pools/input.bspool seed_pools/refined.bspool
+```
+
+Only complete pools from the same model and unlock/pool snapshot are
+accepted. Natural and all-typeable pools are both supported, and the source
+pool decides the seed space. The output must have a different filename.
+Derived headers/manifests retain the source pool ID, criteria fingerprint,
+record count, and refilter depth.
 The adjacent `.state` is an atomic checkpoint containing the committed cursor
 and byte boundary; rerun the identical command to resume safely after Ctrl+C
 or a crash. The adjacent `.manifest` records the criteria and final statistics.

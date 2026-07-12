@@ -92,7 +92,8 @@ def read_pool_header(path):
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("records", "complete", "modelver", "pool_id", "space"):
+        if parts[0] in ("records", "complete", "modelver", "pool_id", "space",
+                        "refilter_depth", "source_pool_id"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
@@ -123,6 +124,8 @@ def list_pools():
             "label": head.get("label", ""),
             "pool_id": head.get("pool_id", ""),
             "space": head.get("space", "natural"),
+            "refilter_depth": int(head.get("refilter_depth", "0") or 0),
+            "source_pool_id": head.get("source_pool_id", ""),
         })
     return pools
 
@@ -154,6 +157,17 @@ def start_job(kind, data, snap):
         if r is not None and not r.done():
             raise ValueError("A scan is already running -- stop it first.")
         crit = criteria_from_json(data, snap)
+        input_name = os.path.basename(str(data.get("inputPool", "")))
+        input_pool = None
+        if input_name:
+            candidate = os.path.join(core.POOL_DIR, input_name)
+            head = read_pool_header(candidate)
+            if not input_name.endswith(".bspool") or not os.path.isfile(candidate):
+                raise ValueError("The selected input pool no longer exists.")
+            if head.get("complete") != "1":
+                raise ValueError("Finish the selected pool before filtering it again.")
+            input_pool = candidate
+            crit.space = head.get("space", "natural")
         if kind == "estimate":
             sample = clamp_int(data.get("sample", 100_000_000), 100_000, SEEDCAP)
             out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
@@ -166,7 +180,9 @@ def start_job(kind, data, snap):
                                  "name, or delete the old files first.")
             count = clamp_int(data.get("count", 0), 0, SEEDCAP)
             text = crit.text("binary", count)
-        JOB.update(runner=core.Runner(snap.modelver4_copy(), text, out),
+        if input_pool and os.path.abspath(input_pool) == os.path.abspath(out):
+            raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
+        JOB.update(runner=core.Runner(snap.modelver4_copy(), text, out, input_pool),
                    kind=kind, started=time.time(), summary=crit.summary(),
                    error="")
 
@@ -250,6 +266,10 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
 
 <div class="card"><h2>2 &middot; How much to scan</h2>
   <div class="row">
+	<label>Input seeds</label>
+	<select id="inputPool"><option value="">Balatro's seed space</option></select>
+	</div>
+	<div class="row">
     <label>Seed space</label>
     <select id="space">
       <option value="natural">Natural seeds &mdash; 1.79 trillion the game can deal</option>
@@ -331,7 +351,8 @@ function criteria(){
     legMin:+$("legMin").value, legMax:+$("legMax").value,
     legNeg:$("legNeg").checked, rules, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
-    space:$("space").value, name:$("name").value };
+	space:$("space").value, inputPool:$("inputPool").value,
+	name:$("name").value };
 }
 
 function updateSpaceHint(){
@@ -389,6 +410,15 @@ async function tick(){
     const th = $("threads");
     for (let i=1;i<=CAT.cpus;i++) th.add(new Option(i,i));
   }
+	const selectedPool = $("inputPool").value;
+	$("inputPool").innerHTML = `<option value="">Balatro's seed space</option>` +
+	  j.pools.filter(p=>p.complete).map(p=>`<option value="${p.name}" data-space="${p.space}">${p.name} (${fmt(p.records)} seeds)</option>`).join("");
+	if ([...$("inputPool").options].some(o=>o.value===selectedPool)) $("inputPool").value=selectedPool;
+	const fromPool = !!$("inputPool").value;
+	if (fromPool) $("space").value = $("inputPool").selectedOptions[0].dataset.space || "natural";
+	$("count").disabled = fromPool;
+	$("space").disabled = fromPool;
+	updateSpaceHint();
   $("legRange").style.display = $("legendary").value ? "" : "none";
   const job = j.job;
   const running = !!job.running;
@@ -417,7 +447,10 @@ async function tick(){
     const sp = p.space === "total" ? ' <span class="part">all-typeable</span>' : "";
     const lbl = (p.label && (p.label + ".bspool") !== p.name)
       ? ` <span class="tagc">&ldquo;${p.label}&rdquo;</span>` : "";
-    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp} &mdash; `
+    const src = p.refilter_depth ? ` <span class="tagc">refilter ${p.refilter_depth}`
+      + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${p.source_pool_id.slice(0,8)}` : "")
+      + `</span>` : "";
+    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp}${src} &mdash; `
       + `${fmt(p.records)} seeds, ${fmtBytes(p.bytes)} &mdash; ${st}<br>`
       + `<span class="tagc">${p.criteria.join(" &middot; ")}</span></div>`;
   }).join("") : "none yet";

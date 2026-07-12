@@ -71,6 +71,12 @@ typedef struct {
 	char kSoulS[POOL_MAX_ANTE + 1][24];
 	char kEdiSoul[POOL_MAX_ANTE + 1][24];
 	uint64_t catalogHash, criteriaHash;
+	int refilter, refilterDepth;
+	uint64_t sourceCriteriaHash, sourceRecords, sourceRangeStart, sourceRangeEnd;
+	char sourcePoolId[24];
+	uint64_t outputRangeStart, outputRangeEnd;
+	int inputFd;
+	uint64_t inputDataOff;
 } PoolPlan;
 
 /* Short shareable fingerprint shown by the builder UI and the in-game
@@ -81,7 +87,7 @@ typedef struct {
 static void pool_compute_id(const PoolPlan *p, uint64_t records, int complete, char out[24]) {
 	char buf[192];
 	int n = snprintf(buf, sizeof buf, "%016" PRIx64 "%016" PRIx64 "%" PRIu64 "-%" PRIu64 "%s%" PRIu64 "%d",
-			p->catalogHash, p->criteriaHash, p->start, p->start + p->count,
+			p->catalogHash, p->criteriaHash, p->outputRangeStart, p->outputRangeEnd,
 			space_name(p->space), records, complete);
 	uint64_t h = pool_hash_update(UINT64_C(1469598103934665603), buf, (size_t)n);
 	snprintf(out, 24, "%016" PRIx64, h);
@@ -167,6 +173,12 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 		const PoolLegendaryRule *r = &p->legendary;
 		n = snprintf(line, sizeof line, "legendary %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		h = pool_hash_update(h, line, (size_t)n);
+	}
+	if (p->refilter) {
+		n = snprintf(line, sizeof line, "source %016" PRIx64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %d\n",
+				p->sourceCriteriaHash, p->sourceRecords, p->sourceRangeStart,
+				p->sourceRangeEnd, p->space);
 		h = pool_hash_update(h, line, (size_t)n);
 	}
 	return h;
@@ -612,6 +624,20 @@ typedef struct {
 	bs_mutex_t outMutex;
 } PoolScanShared;
 
+static bool pool_read_input_batch(const PoolScanShared *s, uint64_t first,
+		uint64_t count, uint64_t ranks[ILV], unsigned char raw[ILV * 8]) {
+	size_t bytes = (size_t)count * 8u;
+	int64_t off = (int64_t)(s->p->inputDataOff + first * 8u);
+	if (bs_pread(s->p->inputFd, raw, bytes, off) != (int64_t)bytes) return false;
+	for (uint64_t i = 0; i < count; i++) {
+		uint64_t rank = 0;
+		for (int b = 0; b < 8; b++) rank |= (uint64_t)raw[i * 8u + (uint64_t)b] << (8 * b);
+		if (rank >= space_size(s->p->space)) return false;
+		ranks[i] = rank;
+	}
+	return true;
+}
+
 static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf, size_t *used) {
 	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
 	bs_mutex_lock(&s->outMutex);
@@ -654,6 +680,8 @@ static void *pool_scan_worker(void *arg) {
 	size_t outUsed = 0;
 	char seeds[ILV][9];
 	double hseed[ILV], hfirst[ILV];
+	uint64_t ranks[ILV];
+	unsigned char raw[ILV * 8];
 	while (!atomic_load(&s->ioError)) {
 		uint64_t begin = atomic_fetch_add(&s->next, s->p->chunk);
 		if (begin >= s->end) break;
@@ -663,14 +691,16 @@ static void *pool_scan_worker(void *arg) {
 		uint64_t chunkMatched = 0;
 		int space = s->p->space;
 		for (; rank + ILV <= end; rank += ILV) {
-			/* In the total space seed length grows with rank; the batched
-			 * hash needs one shared length. Lengths differ inside a group
-			 * only at the 7 length boundaries of the whole space -- those
-			 * groups take the serial path below. */
-			int l0 = make_seed_in(space, rank, seeds[0]);
-			int uniform = 1;
-			for (int i = 1; i < ILV; i++) {
-				if (make_seed_in(space, rank + (uint64_t)i, seeds[i]) != l0) uniform = 0;
+			if (s->p->refilter && !pool_read_input_batch(s, rank, ILV, ranks, raw)) {
+				atomic_store(&s->ioError, true); goto done;
+			}
+			int l0 = 0, uniform = 1;
+			for (int i = 0; i < ILV; i++) {
+				uint64_t candidate = s->p->refilter ? ranks[i] : rank + (uint64_t)i;
+				int slen = make_seed_in(space, candidate, seeds[i]);
+				if (i == 0) l0 = slen;
+				else if (slen != l0) uniform = 0;
+				ranks[i] = candidate;
 			}
 			if (uniform) {
 				batch_hash_seed_n(seeds, l0, hseed);
@@ -684,17 +714,21 @@ static void *pool_scan_worker(void *arg) {
 			for (int i = 0; i < ILV; i++) {
 				if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i], NULL, 0)) {
 					chunkMatched++;
-					if (!pool_buffer_hit(s, outbuf, &outUsed, rank + (uint64_t)i, seeds[i])) goto done;
+					if (!pool_buffer_hit(s, outbuf, &outUsed, ranks[i], seeds[i])) goto done;
 				}
 			}
 		}
 		for (; rank < end; rank++) {
-			make_seed_in(space, rank, seeds[0]);
+			if (s->p->refilter && !pool_read_input_batch(s, rank, 1, ranks, raw)) {
+				atomic_store(&s->ioError, true); goto done;
+			}
+			uint64_t candidate = s->p->refilter ? ranks[0] : rank;
+			make_seed_in(space, candidate, seeds[0]);
 			double hs = pseudohash_ks("", seeds[0]);
 			double hf = pseudohash_ks(s->p->firstKey, seeds[0]);
 			if (pool_evaluate_pre(c, seeds[0], hs, hf, NULL, 0)) {
 				chunkMatched++;
-				if (!pool_buffer_hit(s, outbuf, &outUsed, rank, seeds[0])) goto done;
+				if (!pool_buffer_hit(s, outbuf, &outUsed, candidate, seeds[0])) goto done;
 			}
 		}
 		atomic_fetch_add(&s->matched, chunkMatched);
@@ -727,7 +761,7 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			"tag_route %s\n",
 			POOL_SCHEMA, MODELVER, space_charset(p->space), space_size(p->space),
 			space_name(p->space),
-			p->start, p->start + p->count, p->catalogHash, p->criteriaHash,
+			p->outputRangeStart, p->outputRangeEnd, p->catalogHash, p->criteriaHash,
 			poolId,
 			p->collectTags ? "collect" : "observe");
 	if (n < 0 || n >= (int)sizeof buf) { snprintf(err, errsz, "binary header overflow"); return false; }
@@ -747,6 +781,14 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		const PoolLegendaryRule *r = &p->legendary;
 		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "legendary %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		n += w;
+	}
+	if (p->refilter) {
+		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+				"refilter_depth %d\nsource_criteria_hash %016" PRIx64 "\nsource_records %" PRIu64 "\nsource_pool_id %s\n",
+				p->refilterDepth, p->sourceCriteriaHash, p->sourceRecords,
+				p->sourcePoolId[0] ? p->sourcePoolId : "-");
 		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
@@ -838,11 +880,15 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 	if (p->label[0]) fprintf(f, "label %s\n", p->label);
 	fprintf(f, "charset %s\nseedspace %" PRIu64 "\nspace %s\n",
 			space_charset(p->space), space_size(p->space), space_name(p->space));
-	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->start, p->start + p->count);
+	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->outputRangeStart, p->outputRangeEnd);
 	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\n", s->scanned, s->matched, s->done);
 	fprintf(f, "format %s\nrecord_order unordered\ntag_route %s\n",
 			p->format == POOL_BINARY ? "u64le" : p->format == POOL_TEXT ? "seed-text" : "count-only",
 			p->collectTags ? "collect-first-required" : "observe");
+	if (p->refilter) fprintf(f,
+			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n",
+			p->refilterDepth, p->sourceRecords, p->sourceCriteriaHash,
+			p->sourcePoolId[0] ? p->sourcePoolId : "-");
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		fprintf(f, "tag %s %d %d %d\n", r->key, r->minAnte, r->maxAnte, r->minCount);
@@ -851,7 +897,8 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			p->legendary.key, p->legendary.minAnte, p->legendary.maxAnte, p->legendary.requireNegative);
 	fprintf(f, "elapsed_seconds %.6f\nseeds_per_second %.3f\nmatch_rate %.12g\n", s->elapsed,
 			s->elapsed > 0.0 ? (double)s->scanned / s->elapsed : 0.0, rate);
-	fprintf(f, "projected_full_matches %.0f\nprojected_u64_bytes %.0f\nend\n", projected, projected * 8.0);
+	if (!p->refilter) fprintf(f, "projected_full_matches %.0f\nprojected_u64_bytes %.0f\n", projected, projected * 8.0);
+	fprintf(f, "end\n");
 	if (fclose(f) != 0) { snprintf(err, errsz, "cannot close manifest: %s", strerror(errno)); return false; }
 	return true;
 }
@@ -886,7 +933,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 				fprintf(stderr, "cannot restore committed output boundary: %s\n", strerror(errno)); fclose(out); return 1;
 			}
 		}
-		fprintf(stderr, "resuming at rank %" PRIu64 " (%" PRIu64 " already scanned)\n", state.cursor, state.scanned);
+		fprintf(stderr, "resuming at %s %" PRIu64 " (%" PRIu64 " already scanned)\n",
+				p->refilter ? "input record" : "rank", state.cursor, state.scanned);
 	} else {
 		if (stateExists && p->resume) { fprintf(stderr, "existing state could not be resumed\n"); return 1; }
 		if (p->format != POOL_COUNT) {
@@ -980,8 +1028,65 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		fprintf(stderr, "complete: scanned=%" PRIu64 " matched=%" PRIu64 " elapsed=%.3fs\n", state.scanned, state.matched, state.elapsed);
 		return 0;
 	}
-	fprintf(stderr, "stopped cleanly at rank %" PRIu64 "; rerun the same command to resume\n", state.cursor);
+	fprintf(stderr, "stopped cleanly at %s %" PRIu64 "; rerun the same command to resume\n",
+			p->refilter ? "input record" : "rank", state.cursor);
 	return 130;
+}
+
+static bool pool_prepare_refilter(PoolPlan *p, const char *input,
+		const char *output, FILE **inputFile, char *err, size_t errsz) {
+	FILE *f = fopen(input, "rb");
+	if (!f) { snprintf(err, errsz, "cannot open input pool %s: %s", input, strerror(errno)); return false; }
+	FILE *existingOutput = fopen(output, "rb");
+	if (existingOutput) {
+		bool same = bs_same_file(f, existingOutput);
+		fclose(existingOutput);
+		if (same) {
+			snprintf(err, errsz, "input and output pool resolve to the same file");
+			fclose(f); return false;
+		}
+	}
+	BspoolHeader h;
+	if (!bspool_read_header(f, &h, err, errsz)) { fclose(f); return false; }
+	if (h.modelver != MODELVER) {
+		snprintf(err, errsz, "input pool model %d != scanner model %d", h.modelver, MODELVER);
+		fclose(f); return false;
+	}
+	if (!h.complete) {
+		snprintf(err, errsz, "input pool is incomplete; finish its scan before refiltering");
+		fclose(f); return false;
+	}
+	if (h.catalogHash != p->catalogHash) {
+		snprintf(err, errsz, "input pool was built from a different pool/unlock snapshot");
+		fclose(f); return false;
+	}
+	int64_t size = bs_file_size(f);
+	uint64_t expected = (uint64_t)h.headerBytes + h.records * 8u;
+	if (size < 0 || (uint64_t)size != expected) {
+		snprintf(err, errsz, "input pool size does not match its committed record count");
+		fclose(f); return false;
+	}
+	if (!h.records) {
+		snprintf(err, errsz, "input pool has no seed records");
+		fclose(f); return false;
+	}
+	p->refilter = 1;
+	p->refilterDepth = h.refilterDepth + 1;
+	p->sourceCriteriaHash = h.criteriaHash;
+	p->sourceRecords = h.records;
+	p->sourceRangeStart = h.rangeStart;
+	p->sourceRangeEnd = h.rangeEnd;
+	snprintf(p->sourcePoolId, sizeof p->sourcePoolId, "%s", h.poolId);
+	p->space = h.space;
+	p->start = 0;
+	p->count = h.records;
+	p->countAll = 0;
+	p->outputRangeStart = h.rangeStart;
+	p->outputRangeEnd = h.rangeEnd;
+	p->inputFd = fileno(f);
+	p->inputDataOff = (uint64_t)h.headerBytes;
+	*inputFile = f;
+	return true;
 }
 
 static int pool_mode_fixture(const Config *g, const PoolPlan *p, const char *seedfile) {
@@ -1059,16 +1164,22 @@ static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
 			"  %s scan <native-snapshot.cfg> <pool-criteria.cfg> <output>\n"
+			"  %s refilter <native-snapshot.cfg> <pool-criteria.cfg> <input.bspool> <output.bspool>\n"
 			"  %s fixture <native-snapshot.cfg> <pool-criteria.cfg> <seed-file>\n"
 			"  %s export <input.bspool> <output.txt|->\n",
-			prog, prog, prog);
+			prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
 	bs_platform_init();
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
-	if (argc != 5 || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture"))) {
+	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
+	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);
+		return 2;
+	}
+	if (refilter && !strcmp(argv[4], argv[5])) {
+		fprintf(stderr, "input and output pool must be different files\n");
 		return 2;
 	}
 	static Config catalog;
@@ -1088,7 +1199,19 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	plan.catalogHash = catalogHash;
+	plan.outputRangeStart = plan.start;
+	plan.outputRangeEnd = plan.start + plan.count;
+	FILE *inputFile = NULL;
+	if (refilter && !pool_prepare_refilter(&plan, argv[4], argv[5], &inputFile, err, sizeof err)) {
+		fprintf(stderr, "input pool error: %s\n", err);
+		return 1;
+	}
 	plan.criteriaHash = pool_hash_plan(&plan);
 	if (!strcmp(argv[1], "scan")) return pool_mode_scan(&catalog, &plan, argv[4]);
+	if (refilter) {
+		int rc = pool_mode_scan(&catalog, &plan, argv[5]);
+		fclose(inputFile);
+		return rc;
+	}
 	return pool_mode_fixture(&catalog, &plan, argv[4]);
 }

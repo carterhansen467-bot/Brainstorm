@@ -1141,6 +1141,7 @@ typedef struct {
 	int space;           /* SPACE_NATURAL / SPACE_TOTAL, derived from charset */
 	char label[136];     /* optional user-given pool name (may contain spaces) */
 	char poolId[24];     /* short shareable fingerprint, hex */
+	int refilterDepth;
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
 	int ntagRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
@@ -1242,6 +1243,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		else if (!strcmp(d, "header_bytes")) { v = pool_tok(&sp); h->headerBytes = v ? atoi(v) : 0; }
 		else if (!strcmp(d, "tag_route")) { v = pool_tok(&sp); h->route = (v && !strcmp(v, "observe")) ? 0 : 1; }
 		else if (!strcmp(d, "pool_id")) { v = pool_tok(&sp); if (v) snprintf(h->poolId, sizeof h->poolId, "%s", v); }
+		else if (!strcmp(d, "refilter_depth")) { v = pool_tok(&sp); h->refilterDepth = v ? atoi(v) : 0; }
 		else if (!strcmp(d, "label")) {
 			/* rest of the line, spaces included */
 			while (*sp == ' ' || *sp == '\t') sp++;

@@ -696,6 +696,18 @@ time the tab re-renders, even though the underlying saved value is untouched.
       stay natural (they hunt seeds the game can deal); the total space is
       reachable only through a total-space .bspool.
 
+19. **Pool-on-pool refiltering experiment** (`bspool-refilter-experiment`):
+    - `brainstorm_seed_pool refilter` consumes committed u64le records from a
+      complete `.bspool`, evaluates the new criteria, and emits another
+      canonical `.bspool`. Work cursors are input-record indexes, preserving
+      the scanner's checkpoint/pause/resume guarantees.
+    - Input headers, exact file length, model, seed space, and catalog
+      fingerprint are validated before output opens. File-identity checks
+      prevent overwriting the source even through aliases/hard links.
+    - Derived headers/manifests include source pool ID, criteria fingerprint,
+      record count, and chain depth. Both builder UIs expose **Input seeds**
+      for natural and all-typeable pools.
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip

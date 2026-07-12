@@ -219,8 +219,9 @@ class Criteria:
 class Runner:
     """One scanner process: criteria written to disk, stderr streamed."""
 
-    def __init__(self, snapshot_path, criteria_text, output):
+    def __init__(self, snapshot_path, criteria_text, output, input_pool=None):
         self.output = output
+        self.input_pool = input_pool
         self.criteria_path = output + ".criteria.cfg"
         with open(self.criteria_path, "w", encoding="utf-8") as f:
             f.write(criteria_text)
@@ -229,8 +230,14 @@ class Runner:
         # to the scanner alone (the C side turns it into a checkpointed pause,
         # same contract as SIGINT elsewhere).
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+        command = [POOL_BIN, "scan", snapshot_path, self.criteria_path, output]
+        if input_pool:
+            if os.path.abspath(input_pool) == os.path.abspath(output):
+                raise ValueError("Input and output pool must be different files.")
+            command = [POOL_BIN, "refilter", snapshot_path, self.criteria_path,
+                       input_pool, output]
         self.proc = subprocess.Popen(
-            [POOL_BIN, "scan", snapshot_path, self.criteria_path, output],
+            command,
             stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
             creationflags=flags)
         self.reader = threading.Thread(target=self._pump, daemon=True)
@@ -279,6 +286,22 @@ def read_state(path):
     return read_manifest(path)
 
 
+def read_pool_header(path):
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(1024).split(b"\0", 1)[0].decode("latin-1")
+        for line in raw.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                out[parts[0]] = parts[1].strip()
+            if parts and parts[0] == "end":
+                break
+    except OSError:
+        pass
+    return out
+
+
 def human_bytes(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -316,6 +339,13 @@ class App:
         self.tag_keys = [k for k, _ in snap.usable_tags()]
         self.tag_min_ante = {k: ma for k, ma in snap.usable_tags()}
         self.legendaries = snap.usable_legendaries()
+        self.input_pools = [""]
+        if os.path.isdir(POOL_DIR):
+            for fn in sorted(os.listdir(POOL_DIR)):
+                path = os.path.join(POOL_DIR, fn)
+                if fn.endswith(".bspool") and read_pool_header(path).get("complete") == "1":
+                    self.input_pools.append(path)
+        self.input_idx = 0
         if "j_perkeo" in self.legendaries:
             self.crit.legendary = "j_perkeo"
         elif self.legendaries:
@@ -351,6 +381,10 @@ class App:
                        get=lambda: c.route_collect, set=self._set_route,
                        on="collect (skip matched blinds)",
                        off="observe (play those blinds)"))
+        f.append(Field("cycle", "Input seeds",
+                       options=["Balatro's seed space"] +
+                       [os.path.basename(p) for p in self.input_pools[1:]],
+                       idx=self.input_idx, set=self._set_input))
         f.append(Field("cycle", "Threads",
                        options=["Auto (cores-1)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
                        idx=c.threads, set=self._set_threads))
@@ -387,11 +421,17 @@ class App:
     def _set_threads(self, i):
         self.crit.threads = i
 
+    def _set_input(self, i):
+        self.input_idx = i
+        if i:
+            self.crit.space = read_pool_header(self.input_pools[i]).get("space", "natural")
+
     def _set_scope(self, i):
         self.crit.scope = i
 
     def _set_space(self, i):
-        self.crit.space = SPACES[i][0]
+        if not self.input_idx:
+            self.crit.space = SPACES[i][0]
 
     def _set_name(self, s):
         self.crit.name = s
@@ -531,8 +571,10 @@ class App:
             return
         out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
         text = self.crit.text("count", ESTIMATE_COUNT)
-        self.run_screen(Runner(self.snap.modelver4_copy(), text, out),
-                        "Estimating (100M-seed sample)", estimate=True)
+        input_pool = self.input_pools[self.input_idx] or None
+        self.run_screen(Runner(self.snap.modelver4_copy(), text, out, input_pool),
+                        "Filtering input pool" if input_pool else "Estimating (100M-seed sample)",
+                        estimate=True)
 
     def _do_build(self):
         err = self.validate()
@@ -546,7 +588,8 @@ class App:
             self.status = "That pool is already complete -- pick a new name (or delete it)."
             return
         text = self.crit.text("binary", SCOPES[self.crit.scope][1])
-        self.run_screen(Runner(self.snap.modelver4_copy(), text, out),
+        input_pool = self.input_pools[self.input_idx] or None
+        self.run_screen(Runner(self.snap.modelver4_copy(), text, out, input_pool),
                         "Building " + os.path.basename(out), estimate=False)
 
     def run_screen(self, runner, title, estimate):
