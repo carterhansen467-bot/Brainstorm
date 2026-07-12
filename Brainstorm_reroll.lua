@@ -1,35 +1,41 @@
-local lovely = require("lovely")
 local nativefs = require("nativefs")
+
+-- In-game this is already defined (Brainstorm.lua locates MOD_PATH before
+-- loading us); the fallback covers standalone loads -- test harnesses and
+-- search worker threads -- which fake lovely with mod_dir = "".
+Brainstorm.modPath = Brainstorm.modPath or function()
+	return Brainstorm.MOD_PATH or (require("lovely").mod_dir .. "/Brainstorm")
+end
 
 Brainstorm.AUTOREROLL = {}
 
 G.FUNCS.change_search_tag = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchTagID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchTag = Brainstorm.SearchTagList[x.to_val]
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 G.FUNCS.change_search_pack = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchPackID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchPack = Brainstorm.SearchPackList[x.to_val]
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 G.FUNCS.change_search_soul_count = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchForSoul = x.to_val
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 G.FUNCS.change_seeds_per_frame = function(x)
 	Brainstorm.SETTINGS.autoreroll.seedsPerFrameID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.seedsPerFrame = Brainstorm.seedsPerFrame[x.to_val]
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 G.FUNCS.change_search_threads = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchThreadsID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchThreads = Brainstorm.searchThreadsValues[x.to_val] or 0
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 Brainstorm.AUTOREROLL.autoRerollActive = false
@@ -256,7 +262,7 @@ function Brainstorm.recordFoundJoker(seed, joker)
 	if not seed or not joker then return end
 	Brainstorm.SETTINGS.foundJokers = Brainstorm.SETTINGS.foundJokers or {}
 	Brainstorm.SETTINGS.foundJokers[string.upper(seed)] = joker
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- What Ctrl+J should show: the joker recorded for the seed the player is CURRENTLY
@@ -391,9 +397,8 @@ function Brainstorm.debugPredictVoucher()
 		lines[#lines + 1] = "Pool size " .. #G.P_CENTER_POOLS['Voucher'] .. ", available " .. #avail
 		lines[#lines + 1] = "Available: " .. table.concat(avail, ", ")
 	end
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
 -- Main-thread self-test (Ctrl+P) for the physical pack model. Predicts the
@@ -458,9 +463,8 @@ function Brainstorm.debugPredictPacks()
 			lines[#lines + 1] = "Predicted A" .. a .. ": " .. table.concat(parts, " ") .. note .. mark
 		end
 	end
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
 -- ===========================================================================
@@ -627,9 +631,8 @@ end
 function Brainstorm.dumpDiagnostics()
 	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
 	local text = seed and Brainstorm.buildDiagnosticsText(seed) or "No active run/seed."
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/brainstorm_diagnostics.txt", text)
+	nativefs.write(Brainstorm.modPath() .. "/brainstorm_diagnostics.txt", text)
 end
 
 -- Safety-rail logger: a worker hit failed main-thread re-verification. Records the
@@ -643,9 +646,8 @@ function Brainstorm.logSeedMismatch(res)
 		Brainstorm.buildDiagnosticsText(seed),
 		"",
 	}
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	local path = lovely.mod_dir .. "/Brainstorm/brainstorm_mismatch.txt"
+	local path = Brainstorm.modPath() .. "/brainstorm_mismatch.txt"
 	local prior = nativefs.read(path) or ""
 	nativefs.write(path, prior .. table.concat(parts, "\n") .. "\n")
 	print("[Brainstorm] SEED MISMATCH logged for " .. tostring(seed) .. " -> brainstorm_mismatch.txt")
@@ -903,9 +905,8 @@ function Brainstorm.debugPredictShop(seed_found, ante, num_slots)
 		end
 	end
 
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
 function Brainstorm.joker_is_pool_eligible(v)
@@ -1633,9 +1634,8 @@ function Brainstorm.debugPredictLegendary(seed_found)
 		lines[#lines+1] = "Predicted legendary: " .. chosen_key
 	end
 
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/debug_predict.txt", table.concat(lines, "\n"))
+	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
 function Brainstorm.checkLegendarySearch(seed_found, target_key)
@@ -1681,9 +1681,8 @@ Brainstorm.SEARCH_CHANNELS = {
 }
 
 function Brainstorm.getRerollSource()
-	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	return nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_reroll.lua")
+	return nativefs.read(Brainstorm.modPath() .. "/Brainstorm_reroll.lua")
 end
 
 -- Serialize primitives / nested tables to a Lua literal the worker rebuilds via
@@ -2100,10 +2099,9 @@ function Brainstorm.isWindows()
 end
 
 function Brainstorm.nativePaths()
-	local lovely = require("lovely")
-	local base = lovely.mod_dir .. "/Brainstorm/native_search"
+	local base = Brainstorm.modPath() .. "/native_search"
 	return {
-		bin = lovely.mod_dir .. "/Brainstorm/native/brainstorm_native_search"
+		bin = Brainstorm.modPath() .. "/native/brainstorm_native_search"
 			.. (Brainstorm.isWindows() and ".exe" or ""),
 		cfg = base .. ".cfg",
 		status = base .. ".status",
@@ -2133,8 +2131,7 @@ end
 -- they stop with an alert instead.
 -- ---------------------------------------------------------------------------
 function Brainstorm.seedPoolDir()
-	local lovely = require("lovely")
-	return lovely.mod_dir .. "/Brainstorm/seed_pools"
+	return Brainstorm.modPath() .. "/seed_pools"
 end
 
 -- Selected pool's full path, or nil when no pool is selected. Existence is
@@ -2287,10 +2284,9 @@ function Brainstorm.startNativeSearch()
 		-- quoting; win_spawn.lua goes straight to CreateProcessA instead.
 		local N = Brainstorm.NATIVE_STATE or {}
 		if N.winSpawn == nil then
-			local lovely = require("lovely")
 			local okLoad, mod = pcall(function()
 				return assert(load(nativefs.read(
-					lovely.mod_dir .. "/Brainstorm/win_spawn.lua"), "win_spawn.lua"))()
+					Brainstorm.modPath() .. "/win_spawn.lua"), "win_spawn.lua"))()
 			end)
 			N.winSpawn = okLoad and mod or false
 			Brainstorm.NATIVE_STATE = N

@@ -1,11 +1,53 @@
 Brainstorm = {}
+
+-- The mod's own folder under Mods/. Historically hardcoded as
+-- "<Mods>/Brainstorm", which crashed the game at boot ("bad argument #1 to
+-- 'load'") whenever the folder was named anything else -- GitHub branch ZIPs
+-- extract as Brainstorm-<branch>, and users sometimes unzip one level deep.
+-- Lovely applies our patches wherever the folder is, so locate it the same
+-- way: find the directory that holds Brainstorm_main.lua.
+function Brainstorm.locateModDir(root, nativefs)
+	local function isMod(p)
+		return nativefs.getInfo(p .. "/Brainstorm_main.lua") ~= nil and p or nil
+	end
+	local found = isMod(root .. "/Brainstorm")
+	if found then return found end
+	local dirs = nativefs.getDirectoryItems(root) or {}
+	for _, d in ipairs(dirs) do
+		found = isMod(root .. "/" .. d)
+		if found then return found end
+	end
+	for _, d in ipairs(dirs) do
+		for _, d2 in ipairs(nativefs.getDirectoryItems(root .. "/" .. d) or {}) do
+			found = isMod(root .. "/" .. d .. "/" .. d2)
+			if found then return found end
+		end
+	end
+	return nil
+end
+
+-- All mod file paths go through here. MOD_PATH is set by initBrainstorm();
+-- the fallback keeps the pre-locator behavior for test bootstraps that load
+-- individual files without running init.
+function Brainstorm.modPath()
+	return Brainstorm.MOD_PATH or (require("lovely").mod_dir .. "/Brainstorm")
+end
+
 function initBrainstorm()
 	local lovely = require("lovely")
 	local nativefs = require("nativefs")
-	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_main.lua")))()
-	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_UI.lua")))()
-	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_keyhandler.lua")))()
-	assert(load(nativefs.read(lovely.mod_dir .. "/Brainstorm/Brainstorm_reroll.lua")))()
+	Brainstorm.MOD_PATH = Brainstorm.locateModDir(lovely.mod_dir, nativefs)
+	if not Brainstorm.MOD_PATH then
+		error("[Brainstorm] could not find Brainstorm_main.lua anywhere under\n"
+			.. lovely.mod_dir .. "\n"
+			.. "Reinstall so the mod's files sit directly in Mods/Brainstorm\n"
+			.. "(no extra nesting; see the README install steps).")
+	end
+	local MOD = Brainstorm.MOD_PATH
+	assert(load(nativefs.read(MOD .. "/Brainstorm_main.lua")))()
+	assert(load(nativefs.read(MOD .. "/Brainstorm_UI.lua")))()
+	assert(load(nativefs.read(MOD .. "/Brainstorm_keyhandler.lua")))()
+	assert(load(nativefs.read(MOD .. "/Brainstorm_reroll.lua")))()
 	-- Full defaults for a fresh install. settings.lua is NOT shipped in the repo
 	-- (it's user state, rewritten by the mod on every settings change -- shipping
 	-- it made every `git pull` conflict); it's created on first save. A loaded
@@ -23,8 +65,8 @@ function initBrainstorm()
 		},
 		debug_mode = false,
 	}
-	if nativefs.getInfo(lovely.mod_dir .. "/Brainstorm/settings.lua") then
-		local settings_file = STR_UNPACK(nativefs.read((lovely.mod_dir .. "/Brainstorm/settings.lua")))
+	if nativefs.getInfo(MOD .. "/settings.lua") then
+		local settings_file = STR_UNPACK(nativefs.read(MOD .. "/settings.lua"))
 		if settings_file ~= nil then
 			Brainstorm.SETTINGS = settings_file
 		end

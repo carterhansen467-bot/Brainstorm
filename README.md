@@ -20,13 +20,15 @@
    ```
 
    No git? On the repo page pick the `joker-search-experiment` branch →
-   Code → Download ZIP, and extract it so the folder is
-   `%AppData%\Balatro\Mods\Brainstorm` [^1]
+   Code → Download ZIP, and extract it into `%AppData%\Balatro\Mods`. The mod
+   finds its own folder at launch, so the ZIP's default folder name
+   (`Brainstorm-joker-search-experiment`) works as-is — renaming it to
+   `Brainstorm` is tidier but optional.
 4. **For the fast native search and seed pools** (optional but recommended):
    download `brainstorm-windows-x64.zip` from this fork's
    [releases](https://github.com/carterhansen467-bot/Brainstorm/releases) and
-   follow its `INSTALL.txt` (two `.exe` files go into `Mods\Brainstorm\native\`,
-   the Seed Pool Builder goes next to them). If Windows blocks a downloaded
+   follow its `INSTALL.txt` (two `.exe` files go into the mod folder's
+   `native\` subfolder, the Seed Pool Builder goes next to them). If Windows blocks a downloaded
    file: right-click → Properties → check **Unblock**, or choose
    "More info → Run anyway" on the SmartScreen prompt.
 5. Reload the game to activate the mod.

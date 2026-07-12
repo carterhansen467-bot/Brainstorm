@@ -1,4 +1,3 @@
-local lovely = require("lovely")
 local nativefs = require("nativefs")
 
 local searchLegendaryKeys = {"None", "Caino", "Triboulet", "Yorick", "Chicot", "Perkeo"}
@@ -193,7 +192,7 @@ G.FUNCS.change_search_legendary = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchLegendary = legendaryKeyByName[x.to_val]
 	Brainstorm.applyLegendaryBarColour()
 	Brainstorm.applyLegendaryTex()
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- "Negative" toggle for the legendary search, styled like the joker-slot
@@ -213,7 +212,7 @@ G.FUNCS.brainstorm_toggle_neg_legendary = function(e)
 	local s = Brainstorm.SETTINGS.autoreroll
 	s.searchNegativeLegendary = not s.searchNegativeLegendary
 	Brainstorm.applyNegLegendaryDisplay()
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Per-frame visual on the negative-search buttons, stealing the collection's
@@ -273,13 +272,13 @@ G.FUNCS.brainstorm_toggle_match_any = function(e)
 	local s = Brainstorm.SETTINGS.autoreroll
 	s.jokerSearchMatchAny = not s.jokerSearchMatchAny
 	Brainstorm.applyMatchAnyDisplay()
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 G.FUNCS.change_search_voucher = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchVoucherID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchVoucher = Brainstorm.voucherKeyByName[x.to_val]
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Which ante the searched voucher must be offered at. Vouchers roll from one
@@ -294,7 +293,7 @@ Brainstorm.voucherAnteValues  = {["Ante 1"]=1, ["Ante 2"]=2, ["Ante 3"]=3, ["Ant
 G.FUNCS.change_search_voucher_ante = function(x)
 	Brainstorm.SETTINGS.autoreroll.searchVoucherAnteID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.searchVoucherAnte = Brainstorm.voucherAnteValues[x.to_val] or 1
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Where a found seed is delivered. "Current run" overwrites the live run
@@ -306,7 +305,7 @@ Brainstorm.foundSeedSlotValues  = {["Current run"]=0, ["Slot 1"]=1, ["Slot 2"]=2
 G.FUNCS.change_found_seed_slot = function(x)
 	Brainstorm.SETTINGS.autoreroll.foundSeedSlotID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.foundSeedSlot = Brainstorm.foundSeedSlotValues[x.to_val] or 0
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Seed pool (.bspool) restricting the native search to a prebuilt match set.
@@ -315,7 +314,7 @@ end
 -- FILENAME (not the index): the list can change between sessions.
 G.FUNCS.change_seed_pool = function(x)
 	Brainstorm.SETTINGS.autoreroll.seedPoolFile = (x.to_val ~= "None") and x.to_val or ""
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Stake the found run starts at (applies to both "Current run" overwrite and
@@ -329,7 +328,7 @@ Brainstorm.foundStakeValues  = {["White Stake"]=1, ["Black Stake"]=4, ["Gold Sta
 G.FUNCS.change_found_seed_stake = function(x)
 	Brainstorm.SETTINGS.autoreroll.foundSeedStakeID = x.to_key
 	Brainstorm.SETTINGS.autoreroll.foundSeedStake = Brainstorm.foundStakeValues[x.to_val] or 1
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 Brainstorm.SearchTagList = {
@@ -568,7 +567,7 @@ G.FUNCS.brainstorm_toggle_neg_slot = function(e)
 	local si = e.config.ref_table.slotIdx
 	local slot = Brainstorm.SETTINGS.autoreroll.jokerSlotData[si]
 	slot.requireNegative = not slot.requireNegative
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 	Brainstorm.refreshJokerSection("bs_joker_slots", Brainstorm.buildJokerSlots)
 end
 
@@ -595,7 +594,7 @@ G.FUNCS.brainstorm_assign_to_slot = function(e)
 	for j, k in ipairs(Brainstorm.allJokerKeys) do
 		if k == slot.key then slot.index = j; break end
 	end
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 	Brainstorm.refreshJokerSection("bs_joker_slots", Brainstorm.buildJokerSlots)
 	-- Clear the selection so the "selected" area resets to default immediately.
 	ss.name = "None"
@@ -608,7 +607,7 @@ G.FUNCS.brainstorm_joker_clear = function(e)
 	local slot = Brainstorm.SETTINGS.autoreroll.jokerSlotData[si]
 	slot.key = ""
 	slot.index = 1
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 	Brainstorm.refreshJokerSection("bs_joker_slots", Brainstorm.buildJokerSlots)
 end
 
@@ -620,7 +619,7 @@ for ante = 1, 4 do
 	G.FUNCS["change_multi_ante_slots_" .. ante] = function(x)
 		Brainstorm.SETTINGS.multiAnteSearch["ante" .. _ante .. "SlotsID"] = x.to_key
 		Brainstorm.SETTINGS.multiAnteSearch["ante" .. _ante .. "Slots"] = multiAnteSlotValues[x.to_val] or 0
-		nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+		nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 	end
 end
 
@@ -633,7 +632,7 @@ local anywhereSlotValues  = {["4"]=4, ["6"]=6, ["8"]=8, ["12"]=12, ["16"]=16}
 G.FUNCS.change_anywhere_slots = function(x)
 	Brainstorm.SETTINGS.multiAnteSearch.anywhereSlotsID = x.to_key
 	Brainstorm.SETTINGS.multiAnteSearch.anywhereSlots = anywhereSlotValues[x.to_val] or 8
-	nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 local searchTagKeys = {"None", "Charm Tag", "Double Tag", "Uncommon Tag", "Rare Tag", "Holographic Tag", "Foil Tag", "Polychrome Tag", "Investment Tag", "Voucher Tag", "Boss Tag", "Juggle Tag", "Coupon Tag", "Economy Tag", "Skip Tag", "D6 Tag"}
@@ -679,7 +678,7 @@ function create_tabs(args)
 				-- Seed pools: whatever .bspool files are in <mod>/seed_pools/
 				-- right now (created here so drag-and-drop sharing "just works").
 				local poolDir = Brainstorm.seedPoolDir and Brainstorm.seedPoolDir()
-					or (lovely.mod_dir .. "/Brainstorm/seed_pools")
+					or (Brainstorm.modPath() .. "/seed_pools")
 				nativefs.createDirectory(poolDir)
 				local poolNames = {"None"}
 				local poolItems = nativefs.getDirectoryItems(poolDir) or {}
@@ -743,7 +742,7 @@ function create_tabs(args)
 							w = 1.2,
 							ref_table = Brainstorm.SETTINGS.autoreroll,
 							ref_value = "searchTagAnywhere",
-							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+							callback = function() nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
 						}),
 					}},
 					create_option_cycle({
@@ -797,7 +796,7 @@ function create_tabs(args)
 							w = 1.2,
 							ref_table = Brainstorm.SETTINGS.autoreroll,
 							ref_value = "searchLegendaryAnywhere",
-							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+							callback = function() nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
 						}),
 					}},
 					create_option_cycle({
@@ -988,7 +987,7 @@ function create_tabs(args)
 							label = "Anywhere (Antes 1-8)",
 							ref_table = Brainstorm.SETTINGS.multiAnteSearch,
 							ref_value = "anywhereMode",
-							callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+							callback = function() nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
 						}),
 					}},
 					{n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
@@ -1043,7 +1042,7 @@ function create_tabs(args)
 									w = 1.2,
 									ref_table = Brainstorm.SETTINGS.multiAnteSearch,
 									ref_value = "ante" .. ante .. "Packs",
-									callback = function() nativefs.write(lovely.mod_dir .. "/Brainstorm/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
+									callback = function() nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS)) end,
 								}),
 							}},
 						}},
