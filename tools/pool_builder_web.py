@@ -61,6 +61,10 @@ def criteria_from_json(data, snap):
         raise ValueError("Pick a legendary or add at least one tag requirement.")
     c.route_collect = data.get("route", "collect") != "observe"
     c.threads = clamp_int(data.get("threads", 0), 0, 64)
+    space = data.get("space", "natural")
+    if space not in (s[0] for s in core.SPACES):
+        raise ValueError("Unknown seed space %r" % space)
+    c.space = space
     name = re.sub(r"[^A-Za-z0-9._+-]", "-", str(data.get("name", "")).strip())
     if name:
         c.name, c.name_edited = name, True
@@ -88,8 +92,10 @@ def read_pool_header(path):
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("records", "complete", "modelver"):
+        if parts[0] in ("records", "complete", "modelver", "pool_id", "space"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
+        elif parts[0] == "label":
+            out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
         elif parts[0] in ("tag", "legendary", "tag_route"):
             out["criteria"].append(line)
         elif parts[0] == "end":
@@ -114,6 +120,9 @@ def list_pools():
             "complete": head.get("complete") == "1",
             "resumable": state.get("done") == "0",
             "criteria": head.get("criteria", []),
+            "label": head.get("label", ""),
+            "pool_id": head.get("pool_id", ""),
+            "space": head.get("space", "natural"),
         })
     return pools
 
@@ -162,7 +171,7 @@ def start_job(kind, data, snap):
                    error="")
 
 
-SEEDCAP = core.SEEDSPACE
+SEEDCAP = core.SEEDSPACE_TOTAL  # UI clamp only; the scanner enforces per-space bounds
 
 
 # ------------------------------------------------------------------ http ---
@@ -241,9 +250,17 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
 
 <div class="card"><h2>2 &middot; How much to scan</h2>
   <div class="row">
+    <label>Seed space</label>
+    <select id="space">
+      <option value="natural">Natural seeds &mdash; 1.79 trillion the game can deal</option>
+      <option value="total">All typeable seeds &mdash; 2.90 trillion, adds 0/O and short seeds</option>
+    </select>
+    <span class="tagc" id="spaceHint"></span>
+  </div>
+  <div class="row">
     <label>Scope</label>
     <select id="count">
-      <option value="0">Entire seed space (1.78 trillion &mdash; can take days)</option>
+      <option value="0" id="optAll">Entire seed space (can take days)</option>
       <option value="10000000000">First 10 billion seeds</option>
       <option value="1000000000">First 1 billion seeds</option>
       <option value="100000000" selected>First 100 million seeds (quick test)</option>
@@ -314,7 +331,17 @@ function criteria(){
     legMin:+$("legMin").value, legMax:+$("legMax").value,
     legNeg:$("legNeg").checked, rules, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
-    name:$("name").value };
+    space:$("space").value, name:$("name").value };
+}
+
+function updateSpaceHint(){
+  const total = $("space").value === "total";
+  $("optAll").textContent = total
+    ? "Entire typeable space (2.90 trillion — can take days)"
+    : "Entire seed space (1.79 trillion — can take days)";
+  $("spaceHint").textContent = total
+    ? "Seeds with 0/O or under 8 characters never occur naturally — they only exist typed in."
+    : "";
 }
 
 async function run(kind){
@@ -342,7 +369,7 @@ function showResult(j){
       out += `\\nFull seed space: ~${fmt(Math.round(+m.projected_full_matches))} seeds, `
           + `~${fmtBytes(+m.projected_u64_bytes)} file.`;
     if (+m.seeds_per_second)
-      out += `\\nFull scan at this speed: ~${fmtSecs(1785793904896 / +m.seeds_per_second)}.`;
+      out += `\\nFull scan at this speed: ~${fmtSecs((+m.seedspace || 1785793904896) / +m.seeds_per_second)}.`;
   } else {
     out = `Done! ${fmt(+m.matched||j.matched)} seeds saved to seed_pools/${j.output}.\\n`
         + `It now shows up in the in-game Seed Pool selector. Share that one file `
@@ -386,12 +413,20 @@ async function tick(){
     const st = p.complete ? '<span class="ok">complete</span>'
       : (p.resumable ? '<span class="part">paused &mdash; resumable</span>'
                      : '<span class="part">partial</span>');
-    return `<div class="pool"><b>${p.name}</b> &mdash; ${fmt(p.records)} seeds, `
-      + `${fmtBytes(p.bytes)} &mdash; ${st}<br>`
+    const idb = p.pool_id ? ` <span class="tagc">id ${p.pool_id.slice(0,8)}</span>` : "";
+    const sp = p.space === "total" ? ' <span class="part">all-typeable</span>' : "";
+    const lbl = (p.label && (p.label + ".bspool") !== p.name)
+      ? ` <span class="tagc">&ldquo;${p.label}&rdquo;</span>` : "";
+    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp} &mdash; `
+      + `${fmt(p.records)} seeds, ${fmtBytes(p.bytes)} &mdash; ${st}<br>`
       + `<span class="tagc">${p.criteria.join(" &middot; ")}</span></div>`;
   }).join("") : "none yet";
 }
-addEventListener("load", ()=>{ tick(); setInterval(tick, 1000); });
+addEventListener("load", ()=>{
+  $("space").addEventListener("change", updateSpaceHint);
+  updateSpaceHint();
+  tick(); setInterval(tick, 1000);
+});
 </script></body></html>
 """
 

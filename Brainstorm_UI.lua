@@ -314,8 +314,13 @@ end
 -- FILENAME (not the index): the list can change between sessions.
 G.FUNCS.change_seed_pool = function(x)
 	Brainstorm.SETTINGS.autoreroll.seedPoolFile = (x.to_val ~= "None") and x.to_val or ""
+	Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(Brainstorm.SETTINGS.autoreroll.seedPoolFile)
 	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
+
+-- Identity line under the Seed Pool cycler (label / pool_id / space /
+-- records). A ref'd table so the text swaps live as the cycler moves.
+Brainstorm.UI_POOL_INFO = { text = "" }
 
 -- Stake the found run starts at (applies to both "Current run" overwrite and
 -- banked slots). Only the gameplay-relevant tiers: White (base), Black
@@ -701,6 +706,7 @@ function create_tabs(args)
 						poolCurrent = #poolNames
 					end
 				end
+				Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(savedPool or "")
 				-- Left column: the core search settings
 				local leftColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
 					create_option_cycle({
@@ -753,6 +759,14 @@ function create_tabs(args)
 						opt_callback = "change_seed_pool",
 						current_option = poolCurrent,
 					}),
+					{n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+						{n = G.UIT.T, config = {
+							ref_table = Brainstorm.UI_POOL_INFO,
+							ref_value = "text",
+							scale = 0.26,
+							colour = G.C.UI.TEXT_INACTIVE,
+						}},
+					}},
 				}}
 
 				-- Right column: legendary + misc settings. The legendary cycle bar

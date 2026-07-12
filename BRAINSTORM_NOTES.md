@@ -650,6 +650,52 @@ time the tab re-renders, even though the underlying saved value is untouched.
       Watch for SmartScreen blocking the unsigned exes (README has the
       unblock steps).
 
+18. **Total seed space + pool identity** (2026-07-12, `total-seed-space`
+    branch): the pool scanner can now cover every seed the game ACCEPTS, not
+    just the ones it generates, and pools carry a shareable identity.
+    - Two spaces. `natural` (default, unchanged): 34^8 eight-char seeds, no
+      0/O. `total` (`space total` criteria directive): 36 symbols including
+      0 and O, lengths 1-8, ranks ordered shortest-first — 2,901,713,047,668
+      seeds (~1.6x natural). The ~1.1T extra seeds are only reachable typed
+      into the seed box; rerolling never lands on them.
+    - The space is decided by the .bspool header's `charset` line (the
+      `space` line is informational); rank<->seed conversion goes through
+      `make_seed_in(space, ...)` in the shared core. Old helper builds refuse
+      total-space pools cleanly ("pool charset differs"); natural pools are
+      byte-identical to before, and their criteria_hash is unchanged (the
+      space is hashed into the plan only when non-default), so existing
+      .state resumes survive the upgrade.
+    - The ONLY seed-length assumptions in the engine were pseudohash_ks
+      (fixed 8 -> strlen) and the ILV batched hashes. Batches need uniform
+      lengths, so: the scanner groups by length (mixed groups occur only at
+      the 7 length boundaries of the whole space and take the serial path),
+      the pool-restricted searcher evaluates total-space pools serially
+      (record-bounded, filter cost dominates), and the fixture mode flushes
+      its batch before a short seed so output order stays diffable.
+      pool_batch_selftest now proves every length 1-8 against the serial
+      reference at startup.
+    - Pool identity: criteria `label <name, spaces ok>` (control chars
+      stripped; NOT part of criteria_hash so renames don't kill resumes) and
+      a computed `pool_id` (FNV over catalog_hash+criteria_hash+range+space+
+      records+complete; final once complete=1). Both are in the 1 KiB header,
+      the .manifest, `export`'s summary, the builder web UI pool list, and
+      the in-game selector (Brainstorm.readPoolHeader reads exactly 1 KiB via
+      nativefs.read(path, 1024) — never the whole multi-GB file).
+    - Builder UIs: web page gained a "Seed space" select with per-space
+      "entire space" wording and a hint that typed-only seeds never occur
+      naturally; the curses TUI gained the same cycler. Estimate projections
+      now use the manifest's own `seedspace` instead of a hardcoded 34^8.
+    - Tests: every fixture case gained 36 typed-style seeds (4 random per
+      length 1-8 over the 36-symbol charset + "1", "0", "O", "0O0O0O0O"),
+      proving Lua-oracle parity for short/0/O seeds on both platforms;
+      pool_search_equivalence.sh gained a total-space section — pool over
+      ranks 0..3M (all members shorter than 8 chars by construction), header
+      space/label/pool_id assertions, restricted search whose hit must be a
+      typed-only pool member accepted by the fixture path, and exhaustion.
+    - In-game search semantics are unchanged: full-space Ctrl+A searches
+      stay natural (they hunt seeds the game can deal); the total space is
+      reachable only through a total-space .bspool.
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip

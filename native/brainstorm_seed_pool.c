@@ -53,6 +53,8 @@ typedef struct {
 typedef struct {
 	int schema, sawEnd;
 	int threads, resume, collectTags;
+	int space; /* SPACE_NATURAL (default) or SPACE_TOTAL */
+	char label[136]; /* optional shareable pool name; not part of criteriaHash */
 	uint64_t start, count, checkpoint, chunk;
 	int countAll;
 	PoolFormat format;
@@ -70,6 +72,20 @@ typedef struct {
 	char kEdiSoul[POOL_MAX_ANTE + 1][24];
 	uint64_t catalogHash, criteriaHash;
 } PoolPlan;
+
+/* Short shareable fingerprint shown by the builder UI and the in-game
+ * selector: two people holding the same pool see the same id. Covers
+ * everything that decides the pool's CONTENT (catalog, criteria, range,
+ * space, committed records, completeness) -- and not the label, so renaming
+ * doesn't change identity. Final once the scan completes. */
+static void pool_compute_id(const PoolPlan *p, uint64_t records, int complete, char out[24]) {
+	char buf[192];
+	int n = snprintf(buf, sizeof buf, "%016" PRIx64 "%016" PRIx64 "%" PRIu64 "-%" PRIu64 "%s%" PRIu64 "%d",
+			p->catalogHash, p->criteriaHash, p->start, p->start + p->count,
+			space_name(p->space), records, complete);
+	uint64_t h = pool_hash_update(UINT64_C(1469598103934665603), buf, (size_t)n);
+	snprintf(out, 24, "%016" PRIx64, h);
+}
 
 /* An exhaustive scan evaluates far more than 2^32 candidates per worker.
  * Use 64-bit generations here; the interactive helper's uint32 generation is
@@ -134,6 +150,13 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 	int n = snprintf(line, sizeof line, "poolver %d\nformat %d\ntag_route %d\n",
 			p->schema, (int)p->format, p->collectTags);
 	h = pool_hash_update(h, line, (size_t)n);
+	/* Hashed only when non-default so every existing natural pool, .state
+	 * file, and manifest keeps its criteria_hash. The label is deliberately
+	 * NOT hashed: renaming a pool must not invalidate a resumable scan. */
+	if (p->space != SPACE_NATURAL) {
+		n = snprintf(line, sizeof line, "space %s\n", space_name(p->space));
+		h = pool_hash_update(h, line, (size_t)n);
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		n = snprintf(line, sizeof line, "tag %s %d %d %d\n",
@@ -214,6 +237,22 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 			if (v && !strcmp(v, "collect")) p->collectTags = 1;
 			else if (v && !strcmp(v, "observe")) p->collectTags = 0;
 			else goto bad_value;
+		} else if (!strcmp(d, "space")) {
+			char *v = pool_tok(&sp);
+			if (v && !strcmp(v, "natural")) p->space = SPACE_NATURAL;
+			else if (v && !strcmp(v, "total")) p->space = SPACE_TOTAL;
+			else goto bad_value;
+		} else if (!strcmp(d, "label")) {
+			/* rest of the line, spaces allowed; drop control characters so
+			 * the label can't forge header/manifest lines */
+			while (*sp == ' ' || *sp == '\t') sp++;
+			size_t w = 0;
+			for (; *sp && w + 1 < sizeof p->label; sp++) {
+				if ((unsigned char)*sp >= 32) p->label[w++] = *sp;
+			}
+			while (w && p->label[w - 1] == ' ') w--;
+			p->label[w] = 0;
+			continue;
 		} else if (!strcmp(d, "tag")) {
 			if (p->ntagRules >= POOL_MAX_TAG_RULES) {
 				snprintf(err, errsz, "criteria line %d: too many tag rules (max %d)", lineno, POOL_MAX_TAG_RULES);
@@ -261,9 +300,10 @@ bad_value:
 
 	if (!p->sawEnd) { snprintf(err, errsz, "criteria truncated (no end marker)"); return false; }
 	if (p->schema != POOL_SCHEMA) { snprintf(err, errsz, "criteria poolver %d != scanner schema %d", p->schema, POOL_SCHEMA); return false; }
-	if (p->start >= SEEDSPACE) { snprintf(err, errsz, "start is outside the 34^8 seed space"); return false; }
-	if (p->countAll) p->count = SEEDSPACE - p->start;
-	if (!p->count || p->count > SEEDSPACE - p->start) { snprintf(err, errsz, "count extends outside the 34^8 seed space"); return false; }
+	uint64_t seedspace = space_size(p->space);
+	if (p->start >= seedspace) { snprintf(err, errsz, "start is outside the %s seed space (%" PRIu64 " seeds)", space_name(p->space), seedspace); return false; }
+	if (p->countAll) p->count = seedspace - p->start;
+	if (!p->count || p->count > seedspace - p->start) { snprintf(err, errsz, "count extends outside the %s seed space (%" PRIu64 " seeds)", space_name(p->space), seedspace); return false; }
 	if (p->threads == 0) {
 		int ncpu = bs_cpu_count();
 		p->threads = ncpu > 1 ? ncpu - 1 : 1;
@@ -543,6 +583,21 @@ static bool pool_batch_selftest(const PoolPlan *p) {
 			if (hf[i] != pseudohash_ks(p->firstKey, seeds[i])) return false;
 		}
 	}
+	/* Total-space batches run at every seed length; prove each length's
+	 * batched hash against the serial reference too. */
+	for (int slen = 1; slen <= 8; slen++) {
+		uint64_t base = 0;
+		for (int l = 1; l < slen; l++) base = (base + 1) * CHARSET_TOTAL_N;
+		for (int i = 0; i < ILV; i++) {
+			if (make_seed_in(SPACE_TOTAL, base + (uint64_t)i * 31 % 36, seeds[i]) != slen) return false;
+		}
+		batch_hash_seed_n(seeds, slen, hs);
+		batch_hash_key_n(p->firstKey, seeds, slen, hf);
+		for (int i = 0; i < ILV; i++) {
+			if (hs[i] != pseudohash_ks("", seeds[i])) return false;
+			if (hf[i] != pseudohash_ks(p->firstKey, seeds[i])) return false;
+		}
+	}
 	return true;
 }
 
@@ -572,13 +627,14 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf, size_t *used)
 
 static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf, size_t *used,
 		uint64_t rank, const char seed[9]) {
-	size_t record = s->p->format == POOL_BINARY ? 8u : 9u;
+	size_t slen = strlen(seed); /* 8 in the natural space, 1..8 in total */
+	size_t record = s->p->format == POOL_BINARY ? 8u : slen + 1;
 	if (*used + record > POOL_OUTPUT_BUFFER && !pool_flush_hits(s, buf, used)) return false;
 	if (s->p->format == POOL_BINARY) {
 		for (int i = 0; i < 8; i++) buf[(*used)++] = (unsigned char)(rank >> (8 * i));
 	} else if (s->p->format == POOL_TEXT) {
-		memcpy(buf + *used, seed, 8);
-		*used += 8;
+		memcpy(buf + *used, seed, slen);
+		*used += slen;
 		buf[(*used)++] = '\n';
 	}
 	return true;
@@ -605,10 +661,26 @@ static void *pool_scan_worker(void *arg) {
 		if (end > s->end) end = s->end;
 		uint64_t rank = begin;
 		uint64_t chunkMatched = 0;
+		int space = s->p->space;
 		for (; rank + ILV <= end; rank += ILV) {
-			for (int i = 0; i < ILV; i++) make_seed(rank + (uint64_t)i, seeds[i]);
-			batch_hash_seed(seeds, hseed);
-			batch_hash_key(s->p->firstKey, seeds, hfirst);
+			/* In the total space seed length grows with rank; the batched
+			 * hash needs one shared length. Lengths differ inside a group
+			 * only at the 7 length boundaries of the whole space -- those
+			 * groups take the serial path below. */
+			int l0 = make_seed_in(space, rank, seeds[0]);
+			int uniform = 1;
+			for (int i = 1; i < ILV; i++) {
+				if (make_seed_in(space, rank + (uint64_t)i, seeds[i]) != l0) uniform = 0;
+			}
+			if (uniform) {
+				batch_hash_seed_n(seeds, l0, hseed);
+				batch_hash_key_n(s->p->firstKey, seeds, l0, hfirst);
+			} else {
+				for (int i = 0; i < ILV; i++) {
+					hseed[i] = pseudohash_ks("", seeds[i]);
+					hfirst[i] = pseudohash_ks(s->p->firstKey, seeds[i]);
+				}
+			}
 			for (int i = 0; i < ILV; i++) {
 				if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i], NULL, 0)) {
 					chunkMatched++;
@@ -617,7 +689,7 @@ static void *pool_scan_worker(void *arg) {
 			}
 		}
 		for (; rank < end; rank++) {
-			make_seed(rank, seeds[0]);
+			make_seed_in(space, rank, seeds[0]);
 			double hs = pseudohash_ks("", seeds[0]);
 			double hf = pseudohash_ks(s->p->firstKey, seeds[0]);
 			if (pool_evaluate_pre(c, seeds[0], hs, hf, NULL, 0)) {
@@ -643,16 +715,27 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	/* The header embeds the criteria that built the pool so a shared .bspool
 	 * is self-describing without its .manifest sidecar, and so the in-game
 	 * consumer can later compose the pool's tag route with overlay filters. */
+	char poolId[24];
+	pool_compute_id(p, records, complete, poolId);
 	int n = snprintf((char *)buf, sizeof buf,
 			"BRAINSTORM_SEED_POOL %d\n"
 			"modelver %d\nencoding u64le\ncharset %s\nseedspace %" PRIu64 "\n"
+			"space %s\n"
 			"range_start %" PRIu64 "\nrange_end %" PRIu64 "\n"
 			"catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n"
+			"pool_id %s\n"
 			"tag_route %s\n",
-			POOL_SCHEMA, MODELVER, CHARSET, (uint64_t)SEEDSPACE,
+			POOL_SCHEMA, MODELVER, space_charset(p->space), space_size(p->space),
+			space_name(p->space),
 			p->start, p->start + p->count, p->catalogHash, p->criteriaHash,
+			poolId,
 			p->collectTags ? "collect" : "observe");
 	if (n < 0 || n >= (int)sizeof buf) { snprintf(err, errsz, "binary header overflow"); return false; }
+	if (p->label[0]) {
+		int lw = snprintf((char *)buf + n, sizeof buf - (size_t)n, "label %s\n", p->label);
+		if (lw < 0 || lw >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		n += lw;
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "tag %s %d %d %d\n",
@@ -745,11 +828,16 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 	FILE *f = fopen(path, "w");
 	if (!f) { snprintf(err, errsz, "cannot write manifest: %s", strerror(errno)); return false; }
 	double rate = s->scanned ? (double)s->matched / (double)s->scanned : 0.0;
-	double projected = rate * (double)SEEDSPACE;
+	double projected = rate * (double)space_size(p->space);
+	char poolId[24];
+	pool_compute_id(p, s->matched, s->done, poolId);
 	fprintf(f, "BRAINSTORM_SEED_POOL_MANIFEST %d\n", POOL_SCHEMA);
 	fprintf(f, "modelver %d\nfp_mode %s\n", MODELVER, g_seed_fma ? "fma" : "plain");
 	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n", p->catalogHash, p->criteriaHash);
-	fprintf(f, "charset %s\nseedspace %" PRIu64 "\n", CHARSET, (uint64_t)SEEDSPACE);
+	fprintf(f, "pool_id %s\n", poolId);
+	if (p->label[0]) fprintf(f, "label %s\n", p->label);
+	fprintf(f, "charset %s\nseedspace %" PRIu64 "\nspace %s\n",
+			space_charset(p->space), space_size(p->space), space_name(p->space));
 	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->start, p->start + p->count);
 	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\n", s->scanned, s->matched, s->done);
 	fprintf(f, "format %s\nrecord_order unordered\ntag_route %s\n",
@@ -907,8 +995,12 @@ static int pool_mode_fixture(const Config *g, const PoolPlan *p, const char *see
 	c->g = g; c->p = p;
 	char line[128], seed[9], label[POOL_LABEL];
 	while (fgets(line, sizeof line, f)) {
-		if (strlen(line) < 8) continue;
-		memcpy(seed, line, 8); seed[8] = 0;
+		size_t slen = strlen(line);
+		while (slen > 0 && (line[slen - 1] == '\n' || line[slen - 1] == '\r'
+				|| line[slen - 1] == ' ' || line[slen - 1] == '\t')) slen--;
+		if (slen == 0) continue;
+		if (slen > 8) slen = 8;
+		memcpy(seed, line, slen); seed[slen] = 0;
 		double hs = pseudohash_ks("", seed);
 		double hf = pseudohash_ks(p->firstKey, seed);
 		bool ok = pool_evaluate_pre(c, seed, hs, hf, label, sizeof label);
@@ -946,17 +1038,20 @@ static int pool_mode_export(const char *input, const char *output) {
 		}
 		uint64_t rank = 0;
 		for (int i = 0; i < 8; i++) rank |= (uint64_t)raw[i] << (8 * i);
-		if (rank >= SEEDSPACE) {
+		if (rank >= space_size(h.space)) {
 			fprintf(stderr, "invalid seed rank %" PRIu64 " at record %" PRIu64 "\n", rank, record);
 			if (out != stdout) fclose(out); fclose(in); return 1;
 		}
 		char seed[9];
-		make_seed(rank, seed);
+		make_seed_in(h.space, rank, seed);
 		fprintf(out, "%s\n", seed);
 	}
 	if (out != stdout && fclose(out) != 0) { fprintf(stderr, "cannot close export\n"); fclose(in); return 1; }
 	fclose(in);
-	fprintf(stderr, "exported %" PRIu64 " seeds%s\n", records, complete ? " from a complete pool" : " from an incomplete pool");
+	fprintf(stderr, "exported %" PRIu64 " seeds%s (space %s, pool_id %s%s%s)\n",
+			records, complete ? " from a complete pool" : " from an incomplete pool",
+			space_name(h.space), h.poolId[0] ? h.poolId : "-",
+			h.label[0] ? ", label " : "", h.label);
 	return 0;
 }
 

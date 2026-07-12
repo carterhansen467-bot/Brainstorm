@@ -255,6 +255,30 @@ local function bootstrapCase(case, session)
 end
 
 local CHARSET = "123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+-- Typed-style seeds: the seed box also accepts 0/O and 1-7 character seeds
+-- even though the game never generates them, and total-space .bspool pools
+-- contain them -- the helper must agree on those too. Four random seeds of
+-- every length over the full 36-symbol charset, plus fixed edge cases.
+local CHARSET_TYPED = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+local function appendTypedSeeds(list, salt)
+	local x = 987654321 + (salt or 0) * 104729
+	for len = 1, 8 do
+		for _ = 1, 4 do
+			local chars = {}
+			for j = 1, len do
+				x = lcg(x)
+				local idx = (x % 36) + 1
+				chars[j] = CHARSET_TYPED:sub(idx, idx)
+			end
+			list[#list + 1] = table.concat(chars)
+		end
+	end
+	list[#list + 1] = "1"
+	list[#list + 1] = "0"
+	list[#list + 1] = "O"
+	list[#list + 1] = "0O0O0O0O"
+end
+
 local function makeSeedList(n, salt)
 	local x = 123456789 + (salt or 0) * 7919
 	local list = {}
@@ -267,6 +291,7 @@ local function makeSeedList(n, salt)
 		end
 		list[i] = table.concat(chars)
 	end
+	appendTypedSeeds(list, salt)
 	return list
 end
 

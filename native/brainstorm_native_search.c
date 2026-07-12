@@ -137,12 +137,13 @@ static inline int lj_random_n(PRNG *rs, int n) {
 
 /* ------------------------------------------------------------ pseudohash --
  * Balatro's pseudohash over key..seed (Lua-level math: no contraction). */
-static double pseudohash_ks(const char *key, const char *seed8) {
+static double pseudohash_ks(const char *key, const char *seed) {
 	char buf[96];
 	size_t kl = strlen(key);
+	size_t sl = strlen(seed); /* 8 for natural seeds; 1..8 in a total-space pool */
 	memcpy(buf, key, kl);
-	memcpy(buf + kl, seed8, 8);
-	int len = (int)kl + 8;
+	memcpy(buf + kl, seed, sl);
+	int len = (int)(kl + sl);
 	double num = 1.0;
 	for (int i = len; i >= 1; i--) {
 		num = lua_mod1((1.1239285023 / num) * (double)(unsigned char)buf[i - 1] * LUA_PI + LUA_PI * (double)i);
@@ -221,6 +222,56 @@ static void make_seed(uint64_t k, char out[9]) {
 		k /= CHARSET_N;
 	}
 	out[8] = 0;
+}
+
+/* The natural space above is what the game GENERATES. The "total" space is
+ * everything its seed box ACCEPTS typed in: 0-9 A-Z (0 and O included),
+ * lengths 1..8. Ranks order seeds shortest-first; within a length the digit
+ * order is little-endian, same convention as make_seed. Only .bspool files
+ * carry a space choice -- live full-space searches stay natural, since they
+ * hunt seeds the game can actually deal. */
+static const char CHARSET_TOTAL[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+#define CHARSET_TOTAL_N 36
+static const uint64_t SEEDSPACE_TOTAL = 2901713047668ULL; /* 36^1 + ... + 36^8 */
+
+enum { SPACE_NATURAL = 0, SPACE_TOTAL = 1 };
+
+/* the last two are used by the pool-builder translation unit only */
+#if defined(__GNUC__) || defined(__clang__)
+#define BS_MAYBE_UNUSED __attribute__((unused))
+#else
+#define BS_MAYBE_UNUSED
+#endif
+static uint64_t space_size(int space) {
+	return space == SPACE_TOTAL ? SEEDSPACE_TOTAL : SEEDSPACE;
+}
+BS_MAYBE_UNUSED static const char *space_charset(int space) {
+	return space == SPACE_TOTAL ? CHARSET_TOTAL : CHARSET;
+}
+BS_MAYBE_UNUSED static const char *space_name(int space) {
+	return space == SPACE_TOTAL ? "total" : "natural";
+}
+
+/* rank -> seed in a given space; returns the seed's length. The length clamp
+ * only matters for corrupt out-of-space ranks (callers validate first). */
+static int make_seed_in(int space, uint64_t k, char out[9]) {
+	if (space != SPACE_TOTAL) {
+		make_seed(k, out);
+		return 8;
+	}
+	uint64_t block = CHARSET_TOTAL_N;
+	int len = 1;
+	while (len < 8 && k >= block) {
+		k -= block;
+		block *= CHARSET_TOTAL_N;
+		len++;
+	}
+	for (int i = 0; i < len; i++) {
+		out[i] = CHARSET_TOTAL[k % CHARSET_TOTAL_N];
+		k /= CHARSET_TOTAL_N;
+	}
+	out[len] = 0;
+	return len;
 }
 
 static uint64_t splitmix64(uint64_t x) {
@@ -756,10 +807,12 @@ static bool passes(Ctx *c) {
  * whose fixture mode runs this exact path). */
 #define ILV 8
 
-static void batch_hash_seed(const char seeds[ILV][9], double *out) {
+/* slen: shared length of every seed in the batch (8 for natural seeds;
+ * total-space callers group same-length candidates before batching). */
+static void batch_hash_seed_n(const char seeds[ILV][9], int slen, double *out) {
 	double num[ILV];
 	for (int i = 0; i < ILV; i++) num[i] = 1.0;
-	for (int pos = 8; pos >= 1; pos--) {
+	for (int pos = slen; pos >= 1; pos--) {
 		double pi_pos = LUA_PI * (double)pos; /* same product as the serial code */
 		for (int i = 0; i < ILV; i++) {
 			double x = (1.1239285023 / num[i]) * (double)(unsigned char)seeds[i][pos - 1] * LUA_PI + pi_pos;
@@ -769,9 +822,13 @@ static void batch_hash_seed(const char seeds[ILV][9], double *out) {
 	for (int i = 0; i < ILV; i++) out[i] = num[i];
 }
 
-static void batch_hash_key(const char *key, const char seeds[ILV][9], double *out) {
+static void batch_hash_seed(const char seeds[ILV][9], double *out) {
+	batch_hash_seed_n(seeds, 8, out);
+}
+
+static void batch_hash_key_n(const char *key, const char seeds[ILV][9], int slen, double *out) {
 	int kl = (int)strlen(key);
-	int len = kl + 8;
+	int len = kl + slen;
 	double num[ILV];
 	for (int i = 0; i < ILV; i++) num[i] = 1.0;
 	for (int pos = len; pos >= 1; pos--) {
@@ -791,6 +848,10 @@ static void batch_hash_key(const char *key, const char seeds[ILV][9], double *ou
 		}
 	}
 	for (int i = 0; i < ILV; i++) out[i] = num[i];
+}
+
+static void batch_hash_key(const char *key, const char seeds[ILV][9], double *out) {
+	batch_hash_key_n(key, seeds, 8, out);
 }
 
 static Stream *first_stream(Ctx *c) {
@@ -1077,6 +1138,9 @@ typedef struct {
 	uint64_t seedspace, rangeStart, rangeEnd, records;
 	uint64_t catalogHash, criteriaHash;
 	char charset[64];
+	int space;           /* SPACE_NATURAL / SPACE_TOTAL, derived from charset */
+	char label[136];     /* optional user-given pool name (may contain spaces) */
+	char poolId[24];     /* short shareable fingerprint, hex */
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
 	int ntagRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
@@ -1177,6 +1241,12 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		else if (!strcmp(d, "complete")) { v = pool_tok(&sp); h->complete = v ? atoi(v) : 0; }
 		else if (!strcmp(d, "header_bytes")) { v = pool_tok(&sp); h->headerBytes = v ? atoi(v) : 0; }
 		else if (!strcmp(d, "tag_route")) { v = pool_tok(&sp); h->route = (v && !strcmp(v, "observe")) ? 0 : 1; }
+		else if (!strcmp(d, "pool_id")) { v = pool_tok(&sp); if (v) snprintf(h->poolId, sizeof h->poolId, "%s", v); }
+		else if (!strcmp(d, "label")) {
+			/* rest of the line, spaces included */
+			while (*sp == ' ' || *sp == '\t') sp++;
+			snprintf(h->label, sizeof h->label, "%s", sp);
+		}
 		else if (!strcmp(d, "tag")) {
 			if (h->ntagRules < BSPOOL_MAX_TAG_RULES) {
 				char *k = pool_tok(&sp);
@@ -1207,8 +1277,13 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	if (h->schema != BSPOOL_SCHEMA) { snprintf(err, errsz, "pool schema %d unsupported (want %d)", h->schema, BSPOOL_SCHEMA); return false; }
 	if (!sawEnd) { snprintf(err, errsz, "pool header has no end marker"); return false; }
 	if (strcmp(encoding, "u64le")) { snprintf(err, errsz, "pool encoding is not u64le"); return false; }
-	if (strcmp(h->charset, CHARSET)) { snprintf(err, errsz, "pool charset differs"); return false; }
-	if (h->seedspace != SEEDSPACE) { snprintf(err, errsz, "pool seed space differs"); return false; }
+	/* The charset decides which seed space the ranks index (the human-readable
+	 * `space` header line is informational). Unknown charsets are refused: a
+	 * newer format should fail loudly, never decode to wrong seeds. */
+	if (!strcmp(h->charset, CHARSET)) h->space = SPACE_NATURAL;
+	else if (!strcmp(h->charset, CHARSET_TOTAL)) h->space = SPACE_TOTAL;
+	else { snprintf(err, errsz, "pool charset differs"); return false; }
+	if (h->seedspace != space_size(h->space)) { snprintf(err, errsz, "pool seed space differs"); return false; }
 	if (h->headerBytes < 64 || h->headerBytes > BSPOOL_HEADER_SIZE) {
 		snprintf(err, errsz, "pool header_bytes %d is invalid", h->headerBytes);
 		return false;
@@ -1235,6 +1310,7 @@ static char g_warn[256];
  * finished scan with no hit is a DEFINITIVE "nothing in this pool matches". */
 typedef struct {
 	int fd;
+	int space;                /* seed space the pool's ranks index */
 	uint64_t records, rot, dataOff;
 	_Atomic uint64_t next;    /* rotated record index dealt to workers */
 	_Atomic int live;         /* workers still scanning (exhaustion detect) */
@@ -1312,10 +1388,15 @@ static void *pool_worker(void *vp) {
 		/* drop corrupt out-of-space ranks instead of trusting them */
 		uint64_t m = 0;
 		for (uint64_t i = 0; i < n; i++) {
-			if (ranks[i] < SEEDSPACE) ranks[m++] = ranks[i];
+			if (ranks[i] < space_size(g_pool.space)) ranks[m++] = ranks[i];
 		}
 		uint64_t i = 0;
-		for (; i + ILV <= m && !atomic_load_explicit(&g_stop, memory_order_relaxed); i += ILV) {
+		/* The batched hash needs uniform seed lengths; total-space pool
+		 * records mix lengths, so those go through the serial path below
+		 * (pool searches are record-bounded -- batching is a full-space
+		 * scan optimization, not a correctness requirement). */
+		for (; g_pool.space == SPACE_NATURAL && i + ILV <= m
+				&& !atomic_load_explicit(&g_stop, memory_order_relaxed); i += ILV) {
 			for (int j = 0; j < ILV; j++) make_seed(ranks[i + (uint64_t)j], seeds[j]);
 			batch_hash_seed(seeds, hseed);
 			if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
@@ -1327,7 +1408,7 @@ static void *pool_worker(void *vp) {
 			}
 		}
 		for (; i < m && !atomic_load_explicit(&g_stop, memory_order_relaxed); i++) {
-			make_seed(ranks[i], c->seed);
+			make_seed_in(g_pool.space, ranks[i], c->seed);
 			if (passes(c)) record_hit(c);
 		}
 		atomic_fetch_add_explicit(&g_tried, (unsigned long long)m, memory_order_relaxed);
@@ -1439,6 +1520,7 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 	fclose(f);
 	if (fd < 0) { snprintf(err, errsz, "pool: cannot keep %s open", g->poolFile); return false; }
 	g_pool.fd = fd;
+	g_pool.space = h.space;
 	g_pool.records = records;
 	g_pool.dataOff = (uint64_t)h.headerBytes;
 	g_pool_active = true;
@@ -1532,12 +1614,21 @@ static int mode_fixture(const Config *g, const char *seedfile) {
 	char line[64];
 	for (;;) {
 		bool more = fgets(line, sizeof line, f) != NULL;
-		if (more && strlen(line) >= 8) {
+		int slen = 0;
+		if (more) {
+			slen = (int)strlen(line);
+			while (slen > 0 && (line[slen - 1] == '\n' || line[slen - 1] == '\r'
+					|| line[slen - 1] == ' ' || line[slen - 1] == '\t')) slen--;
+			if (slen > 8) slen = 8;
+		}
+		if (more && slen == 8) {
 			memcpy(seeds[nbuf], line, 8);
 			seeds[nbuf][8] = 0;
 			nbuf++;
 		}
-		if (nbuf == ILV || (!more && nbuf > 0)) {
+		/* Flush the batch when full, at EOF, and before any short seed so
+		 * output order always matches input order (fixtures are diffed). */
+		if (nbuf == ILV || ((!more || (slen > 0 && slen < 8)) && nbuf > 0)) {
 			if (nbuf == ILV) {
 				batch_hash_seed(seeds, hseed);
 				if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
@@ -1553,6 +1644,14 @@ static int mode_fixture(const Config *g, const char *seedfile) {
 				}
 			}
 			nbuf = 0;
+		}
+		/* Short seeds (typed-in style, 1..7 chars) evaluate serially: the
+		 * batched hash requires uniform lengths. */
+		if (more && slen > 0 && slen < 8) {
+			memcpy(c->seed, line, (size_t)slen);
+			c->seed[slen] = 0;
+			bool ok = passes(c);
+			printf("%s %d %s\n", c->seed, ok ? 1 : 0, (ok && c->label[0]) ? c->label : "-");
 		}
 		if (!more) break;
 	}

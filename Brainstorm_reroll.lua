@@ -2134,6 +2134,40 @@ function Brainstorm.seedPoolDir()
 	return Brainstorm.modPath() .. "/seed_pools"
 end
 
+-- Identity readout for a .bspool: the header is a fixed 1 KiB text block, so
+-- one bounded read is enough even for multi-GB pools. Returns nil when the
+-- file is missing or not a pool.
+function Brainstorm.readPoolHeader(path)
+	local nativefs = require("nativefs")
+	local raw = nativefs.read(path, 1024)
+	if not raw or not raw:match("^BRAINSTORM_SEED_POOL ") then return nil end
+	local h = {}
+	for line in raw:gmatch("[^\n]+") do
+		local k, v = line:match("^(%S+)%s*(.-)%s*$")
+		if k == "end" then break end
+		if k == "records" or k == "complete" then h[k] = tonumber(v)
+		elseif k == "space" or k == "pool_id" or k == "label" then h[k] = v end
+	end
+	return h
+end
+
+-- One-line description shown under the in-game Seed Pool selector; the
+-- pool_id prefix is the shareable identity mark (same file => same id).
+function Brainstorm.poolInfoString(name)
+	if not name or name == "" then return "" end
+	local h = Brainstorm.readPoolHeader(Brainstorm.seedPoolDir() .. "/" .. name)
+	if not h then return "(pool file missing or unreadable)" end
+	local bits = {}
+	if h.label and h.label ~= "" and (h.label .. ".bspool") ~= name then
+		bits[#bits + 1] = '"' .. h.label .. '"'
+	end
+	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
+	if h.space == "total" then bits[#bits + 1] = "all typeable seeds" end
+	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
+	bits[#bits + 1] = (h.complete == 1) and "complete" or "PARTIAL SCAN"
+	return table.concat(bits, "  |  ")
+end
+
 -- Selected pool's full path, or nil when no pool is selected. Existence is
 -- intentionally NOT cached: the user may drop a file in while the game runs.
 function Brainstorm.seedPoolPath()

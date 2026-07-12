@@ -47,7 +47,14 @@ POOL_BIN = os.path.join(NATIVE_DIR,
                         "brainstorm_seed_pool" + (".exe" if IS_WINDOWS else ""))
 SNAPSHOT = os.path.join(MOD_DIR, "native_search.cfg")
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
-SEEDSPACE = 1785793904896  # 34^8
+SEEDSPACE = 1785793904896  # 34^8: seeds the game's generator can deal
+# 36^1 + ... + 36^8: every seed the game ACCEPTS typed in -- adds 0/O and
+# 1-7 character seeds. Only reachable by typing, never by rerolling.
+SEEDSPACE_TOTAL = 2901713047668
+SPACES = [
+    ("natural", "Natural (34^8 -- seeds the game deals)", SEEDSPACE),
+    ("total", "All typeable (adds 0/O + short seeds)", SEEDSPACE_TOTAL),
+]
 MAX_TAG_RULES = 16
 MAX_ANTE = 39
 
@@ -68,7 +75,7 @@ TAG_NAMES = {
 }
 
 SCOPES = [
-    ("Full space (34^8)", 0),
+    ("Entire seed space", 0),
     ("First 10M seeds", 10_000_000),
     ("First 100M seeds", 100_000_000),
     ("First 1B seeds", 1_000_000_000),
@@ -137,8 +144,12 @@ class Criteria:
         self.route_collect = True
         self.threads = 0         # 0 = auto
         self.scope = 0           # index into SCOPES
+        self.space = "natural"   # SPACES key: "natural" or "total"
         self.name = ""           # "" = auto
         self.name_edited = False
+
+    def seedspace(self):
+        return SEEDSPACE_TOTAL if self.space == "total" else SEEDSPACE
 
     def predicates(self):
         return bool(self.legendary) or bool(self.tag_rules)
@@ -158,6 +169,8 @@ class Criteria:
             b += "-a%d" % self.leg_min if self.leg_min == self.leg_max \
                 else "-a%d-%d" % (self.leg_min, self.leg_max)
             bits.append(b)
+        if self.space == "total":
+            bits.append("total")
         return re.sub(r"[^A-Za-z0-9._+-]", "-", "_".join(bits)) or "pool"
 
     def pool_name(self):
@@ -174,6 +187,9 @@ class Criteria:
                  "resume 1",
                  "format %s" % fmt,
                  "tag_route %s" % ("collect" if self.route_collect else "observe")]
+        if self.space != "natural":
+            lines.append("space %s" % self.space)
+        lines.append("label %s" % self.pool_name())
         for key, lo, hi, cnt in self.tag_rules:
             lines.append("tag %s %d %d %d" % (key, lo, hi, cnt))
         if self.legendary:
@@ -194,7 +210,10 @@ class Criteria:
             s = ("Negative " if self.leg_neg else "") + joker_name(self.legendary)
             s += " first Soul (antes %d-%d)" % (self.leg_min, self.leg_max)
             parts.append(s)
-        return " + ".join(parts) if parts else "(no criteria yet)"
+        out = " + ".join(parts) if parts else "(no criteria yet)"
+        if self.space == "total":
+            out += " [all typeable seeds]"
+        return out
 
 
 class Runner:
@@ -335,6 +354,8 @@ class App:
         f.append(Field("cycle", "Threads",
                        options=["Auto (cores-1)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
                        idx=c.threads, set=self._set_threads))
+        f.append(Field("cycle", "Seed space", options=[s[1] for s in SPACES],
+                       idx=[s[0] for s in SPACES].index(c.space), set=self._set_space))
         f.append(Field("cycle", "Scan scope", options=[s[0] for s in SCOPES],
                        idx=c.scope, set=self._set_scope))
         f.append(Field("text", "Pool name", get=c.pool_name, set=self._set_name))
@@ -368,6 +389,9 @@ class App:
 
     def _set_scope(self, i):
         self.crit.scope = i
+
+    def _set_space(self, i):
+        self.crit.space = SPACES[i][0]
 
     def _set_name(self, s):
         self.crit.name = s
@@ -597,8 +621,9 @@ class App:
                 lines.append(("Projected over the full seed space: ~%s seeds, ~%s on disk"
                               % (f"{int(proj):,}", human_bytes(projb)), 0))
                 if rate > 0:
+                    space_total = float(manifest.get("seedspace", "0") or 0) or SEEDSPACE
                     lines.append(("Projected full-scan time at this rate: %s"
-                                  % human_secs(SEEDSPACE / rate), 0))
+                                  % human_secs(space_total / rate), 0))
             elif rc == 0:
                 lines.append(("Pool file: %s" % runner.output, 3))
                 lines.append(("It now appears in the in-game Seed Pool selector; "

@@ -149,11 +149,20 @@ searching.
 ### Exhaustive external seed-pool builder (phase 1)
 
 `native/build.sh` also builds `native/brainstorm_seed_pool`, a standalone
-program for exhaustively scanning an exact numeric range of Balatro's full
-`34^8 = 1,785,793,904,896` eight-character seed space. Unlike the in-game
-first-hit search, it never samples, wraps, or stops after one match. It can
-combine multiple ranged tag constraints with a first-Soul legendary
-constraint and write every match.
+program for exhaustively scanning an exact numeric range of a seed space.
+Unlike the in-game first-hit search, it never samples, wraps, or stops after
+one match. It can combine multiple ranged tag constraints with a first-Soul
+legendary constraint and write every match.
+
+Two seed spaces are supported:
+
+- **natural** (default): `34^8 = 1,785,793,904,896` eight-character seeds
+  over the game's generation alphabet (no `0`, no `O`) — every seed the game
+  can actually deal you.
+- **total** (`space total` in the criteria): `36^1 + ... + 36^8 =
+  2,901,713,047,668` seeds — everything the seed box *accepts typed in*,
+  adding `0`/`O` and 1-7 character seeds. Those extra ~1.1 trillion seeds
+  never occur naturally; they only exist if someone types them.
 
 The scanner reads two inputs:
 
@@ -213,7 +222,14 @@ Criteria directives currently supported are:
 tag <key> <inclusive-min-ante> <inclusive-max-ante> <minimum-count>
 legendary <key> <inclusive-min-ante> <inclusive-max-ante> [require-negative]
 tag_route collect|observe
+space natural|total
+label <any name, spaces allowed>
 ```
+
+`label` names the pool; it is embedded in the `.bspool` header together with
+a `pool_id` (a short fingerprint of catalog + criteria + range + space +
+records), and both are shown by the Seed Pool Builder and the in-game
+selector — two people holding the same pool see the same id.
 
 `tag_route collect` selects the first required matching tag occurrences as
 actual blind skips. Those missing shops are fed into the Model-3 physical pack
@@ -231,13 +247,19 @@ leaves the machine) where you can:
 
 - pick a legendary (first Soul) with an ante window and optional Negative,
   plus any tag requirements, with dropdowns instead of config files;
+- choose the **seed space**: natural seeds only (the 1.79 trillion the game
+  can deal you), or all typeable seeds (2.90 trillion -- adds seeds with
+  `0`/`O` and seeds shorter than 8 characters, which only exist typed into
+  the seed box);
 - press **Estimate** to sample 100M seeds and see the projected pool size
   and how long the full scan would take on your machine;
 - press **Build pool** and watch live progress. Closing the window (or
   pressing **Pause scan**) stops at a checkpoint; pressing Build again with
   the same name resumes exactly where it left off -- safe across reboots,
   so a days-long full-space scan can be done in sittings;
-- see every finished pool with its embedded criteria. Finished pools land
+- see every finished pool with its embedded criteria, its name, and its
+  **pool id** -- a short fingerprint also shown by the in-game selector, so
+  two people can confirm they're holding the same pool. Finished pools land
   in `seed_pools/` and appear in the in-game Seed Pool selector
   automatically; sharing a pool = sending someone that one `.bspool` file
   to drop into their own `seed_pools/` folder.
