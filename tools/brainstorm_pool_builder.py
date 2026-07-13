@@ -660,7 +660,8 @@ class App:
                           % (f"{scanned:,}", f"{matched:,}", 100.0 * matched / scanned), 0))
             if estimate:
                 proj = float(manifest.get("projected_full_matches", "0") or 0)
-                projb = float(manifest.get("projected_u64_bytes", "0") or 0)
+                projb = float(manifest.get("projected_compressed_bytes",
+                                           manifest.get("projected_u64_bytes", "0")) or 0)
                 lines.append(("Projected over the full seed space: ~%s seeds, ~%s on disk"
                               % (f"{int(proj):,}", human_bytes(projb)), 0))
                 if rate > 0:

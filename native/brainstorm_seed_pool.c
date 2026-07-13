@@ -27,12 +27,15 @@
 /* Schema, header size, and header parsing live in the shared core
  * (.bspool contract section of brainstorm_native_search.c) because the
  * interactive searcher consumes these files too. */
-#define POOL_SCHEMA BSPOOL_SCHEMA
+/* Criteria/state schema remains 1; .bspool file schema is independently at 2. */
+#define POOL_SCHEMA 1
 #define POOL_MAX_ANTE 39
 #define POOL_MAX_TAG_RULES BSPOOL_MAX_TAG_RULES
 #define POOL_LABEL 512
 #define POOL_HEADER_SIZE BSPOOL_HEADER_SIZE
 #define POOL_OUTPUT_BUFFER (64 * 1024)
+_Static_assert(POOL_OUTPUT_BUFFER / 8 == BSPOOL_BLOCK_MAX_RECORDS,
+		"pool writer and schema-2 block limit must agree");
 
 typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
 
@@ -76,7 +79,7 @@ typedef struct {
 	char sourcePoolId[24];
 	uint64_t outputRangeStart, outputRangeEnd;
 	int inputFd;
-	uint64_t inputDataOff;
+	BspoolReader inputReader;
 } PoolPlan;
 
 /* Short shareable fingerprint shown by the builder UI and the in-game
@@ -625,25 +628,62 @@ typedef struct {
 } PoolScanShared;
 
 static bool pool_read_input_batch(const PoolScanShared *s, uint64_t first,
-		uint64_t count, uint64_t ranks[ILV], unsigned char raw[ILV * 8]) {
-	size_t bytes = (size_t)count * 8u;
-	int64_t off = (int64_t)(s->p->inputDataOff + first * 8u);
-	if (bs_pread(s->p->inputFd, raw, bytes, off) != (int64_t)bytes) return false;
-	for (uint64_t i = 0; i < count; i++) {
-		uint64_t rank = 0;
-		for (int b = 0; b < 8; b++) rank |= (uint64_t)raw[i * 8u + (uint64_t)b] << (8 * b);
-		if (rank >= space_size(s->p->space)) return false;
-		ranks[i] = rank;
-	}
-	return true;
+		uint64_t count, uint64_t ranks[ILV], BspoolScratch *scratch) {
+	return bspool_reader_read(&s->p->inputReader, first, count, ranks, scratch);
 }
 
-static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf, size_t *used) {
+static int pool_rank_compare(const void *a, const void *b) {
+	uint64_t x, y;
+	memcpy(&x, a, sizeof x); memcpy(&y, b, sizeof y);
+	return x < y ? -1 : x > y;
+}
+
+static size_t pool_encode_rank_block(unsigned char *buf, uint32_t count,
+		unsigned char *encoded, unsigned char header[BSPOOL_BLOCK_HEADER_SIZE]) {
+	qsort(buf, count, 8u, pool_rank_compare);
+	uint64_t first, last;
+	memcpy(&first, buf, 8); memcpy(&last, buf + (size_t)(count - 1) * 8u, 8);
+	size_t out = 0;
+	uint64_t prior = first;
+	for (uint32_t i = 1; i < count; i++) {
+		uint64_t rank;
+		memcpy(&rank, buf + (size_t)i * 8u, 8);
+		uint64_t delta = rank - prior;
+		do {
+			unsigned char b = (unsigned char)(delta & 0x7f);
+			delta >>= 7;
+			if (delta) b |= 0x80;
+			encoded[out++] = b;
+		} while (delta);
+		prior = rank;
+	}
+	memset(header, 0, BSPOOL_BLOCK_HEADER_SIZE);
+	memcpy(header, "BSP2", 4);
+	bspool_put_u32le(header + 4, count);
+	bspool_put_u32le(header + 8, (uint32_t)out);
+	bspool_put_u32le(header + 12, bspool_checksum(encoded, out));
+	bspool_put_u64le(header + 16, first);
+	bspool_put_u64le(header + 24, last);
+	return out;
+}
+
+static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
+		unsigned char *encoded, size_t *used) {
 	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
+	const unsigned char *writeBuf = buf;
+	size_t writeBytes = *used;
+	unsigned char header[BSPOOL_BLOCK_HEADER_SIZE];
+	if (s->p->format == POOL_BINARY) {
+		uint32_t count = (uint32_t)(*used / 8u);
+		size_t out = pool_encode_rank_block(buf, count, encoded, header);
+		writeBuf = encoded; writeBytes = out;
+	}
 	bs_mutex_lock(&s->outMutex);
-	size_t wrote = fwrite(buf, 1, *used, s->out);
+	size_t wroteHeader = s->p->format == POOL_BINARY
+			? fwrite(header, 1, sizeof header, s->out) : sizeof header;
+	size_t wrote = fwrite(writeBuf, 1, writeBytes, s->out);
 	bs_mutex_unlock(&s->outMutex);
-	if (wrote != *used) {
+	if (wroteHeader != sizeof header || wrote != writeBytes) {
 		atomic_store(&s->ioError, true);
 		return false;
 	}
@@ -651,13 +691,13 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf, size_t *used)
 	return true;
 }
 
-static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf, size_t *used,
-		uint64_t rank, const char seed[9]) {
+static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf,
+		unsigned char *encoded, size_t *used, uint64_t rank, const char seed[9]) {
 	size_t slen = strlen(seed); /* 8 in the natural space, 1..8 in total */
 	size_t record = s->p->format == POOL_BINARY ? 8u : slen + 1;
-	if (*used + record > POOL_OUTPUT_BUFFER && !pool_flush_hits(s, buf, used)) return false;
+	if (*used + record > POOL_OUTPUT_BUFFER && !pool_flush_hits(s, buf, encoded, used)) return false;
 	if (s->p->format == POOL_BINARY) {
-		for (int i = 0; i < 8; i++) buf[(*used)++] = (unsigned char)(rank >> (8 * i));
+		memcpy(buf + *used, &rank, 8); *used += 8;
 	} else if (s->p->format == POOL_TEXT) {
 		memcpy(buf + *used, seed, slen);
 		*used += slen;
@@ -670,8 +710,10 @@ static void *pool_scan_worker(void *arg) {
 	PoolScanShared *s = arg;
 	PoolCtx *c = calloc(1, sizeof *c);
 	unsigned char *outbuf = malloc(POOL_OUTPUT_BUFFER);
-	if (!c || !outbuf) {
-		free(c); free(outbuf);
+	unsigned char *encoded = malloc(POOL_OUTPUT_BUFFER);
+	BspoolScratch inputScratch = { .cachedBlock = UINT64_MAX };
+	if (!c || !outbuf || !encoded) {
+		free(c); free(outbuf); free(encoded);
 		atomic_store(&s->ioError, true);
 		return NULL;
 	}
@@ -681,7 +723,6 @@ static void *pool_scan_worker(void *arg) {
 	char seeds[ILV][9];
 	double hseed[ILV], hfirst[ILV];
 	uint64_t ranks[ILV];
-	unsigned char raw[ILV * 8];
 	while (!atomic_load(&s->ioError)) {
 		uint64_t begin = atomic_fetch_add(&s->next, s->p->chunk);
 		if (begin >= s->end) break;
@@ -691,7 +732,7 @@ static void *pool_scan_worker(void *arg) {
 		uint64_t chunkMatched = 0;
 		int space = s->p->space;
 		for (; rank + ILV <= end; rank += ILV) {
-			if (s->p->refilter && !pool_read_input_batch(s, rank, ILV, ranks, raw)) {
+			if (s->p->refilter && !pool_read_input_batch(s, rank, ILV, ranks, &inputScratch)) {
 				atomic_store(&s->ioError, true); goto done;
 			}
 			int l0 = 0, uniform = 1;
@@ -714,12 +755,12 @@ static void *pool_scan_worker(void *arg) {
 			for (int i = 0; i < ILV; i++) {
 				if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i], NULL, 0)) {
 					chunkMatched++;
-					if (!pool_buffer_hit(s, outbuf, &outUsed, ranks[i], seeds[i])) goto done;
+					if (!pool_buffer_hit(s, outbuf, encoded, &outUsed, ranks[i], seeds[i])) goto done;
 				}
 			}
 		}
 		for (; rank < end; rank++) {
-			if (s->p->refilter && !pool_read_input_batch(s, rank, 1, ranks, raw)) {
+			if (s->p->refilter && !pool_read_input_batch(s, rank, 1, ranks, &inputScratch)) {
 				atomic_store(&s->ioError, true); goto done;
 			}
 			uint64_t candidate = s->p->refilter ? ranks[0] : rank;
@@ -728,21 +769,23 @@ static void *pool_scan_worker(void *arg) {
 			double hf = pseudohash_ks(s->p->firstKey, seeds[0]);
 			if (pool_evaluate_pre(c, seeds[0], hs, hf, NULL, 0)) {
 				chunkMatched++;
-				if (!pool_buffer_hit(s, outbuf, &outUsed, candidate, seeds[0])) goto done;
+				if (!pool_buffer_hit(s, outbuf, encoded, &outUsed, candidate, seeds[0])) goto done;
 			}
 		}
 		atomic_fetch_add(&s->matched, chunkMatched);
 		atomic_fetch_add(&s->scanned, end - begin);
 	}
 done:
-	(void)pool_flush_hits(s, outbuf, &outUsed);
+	(void)pool_flush_hits(s, outbuf, encoded, &outUsed);
+	bspool_scratch_destroy(&inputScratch);
+	free(encoded);
 	free(outbuf);
 	free(c);
 	return NULL;
 }
 
 static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
-		int complete, char *err, size_t errsz) {
+		uint64_t dataBytes, int complete, char *err, size_t errsz) {
 	if (p->format != POOL_BINARY) return true;
 	unsigned char buf[POOL_HEADER_SIZE];
 	memset(buf, 0, sizeof buf);
@@ -753,13 +796,13 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	pool_compute_id(p, records, complete, poolId);
 	int n = snprintf((char *)buf, sizeof buf,
 			"BRAINSTORM_SEED_POOL %d\n"
-			"modelver %d\nencoding u64le\ncharset %s\nseedspace %" PRIu64 "\n"
+			"modelver %d\nencoding delta-varint-blocks-v1\ncharset %s\nseedspace %" PRIu64 "\n"
 			"space %s\n"
 			"range_start %" PRIu64 "\nrange_end %" PRIu64 "\n"
 			"catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n"
 			"pool_id %s\n"
 			"tag_route %s\n",
-			POOL_SCHEMA, MODELVER, space_charset(p->space), space_size(p->space),
+			BSPOOL_SCHEMA, MODELVER, space_charset(p->space), space_size(p->space),
 			space_name(p->space),
 			p->outputRangeStart, p->outputRangeEnd, p->catalogHash, p->criteriaHash,
 			poolId,
@@ -793,8 +836,8 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		n += w;
 	}
 	int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
-			"records %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
-			records, complete, POOL_HEADER_SIZE);
+			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
+			records, dataBytes, complete, POOL_HEADER_SIZE);
 	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 	n += w;
 	int64_t at = bs_ftello(f);
@@ -803,6 +846,57 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		snprintf(err, errsz, "cannot update binary header: %s", strerror(errno));
 		return false;
 	}
+	return true;
+}
+
+static bool pool_append_index(FILE *f, int space, uint64_t records,
+		uint64_t dataBytes, uint64_t *finalBytes, char *err, size_t errsz) {
+	if (fflush(f) != 0) { snprintf(err, errsz, "cannot flush pool data before indexing"); return false; }
+	BspoolHeader h;
+	memset(&h, 0, sizeof h);
+	h.headerBytes = POOL_HEADER_SIZE; h.encoding = BSPOOL_ENCODING_DELTA_BLOCKS;
+	h.space = space; h.records = records; h.dataBytes = dataBytes;
+	BspoolReader r;
+	if (!bspool_reader_init(&r, fileno(f), &h, POOL_HEADER_SIZE + dataBytes, err, errsz)) return false;
+	uint64_t indexOff = POOL_HEADER_SIZE + dataBytes;
+	if (bs_fseeko(f, (int64_t)indexOff, SEEK_SET) != 0) {
+		snprintf(err, errsz, "cannot seek to compressed pool index"); bspool_reader_destroy(&r); return false;
+	}
+	unsigned char raw[BSPOOL_INDEX_ENTRY_SIZE * 4096];
+	uint64_t done = 0;
+	while (done < r.nblocks) {
+		uint64_t n = r.nblocks - done;
+		if (n > 4096) n = 4096;
+		for (uint64_t i = 0; i < n; i++) {
+			const BspoolBlockIndex *e = &r.blocks[done + i];
+			unsigned char *q = raw + i * BSPOOL_INDEX_ENTRY_SIZE;
+			bspool_put_u64le(q, e->offset);
+			bspool_put_u64le(q + 8, e->firstRecord);
+			bspool_put_u32le(q + 16, e->count);
+			bspool_put_u32le(q + 20, e->payloadBytes);
+		}
+		size_t bytes = (size_t)n * BSPOOL_INDEX_ENTRY_SIZE;
+		if (fwrite(raw, 1, bytes, f) != bytes) {
+			snprintf(err, errsz, "cannot write compressed pool index"); bspool_reader_destroy(&r); return false;
+		}
+		done += n;
+	}
+	unsigned char footer[BSPOOL_FOOTER_SIZE];
+	memset(footer, 0, sizeof footer); memcpy(footer, "BSPIDX2\n", 8);
+	bspool_put_u64le(footer + 8, indexOff);
+	bspool_put_u64le(footer + 16, r.nblocks);
+	bspool_put_u64le(footer + 24, records);
+	bspool_put_u64le(footer + 32, dataBytes);
+	uint64_t blocks = r.nblocks;
+	bspool_reader_destroy(&r);
+	if (fwrite(footer, 1, sizeof footer, f) != sizeof footer || fflush(f) != 0 || bs_fsync_file(f) != 0) {
+		snprintf(err, errsz, "cannot commit compressed pool index"); return false;
+	}
+	int64_t pos = bs_ftello(f);
+	if (pos < 0 || (uint64_t)pos != indexOff + blocks * BSPOOL_INDEX_ENTRY_SIZE + BSPOOL_FOOTER_SIZE) {
+		snprintf(err, errsz, "compressed pool index size accounting failed"); return false;
+	}
+	*finalBytes = (uint64_t)pos;
 	return true;
 }
 
@@ -882,8 +976,8 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			space_charset(p->space), space_size(p->space), space_name(p->space));
 	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->outputRangeStart, p->outputRangeEnd);
 	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\n", s->scanned, s->matched, s->done);
-	fprintf(f, "format %s\nrecord_order unordered\ntag_route %s\n",
-			p->format == POOL_BINARY ? "u64le" : p->format == POOL_TEXT ? "seed-text" : "count-only",
+	fprintf(f, "format %s\nrecord_order block-sorted\ntag_route %s\n",
+			p->format == POOL_BINARY ? "delta-varint-blocks-v1" : p->format == POOL_TEXT ? "seed-text" : "count-only",
 			p->collectTags ? "collect-first-required" : "observe");
 	if (p->refilter) fprintf(f,
 			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n",
@@ -897,7 +991,25 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			p->legendary.key, p->legendary.minAnte, p->legendary.maxAnte, p->legendary.requireNegative);
 	fprintf(f, "elapsed_seconds %.6f\nseeds_per_second %.3f\nmatch_rate %.12g\n", s->elapsed,
 			s->elapsed > 0.0 ? (double)s->scanned / s->elapsed : 0.0, rate);
-	if (!p->refilter) fprintf(f, "projected_full_matches %.0f\nprojected_u64_bytes %.0f\n", projected, projected * 8.0);
+	if (!p->refilter) {
+		double expectedDeltaBytes = 1.0;
+		if (rate > 0.0 && rate < 1.0) {
+			double threshold = 128.0;
+			while (threshold <= (double)space_size(p->space)) {
+				expectedDeltaBytes += pow(1.0 - rate, threshold - 1.0);
+				threshold *= 128.0;
+			}
+		}
+		double projectedCompressed = projected * (expectedDeltaBytes + 0.01)
+				+ POOL_HEADER_SIZE + BSPOOL_FOOTER_SIZE;
+		fprintf(f, "projected_full_matches %.0f\nprojected_u64_bytes %.0f\n"
+				"projected_compressed_bytes %.0f\nexpected_compressed_bytes_per_record %.6f\n",
+				projected, projected * 8.0, projectedCompressed, expectedDeltaBytes + 0.01);
+	}
+	if (p->format == POOL_BINARY && s->matched && s->outputBytes >= POOL_HEADER_SIZE) {
+		fprintf(f, "compressed_file_bytes %" PRIu64 "\nbytes_per_record %.6f\n",
+				s->outputBytes, (double)(s->outputBytes - POOL_HEADER_SIZE) / (double)s->matched);
+	}
 	fprintf(f, "end\n");
 	if (fclose(f) != 0) { snprintf(err, errsz, "cannot close manifest: %s", strerror(errno)); return false; }
 	return true;
@@ -943,7 +1055,7 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 			if (p->format == POOL_BINARY) {
 				state.outputBytes = POOL_HEADER_SIZE;
 				if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
-						|| !pool_write_header(out, p, 0, 0, err, sizeof err)) {
+						|| !pool_write_header(out, p, 0, 0, 0, err, sizeof err)) {
 					fprintf(stderr, "%s\n", err); fclose(out); return 1;
 				}
 			}
@@ -1004,7 +1116,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 			int64_t pos = bs_ftello(out);
 			if (pos < 0) { fprintf(stderr, "cannot read output position\n"); fclose(out); return 1; }
 			state.outputBytes = (uint64_t)pos;
-			if (!pool_write_header(out, p, state.matched, 0, err, sizeof err)) {
+			if (!pool_write_header(out, p, state.matched,
+					state.outputBytes - POOL_HEADER_SIZE, 0, err, sizeof err)) {
 				fprintf(stderr, "%s\n", err); fclose(out); return 1;
 			}
 		}
@@ -1017,7 +1130,14 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 	state.done = state.cursor == p->start + p->count;
 	state.elapsed = priorElapsed + (pool_now() - started);
 	if (out) {
-		if (!pool_write_header(out, p, state.matched, state.done, err, sizeof err)) {
+		uint64_t dataBytes = p->format == POOL_BINARY
+				? state.outputBytes - POOL_HEADER_SIZE : state.outputBytes;
+		if (p->format == POOL_BINARY && state.done
+				&& !pool_append_index(out, p->space, state.matched, dataBytes,
+						&state.outputBytes, err, sizeof err)) {
+			fprintf(stderr, "%s\n", err); fclose(out); return 1;
+		}
+		if (!pool_write_header(out, p, state.matched, dataBytes, state.done, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); fclose(out); return 1;
 		}
 		if (fclose(out) != 0) { fprintf(stderr, "cannot close output: %s\n", strerror(errno)); return 1; }
@@ -1061,13 +1181,16 @@ static bool pool_prepare_refilter(PoolPlan *p, const char *input,
 		fclose(f); return false;
 	}
 	int64_t size = bs_file_size(f);
-	uint64_t expected = (uint64_t)h.headerBytes + h.records * 8u;
-	if (size < 0 || (uint64_t)size != expected) {
-		snprintf(err, errsz, "input pool size does not match its committed record count");
+	if (size < 0 || (h.encoding == BSPOOL_ENCODING_U64
+			&& (uint64_t)size != (uint64_t)h.headerBytes + h.records * 8u)
+			|| !bspool_reader_init(&p->inputReader, fileno(f), &h,
+					(uint64_t)(size < 0 ? 0 : size), err, errsz)) {
+		if (!err[0]) snprintf(err, errsz, "input pool size does not match its committed record count");
 		fclose(f); return false;
 	}
 	if (!h.records) {
 		snprintf(err, errsz, "input pool has no seed records");
+		bspool_reader_destroy(&p->inputReader);
 		fclose(f); return false;
 	}
 	p->refilter = 1;
@@ -1084,7 +1207,6 @@ static bool pool_prepare_refilter(PoolPlan *p, const char *input,
 	p->outputRangeStart = h.rangeStart;
 	p->outputRangeEnd = h.rangeEnd;
 	p->inputFd = fileno(f);
-	p->inputDataOff = (uint64_t)h.headerBytes;
 	*inputFile = f;
 	return true;
 }
@@ -1129,28 +1251,33 @@ static int pool_mode_export(const char *input, const char *output) {
 	}
 	uint64_t records = h.records;
 	int complete = h.complete;
-	if (bs_fseeko(in, h.headerBytes, SEEK_SET) != 0) {
-		fprintf(stderr, "cannot seek past pool header\n"); fclose(in); return 1;
+	int64_t fileBytes = bs_file_size(in);
+	BspoolReader reader;
+	if (fileBytes < 0 || !bspool_reader_init(&reader, fileno(in), &h,
+			(uint64_t)(fileBytes < 0 ? 0 : fileBytes), err, sizeof err)) {
+		fprintf(stderr, "%s\n", fileBytes < 0 ? "cannot stat pool" : err); fclose(in); return 1;
 	}
 	/* "wb": exported seed lists are diffed/grepped byte-exactly by the tests */
 	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "wb");
-	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); fclose(in); return 1; }
-	for (uint64_t record = 0; record < records; record++) {
-		unsigned char raw[8];
-		if (fread(raw, 1, sizeof raw, in) != sizeof raw) {
-			fprintf(stderr, "pool ended before record %" PRIu64 "\n", record);
+	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
+	uint64_t ranks[16384];
+	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
+	for (uint64_t record = 0; record < records;) {
+		uint64_t n = records - record;
+		if (n > 16384) n = 16384;
+		if (!bspool_reader_read(&reader, record, n, ranks, &scratch)) {
+			fprintf(stderr, "cannot decode pool at record %" PRIu64 "\n", record);
+			bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader);
 			if (out != stdout) fclose(out); fclose(in); return 1;
 		}
-		uint64_t rank = 0;
-		for (int i = 0; i < 8; i++) rank |= (uint64_t)raw[i] << (8 * i);
-		if (rank >= space_size(h.space)) {
-			fprintf(stderr, "invalid seed rank %" PRIu64 " at record %" PRIu64 "\n", rank, record);
-			if (out != stdout) fclose(out); fclose(in); return 1;
+		for (uint64_t i = 0; i < n; i++) {
+			char seed[9];
+			make_seed_in(h.space, ranks[i], seed);
+			fprintf(out, "%s\n", seed);
 		}
-		char seed[9];
-		make_seed_in(h.space, rank, seed);
-		fprintf(out, "%s\n", seed);
+		record += n;
 	}
+	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader);
 	if (out != stdout && fclose(out) != 0) { fprintf(stderr, "cannot close export\n"); fclose(in); return 1; }
 	fclose(in);
 	fprintf(stderr, "exported %" PRIu64 " seeds%s (space %s, pool_id %s%s%s)\n",
@@ -1160,19 +1287,146 @@ static int pool_mode_export(const char *input, const char *output) {
 	return 0;
 }
 
+static bool pool_write_converted_header(FILE *f, const unsigned char original[POOL_HEADER_SIZE],
+		uint64_t records, uint64_t dataBytes, int complete, char *err, size_t errsz) {
+	unsigned char out[POOL_HEADER_SIZE];
+	char work[POOL_HEADER_SIZE + 1];
+	memcpy(work, original, POOL_HEADER_SIZE); work[POOL_HEADER_SIZE] = 0;
+	memset(out, 0, sizeof out);
+	size_t used = 0;
+	char *line = work;
+	while (line && *line) {
+		char *nl = strchr(line, '\n');
+		if (nl) *nl = 0;
+		char copy[POOL_HEADER_SIZE + 1];
+		snprintf(copy, sizeof copy, "%s", line);
+		char *sp = copy;
+		char *d = pool_tok(&sp);
+		if (!d || !strcmp(d, "end")) break;
+		const char *replacement = NULL;
+		char generated[96];
+		if (!strcmp(d, "BRAINSTORM_SEED_POOL")) {
+			snprintf(generated, sizeof generated, "BRAINSTORM_SEED_POOL %d", BSPOOL_SCHEMA);
+			replacement = generated;
+		} else if (!strcmp(d, "encoding")) replacement = "encoding delta-varint-blocks-v1";
+		else if (!strcmp(d, "records") || !strcmp(d, "data_bytes") || !strcmp(d, "complete")
+				|| !strcmp(d, "header_bytes")) replacement = NULL;
+		else replacement = line;
+		if (replacement) {
+			size_t n = strlen(replacement);
+			if (n + 1 > sizeof out - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+			memcpy(out + used, replacement, n); used += n; out[used++] = '\n';
+		}
+		line = nl ? nl + 1 : NULL;
+	}
+	char tail[192];
+	int n = snprintf(tail, sizeof tail,
+			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
+			records, dataBytes, complete, POOL_HEADER_SIZE);
+	if (n < 0 || (size_t)n > sizeof out - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+	memcpy(out + used, tail, (size_t)n);
+	int64_t at = bs_ftello(f);
+	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(out, 1, sizeof out, f) != sizeof out
+			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
+		snprintf(err, errsz, "cannot update converted pool header: %s", strerror(errno)); return false;
+	}
+	return true;
+}
+
+static int pool_mode_convert(const char *input, const char *output) {
+	FILE *in = fopen(input, "rb");
+	if (!in) { fprintf(stderr, "cannot open %s: %s\n", input, strerror(errno)); return 1; }
+	FILE *existing = fopen(output, "rb");
+	if (existing) {
+		bool same = bs_same_file(in, existing);
+		fclose(existing);
+		fprintf(stderr, "%s\n", same ? "input and output pool resolve to the same file"
+				: "output already exists; choose a new filename");
+		fclose(in); return 1;
+	}
+	BspoolHeader h;
+	char err[256] = "";
+	if (!bspool_read_header(in, &h, err, sizeof err)) { fprintf(stderr, "%s\n", err); fclose(in); return 1; }
+	if (!h.complete) { fprintf(stderr, "finish the input pool before converting it\n"); fclose(in); return 1; }
+	if (h.encoding == BSPOOL_ENCODING_DELTA_BLOCKS) {
+		fprintf(stderr, "pool is already block-compressed; no output was created\n"); fclose(in); return 1;
+	}
+	int64_t inputBytes = bs_file_size(in);
+	if (inputBytes < 0 || (uint64_t)inputBytes != (uint64_t)h.headerBytes + h.records * 8u) {
+		fprintf(stderr, "legacy pool size does not match its committed record count\n"); fclose(in); return 1;
+	}
+	BspoolReader reader;
+	if (!bspool_reader_init(&reader, fileno(in), &h, (uint64_t)inputBytes, err, sizeof err)) {
+		fprintf(stderr, "%s\n", err); fclose(in); return 1;
+	}
+	unsigned char original[POOL_HEADER_SIZE];
+	if (bs_fseeko(in, 0, SEEK_SET) != 0 || fread(original, 1, sizeof original, in) != sizeof original) {
+		fprintf(stderr, "cannot preserve input pool header\n"); bspool_reader_destroy(&reader); fclose(in); return 1;
+	}
+	FILE *out = fopen(output, "w+b");
+	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
+	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
+			|| !pool_write_converted_header(out, original, h.records, 0, 0, err, sizeof err)) {
+		fprintf(stderr, "%s\n", err); fclose(out); bspool_reader_destroy(&reader); fclose(in); return 1;
+	}
+	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
+	unsigned char encoded[POOL_OUTPUT_BUFFER], header[BSPOOL_BLOCK_HEADER_SIZE];
+	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
+	uint64_t record = 0;
+	while (record < h.records) {
+		uint64_t n = h.records - record;
+		if (n > POOL_OUTPUT_BUFFER / 8) n = POOL_OUTPUT_BUFFER / 8;
+		if (!bspool_reader_read(&reader, record, n, ranks, &scratch)) {
+			fprintf(stderr, "cannot decode input at record %" PRIu64 "\n", record); goto fail;
+		}
+		size_t payload = pool_encode_rank_block((unsigned char *)ranks, (uint32_t)n, encoded, header);
+		if (fwrite(header, 1, sizeof header, out) != sizeof header
+				|| fwrite(encoded, 1, payload, out) != payload) {
+			fprintf(stderr, "cannot write compressed output: %s\n", strerror(errno)); goto fail;
+		}
+		record += n;
+		if ((record & UINT64_C(0x3ffffff)) == 0 || record == h.records)
+			fprintf(stderr, "converted=%" PRIu64 "/%" PRIu64 "\n", record, h.records);
+	}
+	{
+		int64_t dataEnd = bs_ftello(out);
+		uint64_t finalBytes = 0;
+		if (dataEnd < POOL_HEADER_SIZE || !pool_append_index(out, h.space, h.records,
+				(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err)
+				|| !pool_write_converted_header(out, original, h.records,
+						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, err, sizeof err)) {
+			fprintf(stderr, "%s\n", err); goto fail;
+		}
+		if (fclose(out) != 0) { out = NULL; fprintf(stderr, "cannot close converted pool\n"); goto fail_no_out; }
+		out = NULL;
+		bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
+		fprintf(stderr, "compressed %" PRIu64 " records: %.3f GB -> %.3f GB (%.1f%% smaller)\n",
+				h.records, (double)inputBytes / 1e9, (double)finalBytes / 1e9,
+				100.0 * (1.0 - (double)finalBytes / (double)inputBytes));
+		return 0;
+	}
+fail:
+	if (out) fclose(out);
+fail_no_out:
+	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
+	return 1;
+}
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
 			"  %s scan <native-snapshot.cfg> <pool-criteria.cfg> <output>\n"
 			"  %s refilter <native-snapshot.cfg> <pool-criteria.cfg> <input.bspool> <output.bspool>\n"
 			"  %s fixture <native-snapshot.cfg> <pool-criteria.cfg> <seed-file>\n"
-			"  %s export <input.bspool> <output.txt|->\n",
-			prog, prog, prog, prog);
+			"  %s export <input.bspool> <output.txt|->\n"
+			"  %s convert <legacy-input.bspool> <compressed-output.bspool>\n",
+			prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
 	bs_platform_init();
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "convert")) return pool_mode_convert(argv[2], argv[3]);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);
@@ -1210,6 +1464,7 @@ int main(int argc, char **argv) {
 	if (!strcmp(argv[1], "scan")) return pool_mode_scan(&catalog, &plan, argv[4]);
 	if (refilter) {
 		int rc = pool_mode_scan(&catalog, &plan, argv[5]);
+		bspool_reader_destroy(&plan.inputReader);
 		fclose(inputFile);
 		return rc;
 	}

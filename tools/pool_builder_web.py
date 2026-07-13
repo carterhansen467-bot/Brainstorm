@@ -92,7 +92,7 @@ def read_pool_header(path):
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("records", "complete", "modelver", "pool_id", "space",
+        if parts[0] in ("records", "complete", "modelver", "pool_id", "space", "encoding",
                         "refilter_depth", "source_pool_id"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
@@ -126,6 +126,7 @@ def list_pools():
             "space": head.get("space", "natural"),
             "refilter_depth": int(head.get("refilter_depth", "0") or 0),
             "source_pool_id": head.get("source_pool_id", ""),
+            "encoding": head.get("encoding", ""),
         })
     return pools
 
@@ -388,7 +389,7 @@ function showResult(j){
         + `(${(100*matched/scanned).toFixed(5)}%).`;
     if (+m.projected_full_matches)
       out += `\\nFull seed space: ~${fmt(Math.round(+m.projected_full_matches))} seeds, `
-          + `~${fmtBytes(+m.projected_u64_bytes)} file.`;
+          + `~${fmtBytes(+(m.projected_compressed_bytes || m.projected_u64_bytes))} compressed file.`;
     if (+m.seeds_per_second)
       out += `\\nFull scan at this speed: ~${fmtSecs((+m.seedspace || 1785793904896) / +m.seeds_per_second)}.`;
   } else {
@@ -450,7 +451,8 @@ async function tick(){
     const src = p.refilter_depth ? ` <span class="tagc">refilter ${p.refilter_depth}`
       + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${p.source_pool_id.slice(0,8)}` : "")
       + `</span>` : "";
-    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp}${src} &mdash; `
+    const enc = p.encoding === "u64le" ? ` <span class="part">legacy format</span>` : "";
+    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp}${src}${enc} &mdash; `
       + `${fmt(p.records)} seeds, ${fmtBytes(p.bytes)} &mdash; ${st}<br>`
       + `<span class="tagc">${p.criteria.join(" &middot; ")}</span></div>`;
   }).join("") : "none yet";

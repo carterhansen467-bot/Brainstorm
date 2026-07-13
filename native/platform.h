@@ -98,6 +98,7 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 }
 
 static inline int bs_dup(int fd) { return _dup(fd); }
+static inline int bs_close(int fd) { return _close(fd); }
 
 static inline int bs_fsync_file(FILE *f) {
 	HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
@@ -222,6 +223,7 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 }
 
 static inline int bs_dup(int fd) { return dup(fd); }
+static inline int bs_close(int fd) { return close(fd); }
 
 static inline int bs_fsync_file(FILE *f) { return fsync(fileno(f)); }
 

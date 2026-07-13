@@ -697,7 +697,7 @@ time the tab re-renders, even though the underlying saved value is untouched.
       reachable only through a total-space .bspool.
 
 19. **Pool-on-pool refiltering experiment** (`bspool-refilter-experiment`):
-    - `brainstorm_seed_pool refilter` consumes committed u64le records from a
+    - `brainstorm_seed_pool refilter` consumes committed rank records from a
       complete `.bspool`, evaluates the new criteria, and emits another
       canonical `.bspool`. Work cursors are input-record indexes, preserving
       the scanner's checkpoint/pause/resume guarantees.
@@ -707,6 +707,25 @@ time the tab re-renders, even though the underlying saved value is untouched.
     - Derived headers/manifests include source pool ID, criteria fingerprint,
       record count, and chain depth. Both builder UIs expose **Input seeds**
       for natural and all-typeable pools.
+
+20. **Indexed compressed pools** (`bspool-compression-experiment`):
+    - Schema 2 replaces one unordered u64 per hit with independently
+      checksummed blocks. Each worker sorts a block, stores the first rank,
+      and ULEB128-encodes the remaining deltas; a compact footer index maps
+      record positions to blocks for randomized in-game traversal.
+    - RNG/filter evaluation is untouched. Checkpoints commit only complete
+      blocks, incomplete pools rebuild their index from committed block
+      headers, and completed pools validate their embedded index and every
+      decoded payload checksum.
+    - The shared reader accepts both legacy schema-1 u64le and schema-2 files,
+      so search, export, and refilter stay backward compatible. `convert`
+      streams a finished legacy pool into schema 2 under a new filename while
+      preserving its pool ID, provenance, and criteria.
+    - The representative 27,080-record compatibility fixture shrank from
+      217,664 to 33,317 bytes (84.7%) with byte-exact exported membership.
+      CI covers legacy reading/conversion, corrupted-payload rejection,
+      compressed search/exhaustion, refilter intersection, and pause/resume
+      on macOS and Windows.
 
 ## Not yet built (next steps)
 

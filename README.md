@@ -186,11 +186,13 @@ mkdir -p seed_pools
 ```
 
 The `.manifest` reports the observed match rate, throughput, projected
-full-space record count, and projected binary size. On the current development
+full-space record count, projected compressed and legacy sizes, and the final
+compressed bytes per record. On the current development
 machine, that sample found 403,012 matches (0.403012%) at about 12.3 million
 seeds/second, projecting roughly 7.20 billion records and 57.6 GB before the
-1 KiB header. Treat that as an estimate; the active pool/profile snapshot
-can change it.
+1 KiB header in the legacy format. The current indexed delta format projects
+about 11.6 GB for the same match rate. Treat both as estimates; the active
+pool/profile snapshot can change them.
 
 For the exhaustive run, copy the example criteria and change:
 
@@ -200,10 +202,36 @@ format binary
 ```
 
 Then run the same command with an output name ending in `.bspool`. The
-canonical pool stores each match as an eight-byte little-endian numeric seed
-rank. Its 1 KiB header includes schema/model versions, the scanned range,
-record count, completion flag, alphabet, catalog/criteria fingerprints, and
-the criteria themselves, so a shared `.bspool` is self-describing.
+canonical schema-2 pool stores sorted numeric seed-rank deltas in independently
+checksummed blocks, followed by an index for fast randomized access. Its 1 KiB
+header includes schema/model versions, the scanned range, record count,
+completion flag, alphabet, catalog/criteria fingerprints, and the criteria
+themselves, so a shared `.bspool` is self-describing. Compression changes only
+the representation: seed evaluation, checkpoint boundaries, and exhaustive
+search semantics are unchanged.
+
+Current helpers still read existing schema-1 `u64le` pools. To shrink a
+finished legacy pool without rescanning the seed space, give the output a new
+filename:
+
+```sh
+./native/brainstorm_seed_pool convert seed_pools/legacy.bspool \
+  seed_pools/legacy-compressed.bspool
+```
+
+Windows Command Prompt uses the same operation from the Brainstorm folder:
+
+```bat
+native\brainstorm_seed_pool.exe convert seed_pools\legacy.bspool seed_pools\legacy-compressed.bspool
+```
+
+Conversion streams the old file, preserves its pool ID and embedded criteria,
+and reports the measured reduction. Keep the original until an export or
+refilter of the converted pool has been verified. If conversion is interrupted,
+delete the incomplete output and run it again; the input is never modified.
+Older Brainstorm helpers do
+not understand schema 2, so anyone receiving a newly compressed pool must also
+update both native helpers.
 
 #### Filtering an existing pool again
 
