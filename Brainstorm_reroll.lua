@@ -2145,7 +2145,7 @@ function Brainstorm.readPoolHeader(path)
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
-		if k == "records" or k == "complete" then h[k] = tonumber(v)
+		if k == "records" or k == "complete" or k == "soul_depth" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label" then h[k] = v end
 	end
 	return h
@@ -2163,6 +2163,7 @@ function Brainstorm.poolInfoString(name)
 	end
 	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
 	if h.space == "total" then bits[#bits + 1] = "all typeable seeds" end
+	if h.soul_depth == 2 then bits[#bits + 1] = "Soul #2 only" end
 	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
 	bits[#bits + 1] = (h.complete == 1) and "complete" or "PARTIAL SCAN"
 	return table.concat(bits, "  |  ")

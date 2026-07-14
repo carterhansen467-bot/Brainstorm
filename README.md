@@ -151,8 +151,8 @@ searching.
 `native/build.sh` also builds `native/brainstorm_seed_pool`, a standalone
 program for exhaustively scanning an exact numeric range of a seed space.
 Unlike the in-game first-hit search, it never samples, wraps, or stops after
-one match. It can combine multiple ranged tag constraints with a first-Soul
-legendary constraint and write every match.
+one match. It can combine multiple ranged tag constraints with an exact
+first- or second-Soul legendary constraint and write every match.
 
 Two seed spaces are supported:
 
@@ -269,6 +269,7 @@ Criteria directives currently supported are:
 ```text
 tag <key> <inclusive-min-ante> <inclusive-max-ante> <minimum-count>
 legendary <key> <inclusive-min-ante> <inclusive-max-ante> [require-negative]
+soul_depth 1|2
 tag_route collect|observe
 space natural|total
 label <any name, spaces allowed>
@@ -282,8 +283,13 @@ selector — two people holding the same pool see the same id.
 `tag_route collect` selects the first required matching tag occurrences as
 actual blind skips. Those missing shops are fed into the Model-3 physical pack
 simulation before Souls are checked. `observe` requires the tags but assumes
-their blinds are played. The legendary rule intentionally means the run's
-**first Soul**; later-Soul pool mutation has not yet been source-verified.
+their blinds are played. Legendary rules default to exact depth 1.
+`soul_depth 2` is exclusive: the first Soul must yield a different legendary,
+be used, and remain owned; the target must come from the second Soul in a
+later pack. A seed with the target on Soul #1 does not match depth 2. Showman,
+selling or destroying the first legendary, or skipping the first Soul changes
+the pool and is outside this route convention. The ante window applies to the
+target Soul itself, so Soul #1 may occur before the window at depth 2.
 
 ### Seed Pool Builder app (no terminal knowledge needed)
 
@@ -293,8 +299,8 @@ if you have Python installed). It opens a point-and-click page in your
 browser (running only on your computer -- nothing is installed and nothing
 leaves the machine) where you can:
 
-- pick a legendary (first Soul) with an ante window and optional Negative,
-  plus any tag requirements, with dropdowns instead of config files;
+- pick a legendary with an ante window and optional Negative, optionally
+  require it from the second Soul exclusively, and add any tag requirements;
 - choose the **seed space**: natural seeds only (the 1.79 trillion the game
   can deal you), or all typeable seeds (2.90 trillion -- adds seeds with
   `0`/`O` and seeds shorter than 8 characters, which only exist typed into

@@ -44,6 +44,7 @@ def criteria_from_json(data, snap):
     c.leg_min = clamp_int(data.get("legMin", 1), 1, core.MAX_ANTE)
     c.leg_max = clamp_int(data.get("legMax", 8), c.leg_min, core.MAX_ANTE)
     c.leg_neg = bool(data.get("legNeg"))
+    c.leg_second_soul = bool(data.get("legSecondSoul"))
     tag_keys = {k for k, _ in snap.usable_tags()}
     min_ante = dict(snap.usable_tags())
     for rule in data.get("rules", [])[: core.MAX_TAG_RULES]:
@@ -97,7 +98,7 @@ def read_pool_header(path):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
-        elif parts[0] in ("tag", "legendary", "tag_route"):
+        elif parts[0] in ("tag", "legendary", "soul_depth", "tag_route"):
             out["criteria"].append(line)
         elif parts[0] == "end":
             break
@@ -246,12 +247,15 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
 
 <div class="card"><h2>1 &middot; What must every seed have?</h2>
   <div class="row">
-    <label>Legendary (from the run's first Soul card)</label>
+    <label>Legendary</label>
     <select id="legendary"></select>
     <span id="legRange">
       <label>between ante</label> <input type="number" id="legMin" min="1" max="39" value="1">
       <label>and</label> <input type="number" id="legMax" min="1" max="39" value="8">
       <label><input type="checkbox" id="legNeg"> Negative edition</label>
+      <label title="Exclusive: seeds where Soul #1 is already this Legendary are rejected.">
+        <input type="checkbox" id="legSecondSoul"> Second Soul only</label>
+      <span class="tagc">Exclusive: use Soul #1 and keep its different Legendary.</span>
     </span>
   </div>
   <div id="rules"></div>
@@ -350,7 +354,8 @@ function criteria(){
     max: +r.querySelector(".rmax").value }));
   return { legendary: $("legendary").value,
     legMin:+$("legMin").value, legMax:+$("legMax").value,
-    legNeg:$("legNeg").checked, rules, route:$("route").value,
+    legNeg:$("legNeg").checked, legSecondSoul:$("legSecondSoul").checked,
+    rules, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
 	space:$("space").value, inputPool:$("inputPool").value,
 	name:$("name").value };

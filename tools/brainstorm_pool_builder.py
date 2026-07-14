@@ -140,6 +140,7 @@ class Criteria:
         self.leg_min = 1
         self.leg_max = 8
         self.leg_neg = False
+        self.leg_second_soul = False  # exact Soul #2; never first-or-second
         self.tag_rules = []      # [key, min, max, count]
         self.route_collect = True
         self.threads = 0         # 0 = auto
@@ -166,6 +167,8 @@ class Criteria:
             b = self.legendary.replace("j_", "")
             if self.leg_neg:
                 b = "neg-" + b
+            if self.leg_second_soul:
+                b += "-soul2"
             b += "-a%d" % self.leg_min if self.leg_min == self.leg_max \
                 else "-a%d-%d" % (self.leg_min, self.leg_max)
             bits.append(b)
@@ -196,6 +199,8 @@ class Criteria:
             lines.append("legendary %s %d %d %d"
                          % (self.legendary, self.leg_min, self.leg_max,
                             1 if self.leg_neg else 0))
+            if self.leg_second_soul:
+                lines.append("soul_depth 2")
         lines.append("end")
         return "\n".join(lines) + "\n"
 
@@ -208,7 +213,8 @@ class Criteria:
             parts.append(s)
         if self.legendary:
             s = ("Negative " if self.leg_neg else "") + joker_name(self.legendary)
-            s += " first Soul (antes %d-%d)" % (self.leg_min, self.leg_max)
+            s += " second Soul only" if self.leg_second_soul else " first Soul"
+            s += " (antes %d-%d)" % (self.leg_min, self.leg_max)
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
         if self.space == "total":
@@ -364,9 +370,14 @@ class App:
         f = []
         legopts = ["None"] + [joker_name(k) for k in self.legendaries]
         legidx = ([""] + self.legendaries).index(c.legendary)
-        f.append(Field("cycle", "Legendary (first Soul)", options=legopts,
+        f.append(Field("cycle", "Legendary", options=legopts,
                        idx=legidx, set=self._set_leg))
         if c.legendary:
+            f.append(Field("toggle", "  Second Soul only (exclusive)",
+                           get=lambda: c.leg_second_soul,
+                           set=self._set_leg_second_soul,
+                           on="ON -- target must be from Soul #2",
+                           off="OFF -- target must be from Soul #1"))
             f.append(Field("number", "  Earliest ante", get=lambda: c.leg_min,
                            set=self._set_leg_min, lo=1, hi=MAX_ANTE))
             f.append(Field("number", "  Latest ante", get=lambda: c.leg_max,
@@ -414,6 +425,9 @@ class App:
 
     def _set_leg_neg(self, v):
         self.crit.leg_neg = v
+
+    def _set_leg_second_soul(self, v):
+        self.crit.leg_second_soul = v
 
     def _set_route(self, v):
         self.crit.route_collect = v
@@ -749,6 +763,7 @@ def main():
     if "--headless-criteria" in sys.argv:
         c = Criteria()
         c.legendary = "j_perkeo"
+        c.leg_second_soul = True
         c.leg_min, c.leg_max = 7, 7
         c.tag_rules.append(["tag_rare", 1, 8, 1])
         sys.stdout.write(c.text("binary", 0))

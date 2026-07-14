@@ -727,6 +727,24 @@ time the tab re-renders, even though the underlying saved value is untouched.
       compressed search/exhaustion, refilter intersection, and pause/resume
       on macOS and Windows.
 
+21. **Exclusive second-Soul seed pools**:
+    - Pool criteria accept optional `soul_depth 2`; omitted/default depth 1
+      retains byte-identical criteria fingerprints and first-Soul behavior.
+      Depth 2 is deliberately exclusive: the target on Soul #1 rejects, the
+      first non-target legendary is marked unavailable, and Soul #2 must
+      select the target through the advancing bare `Joker4` stream plus the
+      game's normal unavailable-slot resamples.
+    - The route assumes Soul #1 is used and its legendary stays owned. Soul
+      #2 must occur in a later pack: a visible Soul suppresses later Soul
+      rolls while the same pack is generated. The first legendary's edition
+      stream is consumed before an optional Negative check on Soul #2.
+    - Both builder UIs expose **Second Soul only**, generated names include
+      `soul2`, headers/manifests carry `soul_depth 2`, and the in-game pool
+      identity line calls out `Soul #2 only`.
+    - `tests/seed_pool_soul_depth.sh` proves depth-1/depth-2 result sets are
+      disjoint, fixtures expose both pack locations, metadata round-trips,
+      and the criteria fingerprints differ on macOS and Windows CI.
+
 ## Not yet built (next steps)
 
 1. **Pool route composition** — merge a selected pool's collected-tag skip

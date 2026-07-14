@@ -1153,7 +1153,7 @@ typedef struct {
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
 	int ntagRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
-	struct { int used; char key[MAX_KEY]; int minAnte, maxAnte, neg; } legendary;
+	struct { int used; char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; } legendary;
 } BspoolHeader;
 
 static char *pool_tok(char **sp) {
@@ -1216,6 +1216,7 @@ static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
 static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz) {
 	memset(h, 0, sizeof *h);
 	h->route = 1;
+	h->legendary.soulDepth = 1;
 	char buf[BSPOOL_HEADER_SIZE + 1];
 	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
 	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
@@ -1281,6 +1282,10 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 				h->legendary.maxAnte = atoi(b);
 				h->legendary.neg = n ? atoi(n) : 0;
 			}
+		}
+		else if (!strcmp(d, "soul_depth")) {
+			v = pool_tok(&sp);
+			h->legendary.soulDepth = v ? atoi(v) : 1;
 		}
 		else if (!strcmp(d, "end")) sawEnd = 1;
 	}
