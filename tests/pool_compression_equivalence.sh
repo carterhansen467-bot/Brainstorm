@@ -35,6 +35,25 @@ EOF
   "$OUT/criteria.cfg" "$OUT/native-v2.bspool"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/native-v2.bspool" "$OUT/native-v2.txt"
 
+# A checkpoint is a trust boundary: inconsistent counters must be rejected,
+# never used to truncate/append the pool at a fabricated committed position.
+sed 's/^resume 0$/resume 1/' "$OUT/criteria.cfg" > "$OUT/resume.cfg"
+cp "$OUT/native-v2.bspool" "$OUT/bad-state.bspool"
+cp "$OUT/native-v2.bspool.state" "$OUT/bad-state.bspool.state"
+python3 - "$OUT/bad-state.bspool.state" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="ascii").read()
+m = re.search(r"^scanned (\d+)$", s, re.M)
+assert m and int(m.group(1)) > 0
+s = s[:m.start(1)] + str(int(m.group(1)) - 1) + s[m.end(1):]
+open(p, "w", encoding="ascii").write(s)
+PY
+if "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+    "$OUT/resume.cfg" "$OUT/bad-state.bspool" 2>/dev/null; then
+  echo "FAIL: inconsistent resume state was accepted"; exit 1
+fi
+
 # Re-encode the exact exported set as the former schema-1 u64le format.
 python3 - "$OUT/native-v2.bspool" "$OUT/native-v2.txt" "$OUT/legacy-v1.bspool" <<'PY'
 import struct, sys
@@ -100,6 +119,29 @@ with open(p, "r+b") as f:
 PY
 if "./native/brainstorm_seed_pool$EXE" export "$OUT/corrupt.bspool" "$OUT/corrupt.txt" 2>/dev/null; then
   echo "FAIL: payload corruption was accepted"; exit 1
+fi
+
+# Even a checksummed block is invalid when one of its ranks lies outside the
+# shard's declared half-open range. Move range_start just past block 1's first
+# rank without touching the payload/checksum and require a decode failure.
+cp "$OUT/converted-v2.bspool" "$OUT/out-of-range.bspool"
+python3 - "$OUT/out-of-range.bspool" <<'PY'
+import re, struct, sys
+p = sys.argv[1]
+with open(p, "r+b") as f:
+    header = f.read(1024)
+    text = header.split(b"\0", 1)[0].decode("ascii")
+    f.seek(1024 + 16)
+    first = struct.unpack("<Q", f.read(8))[0]
+    text2, n = re.subn(r"^range_start \d+$", "range_start %d" % (first + 1),
+                       text, count=1, flags=re.M)
+    assert n == 1 and len(text2.encode("ascii")) <= 1024
+    f.seek(0)
+    f.write(text2.encode("ascii").ljust(1024, b"\0"))
+PY
+if "./native/brainstorm_seed_pool$EXE" export "$OUT/out-of-range.bspool" \
+    "$OUT/out-of-range.txt" 2>/dev/null; then
+  echo "FAIL: rank outside the declared shard range was accepted"; exit 1
 fi
 
 echo "PASS: schema-1 compatibility + conversion + checksummed compression ($LEGACY_BYTES -> $COMPRESSED_BYTES bytes)"

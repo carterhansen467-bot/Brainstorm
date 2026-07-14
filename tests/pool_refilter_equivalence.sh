@@ -12,12 +12,14 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 case "$(uname -s)" in
-	MINGW*|MSYS*|CYGWIN*) EXE=.exe; BUILD=native/build_windows.sh ;;
-	*) EXE=; BUILD=native/build.sh ;;
+	MINGW*|MSYS*|CYGWIN*) EXE=.exe; BUILD=native/build_windows.sh
+		native_path() { cygpath -m "$1"; } ;;
+	*) EXE=; BUILD=native/build.sh
+		native_path() { printf '%s\n' "$1"; } ;;
 esac
 
 sh "$BUILD"
-sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
+cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 
 write_criteria() {
 	file="$1"
@@ -40,23 +42,80 @@ write_criteria() {
 
 write_criteria "$OUT/broad.cfg" "tag $TAG 1 8 1"
 write_criteria "$OUT/narrow.cfg" "legendary j_perkeo 1 8 0"
+write_criteria "$OUT/combined.cfg" "tag $TAG 1 8 1" "legendary j_perkeo 1 8 0"
 
 "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
 	"$OUT/broad.cfg" "$OUT/broad.bspool"
 "./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
 	"$OUT/narrow.cfg" "$OUT/broad.bspool" "$OUT/refined.bspool"
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+	"$OUT/combined.cfg" "$OUT/combined.bspool"
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+	"$OUT/narrow.cfg" "$OUT/legend-source.bspool"
+"./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
+	"$OUT/broad.cfg" "$OUT/legend-source.bspool" "$OUT/reverse-refined.bspool"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/broad.bspool" "$OUT/broad.txt"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/refined.bspool" "$OUT/refined.txt"
-"./native/brainstorm_seed_pool$EXE" fixture "$OUT/snapshot.cfg" \
-	"$OUT/narrow.cfg" "$OUT/broad.txt" | awk '$2 == 1 { print $1 }' > "$OUT/expected.txt"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/combined.bspool" "$OUT/expected.txt"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/legend-source.bspool" "$OUT/legend-source.txt"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/reverse-refined.bspool" "$OUT/reverse-refined.txt"
 
 sort "$OUT/refined.txt" > "$OUT/refined.sorted.txt"
 sort "$OUT/expected.txt" > "$OUT/expected.sorted.txt"
 cmp "$OUT/refined.sorted.txt" "$OUT/expected.sorted.txt"
+sort "$OUT/reverse-refined.txt" > "$OUT/reverse-refined.sorted.txt"
+cmp "$OUT/reverse-refined.sorted.txt" "$OUT/expected.sorted.txt"
 grep -q '^complete 1$' "$OUT/refined.bspool"
 grep -q '^source_criteria_hash ' "$OUT/refined.bspool"
+grep -q "^route_tag collect $TAG 1 8 1$" "$OUT/refined.bspool"
+grep -q '^route_legendary j_perkeo 1 8 0 1$' "$OUT/reverse-refined.bspool"
 grep -q "^space $SPACE$" "$OUT/refined.bspool"
+
+# The in-game native overlay must inherit the input pool's collected-tag
+# skips. With no active tag filter, first-Soul Perkeo over the broad pool must
+# still equal the one-pass/refilter result exactly.
+{
+	echo "session 1"; echo "threads 4"; echo "modelver 5"; echo "entropy 1"
+	echo "soul 0"; echo "legendary j_perkeo"; echo "neglegendary 0"; echo "tag -"
+	echo "voucher -"; echo "voucherante 1"; echo "taganywhere 0"; echo "leganywhere 1"
+	echo "matchany 0"; echo "jslot 1 - 0"; echo "jslot 2 - 0"; echo "jslot 3 - 0"
+	echo "maslots 0 0 0 0 0 0 0 0"; echo "mapacks 0 0 0 0 0 0 0 0"; echo "packslots 2"
+	echo "poolfile $(native_path "$OUT/broad.bspool")"
+	grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
+	echo "end"
+} > "$OUT/overlay.cfg"
+"./native/brainstorm_native_search$EXE" fixture "$OUT/overlay.cfg" "$OUT/broad.txt" \
+	| awk '$2 == 1 { print $1 }' | sort > "$OUT/overlay.sorted.txt"
+cmp "$OUT/refined.sorted.txt" "$OUT/overlay.sorted.txt"
+
+# Composition is order-independent: adding a collected tag on top of a
+# legendary pool must re-check that inherited Soul after the tag removes its
+# shop. The native in-game overlay and refilter path both equal one-pass.
+{
+	echo "session 1"; echo "threads 4"; echo "modelver 5"; echo "entropy 1"
+	echo "soul 0"; echo "legendary -"; echo "neglegendary 0"; echo "tag $TAG"
+	echo "voucher -"; echo "voucherante 1"; echo "taganywhere 1"; echo "leganywhere 0"
+	echo "matchany 0"; echo "jslot 1 - 0"; echo "jslot 2 - 0"; echo "jslot 3 - 0"
+	echo "maslots 0 0 0 0 0 0 0 0"; echo "mapacks 0 0 0 0 0 0 0 0"; echo "packslots 2"
+	echo "poolfile $(native_path "$OUT/legend-source.bspool")"
+	grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
+	echo "end"
+} > "$OUT/reverse-overlay.cfg"
+"./native/brainstorm_native_search$EXE" fixture "$OUT/reverse-overlay.cfg" "$OUT/legend-source.txt" \
+	| awk '$2 == 1 { print $1 }' | sort > "$OUT/reverse-overlay.sorted.txt"
+cmp "$OUT/refined.sorted.txt" "$OUT/reverse-overlay.sorted.txt"
+"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+	"$OUT/snapshot.cfg" "$OUT/legend-source.bspool" "$OUT/legend-source.txt" "$TAG" \
+	| awk '$2 == 1 { print $1 }' | sort > "$OUT/reverse-lua-overlay.sorted.txt"
+cmp "$OUT/refined.sorted.txt" "$OUT/reverse-lua-overlay.sorted.txt"
+sed -n '1,200p' "$OUT/reverse-refined.txt" > "$OUT/reverse-lua.seeds"
+"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+	"$OUT/snapshot.cfg" "$OUT/reverse-refined.bspool" "$OUT/reverse-lua.seeds" \
+	> "$OUT/reverse-lua.out"
+if grep -v ' 1$' "$OUT/reverse-lua.out" >/dev/null; then
+	echo "FAIL: production Lua rejects a cumulative-route refilter member"; exit 1
+fi
 
 RECORDS=$(wc -l < "$OUT/refined.txt" | tr -d ' ')
 [ "$RECORDS" -gt 0 ] || { echo "FAIL: refined pool is empty; grow seed-count"; exit 1; }
-echo "PASS: refilter output is the exact $RECORDS-seed intersection"
+echo "PASS: refilter order + in-game overlays share the exact $RECORDS-seed cumulative route"

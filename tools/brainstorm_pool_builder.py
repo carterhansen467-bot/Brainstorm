@@ -57,6 +57,7 @@ SPACES = [
 ]
 MAX_TAG_RULES = 16
 MAX_ANTE = 39
+MODEL_VERSION = 5
 
 # Friendly names, mirroring Brainstorm_UI's SearchTagList (fallback: raw key).
 TAG_NAMES = {
@@ -95,6 +96,9 @@ class Snapshot:
     def __init__(self, path):
         self.path = path
         self.modelver = None
+        self.has_specialdef = False
+        self.has_boostdef = False
+        self.bad_boostdef = False
         self.tags = []        # (key, reqOk, minAnte)
         self.legendaries = [] # (key, avail)
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -108,6 +112,11 @@ class Snapshot:
                     self.tags.append((parts[1], parts[2] == "1", int(parts[3])))
                 elif parts[0] == "jokerdef" and len(parts) >= 4 and parts[1] == "4":
                     self.legendaries.append((parts[2], parts[3] == "1"))
+                elif parts[0] == "boostdef":
+                    self.has_boostdef = True
+                    self.bad_boostdef = self.bad_boostdef or len(parts) != 7
+                elif parts[0] == "specialdef" and len(parts) == 3:
+                    self.has_specialdef = True
 
     def usable_tags(self):
         return [(k, ma) for k, ok, ma in self.tags if ok]
@@ -115,22 +124,19 @@ class Snapshot:
     def usable_legendaries(self):
         return [k for k, ok in self.legendaries if ok]
 
-    def modelver4_copy(self):
-        """The pool builder demands the current handshake; catalog data is
-        protocol-independent, so a modelver-3 snapshot only needs its
-        handshake line rewritten (same normalization the test suite does)."""
-        if self.modelver == 4:
+    def current_model_copy(self):
+        """Return a current snapshot or refuse stale catalog semantics.
+
+        Model 5 adds booster/Soul availability, so changing only the version
+        number would fabricate missing profile data and can produce a false
+        pool. Launch one in-game native search to refresh native_search.cfg.
+        """
+        if (self.modelver == MODEL_VERSION and self.has_specialdef and self.has_boostdef
+                and not self.bad_boostdef):
             return self.path
-        patched = os.path.join(POOL_DIR, ".snapshot_m4.cfg")
-        os.makedirs(POOL_DIR, exist_ok=True)
-        with open(self.path, "r", encoding="utf-8", errors="replace") as src, \
-                open(patched, "w", encoding="utf-8") as dst:
-            for line in src:
-                if re.match(r"^modelver \d+$", line.strip()):
-                    dst.write("modelver 4\n")
-                else:
-                    dst.write(line)
-        return patched
+        raise ValueError("native_search.cfg is stale or missing current profile data. "
+                         "Launch Balatro, toggle Ctrl+A on and off once, then "
+                         "reopen the Seed Pool Builder.")
 
 
 class Criteria:
@@ -663,7 +669,7 @@ class App:
         out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
         text = self.crit.text("count", ESTIMATE_COUNT, apply_shard=False)
         input_pool = self.input_pools[self.input_idx] or None
-        self.run_screen(Runner(self.snap.modelver4_copy(), text, out, input_pool),
+        self.run_screen(Runner(self.snap.current_model_copy(), text, out, input_pool),
                         "Filtering input pool" if input_pool else "Estimating (100M-seed sample)",
                         estimate=True)
 
@@ -680,7 +686,7 @@ class App:
             return
         text = self.crit.text("binary", SCOPES[self.crit.scope][1])
         input_pool = self.input_pools[self.input_idx] or None
-        self.run_screen(Runner(self.snap.modelver4_copy(), text, out, input_pool),
+        self.run_screen(Runner(self.snap.current_model_copy(), text, out, input_pool),
                         "Building " + os.path.basename(out), estimate=False)
 
     def run_screen(self, runner, title, estimate):
@@ -833,6 +839,11 @@ def preflight():
             "native_search.cfg not found. Launch Balatro and briefly toggle an\n"
             "auto-reroll (Ctrl+A on, then off) so Brainstorm writes the snapshot\n"
             "of YOUR unlocks; then run this again.")
+    else:
+        try:
+            Snapshot(SNAPSHOT).current_model_copy()
+        except (OSError, ValueError, TypeError) as e:
+            problems.append(str(e))
     return problems
 
 
@@ -860,7 +871,7 @@ def main():
         c.legendary = "j_perkeo"
         c.tag_rules.append(["tag_rare", 1, 8, 1])
         out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-        r = Runner(snap.modelver4_copy(), c.text("count", 3_000_000), out)
+        r = Runner(snap.current_model_copy(), c.text("count", 3_000_000), out)
         while not r.done():
             time.sleep(0.1)
         m = read_manifest(out + ".manifest")

@@ -28,5 +28,23 @@ for cfg in "$OUT"/case*.cfg; do
 		fail=1
 	fi
 done
+
+# Malformed/truncated snapshots are external files and must fail cleanly,
+# never dereference a missing token or degrade to an accept-all search.
+awk 'BEGIN { changed=0 }
+	/^boostdef / && !changed { sub(/ [01]$/, ""); changed=1 }
+	{ print }' "$OUT/case1.cfg" > "$OUT/malformed.cfg"
+if "./native/brainstorm_native_search$EXE" verifychecks "$OUT/malformed.cfg" >/dev/null 2>&1; then
+	echo "FAIL malformed config was accepted"; fail=1
+else
+	echo "PASS malformed config rejected cleanly"
+fi
+awk '{ if ($1 == "taganywhere") $2 = "not-a-number"; print }' \
+	"$OUT/case1.cfg" > "$OUT/malformed-number.cfg"
+if "./native/brainstorm_native_search$EXE" verifychecks "$OUT/malformed-number.cfg" >/dev/null 2>&1; then
+	echo "FAIL malformed numeric value was accepted"; fail=1
+else
+	echo "PASS malformed numeric value rejected cleanly"
+fi
 if [ "$fail" = 0 ]; then echo "NATIVE EQUIVALENCE: ALL PASS"; else echo "NATIVE EQUIVALENCE: FAILURES"; fi
 exit $fail

@@ -26,7 +26,7 @@ jobs:
         run: brew install luajit
       - name: Oracle equivalence (Lua vs native, this machine's LuaJIT)
         run: LUAJIT=luajit sh tests/native_equivalence.sh
-      - name: Pool engine vs Model-3 equivalence
+      - name: Pool engine vs established reference equivalence
         run: TAG=tag_charm sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
       - name: Exclusive second-Soul pool criteria
         run: sh tests/seed_pool_soul_depth.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 5000000
@@ -69,7 +69,7 @@ jobs:
           "$(cygpath -u "$RUNNER_TEMP")/luajit/src/luajit.exe" -v
       - name: Oracle equivalence (Windows LuaJIT vs .exe) — the bit-exactness proof
         run: sh tests/native_equivalence.sh
-      - name: Pool engine vs Model-3 equivalence
+      - name: Pool engine vs established reference equivalence
         run: TAG=tag_charm sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
       - name: Exclusive second-Soul pool criteria
         run: sh tests/seed_pool_soul_depth.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 5000000
@@ -111,35 +111,58 @@ jobs:
         run: |
           pip install pyinstaller
           pyinstaller --onefile --console --name "Seed Pool Builder" tools/pool_builder_web.py
-      - name: Assemble release zip
+      - name: Assemble full mod and incremental helper zips
         run: |
-          mkdir -p out/Brainstorm-windows
-          cp native/brainstorm_native_search.exe native/brainstorm_seed_pool.exe out/Brainstorm-windows/
-          cp "dist/Seed Pool Builder.exe" "Seed Pool Builder.bat" out/Brainstorm-windows/
-          cat > out/Brainstorm-windows/INSTALL.txt <<'EOF'
-          Brainstorm native helpers for Windows (x64)
-          ===========================================
-          These files supplement the Brainstorm mod (joker-search-experiment
-          branch). Install the mod itself first (see the README's Windows
-          section), then:
+          mkdir -p out/Brainstorm/native out/Brainstorm/tools
+          cp Brainstorm.lua Brainstorm_UI.lua Brainstorm_keyhandler.lua Brainstorm_main.lua \
+            Brainstorm_reroll.lua nativefs.lua win_spawn.lua lovely.toml manifest.json \
+            README.md LICENSE "Seed Pool Builder.bat" out/Brainstorm/
+          cp -R Assets out/Brainstorm/
+          cp tools/brainstorm_pool_builder.py tools/pool_builder_web.py out/Brainstorm/tools/
+          cp native/brainstorm_native_search.exe native/brainstorm_seed_pool.exe \
+            native/seed_pool.example.cfg out/Brainstorm/native/
+          cp "dist/Seed Pool Builder.exe" out/Brainstorm/
+          cat > out/Brainstorm/INSTALL-WINDOWS.txt <<'EOF'
+          Brainstorm for Windows x64
+          ==========================
+          1. Quit Balatro.
+          2. Copy this Brainstorm folder into %AppData%\Balatro\Mods\.
+             For an update, merge it over the existing active Brainstorm
+             folder and choose Replace for matching files. Keep seed_pools,
+             settings.lua, and native_search.cfg.
+          3. Launch Balatro and toggle Ctrl+A on and off once. This refreshes
+             native_search.cfg for model 5 and your current unlock profile.
+          4. Model-4 .bspool files must be rebuilt before search/refilter use.
+             They may still be exported or converted.
 
-          1. Copy brainstorm_native_search.exe and brainstorm_seed_pool.exe
-             into  %AppData%\Balatro\Mods\Brainstorm\native\
-          2. Copy "Seed Pool Builder.exe" (and/or the .bat) into
-             %AppData%\Balatro\Mods\Brainstorm\
-          3. Launch Balatro. The fast native search and the Seed Pool
-             selector now work; double-click "Seed Pool Builder.exe" to
-             build .bspool seed pools in your browser.
-
-          Windows may warn about unsigned downloaded programs. If a file is
-          blocked: right-click it -> Properties -> check "Unblock" -> OK,
-          or click "More info" -> "Run anyway" on the SmartScreen prompt.
+          The Lua mod, native helpers, and Seed Pool Builder in this package
+          are one tested version. Do not mix them with files from an older
+          release. If SmartScreen blocks an exe: right-click -> Properties ->
+          Unblock, or choose More info -> Run anyway.
           EOF
-          cd out && powershell -Command "Compress-Archive -Path Brainstorm-windows -DestinationPath brainstorm-windows-x64.zip"
+
+          mkdir -p out/Brainstorm-windows-helpers/native
+          cp native/brainstorm_native_search.exe native/brainstorm_seed_pool.exe \
+            out/Brainstorm-windows-helpers/native/
+          cp "dist/Seed Pool Builder.exe" "Seed Pool Builder.bat" \
+            out/Brainstorm-windows-helpers/
+          cat > out/Brainstorm-windows-helpers/INSTALL.txt <<'EOF'
+          Brainstorm incremental Windows helpers (x64)
+          =============================================
+          Use this smaller package only when the Lua files in your active mod
+          already come from this exact release. Copy native\*.exe into the
+          mod's native\ folder and the Seed Pool Builder files into the mod
+          root. For uncertain or ZIP-based installs, use
+          brainstorm-windows-full.zip instead.
+          EOF
+          cd out
+          powershell -Command "Compress-Archive -Path Brainstorm -DestinationPath brainstorm-windows-full.zip"
+          powershell -Command "Compress-Archive -Path Brainstorm-windows-helpers -DestinationPath brainstorm-windows-helpers-x64.zip"
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" out/brainstorm-windows-x64.zip \
-            --title "Brainstorm Windows helpers $GITHUB_REF_NAME" \
-            --notes "Prebuilt Windows x64 native helpers + standalone Seed Pool Builder. See INSTALL.txt inside the zip. Built from $GITHUB_SHA after the full bit-exactness CI suite passed on windows-latest and macos-latest."
+          gh release create "$GITHUB_REF_NAME" \
+            out/brainstorm-windows-full.zip out/brainstorm-windows-helpers-x64.zip \
+            --title "Brainstorm Windows $GITHUB_REF_NAME" \
+            --notes "Ready-to-install full Windows x64 mod plus an incremental helper package. Model-sensitive Lua and native files are built from the same commit. See INSTALL-WINDOWS.txt. Built from $GITHUB_SHA after the full Lua/native, pool-route, Soul-depth, compression, shard/merge, pause/resume, and corruption suites passed on windows-latest and macos-latest."

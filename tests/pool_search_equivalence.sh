@@ -33,9 +33,7 @@ esac
 
 sh "$BUILD"
 
-# The snapshot on disk may predate the current config protocol; the catalog
-# data (pools/checks) is version-independent, so rewrite only the handshake.
-sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
+cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 
 {
 	echo "poolver 1"
@@ -67,7 +65,7 @@ write_search_cfg() {
 	{
 		echo "session 1"
 		echo "threads 4"
-		echo "modelver 4"
+		echo "modelver 5"
 		echo "entropy 98765.25"
 		echo "soul 0"
 		echo "legendary $legendary"
@@ -85,7 +83,7 @@ write_search_cfg() {
 		echo "mapacks 0 0 0 0 0 0 0 0"
 		echo "packslots 2"
 		echo "poolfile $(native_path "$poolf")"
-		grep -E '^(tagdef|vouchdef|jokerdef|boostdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
+		grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
 		echo "end"
 	} > "$out"
 }
@@ -118,6 +116,50 @@ rc=0
 grep -q "^E pool: no seed in the pool matches" "$OUT/status" \
 	|| { echo "FAIL: missing exhaustion verdict"; cat "$OUT/status"; exit 1; }
 echo "PASS: contradictory filter exhausts the pool with a definitive verdict"
+
+# A pool's membership/route is only valid for the exact ordered profile
+# snapshot that built it. A mismatch must be fatal (the former warning could
+# return a seed with the right tag or Soul one ante/depth off).
+cp "$OUT/search_none.cfg" "$OUT/search_mismatch.cfg"
+python3 - "$OUT/search_mismatch.cfg" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+s2, n = re.subn(r"^(tagdef\s+\S+\s+)[01](\s+\d+)$", r"\g<1>0\2",
+                 s, count=1, flags=re.M)
+assert n == 1 and s2 != s
+open(p, "w", encoding="utf-8").write(s2)
+PY
+date +%s > "$OUT/hb"
+rm -f "$OUT/status" "$OUT/stop"
+rc=0
+"./native/brainstorm_native_search$EXE" search "$OUT/search_mismatch.cfg" \
+	"$OUT/status" "$OUT/stop" "$OUT/hb" || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: profile-mismatched pool returned $rc"; cat "$OUT/status"; exit 1; }
+grep -q '^E pool: profile/unlock snapshot differs' "$OUT/status" \
+	|| { echo "FAIL: profile mismatch was not a pool-fatal error"; cat "$OUT/status"; exit 1; }
+echo "PASS: profile/catalog mismatch is rejected before searching"
+
+# A decode/checksum failure must never be mislabeled as definitive pool
+# exhaustion. Corrupt one payload byte and require a fatal read verdict.
+cp "$OUT/pool.bspool" "$OUT/corrupt.bspool"
+python3 - "$OUT/corrupt.bspool" <<'PY'
+import sys
+with open(sys.argv[1], "r+b") as f:
+    f.seek(1024 + 32)
+    b = f.read(1); assert b
+    f.seek(-1, 1); f.write(bytes([b[0] ^ 1]))
+PY
+write_search_cfg j_triboulet "$OUT/search_corrupt.cfg" "$OUT/corrupt.bspool"
+date +%s > "$OUT/hb"
+rm -f "$OUT/status" "$OUT/stop"
+rc=0
+"./native/brainstorm_native_search$EXE" search "$OUT/search_corrupt.cfg" \
+	"$OUT/status" "$OUT/stop" "$OUT/hb" || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: corrupt pool returned $rc"; cat "$OUT/status"; exit 1; }
+grep -q '^E pool: record decode/read failed' "$OUT/status" \
+	|| { echo "FAIL: corrupt pool was reported as exhaustion"; cat "$OUT/status"; exit 1; }
+echo "PASS: pool corruption is fatal, never false exhaustion"
 
 # --- total-space pool: typed-only seeds are first-class members -------------
 # Ranks 0..$COUNT of the total space are all seeds SHORTER than 8 characters
@@ -153,6 +195,17 @@ TRECORDS=$(wc -l < "$OUT/pool_total.txt" | tr -d ' ')
 if [ -n "$(awk 'length($0) == 8 && $0 !~ /[0O]/' "$OUT/pool_total.txt")" ]; then
 	echo "FAIL: pool over total-space ranks 0..$COUNT must contain only typed-only seeds"
 	exit 1
+fi
+
+# Production Lua independently verifies short/0/O members against the
+# embedded tag Ante window and legendary Ante window. This is the regression
+# for typed short seeds appearing one Ante off in-game.
+sed -n '1,200p' "$OUT/pool_total.txt" > "$OUT/total-lua.seeds"
+"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+	"$OUT/snapshot.cfg" "$OUT/pool_total.bspool" "$OUT/total-lua.seeds" \
+	> "$OUT/total-lua.out"
+if grep -v ' 1$' "$OUT/total-lua.out" >/dev/null; then
+	echo "FAIL: production Lua rejects a typed short-seed pool member"; exit 1
 fi
 
 write_search_cfg j_perkeo "$OUT/search_total.cfg" "$OUT/pool_total.bspool"

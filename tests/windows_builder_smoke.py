@@ -40,7 +40,7 @@ def main():
     out = os.path.join(tempfile.mkdtemp(prefix="bs_win_smoke_"), "smoke.bspool")
     text = crit.text("binary", SCAN_COUNT)
 
-    r = core.Runner(snap.modelver4_copy(), text, out)
+    r = core.Runner(snap.current_model_copy(), text, out)
     assert wait(r, 120, until=lambda r: r.scanned > 0), \
         "scanner never reported progress: %r" % list(r.lines)
     r.stop()  # Windows: CTRL_BREAK_EVENT -> checkpointed pause
@@ -52,7 +52,7 @@ def main():
     assert state.get("done") == "0", "state should be resumable"
     assert int(state.get("cursor", "0")) > 0, "no checkpoint was committed"
 
-    r2 = core.Runner(snap.modelver4_copy(), text, out)
+    r2 = core.Runner(snap.current_model_copy(), text, out)
     assert wait(r2, 600), "resumed scan did not finish"
     state = core.read_state(out + ".state")
     manifest = core.read_manifest(out + ".manifest")

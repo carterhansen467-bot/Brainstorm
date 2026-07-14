@@ -527,8 +527,8 @@ time the tab re-renders, even though the underlying saved value is untouched.
       catalog fingerprint, and a header parser shared by builder, exporter,
       and searcher. The header grew to 1 KiB and now EMBEDS the criteria
       (`tag_route`/`tag`/`legendary` lines), so a shared pool is
-      self-describing without its `.manifest` and future route composition
-      has the data it needs in the one file people actually share.
+      self-describing without its `.manifest`. Model-5 route composition is
+      recorded below in item 23.
     - `modelver` bumped 3 -> 4: `load_config` silently ignores unknown
       directives, so an older helper binary would have accepted a config with
       `poolfile` and searched the FULL space. The handshake bump turns that
@@ -552,9 +552,9 @@ time the tab re-renders, even though the underlying saved value is untouched.
       attention-text alert. Non-pool errors keep the old Lua-thread fallback.
       The keyhandler clears `poolAbort` on each fresh search toggle so a
       stale verdict can't kill the next search. A `W <msg>` status line
-      carries non-fatal warnings printed once to the console (catalog
-      fingerprint differs = pool built on another unlock snapshot; pool scan
-      incomplete; partial read).
+      carries non-fatal warnings printed once to the console. As of model 5,
+      a catalog/profile mismatch and any partial record decode are fatal pool
+      errors; neither may be reported as exhaustion or allowed to continue.
     - Lua/UI: `seedPoolDir()` = `Mods/Brainstorm/seed_pools/` (created when
       the settings tab opens), `seedPoolPath()` re-checks existence on every
       call (dropping a file in while the game runs works). The "Seed Pool"
@@ -562,15 +562,9 @@ time the tab re-renders, even though the underlying saved value is untouched.
       stays listed and selected so a temporarily absent pool never silently
       widens the search to full space. `buildNativeConfigText` appends
       `poolfile` as a raw line (bypasses `ck()`; only a newline rejects).
-    - The safety rail is unchanged: every pool hit is still re-verified by
-      `passesAllFilters` on the main thread against the CURRENT profile.
-      Pool membership itself is trusted from the native reader (records are
-      unordered, so a Lua-side membership check would be O(n)).
-    - NOT yet done (also flagged in README): merging the pool's
-      collected-tag skip route into overlay pack/joker filter predictions.
-      Doing it only in C would produce hits the Lua rail rejects; it must
-      land in the C searcher and the Lua filter suite together, keyed off
-      the criteria now embedded in the pool header.
+    - Every pool hit is re-verified by `passesAllFilters` on the main thread.
+      Model 5 also replays every embedded cumulative tag/Soul criterion there;
+      this is O(number of rules), not an O(pool size) membership scan.
     - Validation: `tests/pool_search_equivalence.sh` builds a 3M-seed pool
       (44,847 records), requires the restricted search's hit to be a pool
       member that fixture mode also accepts, and requires a contradictory
@@ -592,9 +586,10 @@ time the tab re-renders, even though the underlying saved value is untouched.
       and resume, plus a pool list read from the .bspool headers. Launched
       by double-clicking `Seed Pool Builder.command`. One job at a time;
       quit-while-running is safe by design (checkpoint resume).
-    - Both UIs normalize an old modelver-3 snapshot the same way the test
-      suite does (catalog data is protocol-independent) and auto-run
-      native/build.sh if the scanner binary is missing.
+    - Model 5 no longer rewrites a stale snapshot's version line: booster,
+      Soul, and Black Hole availability are model data. Both UIs refuse stale
+      snapshots and direct the user to toggle Ctrl+A once in-game. macOS still
+      auto-runs native/build.sh if the scanner binary is missing.
     - Verified via the HTTP API: 3M estimate, 100M build reproducing the
       documented 403,012-match reference sample, already-complete guard,
       pause at rank 33,554,432 and resume from that exact rank.
@@ -639,9 +634,9 @@ time the tab re-renders, even though the underlying saved value is untouched.
       case1.cfg as snapshot, TAG=tag_charm), the CreateProcessA spawn/status
       protocol test (tests/win_spawn_test.lua), and the CTRL_BREAK
       pause/resume smoke (tests/windows_builder_smoke.py). macos-latest runs
-      all the same suites through the POSIX paths. Tags `win-v*` build the
-      release zip (both exes + PyInstaller "Seed Pool Builder.exe" + .bat +
-      INSTALL.txt) via `gh release create`.
+      all the same suites through the POSIX paths. Tags `win-v*` build both a
+      complete ready-to-install mod zip and an incremental helper zip via
+      `gh release create`, preventing mixed Lua/native model installations.
     - All three harnesses re-verified locally on macOS after the port, plus
       a manual SIGINT pause (rc 130) -> resume-from-checkpoint run.
     - Still open (the one thing CI can't prove): a human Windows smoke test
@@ -742,8 +737,9 @@ time the tab re-renders, even though the underlying saved value is untouched.
       `soul2`, headers/manifests carry `soul_depth 2`, and the in-game pool
       identity line calls out `Soul #2 only`.
     - `tests/seed_pool_soul_depth.sh` proves depth-1/depth-2 result sets are
-      disjoint, fixtures expose both pack locations, metadata round-trips,
-      and the criteria fingerprints differ on macOS and Windows CI.
+      disjoint and sends depth-2 members through the production Lua oracle,
+      which independently rejects them at depth 1 and confirms their exact
+      Soul pack/Ante route on macOS and Windows CI.
 22. **Distributed exhaustive shards** (`distributed-pool-shards-experiment`):
     - Builder criteria now derive exact half-open rank ranges from a selected
       part number/count. Floor boundaries cover natural or total seed spaces
@@ -763,20 +759,40 @@ time the tab re-renders, even though the underlying saved value is untouched.
       merging. CI compares a four-way uneven split with a monolithic scan and
       exercises nested merging plus all rejection paths on macOS and Windows.
 
+23. **Model-5 seed-pool integrity audit + cumulative routes**
+    (`seed-pool-integrity-audit`, 2026-07-14):
+    - Root causes of the reported second-Soul/Ante failures were model and
+      composition defects, not Windows RNG: Soul/Black-Hole used-card gates
+      were incorrectly carried between packs, and selected pools did not
+      compose their collected-tag route with later refilters/overlays.
+    - `boostdef` now includes per-pack availability; `specialdef` snapshots
+      Soul/Black-Hole bans; tag pool flags and forced-Buffoon availability are
+      resolved. Banned boosters cannot be selected. Soul and Black Hole gates
+      reset per pack with the game's same-card overwrite behavior.
+    - Headers carry cumulative `route_tag` and `route_legendary` stages.
+      Refiltering in either order evaluates one final physical shop route and
+      rechecks inherited exact Soul #1/#2 target, Ante, and edition rules.
+      Native and production Lua independently apply that same route through
+      the criteria engine's full Ante-39 range.
+    - Model/profile mismatches, malformed config/header/state files, payload
+      checksums, duplicate compressed ranks, ranks outside a shard range,
+      allocation/thread failures, and partial reads all fail closed. A decode
+      failure can never be mislabeled as definitive pool exhaustion.
+    - Short `0`/`O`/1–7-character seeds are verified against production Lua;
+      both refilter orders equal a one-pass combined scan; compression,
+      conversion, pause/resume, four-way merge, restricted search, and all 36
+      existing filter cases run in CI on macOS and Windows.
+
 ## Not yet built (next steps)
 
-1. **Pool route composition** — merge a selected pool's collected-tag skip
-   route (now embedded in the `.bspool` header) into the overlay filters'
-   pack/joker predictions, simultaneously in the C searcher and the Lua
-   filter suite so the safety rail keeps agreeing.
-2. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
+1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
    ante (e.g. Ante 1 Depth, Ante 2 Depth, Ante 3 Depth, Ante 4 Depth, each 0-8, 0 = skip
    that ante). Loop `checkShopJokerSearch`/`checkPackJokerSearch` over each ante with
    its own depth instead of hardcoding ante=1.
-3. **Shop-vs-Pack match indicator** — use the mod's existing `Brainstorm.attention_text()`
+2. **Shop-vs-Pack match indicator** — use the mod's existing `Brainstorm.attention_text()`
    helper to flash "Found in Shop!" or "Found in Pack!" when `auto_reroll` succeeds,
    instead of silently starting the run.
-4. **Multi-joker OR search** (discussed, deprioritized) — currently only one joker can be
+3. **Multi-joker OR search** (discussed, deprioritized) — currently only one joker can be
    searched at a time since all 3 rarity dropdowns write to the same single
    `Brainstorm.SETTINGS.autoreroll.searchJoker` field. Would need to become a list.
 

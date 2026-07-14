@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -161,10 +163,13 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
 }
 
 /* ----------------------------------------------------------------- config */
-#define MODELVER 4 /* RNG/shop model + config protocol version; must match the
-                    * config's modelver. 4 adds the poolfile directive -- an
-                    * older binary would silently IGNORE it and search the full
-                    * space, so the handshake must reject, not degrade. */
+#define MODELVER 5 /* RNG/shop model + config protocol version; must match the
+                    * config's modelver. 5 adds pool-route composition and
+                    * serializes booster/Soul availability. An older binary
+                    * would silently ignore those semantics, so reject it. */
+#define MAX_POOL_ROUTE_RULES 16
+#define MAX_POOL_LEGEND_RULES 2
+#define MAX_SEARCH_ANTE 39
 
 typedef struct {
 	int threads;
@@ -190,9 +195,10 @@ typedef struct {
 	int nvouch; char vouchKey[MAX_VOUCH][MAX_KEY]; uint8_t vouchAvail[MAX_VOUCH];
 	int njoker[5]; char jokerKey[5][MAX_JOKERS][MAX_KEY]; uint8_t jokerAvail[5][MAX_JOKERS];
 	int nboost; char boostKey[MAX_BOOST][MAX_KEY]; double boostW[MAX_BOOST];
-	uint8_t boostBuf[MAX_BOOST]; int boostCards[MAX_BOOST];
+	uint8_t boostBuf[MAX_BOOST], boostAvail[MAX_BOOST]; int boostCards[MAX_BOOST];
 	uint8_t boostSoul[MAX_BOOST]; /* 0 none, 1 Arcana(Tarot), 2 Spectral */
 	double boostCume;
+	int soulAllowed, blackHoleAllowed, forceBuffoon, sawSpecialDef;
 	/* joker-search derived */
 	int ntargets; int wanted[4]; int needNeg; int anyAnteActive;
 	/* parity checks */
@@ -203,6 +209,12 @@ typedef struct {
 	/* optional .bspool restricting search to a prebuilt seed set (may contain
 	 * spaces: the directive consumes the rest of its config line) */
 	char poolFile[1024];
+	int npoolRouteRules;
+	struct { int poolIndex, minAnte, maxAnte, minCount, collect; }
+		poolRouteRules[MAX_POOL_ROUTE_RULES];
+	int npoolLegendRules;
+	struct { int poolIndex, minAnte, maxAnte, neg, soulDepth; }
+		poolLegendRules[MAX_POOL_LEGEND_RULES];
 } Config;
 
 enum { CK_PH = 1, CK_R13, CK_PR, CK_PRN };
@@ -305,16 +317,22 @@ typedef struct {
 	uint32_t gen;
 	PRNG prng;
 	Stream joker4;
-	Stream tagS[9], soulT[9], soulS[9], edisouA[9];
-	Stream voucher[9], shop_pack[9], cdt[9], rarity_sho[9], rarity_buf[9], edisho[9], edibuf[9];
+	Stream tagS[MAX_SEARCH_ANTE + 1], soulT[MAX_SEARCH_ANTE + 1];
+	Stream soulS[MAX_SEARCH_ANTE + 1], edisouA[MAX_SEARCH_ANTE + 1];
+	Stream voucher[9], shop_pack[MAX_SEARCH_ANTE + 1];
+	Stream cdt[9], rarity_sho[9], rarity_buf[9], edisho[9], edibuf[9];
 	Stream joker_sho[4][9], joker_buf[4][9];
 	Stream resample[RBASES][MAX_RESAMPLE];
-	uint32_t packs_gen[9]; int packs_n[9]; int pack_idx[9][6];
+	Stream tagResample[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE];
+	int tagRoll[MAX_SEARCH_ANTE + 1][2];
+	uint8_t tagRollDone[MAX_SEARCH_ANTE + 1][2];
+	uint32_t packs_gen[MAX_SEARCH_ANTE + 1];
+	int packs_n[MAX_SEARCH_ANTE + 1], pack_idx[MAX_SEARCH_ANTE + 1][6];
 	/* per-candidate blind-skip assumption (mirrors skipsFromFilters /
 	 * setPackSkipAssumption): a skipped blind's shop never opens, so its two
 	 * get_pack picks never roll. forcedAnte = first ante that still opens a
 	 * shop; that shop's slot 1 is the run's forced normal Buffoon. */
-	uint8_t skipSm[9], skipBig[9]; int forcedAnte;
+	uint8_t skipSm[MAX_SEARCH_ANTE + 1], skipBig[MAX_SEARCH_ANTE + 1]; int forcedAnte;
 	char label[64];
 	char legloc[16];
 } Ctx;
@@ -423,27 +441,40 @@ static int pick_culled(Ctx *c, Stream *first, const char *firstKey, int rbase,
  * stream advance. `count` is a cap; consumers must read c->packs_n[a] (and
  * never past their own cap). */
 static int pack_max_slots(const Ctx *c, int a) {
+	if (a < 1 || a > MAX_SEARCH_ANTE) return 0;
 	int shops = (a >= 2 ? 3 : 2) - (c->skipSm[a] ? 1 : 0) - (c->skipBig[a] ? 1 : 0);
 	return 2 * shops;
 }
 
+static void resolve_forced_pack_ante(Ctx *c) {
+	c->forcedAnte = 1;
+	for (int a = 1; a <= MAX_SEARCH_ANTE; a++) {
+		if (pack_max_slots(c, a) > 0) { c->forcedAnte = a; break; }
+	}
+}
+
 static void sim_packs(Ctx *c, int a, int count) {
 	const Config *g = c->g;
+	if (a < 1 || a > MAX_SEARCH_ANTE) return;
 	if (c->packs_gen[a] != c->gen) {
 		c->packs_gen[a] = c->gen;
 		c->packs_n[a] = 0;
-		if (a == c->forcedAnte) {
+		if (g->forceBuffoon && a == c->forcedAnte) {
 			c->pack_idx[a][0] = PACK_FORCED;
 			c->packs_n[a] = 1;
 		}
 	}
 	int max = pack_max_slots(c, a);
 	if (count > max) count = max;
+	char dynamicKey[24];
+	const char *packKey = a <= 8 ? K_SHOPPACK[a] : dynamicKey;
+	if (a > 8) snprintf(dynamicKey, sizeof dynamicKey, "shop_pack%d", a);
 	while (c->packs_n[a] < count) {
-		double poll = psr(c, stream_next(c, &c->shop_pack[a], K_SHOPPACK[a])) * g->boostCume;
+		double poll = psr(c, stream_next(c, &c->shop_pack[a], packKey)) * g->boostCume;
 		double it = 0.0;
 		int pick = -1;
 		for (int i = 0; i < g->nboost; i++) {
+			if (!g->boostAvail[i]) continue;
 			it += g->boostW[i];
 			if (it >= poll && it - g->boostW[i] <= poll) { pick = i; break; }
 		}
@@ -537,17 +568,152 @@ static bool check_voucher(Ctx *c) {
 /* Source-verified tag roll (get_next_tag_key): index pick over the culled
  * pool (requires-undiscovered / min_ante > ante => UNAVAILABLE) with
  * 'Tag'..ante..'_resample'..it resamples. One call = one blind's tag. */
-static int roll_tag(Ctx *c, int a) {
+static int roll_tag_at(Ctx *c, int a, int blind) {
+	if (a < 1 || a > MAX_SEARCH_ANTE || blind < 0 || blind > 1) return -1;
+	if (c->tagRollDone[a][blind]) return c->tagRoll[a][blind];
+	/* Big is the second advance of Tag<a>; materialize Small first if this
+	 * caller asks for Big before another predicate has read Small. */
+	if (blind == 1 && !c->tagRollDone[a][0] && roll_tag_at(c, a, 0) < 0) return -1;
 	const Config *g = c->g;
-	int idx = psr_n(c, stream_next(c, &c->tagS[a], K_TAG[a]), g->ntags);
+	char key[32];
+	snprintf(key, sizeof key, "Tag%d", a);
+	int idx = psr_n(c, stream_next(c, &c->tagS[a], key), g->ntags);
 	int it = 1;
 	while (idx > 0 && !(g->tagReqOk[idx - 1] && (g->tagMinAnte[idx - 1] == 0 || g->tagMinAnte[idx - 1] <= a))) {
 		it++;
-		double sv = resample_next(c, RB_TAG(a), it);
-		if (isnan(sv)) return -1;
+		if (it - 2 >= MAX_RESAMPLE) return -1;
+		char rkey[48];
+		snprintf(rkey, sizeof rkey, "Tag%d_resample%d", a, it);
+		double sv = stream_next(c, &c->tagResample[a][it - 2], rkey);
 		idx = psr_n(c, sv, g->ntags);
 	}
-	return idx > 0 ? idx - 1 : -1;
+	idx = idx > 0 ? idx - 1 : -1;
+	c->tagRoll[a][blind] = idx;
+	c->tagRollDone[a][blind] = 1;
+	return idx;
+}
+
+/* Merge every collected tag route embedded in the selected pool into this
+ * candidate's physical shop layout. Pool membership already guarantees the
+ * counts; replaying the deterministic tag rolls identifies WHICH blinds are
+ * skipped. Observe-only rules intentionally contribute no skips. */
+static bool apply_pool_route(Ctx *c) {
+	const Config *g = c->g;
+	int counts[MAX_POOL_ROUTE_RULES] = { 0 };
+	int maxAnte = 0;
+	for (int r = 0; r < g->npoolRouteRules; r++)
+		if (g->poolRouteRules[r].maxAnte > maxAnte) maxAnte = g->poolRouteRules[r].maxAnte;
+	for (int a = 1; a <= maxAnte; a++) {
+		for (int blind = 0; blind < 2; blind++) {
+			int needRoll = 0;
+			for (int r = 0; r < g->npoolRouteRules; r++) {
+				if (g->poolRouteRules[r].collect && counts[r] < g->poolRouteRules[r].minCount
+						&& a >= g->poolRouteRules[r].minAnte
+						&& a <= g->poolRouteRules[r].maxAnte) { needRoll = 1; break; }
+			}
+			if (!needRoll) continue;
+			int idx = roll_tag_at(c, a, blind);
+			if (idx < 0) return false;
+			for (int r = 0; r < g->npoolRouteRules; r++) {
+				if (!g->poolRouteRules[r].collect
+						|| counts[r] >= g->poolRouteRules[r].minCount
+						|| a < g->poolRouteRules[r].minAnte
+						|| a > g->poolRouteRules[r].maxAnte
+						|| idx != g->poolRouteRules[r].poolIndex) continue;
+				counts[r]++;
+				if (blind == 0) c->skipSm[a] = 1; else c->skipBig[a] = 1;
+			}
+		}
+	}
+	return true;
+}
+
+/* Pool criteria and active overlay filters must each read their RNG streams
+ * from the beginning, while sharing the final merged blind-skip route. Reset
+ * only the streams touched by the pool's cumulative Soul oracle; tag-roll
+ * caches and skip arrays intentionally survive. */
+static void reset_pool_legend_streams(Ctx *c) {
+	memset(&c->joker4, 0, sizeof c->joker4);
+	memset(c->resample[RB_JOKER4], 0, sizeof c->resample[RB_JOKER4]);
+	memset(c->shop_pack, 0, sizeof c->shop_pack);
+	memset(c->soulT, 0, sizeof c->soulT);
+	memset(c->soulS, 0, sizeof c->soulS);
+	memset(c->edisouA, 0, sizeof c->edisouA);
+	memset(c->packs_gen, 0, sizeof c->packs_gen);
+	memset(c->packs_n, 0, sizeof c->packs_n);
+}
+
+/* Re-verify every exact Soul rule embedded in the selected pool on the final
+ * route (pool collection + active overlay skips). Membership alone proves the
+ * source route; an added collected tag can remove a shop, so route-sensitive
+ * Soul criteria must be evaluated again before a native hit is returned. */
+static bool check_pool_legend_rules(Ctx *c) {
+	const Config *g = c->g;
+	if (!g->npoolLegendRules) return true;
+	int first = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
+			g->jokerAvail[4], g->njoker[4], -1);
+	if (first < 0) return false;
+	int needDepth = 1, maxAnte = 0;
+	for (int i = 0; i < g->npoolLegendRules; i++) {
+		if (g->poolLegendRules[i].soulDepth > needDepth)
+			needDepth = g->poolLegendRules[i].soulDepth;
+		if (g->poolLegendRules[i].maxAnte > maxAnte)
+			maxAnte = g->poolLegendRules[i].maxAnte;
+	}
+	int second = -1;
+	if (needDepth == 2) {
+		second = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
+				g->jokerAvail[4], g->njoker[4], first);
+		if (second < 0) return false;
+	}
+	for (int i = 0; i < g->npoolLegendRules; i++) {
+		int chosen = g->poolLegendRules[i].soulDepth == 1 ? first : second;
+		if (chosen != g->poolLegendRules[i].poolIndex) return false;
+	}
+
+	int found = 0, eventAnte[3] = { 0 };
+	double eventEdition[3] = { 0.0 };
+	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
+		sim_packs(c, ante, 6);
+		for (int slot = 0; slot < c->packs_n[ante] && found < needDepth; slot++) {
+			int pi = c->pack_idx[ante][slot];
+			if (pi < 0 || !g->boostSoul[pi]) continue;
+			int kind = g->boostSoul[pi], cards = g->boostCards[pi];
+			Stream *stream = kind == 1 ? &c->soulT[ante] : &c->soulS[ante];
+			char soulKey[32];
+			snprintf(soulKey, sizeof soulKey, "soul_%s%d",
+					kind == 1 ? "Tarot" : "Spectral", ante);
+			bool soulInPack = false, blackHoleInPack = false;
+			for (int card = 0; card < cards && found < needDepth; card++) {
+				bool soul = false;
+				if (!soulInPack)
+					soul = psr(c, stream_next(c, stream, soulKey)) > 0.997;
+				if (kind == 2 && !blackHoleInPack) {
+					bool blackHole = psr(c, stream_next(c, stream, soulKey)) > 0.997;
+					if (blackHole) {
+						if (g->blackHoleAllowed) blackHoleInPack = true;
+						soul = false;
+					}
+				}
+				if (!soul) continue;
+				soulInPack = true;
+				found++;
+				eventAnte[found] = ante;
+				char editionKey[24];
+				snprintf(editionKey, sizeof editionKey, "edisou%d", ante);
+				eventEdition[found] = psr(c,
+						stream_next(c, &c->edisouA[ante], editionKey));
+			}
+		}
+	}
+	if (found < needDepth) return false;
+	for (int i = 0; i < g->npoolLegendRules; i++) {
+		int depth = g->poolLegendRules[i].soulDepth;
+		if (eventAnte[depth] < g->poolLegendRules[i].minAnte
+				|| eventAnte[depth] > g->poolLegendRules[i].maxAnte
+				|| (g->poolLegendRules[i].neg && eventEdition[depth] <= 0.997)) return false;
+	}
+	return true;
 }
 
 /* checkLegendaryAnywhere: the run's FIRST Soul across antes 1-8 (see the Lua
@@ -557,7 +723,7 @@ static int roll_tag(Ctx *c, int a) {
  * Soul's legendary = first bare-'Joker4' advance, edition = 'edisou'..ante). */
 static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	const Config *g = c->g;
-	bool bh_found = false;
+	if (!g->soulAllowed) return false;
 	for (int a = 1; a <= 8; a++) {
 		sim_packs(c, a, 6);
 		for (int slot = 0; slot < c->packs_n[a]; slot++) {
@@ -568,12 +734,18 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 			int ncards = g->boostCards[pi];
 			Stream *ss = (sk == 1) ? &c->soulT[a] : &c->soulS[a];
 			const char *skey = (sk == 1) ? K_SOULT[a] : K_SOULS[a];
+			bool soul_in_pack = false, bh_in_pack = false;
 			for (int card = 0; card < ncards; card++) {
-				bool soul = psr(c, stream_next(c, ss, skey)) > 0.997;
-				if (sk == 2 && !bh_found) {
+				bool soul = false;
+				if (!soul_in_pack)
+					soul = psr(c, stream_next(c, ss, skey)) > 0.997;
+				if (sk == 2 && !bh_in_pack) {
 					bool bh = psr(c, stream_next(c, ss, skey)) > 0.997;
 					if (bh) {
-						bh_found = true;
+						/* A banned Black Hole still consumes its roll and
+						 * overwrites a same-card Soul, but it never enters the
+						 * pack and therefore cannot suppress later BH rolls. */
+						if (g->blackHoleAllowed) bh_in_pack = true;
 						soul = false; /* black hole overwrites the soul */
 					}
 				}
@@ -670,6 +842,7 @@ done:;
 static bool passes_prepared(Ctx *c) {
 	const Config *g = c->g;
 	c->label[0] = 0;
+	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
 	bool legAnywhere = g->legAnywhere && g->legendary[0];
 	const char *tagLoc = NULL, *legLoc = NULL;
 	char tagLocBuf[12];
@@ -677,6 +850,7 @@ static bool passes_prepared(Ctx *c) {
 	/* 1) soul / legendary, ante-1 charm-tag convention (replaced by the
 	 * anywhere pack-scan below when the toggle is on) */
 	if (!legAnywhere && (g->soulCount > 0 || g->legendary[0])) {
+		if (!g->soulAllowed) return false;
 		int needed = g->soulCount > 0 ? g->soulCount : 1;
 		bool last = false;
 		for (int i = 0; i < needed; i++) {
@@ -701,14 +875,14 @@ static bool passes_prepared(Ctx *c) {
 	if (g->tag[0]) {
 		if (g->tagAnywhere) {
 			for (int a = 1; a <= 8 && !tagLoc; a++) {
-				int idx = roll_tag(c, a);
+				int idx = roll_tag_at(c, a, 0);
 				if (idx < 0) return false;
 				if (!strcmp(g->tagKey[idx], g->tag)) {
 					snprintf(tagLocBuf, sizeof tagLocBuf, "TagA%dSm", a);
 					tagLoc = tagLocBuf;
 					break;
 				}
-				idx = roll_tag(c, a);
+				idx = roll_tag_at(c, a, 1);
 				if (idx < 0) return false;
 				if (!strcmp(g->tagKey[idx], g->tag)) {
 					snprintf(tagLocBuf, sizeof tagLocBuf, "TagA%dBig", a);
@@ -718,7 +892,7 @@ static bool passes_prepared(Ctx *c) {
 			}
 			if (!tagLoc) return false;
 		} else {
-			int idx = roll_tag(c, 1);
+			int idx = roll_tag_at(c, 1, 0);
 			if (idx < 0) return false;
 			if (strcmp(g->tagKey[idx], g->tag)) return false;
 		}
@@ -731,6 +905,7 @@ static bool passes_prepared(Ctx *c) {
 	 * skipping the matched blind. */
 	memset(c->skipSm, 0, sizeof c->skipSm);
 	memset(c->skipBig, 0, sizeof c->skipBig);
+	if (!apply_pool_route(c)) return false;
 	if (!legAnywhere && (g->soulCount > 0 || g->legendary[0])) c->skipSm[1] = 1;
 	if (g->tag[0]) {
 		if (g->tagAnywhere) {
@@ -743,9 +918,11 @@ static bool passes_prepared(Ctx *c) {
 			c->skipSm[1] = 1;
 		}
 	}
-	c->forcedAnte = 1;
-	for (int a = 1; a <= 8; a++) {
-		if (pack_max_slots(c, a) > 0) { c->forcedAnte = a; break; }
+	resolve_forced_pack_ante(c);
+	if (g->npoolLegendRules) {
+		reset_pool_legend_streams(c);
+		if (!check_pool_legend_rules(c)) return false;
+		reset_pool_legend_streams(c);
 	}
 	/* 2.5) legendary ANYWHERE: first Soul across antes 1-8 */
 	if (legAnywhere) {
@@ -901,8 +1078,115 @@ static bool batch_selftest(const Config *g) {
 }
 
 /* ----------------------------------------------------------- config load */
-static char *next_tok(char **sp) { return strsep(sp, " \t"); }
-static int tok_int(char **sp) { char *t = next_tok(sp); return t ? atoi(t) : 0; }
+static char *next_tok(char **sp) {
+	if (!sp || !*sp) return NULL;
+	char *s = *sp;
+	while (*s == ' ' || *s == '\t') s++;
+	if (!*s) { *sp = NULL; return NULL; }
+	char *out = s;
+	while (*s && *s != ' ' && *s != '\t') s++;
+	if (*s) *s++ = 0;
+	*sp = s;
+	return out;
+}
+static bool config_tok_long(char **sp, long *out) {
+	char *t = next_tok(sp), *end = NULL;
+	if (!t || !*t) return false;
+	errno = 0;
+	long v = strtol(t, &end, 10);
+	if (errno || !end || *end) return false;
+	*out = v;
+	return true;
+}
+
+static bool config_tok_int(char **sp, int *out) {
+	long v;
+	if (!config_tok_long(sp, &v) || v < INT_MIN || v > INT_MAX) return false;
+	*out = (int)v;
+	return true;
+}
+
+static bool config_tok_bool(char **sp, int *out) {
+	int v;
+	if (!config_tok_int(sp, &v) || (v != 0 && v != 1)) return false;
+	*out = v;
+	return true;
+}
+
+static bool config_tok_double(char **sp, double *out) {
+	char *t = next_tok(sp), *end = NULL;
+	if (!t || !*t) return false;
+	errno = 0;
+	double v = strtod(t, &end);
+	if (errno || !end || *end || !isfinite(v)) return false;
+	*out = v;
+	return true;
+}
+
+static bool config_key_ok(const char *s) {
+	return s && *s && strlen(s) < MAX_KEY;
+}
+
+static int config_arity(const char *d) {
+	if (!strcmp(d, "end")) return 0;
+	if (!strcmp(d, "poolfile")) return -2; /* nonempty rest-of-line */
+	if (!strcmp(d, "jslot") || !strcmp(d, "jokerdef") || !strcmp(d, "check_prn")) return 3;
+	if (!strcmp(d, "maslots") || !strcmp(d, "mapacks")) return 8;
+	if (!strcmp(d, "tagdef")) return 3;
+	if (!strcmp(d, "vouchdef") || !strcmp(d, "specialdef")
+			|| !strcmp(d, "check_ph") || !strcmp(d, "check_r13") || !strcmp(d, "check_pr")) return 2;
+	if (!strcmp(d, "boostdef")) return 6;
+	if (!strcmp(d, "threads") || !strcmp(d, "modelver") || !strcmp(d, "entropy")
+			|| !strcmp(d, "session") || !strcmp(d, "soul") || !strcmp(d, "legendary")
+			|| !strcmp(d, "neglegendary") || !strcmp(d, "tag") || !strcmp(d, "voucher")
+			|| !strcmp(d, "voucherante") || !strcmp(d, "taganywhere")
+			|| !strcmp(d, "leganywhere") || !strcmp(d, "packslots")
+			|| !strcmp(d, "matchany") || !strcmp(d, "pack")) return 1;
+	return -1;
+}
+
+static int config_count_tokens(const char *s) {
+	int n = 0, in = 0;
+	for (; s && *s; s++) {
+		if (*s == ' ' || *s == '\t') in = 0;
+		else if (!in) { in = 1; n++; }
+	}
+	return n;
+}
+
+enum {
+	CS_THREADS = UINT64_C(1) << 0, CS_MODEL = UINT64_C(1) << 1,
+	CS_ENTROPY = UINT64_C(1) << 2, CS_SESSION = UINT64_C(1) << 3,
+	CS_SOUL = UINT64_C(1) << 4, CS_LEGENDARY = UINT64_C(1) << 5,
+	CS_NEGLEG = UINT64_C(1) << 6, CS_TAG = UINT64_C(1) << 7,
+	CS_VOUCHER = UINT64_C(1) << 8, CS_VOUCHER_ANTE = UINT64_C(1) << 9,
+	CS_TAG_ANY = UINT64_C(1) << 10, CS_LEG_ANY = UINT64_C(1) << 11,
+	CS_PACK_SLOTS = UINT64_C(1) << 12, CS_MATCH_ANY = UINT64_C(1) << 13,
+	CS_MA_SLOTS = UINT64_C(1) << 14, CS_MA_PACKS = UINT64_C(1) << 15,
+	CS_SPECIAL = UINT64_C(1) << 16, CS_POOLFILE = UINT64_C(1) << 17
+};
+
+static uint64_t config_single_bit(const char *d) {
+	if (!strcmp(d, "threads")) return CS_THREADS;
+	if (!strcmp(d, "modelver")) return CS_MODEL;
+	if (!strcmp(d, "entropy")) return CS_ENTROPY;
+	if (!strcmp(d, "session")) return CS_SESSION;
+	if (!strcmp(d, "soul")) return CS_SOUL;
+	if (!strcmp(d, "legendary")) return CS_LEGENDARY;
+	if (!strcmp(d, "neglegendary")) return CS_NEGLEG;
+	if (!strcmp(d, "tag")) return CS_TAG;
+	if (!strcmp(d, "voucher")) return CS_VOUCHER;
+	if (!strcmp(d, "voucherante")) return CS_VOUCHER_ANTE;
+	if (!strcmp(d, "taganywhere")) return CS_TAG_ANY;
+	if (!strcmp(d, "leganywhere")) return CS_LEG_ANY;
+	if (!strcmp(d, "packslots")) return CS_PACK_SLOTS;
+	if (!strcmp(d, "matchany")) return CS_MATCH_ANY;
+	if (!strcmp(d, "maslots")) return CS_MA_SLOTS;
+	if (!strcmp(d, "mapacks")) return CS_MA_PACKS;
+	if (!strcmp(d, "specialdef")) return CS_SPECIAL;
+	if (!strcmp(d, "poolfile")) return CS_POOLFILE;
+	return 0;
+}
 
 static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	memset(g, 0, sizeof *g);
@@ -910,103 +1194,172 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	FILE *f = fopen(path, "r");
 	if (!f) { snprintf(err, errsz, "cannot open config %s", path); return false; }
 	char line[512];
+	int lineno = 0;
+	uint64_t seenSingles = 0;
+	int sawJslot[3] = { 0 };
 	while (fgets(line, sizeof line, f)) {
+		lineno++;
 		size_t L = strlen(line);
+		if (L == sizeof line - 1 && line[L - 1] != '\n') {
+			snprintf(err, errsz, "config line %d is too long", lineno); goto fail;
+		}
 		while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
 		if (!L || line[0] == '#') continue;
 		char *sp = line;
 		char *d = next_tok(&sp);
 		if (!d) continue;
-		if (!strcmp(d, "threads")) g->threads = atoi(next_tok(&sp));
-		else if (!strcmp(d, "modelver")) g->modelver = tok_int(&sp);
-		else if (!strcmp(d, "entropy")) g->entropy = strtod(next_tok(&sp), NULL);
-		else if (!strcmp(d, "session")) g->session = atol(next_tok(&sp));
-		else if (!strcmp(d, "soul")) g->soulCount = atoi(next_tok(&sp));
-		else if (!strcmp(d, "legendary")) { char *v = next_tok(&sp); if (strcmp(v, "-")) snprintf(g->legendary, MAX_KEY, "%s", v); }
-		else if (!strcmp(d, "neglegendary")) g->negLegendary = atoi(next_tok(&sp));
-		else if (!strcmp(d, "tag")) { char *v = next_tok(&sp); if (strcmp(v, "-")) snprintf(g->tag, MAX_KEY, "%s", v); }
-		else if (!strcmp(d, "voucher")) { char *v = next_tok(&sp); if (strcmp(v, "-")) snprintf(g->voucher, MAX_KEY, "%s", v); }
-		else if (!strcmp(d, "voucherante")) g->voucherAnte = atoi(next_tok(&sp));
-		else if (!strcmp(d, "taganywhere")) g->tagAnywhere = atoi(next_tok(&sp));
-		else if (!strcmp(d, "leganywhere")) g->legAnywhere = atoi(next_tok(&sp));
-		else if (!strcmp(d, "packslots")) g->packSlots = atoi(next_tok(&sp));
-		else if (!strcmp(d, "matchany")) g->matchAny = atoi(next_tok(&sp));
+		int arity = config_arity(d);
+		if (arity == -1) {
+			snprintf(err, errsz, "unknown config directive '%s' on line %d", d, lineno); goto fail;
+		}
+		if ((arity >= 0 && config_count_tokens(sp) != arity)
+				|| (arity == -2 && (!sp || !*sp))) {
+			snprintf(err, errsz, "malformed config directive '%s' on line %d", d, lineno); goto fail;
+		}
+		uint64_t single = config_single_bit(d);
+		if (single && (seenSingles & single)) {
+			snprintf(err, errsz, "duplicate config directive '%s' on line %d", d, lineno); goto fail;
+		}
+		seenSingles |= single;
+		if (!strcmp(d, "threads")) { if (!config_tok_int(&sp, &g->threads)) goto bad_value; }
+		else if (!strcmp(d, "modelver")) { if (!config_tok_int(&sp, &g->modelver)) goto bad_value; }
+		else if (!strcmp(d, "entropy")) { if (!config_tok_double(&sp, &g->entropy)) goto bad_value; }
+		else if (!strcmp(d, "session")) { if (!config_tok_long(&sp, &g->session)) goto bad_value; }
+		else if (!strcmp(d, "soul")) { if (!config_tok_int(&sp, &g->soulCount)) goto bad_value; }
+		else if (!strcmp(d, "legendary")) {
+			char *v = next_tok(&sp); if (!config_key_ok(v)) goto bad_value;
+			if (strcmp(v, "-")) snprintf(g->legendary, MAX_KEY, "%s", v);
+		}
+		else if (!strcmp(d, "neglegendary")) { if (!config_tok_bool(&sp, &g->negLegendary)) goto bad_value; }
+		else if (!strcmp(d, "tag")) {
+			char *v = next_tok(&sp); if (!config_key_ok(v)) goto bad_value;
+			if (strcmp(v, "-")) snprintf(g->tag, MAX_KEY, "%s", v);
+		}
+		else if (!strcmp(d, "voucher")) {
+			char *v = next_tok(&sp); if (!config_key_ok(v)) goto bad_value;
+			if (strcmp(v, "-")) snprintf(g->voucher, MAX_KEY, "%s", v);
+		}
+		else if (!strcmp(d, "voucherante")) { if (!config_tok_int(&sp, &g->voucherAnte)) goto bad_value; }
+		else if (!strcmp(d, "taganywhere")) { if (!config_tok_bool(&sp, &g->tagAnywhere)) goto bad_value; }
+		else if (!strcmp(d, "leganywhere")) { if (!config_tok_bool(&sp, &g->legAnywhere)) goto bad_value; }
+		else if (!strcmp(d, "packslots")) { if (!config_tok_int(&sp, &g->packSlots)) goto bad_value; }
+		else if (!strcmp(d, "matchany")) { if (!config_tok_bool(&sp, &g->matchAny)) goto bad_value; }
 		else if (!strcmp(d, "poolfile")) {
 			/* rest of the line verbatim: mod paths contain spaces */
 			char *v = sp;
 			while (v && (*v == ' ' || *v == '\t')) v++;
-			if (v && *v) snprintf(g->poolFile, sizeof g->poolFile, "%s", v);
+			if (!v || !*v || strlen(v) >= sizeof g->poolFile) {
+				snprintf(err, errsz, "invalid poolfile path on line %d", lineno); goto fail;
+			}
+			snprintf(g->poolFile, sizeof g->poolFile, "%s", v);
 			sp = NULL;
 		}
 		else if (!strcmp(d, "jslot")) {
-			int i = atoi(next_tok(&sp)) - 1;
+			int i, neg;
+			if (!config_tok_int(&sp, &i)) goto bad_value;
+			i--;
 			char *k = next_tok(&sp);
-			int neg = atoi(next_tok(&sp));
+			if (!config_key_ok(k) || !config_tok_bool(&sp, &neg)) goto bad_value;
+			if (i < 0 || i >= 3) { snprintf(err, errsz, "invalid jslot index"); goto fail; }
+			if (sawJslot[i]) { snprintf(err, errsz, "duplicate jslot index"); goto fail; }
+			sawJslot[i] = 1;
 			if (i >= 0 && i < 3 && strcmp(k, "-")) {
 				snprintf(g->jslot[i].key, MAX_KEY, "%s", k);
-				g->jslot[i].neg = neg;
+				g->jslot[i].neg = neg != 0;
 				g->jslot[i].used = 1;
 			}
 		}
-		else if (!strcmp(d, "maslots")) { for (int a = 1; a <= 8; a++) g->maSlots[a] = tok_int(&sp); }
-		else if (!strcmp(d, "mapacks")) { for (int a = 1; a <= 8; a++) g->maPacks[a] = tok_int(&sp); }
+		else if (!strcmp(d, "maslots")) {
+			for (int a = 1; a <= 8; a++) if (!config_tok_int(&sp, &g->maSlots[a])) goto bad_value;
+		}
+		else if (!strcmp(d, "mapacks")) {
+			for (int a = 1; a <= 8; a++) if (!config_tok_bool(&sp, &g->maPacks[a])) goto bad_value;
+		}
 		else if (!strcmp(d, "pack")) {
-			if (g->npack < MAX_PACKF) snprintf(g->packKeys[g->npack++], MAX_KEY, "%s", next_tok(&sp));
+			if (g->npack >= MAX_PACKF) { snprintf(err, errsz, "too many pack filters"); goto fail; }
+			char *k = next_tok(&sp); if (!config_key_ok(k)) goto bad_value;
+			snprintf(g->packKeys[g->npack++], MAX_KEY, "%s", k);
 		}
 		else if (!strcmp(d, "tagdef")) {
 			if (g->ntags >= MAX_TAGS) { snprintf(err, errsz, "too many tags"); goto fail; }
 			char *k = next_tok(&sp);
+			int available;
+			if (!config_key_ok(k) || !config_tok_bool(&sp, &available)
+					|| !config_tok_int(&sp, &g->tagMinAnte[g->ntags])) goto bad_value;
 			snprintf(g->tagKey[g->ntags], MAX_KEY, "%s", k);
-			g->tagReqOk[g->ntags] = (uint8_t)tok_int(&sp);
-			g->tagMinAnte[g->ntags] = tok_int(&sp);
+			g->tagReqOk[g->ntags] = (uint8_t)available;
 			g->ntags++;
 		}
 		else if (!strcmp(d, "vouchdef")) {
 			if (g->nvouch >= MAX_VOUCH) { snprintf(err, errsz, "too many vouchers"); goto fail; }
 			char *k = next_tok(&sp);
+			int available;
+			if (!config_key_ok(k) || !config_tok_bool(&sp, &available)) goto bad_value;
 			snprintf(g->vouchKey[g->nvouch], MAX_KEY, "%s", k);
-			g->vouchAvail[g->nvouch] = (uint8_t)atoi(next_tok(&sp));
+			g->vouchAvail[g->nvouch] = (uint8_t)available;
 			g->nvouch++;
 		}
 		else if (!strcmp(d, "jokerdef")) {
-			int r = atoi(next_tok(&sp));
+			int r, available;
+			if (!config_tok_int(&sp, &r)) goto bad_value;
 			if (r < 1 || r > 4 || g->njoker[r] >= MAX_JOKERS) { snprintf(err, errsz, "bad jokerdef"); goto fail; }
 			char *k = next_tok(&sp);
+			if (!config_key_ok(k) || !config_tok_bool(&sp, &available)) goto bad_value;
 			snprintf(g->jokerKey[r][g->njoker[r]], MAX_KEY, "%s", k);
-			g->jokerAvail[r][g->njoker[r]] = (uint8_t)atoi(next_tok(&sp));
+			g->jokerAvail[r][g->njoker[r]] = (uint8_t)available;
 			g->njoker[r]++;
 		}
 		else if (!strcmp(d, "boostdef")) {
 			if (g->nboost >= MAX_BOOST) { snprintf(err, errsz, "too many boosters"); goto fail; }
 			char *k = next_tok(&sp);
+			int buffoon, cards, available;
+			double weight;
+			if (!config_key_ok(k) || !config_tok_double(&sp, &weight)
+					|| !config_tok_bool(&sp, &buffoon)
+					|| !config_tok_int(&sp, &cards)) goto bad_value;
 			snprintf(g->boostKey[g->nboost], MAX_KEY, "%s", k);
-			g->boostW[g->nboost] = strtod(next_tok(&sp), NULL);
-			g->boostBuf[g->nboost] = (uint8_t)tok_int(&sp);
-			g->boostCards[g->nboost] = tok_int(&sp);
+			g->boostW[g->nboost] = weight;
+			g->boostBuf[g->nboost] = (uint8_t)buffoon;
+			g->boostCards[g->nboost] = cards;
 			char *sk = next_tok(&sp);
-			g->boostSoul[g->nboost] = (sk && sk[0] == 'A') ? 1 : (sk && sk[0] == 'S') ? 2 : 0;
+			if (!sk || (strcmp(sk, "A") && strcmp(sk, "S") && strcmp(sk, "N"))
+					|| !config_tok_bool(&sp, &available)) goto bad_value;
+			g->boostSoul[g->nboost] = !strcmp(sk, "A") ? 1 : !strcmp(sk, "S") ? 2 : 0;
+			g->boostAvail[g->nboost] = (uint8_t)available;
 			g->nboost++;
+		}
+		else if (!strcmp(d, "specialdef")) {
+			if (!config_tok_bool(&sp, &g->soulAllowed)
+					|| !config_tok_bool(&sp, &g->blackHoleAllowed)) goto bad_value;
+			g->sawSpecialDef = 1;
 		}
 		else if (!strcmp(d, "check_ph") || !strcmp(d, "check_r13") || !strcmp(d, "check_pr") || !strcmp(d, "check_prn")) {
 			if (g->nchecks >= MAX_CHECKS) continue;
 			int i = g->nchecks++;
 			if (!strcmp(d, "check_ph")) {
 				g->checks[i].kind = CK_PH;
-				snprintf(g->checks[i].str, MAX_KEY, "%s", next_tok(&sp));
+				char *s = next_tok(&sp);
+				if (!config_key_ok(s)) goto bad_value;
+				snprintf(g->checks[i].str, MAX_KEY, "%s", s);
 			} else if (!strcmp(d, "check_r13")) {
 				g->checks[i].kind = CK_R13;
-				g->checks[i].x = strtod(next_tok(&sp), NULL);
+				if (!config_tok_double(&sp, &g->checks[i].x)) goto bad_value;
 			} else if (!strcmp(d, "check_pr")) {
 				g->checks[i].kind = CK_PR;
-				g->checks[i].x = strtod(next_tok(&sp), NULL);
+				if (!config_tok_double(&sp, &g->checks[i].x)) goto bad_value;
 			} else {
 				g->checks[i].kind = CK_PRN;
-				g->checks[i].x = strtod(next_tok(&sp), NULL);
-				g->checks[i].n = atoi(next_tok(&sp));
+				if (!config_tok_double(&sp, &g->checks[i].x)
+						|| !config_tok_int(&sp, &g->checks[i].n)
+						|| g->checks[i].n < 1) goto bad_value;
 			}
-			g->checks[g->nchecks - 1].expect = strtod(next_tok(&sp), NULL);
+			if (!config_tok_double(&sp, &g->checks[g->nchecks - 1].expect)) goto bad_value;
 		}
 		else if (!strcmp(d, "end")) { g->sawEnd = 1; break; }
+		continue;
+bad_value:
+		snprintf(err, errsz, "invalid value for config directive '%s' on line %d", d, lineno);
+		goto fail;
 	}
 	fclose(f);
 	f = NULL;
@@ -1015,11 +1368,39 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	 * accept everything": demand the end marker and the parity checks the
 	 * mod always writes. */
 	if (!g->sawEnd) { snprintf(err, errsz, "config truncated (no end marker)"); return false; }
+	const uint64_t requiredSingles = CS_THREADS | CS_MODEL | CS_ENTROPY | CS_SESSION
+		| CS_SOUL | CS_LEGENDARY | CS_NEGLEG | CS_TAG | CS_VOUCHER
+		| CS_VOUCHER_ANTE | CS_TAG_ANY | CS_LEG_ANY | CS_PACK_SLOTS
+		| CS_MATCH_ANY | CS_MA_SLOTS | CS_MA_PACKS | CS_SPECIAL;
+	if ((seenSingles & requiredSingles) != requiredSingles
+			|| !sawJslot[0] || !sawJslot[1] || !sawJslot[2]) {
+		snprintf(err, errsz, "config is missing required search settings"); return false;
+	}
 	if (g->nchecks < 8) { snprintf(err, errsz, "config has no parity checks"); return false; }
 	if (g->modelver != MODELVER) {
 		snprintf(err, errsz, "config modelver %d != helper model %d (rebuild native/brainstorm_native_search via native/build.sh)",
 				g->modelver, MODELVER);
 		return false;
+	}
+	if (!g->sawSpecialDef) {
+		snprintf(err, errsz, "config has no Soul/Black Hole availability snapshot");
+		return false;
+	}
+	if (g->threads < 1 || g->threads > 64 || !isfinite(g->entropy)
+			|| g->soulCount < 0 || g->soulCount > 64
+			|| (g->voucherAnte < -1 || g->voucherAnte > 8)
+			|| g->packSlots < 0 || g->packSlots > 6) {
+		snprintf(err, errsz, "config has an out-of-range search setting");
+		return false;
+	}
+	if ((g->tag[0] && g->ntags == 0) || (g->voucher[0] && g->nvouch == 0)
+			|| (g->legendary[0] && g->njoker[4] == 0)) {
+		snprintf(err, errsz, "config is missing a pool required by an active filter");
+		return false;
+	}
+	for (int i = 0; i < g->ntags; i++) if (g->tagMinAnte[i] < 0
+			|| g->tagMinAnte[i] > MAX_SEARCH_ANTE) {
+		snprintf(err, errsz, "config has an invalid tag minimum ante"); return false;
 	}
 
 	/* booster cume (array order, matches the Lua float sum); card counts come
@@ -1027,10 +1408,22 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	 * (mega/jumbo are 4-card packs for Buffoon/Spectral, never 6). */
 	g->boostCume = 0.0;
 	for (int i = 0; i < g->nboost; i++) {
-		g->boostCume += g->boostW[i];
+		if (!isfinite(g->boostW[i]) || g->boostW[i] <= 0.0) {
+			snprintf(err, errsz, "config has an invalid booster weight"); return false;
+		}
+		if (g->boostCards[i] < 0 || g->boostCards[i] > 64) {
+			snprintf(err, errsz, "config has an invalid booster card count"); return false;
+		}
+		if (g->boostAvail[i]) g->boostCume += g->boostW[i];
 		if (g->boostCards[i] <= 0) {
 			g->boostCards[i] = strstr(g->boostKey[i], "mega") ? 4 : (strstr(g->boostKey[i], "jumbo") ? 4 : 2);
 		}
+		if (!strcmp(g->boostKey[i], "p_buffoon_normal_1") && g->boostAvail[i])
+			g->forceBuffoon = 1;
+	}
+	if (g->nboost == 0 || g->boostCume <= 0.0) {
+		snprintf(err, errsz, "config has no available booster packs");
+		return false;
 	}
 	if (g->packSlots <= 0) g->packSlots = 2;
 	/* joker-search derived state (mirrors checkMultiAnteJokerSearch setup).
@@ -1062,6 +1455,8 @@ static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
 	}
 	g->anyAnteActive = 0;
 	for (int a = 1; a <= 8; a++) {
+		if (g->maSlots[a] < 0) { snprintf(err, errsz, "ante slots cannot be negative"); return false; }
+		g->maPacks[a] = g->maPacks[a] != 0;
 		if (g->maSlots[a] > 0 || g->maPacks[a]) g->anyAnteActive = 1;
 		if (g->maSlots[a] > MAX_SLOTS) { snprintf(err, errsz, "ante slots > %d", MAX_SLOTS); return false; }
 	}
@@ -1132,7 +1527,8 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
 #define BSPOOL_SCHEMA_LEGACY 1
 #define BSPOOL_SCHEMA 2
 #define BSPOOL_HEADER_SIZE 1024
-#define BSPOOL_MAX_TAG_RULES 16
+#define BSPOOL_MAX_TAG_RULES MAX_POOL_ROUTE_RULES
+#define BSPOOL_MAX_ANTE MAX_SEARCH_ANTE
 #define BSPOOL_BLOCK_HEADER_SIZE 32
 #define BSPOOL_BLOCK_MAX_RECORDS 8192
 #define BSPOOL_BLOCK_MAX_PAYLOAD ((BSPOOL_BLOCK_MAX_RECORDS - 1) * 6)
@@ -1153,7 +1549,13 @@ typedef struct {
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
 	int ntagRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
+	int nrouteTagRules;
+	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount, collect; }
+		routeTagRules[BSPOOL_MAX_TAG_RULES];
 	struct { int used; char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; } legendary;
+	int nrouteLegendRules;
+	struct { char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; }
+		routeLegendRules[MAX_POOL_LEGEND_RULES];
 } BspoolHeader;
 
 static char *pool_tok(char **sp) {
@@ -1165,6 +1567,54 @@ static char *pool_tok(char **sp) {
 	if (*s) *s++ = 0;
 	*sp = s;
 	return out;
+}
+
+static bool pool_header_u64(const char *s, int base, uint64_t *out) {
+	if (!s || !*s || *s == '-') return false;
+	errno = 0;
+	char *end = NULL;
+	unsigned long long v = strtoull(s, &end, base);
+	if (errno || !end || *end) return false;
+	*out = (uint64_t)v;
+	return true;
+}
+
+static bool pool_header_int(const char *s, int *out) {
+	if (!s || !*s) return false;
+	errno = 0;
+	char *end = NULL;
+	long v = strtol(s, &end, 10);
+	if (errno || !end || *end || v < INT_MIN || v > INT_MAX) return false;
+	*out = (int)v;
+	return true;
+}
+
+static bool pool_header_no_more(char **sp) { return pool_tok(sp) == NULL; }
+
+/* Legendary constraints from successive refilter stages describe the same
+ * physical Soul #1/#2 sequence. Canonicalize them to at most one intersected
+ * rule per depth; conflicting targets or disjoint Ante windows mean the pool
+ * header cannot describe any valid seed on one cumulative route. */
+static bool bspool_add_legend_rule(BspoolHeader *h, const char *key,
+		int minAnte, int maxAnte, int neg, int soulDepth) {
+	for (int i = 0; i < h->nrouteLegendRules; i++) {
+		if (h->routeLegendRules[i].soulDepth != soulDepth) continue;
+		if (strcmp(h->routeLegendRules[i].key, key)) return false;
+		if (minAnte > h->routeLegendRules[i].minAnte)
+			h->routeLegendRules[i].minAnte = minAnte;
+		if (maxAnte < h->routeLegendRules[i].maxAnte)
+			h->routeLegendRules[i].maxAnte = maxAnte;
+		h->routeLegendRules[i].neg = h->routeLegendRules[i].neg || neg;
+		return h->routeLegendRules[i].minAnte <= h->routeLegendRules[i].maxAnte;
+	}
+	if (h->nrouteLegendRules >= MAX_POOL_LEGEND_RULES) return false;
+	int i = h->nrouteLegendRules++;
+	snprintf(h->routeLegendRules[i].key, MAX_KEY, "%s", key);
+	h->routeLegendRules[i].minAnte = minAnte;
+	h->routeLegendRules[i].maxAnte = maxAnte;
+	h->routeLegendRules[i].neg = neg;
+	h->routeLegendRules[i].soulDepth = soulDepth;
+	return true;
 }
 
 static uint64_t pool_hash_update(uint64_t h, const void *data, size_t n) {
@@ -1179,7 +1629,8 @@ static uint64_t pool_hash_update(uint64_t h, const void *data, size_t n) {
 static bool pool_catalog_directive(const char *d) {
 	return !strcmp(d, "modelver") || !strcmp(d, "tagdef")
 		|| !strcmp(d, "vouchdef") || !strcmp(d, "jokerdef")
-		|| !strcmp(d, "boostdef") || !strncmp(d, "check_", 6);
+		|| !strcmp(d, "boostdef") || !strcmp(d, "specialdef")
+		|| !strncmp(d, "check_", 6);
 }
 
 /* Fingerprint only model/pool/check data. Session entropy, current UI filters,
@@ -1220,10 +1671,21 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	char buf[BSPOOL_HEADER_SIZE + 1];
 	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
 	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
-	if (got < 64) { snprintf(err, errsz, "pool header is truncated"); return false; }
+	if (got != BSPOOL_HEADER_SIZE) { snprintf(err, errsz, "pool header is truncated"); return false; }
 	buf[got] = 0;
 	char *cur = buf;
-	int sawMagic = 0, sawEnd = 0;
+	enum {
+		HS_MAGIC = 1u << 0, HS_MODEL = 1u << 1, HS_ENCODING = 1u << 2,
+		HS_CHARSET = 1u << 3, HS_SEEDSPACE = 1u << 4, HS_RANGE_START = 1u << 5,
+		HS_RANGE_END = 1u << 6, HS_CATALOG = 1u << 7, HS_CRITERIA = 1u << 8,
+		HS_RECORDS = 1u << 9, HS_DATA_BYTES = 1u << 10, HS_COMPLETE = 1u << 11,
+		HS_HEADER_BYTES = 1u << 12
+	};
+	const unsigned required = HS_MAGIC | HS_MODEL | HS_ENCODING | HS_CHARSET
+		| HS_SEEDSPACE | HS_RANGE_START | HS_RANGE_END | HS_CATALOG
+		| HS_CRITERIA | HS_RECORDS | HS_COMPLETE | HS_HEADER_BYTES;
+	unsigned seen = 0;
+	int sawEnd = 0, malformed = 0, sawSoulDepth = 0;
 	char encoding[32] = "";
 	while (cur && *cur && !sawEnd) {
 		char *nl = strchr(cur, '\n');
@@ -1236,25 +1698,87 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		char *v = NULL;
 		if (!strcmp(d, "BRAINSTORM_SEED_POOL")) {
 			v = pool_tok(&sp);
-			h->schema = v ? atoi(v) : 0;
-			sawMagic = 1;
+			if ((seen & HS_MAGIC) || !pool_header_int(v, &h->schema)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_MAGIC;
 		}
-		else if (!strcmp(d, "modelver")) { v = pool_tok(&sp); h->modelver = v ? atoi(v) : 0; }
-		else if (!strcmp(d, "encoding")) { v = pool_tok(&sp); if (v) snprintf(encoding, sizeof encoding, "%s", v); }
-		else if (!strcmp(d, "charset")) { v = pool_tok(&sp); if (v) snprintf(h->charset, sizeof h->charset, "%s", v); }
-		else if (!strcmp(d, "seedspace")) { v = pool_tok(&sp); h->seedspace = v ? strtoull(v, NULL, 10) : 0; }
-		else if (!strcmp(d, "range_start")) { v = pool_tok(&sp); h->rangeStart = v ? strtoull(v, NULL, 10) : 0; }
-		else if (!strcmp(d, "range_end")) { v = pool_tok(&sp); h->rangeEnd = v ? strtoull(v, NULL, 10) : 0; }
-		else if (!strcmp(d, "catalog_hash")) { v = pool_tok(&sp); h->catalogHash = v ? strtoull(v, NULL, 16) : 0; }
-		else if (!strcmp(d, "criteria_hash")) { v = pool_tok(&sp); h->criteriaHash = v ? strtoull(v, NULL, 16) : 0; }
-		else if (!strcmp(d, "records")) { v = pool_tok(&sp); h->records = v ? strtoull(v, NULL, 10) : 0; }
-		else if (!strcmp(d, "data_bytes")) { v = pool_tok(&sp); h->dataBytes = v ? strtoull(v, NULL, 10) : 0; }
-		else if (!strcmp(d, "complete")) { v = pool_tok(&sp); h->complete = v ? atoi(v) : 0; }
-		else if (!strcmp(d, "header_bytes")) { v = pool_tok(&sp); h->headerBytes = v ? atoi(v) : 0; }
-		else if (!strcmp(d, "tag_route")) { v = pool_tok(&sp); h->route = (v && !strcmp(v, "observe")) ? 0 : 1; }
-		else if (!strcmp(d, "pool_id")) { v = pool_tok(&sp); if (v) snprintf(h->poolId, sizeof h->poolId, "%s", v); }
-		else if (!strcmp(d, "refilter_depth")) { v = pool_tok(&sp); h->refilterDepth = v ? atoi(v) : 0; }
-		else if (!strcmp(d, "merged_parts")) { v = pool_tok(&sp); h->mergedParts = v ? atoi(v) : 0; }
+		else if (!strcmp(d, "modelver")) {
+			v = pool_tok(&sp); if ((seen & HS_MODEL) || !pool_header_int(v, &h->modelver)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_MODEL;
+		}
+		else if (!strcmp(d, "encoding")) {
+			v = pool_tok(&sp); if ((seen & HS_ENCODING) || !v || strlen(v) >= sizeof encoding
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			else snprintf(encoding, sizeof encoding, "%s", v); seen |= HS_ENCODING;
+		}
+		else if (!strcmp(d, "charset")) {
+			v = pool_tok(&sp); if ((seen & HS_CHARSET) || !v || strlen(v) >= sizeof h->charset
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			else snprintf(h->charset, sizeof h->charset, "%s", v); seen |= HS_CHARSET;
+		}
+		else if (!strcmp(d, "seedspace")) {
+			v = pool_tok(&sp); if ((seen & HS_SEEDSPACE) || !pool_header_u64(v, 10, &h->seedspace)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_SEEDSPACE;
+		}
+		else if (!strcmp(d, "range_start")) {
+			v = pool_tok(&sp); if ((seen & HS_RANGE_START) || !pool_header_u64(v, 10, &h->rangeStart)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_RANGE_START;
+		}
+		else if (!strcmp(d, "range_end")) {
+			v = pool_tok(&sp); if ((seen & HS_RANGE_END) || !pool_header_u64(v, 10, &h->rangeEnd)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_RANGE_END;
+		}
+		else if (!strcmp(d, "catalog_hash")) {
+			v = pool_tok(&sp); if ((seen & HS_CATALOG) || !pool_header_u64(v, 16, &h->catalogHash)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_CATALOG;
+		}
+		else if (!strcmp(d, "criteria_hash")) {
+			v = pool_tok(&sp); if ((seen & HS_CRITERIA) || !pool_header_u64(v, 16, &h->criteriaHash)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_CRITERIA;
+		}
+		else if (!strcmp(d, "records")) {
+			v = pool_tok(&sp); if ((seen & HS_RECORDS) || !pool_header_u64(v, 10, &h->records)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_RECORDS;
+		}
+		else if (!strcmp(d, "data_bytes")) {
+			v = pool_tok(&sp); if ((seen & HS_DATA_BYTES) || !pool_header_u64(v, 10, &h->dataBytes)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_DATA_BYTES;
+		}
+		else if (!strcmp(d, "complete")) {
+			v = pool_tok(&sp); if ((seen & HS_COMPLETE) || !pool_header_int(v, &h->complete)
+					|| !pool_header_no_more(&sp) || (h->complete != 0 && h->complete != 1)) malformed = 1;
+			seen |= HS_COMPLETE;
+		}
+		else if (!strcmp(d, "header_bytes")) {
+			v = pool_tok(&sp); if ((seen & HS_HEADER_BYTES) || !pool_header_int(v, &h->headerBytes)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			seen |= HS_HEADER_BYTES;
+		}
+		else if (!strcmp(d, "tag_route")) {
+			v = pool_tok(&sp);
+			if (!v || (strcmp(v, "collect") && strcmp(v, "observe")) || !pool_header_no_more(&sp)) malformed = 1;
+			else h->route = !strcmp(v, "collect");
+		}
+		else if (!strcmp(d, "pool_id")) {
+			v = pool_tok(&sp); if (!v || strlen(v) >= sizeof h->poolId || !pool_header_no_more(&sp)) malformed = 1;
+			else snprintf(h->poolId, sizeof h->poolId, "%s", v);
+		}
+		else if (!strcmp(d, "refilter_depth")) {
+			v = pool_tok(&sp); if (!pool_header_int(v, &h->refilterDepth)
+					|| h->refilterDepth < 0 || !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "merged_parts")) {
+			v = pool_tok(&sp); if (!pool_header_int(v, &h->mergedParts)
+					|| h->mergedParts < 0 || !pool_header_no_more(&sp)) malformed = 1;
+		}
 		else if (!strcmp(d, "label")) {
 			/* rest of the line, spaces included */
 			while (*sp == ' ' || *sp == '\t') sp++;
@@ -1264,33 +1788,78 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 			if (h->ntagRules < BSPOOL_MAX_TAG_RULES) {
 				char *k = pool_tok(&sp);
 				char *a = pool_tok(&sp), *b = pool_tok(&sp), *c = pool_tok(&sp);
-				if (k && a && b && c) {
+				int ia, ib, ic;
+				if (k && strlen(k) < MAX_KEY && pool_header_int(a, &ia)
+						&& pool_header_int(b, &ib) && pool_header_int(c, &ic)
+						&& pool_header_no_more(&sp)) {
 					snprintf(h->tagRules[h->ntagRules].key, MAX_KEY, "%s", k);
-					h->tagRules[h->ntagRules].minAnte = atoi(a);
-					h->tagRules[h->ntagRules].maxAnte = atoi(b);
-					h->tagRules[h->ntagRules].minCount = atoi(c);
+					h->tagRules[h->ntagRules].minAnte = ia;
+					h->tagRules[h->ntagRules].maxAnte = ib;
+					h->tagRules[h->ntagRules].minCount = ic;
 					h->ntagRules++;
-				}
-			}
+				} else malformed = 1;
+			} else malformed = 1;
+		}
+		else if (!strcmp(d, "route_tag")) {
+			if (h->nrouteTagRules < BSPOOL_MAX_TAG_RULES) {
+				char *mode = pool_tok(&sp), *k = pool_tok(&sp);
+				char *a = pool_tok(&sp), *b = pool_tok(&sp), *c = pool_tok(&sp);
+				int ia, ib, ic;
+				if (mode && k && strlen(k) < MAX_KEY && pool_header_int(a, &ia)
+						&& pool_header_int(b, &ib) && pool_header_int(c, &ic)
+						&& (!strcmp(mode, "collect") || !strcmp(mode, "observe"))
+						&& pool_header_no_more(&sp)) {
+					int i = h->nrouteTagRules++;
+					snprintf(h->routeTagRules[i].key, MAX_KEY, "%s", k);
+					h->routeTagRules[i].minAnte = ia;
+					h->routeTagRules[i].maxAnte = ib;
+					h->routeTagRules[i].minCount = ic;
+					h->routeTagRules[i].collect = !strcmp(mode, "collect");
+				} else malformed = 1;
+			} else malformed = 1;
+		}
+		else if (!strcmp(d, "route_legendary")) {
+			char *k = pool_tok(&sp), *a = pool_tok(&sp), *b = pool_tok(&sp);
+			char *n = pool_tok(&sp), *depth = pool_tok(&sp);
+			int ia, ib, in, id;
+			if (!k || strlen(k) >= MAX_KEY || !pool_header_int(a, &ia)
+					|| !pool_header_int(b, &ib) || !pool_header_int(n, &in)
+					|| !pool_header_int(depth, &id) || !pool_header_no_more(&sp)
+					|| ia < 1 || ib < ia || ib > BSPOOL_MAX_ANTE
+					|| (in != 0 && in != 1) || id < 1 || id > 2
+					|| !bspool_add_legend_rule(h, k, ia, ib, in, id)) malformed = 1;
 		}
 		else if (!strcmp(d, "legendary")) {
 			char *k = pool_tok(&sp);
 			char *a = pool_tok(&sp), *b = pool_tok(&sp), *n = pool_tok(&sp);
-			if (k && a && b) {
+			int ia, ib, in = 0;
+			if (!h->legendary.used && k && strlen(k) < MAX_KEY
+					&& pool_header_int(a, &ia) && pool_header_int(b, &ib)
+					&& (!n || pool_header_int(n, &in)) && (in == 0 || in == 1)
+					&& pool_header_no_more(&sp)) {
 				h->legendary.used = 1;
 				snprintf(h->legendary.key, MAX_KEY, "%s", k);
-				h->legendary.minAnte = atoi(a);
-				h->legendary.maxAnte = atoi(b);
-				h->legendary.neg = n ? atoi(n) : 0;
-			}
+				h->legendary.minAnte = ia;
+				h->legendary.maxAnte = ib;
+				h->legendary.neg = in;
+			} else malformed = 1;
 		}
 		else if (!strcmp(d, "soul_depth")) {
 			v = pool_tok(&sp);
-			h->legendary.soulDepth = v ? atoi(v) : 1;
+			if (sawSoulDepth || !pool_header_int(v, &h->legendary.soulDepth)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			sawSoulDepth = 1;
 		}
-		else if (!strcmp(d, "end")) sawEnd = 1;
+		else if (!strcmp(d, "end")) {
+			if (!pool_header_no_more(&sp)) malformed = 1;
+			sawEnd = 1;
+		}
 	}
-	if (!sawMagic) { snprintf(err, errsz, "not a Brainstorm seed pool"); return false; }
+	if (!(seen & HS_MAGIC)) { snprintf(err, errsz, "not a Brainstorm seed pool"); return false; }
+	if (malformed || (seen & required) != required
+			|| (sawSoulDepth && !h->legendary.used)) {
+		snprintf(err, errsz, "pool header is malformed or missing required metadata"); return false;
+	}
 	if (h->schema != BSPOOL_SCHEMA_LEGACY && h->schema != BSPOOL_SCHEMA) {
 		snprintf(err, errsz, "pool schema %d unsupported (want %d or %d)",
 				h->schema, BSPOOL_SCHEMA_LEGACY, BSPOOL_SCHEMA);
@@ -1306,6 +1875,9 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	if (h->schema == BSPOOL_SCHEMA && h->encoding != BSPOOL_ENCODING_DELTA_BLOCKS) {
 		snprintf(err, errsz, "schema %d pool must use delta blocks", BSPOOL_SCHEMA); return false;
 	}
+	if (h->schema == BSPOOL_SCHEMA && !(seen & HS_DATA_BYTES)) {
+		snprintf(err, errsz, "compressed pool is missing its committed byte count"); return false;
+	}
 	/* The charset decides which seed space the ranks index (the human-readable
 	 * `space` header line is informational). Unknown charsets are refused: a
 	 * newer format should fail loudly, never decode to wrong seeds. */
@@ -1313,9 +1885,49 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	else if (!strcmp(h->charset, CHARSET_TOTAL)) h->space = SPACE_TOTAL;
 	else { snprintf(err, errsz, "pool charset differs"); return false; }
 	if (h->seedspace != space_size(h->space)) { snprintf(err, errsz, "pool seed space differs"); return false; }
-	if (h->headerBytes < 64 || h->headerBytes > BSPOOL_HEADER_SIZE) {
+	if (h->rangeStart >= h->rangeEnd || h->rangeEnd > h->seedspace
+			|| h->records > h->rangeEnd - h->rangeStart) {
+		snprintf(err, errsz, "pool range or record count is invalid");
+		return false;
+	}
+	if (h->headerBytes != BSPOOL_HEADER_SIZE) {
 		snprintf(err, errsz, "pool header_bytes %d is invalid", h->headerBytes);
 		return false;
+	}
+	/* `tag` rules describe the latest scan stage and inherit tag_route.
+	 * `route_tag` carries earlier stages through refilters. Together they are
+	 * the cumulative physical blind-skip route used by in-game overlays. */
+	for (int i = 0; i < h->ntagRules; i++) {
+		if (h->nrouteTagRules >= BSPOOL_MAX_TAG_RULES) {
+			snprintf(err, errsz, "pool route has too many tag rules"); return false;
+		}
+		int j = h->nrouteTagRules++;
+		snprintf(h->routeTagRules[j].key, MAX_KEY, "%s", h->tagRules[i].key);
+		h->routeTagRules[j].minAnte = h->tagRules[i].minAnte;
+		h->routeTagRules[j].maxAnte = h->tagRules[i].maxAnte;
+		h->routeTagRules[j].minCount = h->tagRules[i].minCount;
+		h->routeTagRules[j].collect = h->route;
+	}
+	for (int i = 0; i < h->nrouteTagRules; i++) {
+		if (!h->routeTagRules[i].key[0] || h->routeTagRules[i].minAnte < 1
+				|| h->routeTagRules[i].maxAnte < h->routeTagRules[i].minAnte
+				|| h->routeTagRules[i].maxAnte > BSPOOL_MAX_ANTE
+				|| h->routeTagRules[i].minCount < 1
+				|| h->routeTagRules[i].minCount > 2 * (h->routeTagRules[i].maxAnte
+						- h->routeTagRules[i].minAnte + 1)) {
+			snprintf(err, errsz, "pool has an invalid embedded tag route"); return false;
+		}
+	}
+	if (h->legendary.used && (h->legendary.minAnte < 1
+			|| h->legendary.maxAnte < h->legendary.minAnte
+			|| h->legendary.maxAnte > BSPOOL_MAX_ANTE
+			|| h->legendary.soulDepth < 1 || h->legendary.soulDepth > 2)) {
+		snprintf(err, errsz, "pool has an invalid embedded legendary rule"); return false;
+	}
+	if (h->legendary.used && !bspool_add_legend_rule(h, h->legendary.key,
+			h->legendary.minAnte, h->legendary.maxAnte, h->legendary.neg,
+			h->legendary.soulDepth)) {
+		snprintf(err, errsz, "pool has conflicting cumulative legendary rules"); return false;
 	}
 	return true;
 }
@@ -1331,7 +1943,7 @@ typedef struct {
 
 typedef struct {
 	int fd, space, encoding;
-	uint64_t records, dataOff, dataBytes, nblocks;
+	uint64_t records, dataOff, dataBytes, nblocks, rangeStart, rangeEnd;
 	BspoolBlockIndex *blocks;
 } BspoolReader;
 
@@ -1368,7 +1980,7 @@ static uint32_t bspool_checksum(const unsigned char *p, size_t n) {
 }
 
 static bool bspool_scratch_bytes(BspoolScratch *s, size_t need) {
-	if (need <= s->bytesCap) return true;
+	if (need <= s->bytesCap) return need == 0 || s->bytes != NULL;
 	unsigned char *p = realloc(s->bytes, need);
 	if (!p) return false;
 	s->bytes = p; s->bytesCap = need;
@@ -1376,7 +1988,7 @@ static bool bspool_scratch_bytes(BspoolScratch *s, size_t need) {
 }
 
 static bool bspool_scratch_ranks(BspoolScratch *s, size_t need) {
-	if (need <= s->ranksCap) return true;
+	if (need <= s->ranksCap) return need == 0 || s->ranks != NULL;
 	if (need > SIZE_MAX / sizeof *s->ranks) return false;
 	uint64_t *p = realloc(s->ranks, need * sizeof *p);
 	if (!p) return false;
@@ -1421,6 +2033,7 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 	memset(r, 0, sizeof *r);
 	r->fd = fd; r->space = h->space; r->encoding = h->encoding;
 	r->records = h->records; r->dataOff = (uint64_t)h->headerBytes;
+	r->rangeStart = h->rangeStart; r->rangeEnd = h->rangeEnd;
 	if (h->encoding == BSPOOL_ENCODING_U64) {
 		if (h->records > (UINT64_MAX - r->dataOff) / 8u
 				|| fileBytes < r->dataOff + h->records * 8u) {
@@ -1530,8 +2143,8 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 	const BspoolBlockIndex *e = &r->blocks[block];
 	uint32_t count, payload, checksum; uint64_t first, last;
 	if (!bspool_block_header(r->fd, e->offset, &count, &payload, &checksum, &first, &last)
-			|| count != e->count || payload != e->payloadBytes || first >= space_size(r->space)
-			|| last >= space_size(r->space) || first > last
+			|| count != e->count || payload != e->payloadBytes
+			|| first < r->rangeStart || last >= r->rangeEnd || first > last
 			|| !bspool_scratch_bytes(s, payload) || !bspool_scratch_ranks(s, count)) return false;
 	if (payload && bs_pread(r->fd, s->bytes, payload,
 			(int64_t)(e->offset + BSPOOL_BLOCK_HEADER_SIZE)) != (int64_t)payload) return false;
@@ -1547,9 +2160,9 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 			if (!(b & 0x80)) { sawEnd = 1; break; }
 			shift += 7;
 		}
-		if (!sawEnd || UINT64_MAX - s->ranks[i - 1] < delta) return false;
+		if (!sawEnd || delta == 0 || UINT64_MAX - s->ranks[i - 1] < delta) return false;
 		s->ranks[i] = s->ranks[i - 1] + delta;
-		if (s->ranks[i] >= space_size(r->space)) return false;
+		if (s->ranks[i] >= r->rangeEnd) return false;
 	}
 	if (at != payload || s->ranks[count - 1] != last) return false;
 	s->cachedBlock = block;
@@ -1561,12 +2174,13 @@ static bool bspool_reader_read(const BspoolReader *r, uint64_t first,
 	if (first > r->records || count > r->records - first) return false;
 	if (!count) return true;
 	if (r->encoding == BSPOOL_ENCODING_U64) {
+		if (count > SIZE_MAX / 8u) return false;
 		size_t bytes = (size_t)count * 8u;
-		if (count > SIZE_MAX / 8u || !bspool_scratch_bytes(s, bytes)
+		if (bytes == 0 || !bspool_scratch_bytes(s, bytes)
 				|| bs_pread(r->fd, s->bytes, bytes, (int64_t)(r->dataOff + first * 8u)) != (int64_t)bytes) return false;
 		for (uint64_t i = 0; i < count; i++) {
 			out[i] = bspool_get_u64le(s->bytes + i * 8u);
-			if (out[i] >= space_size(r->space)) return false;
+			if (out[i] < r->rangeStart || out[i] >= r->rangeEnd) return false;
 		}
 		return true;
 	}
@@ -1595,6 +2209,7 @@ static bool bspool_reader_read(const BspoolReader *r, uint64_t first,
 
 /* ------------------------------------------------------------- searching */
 static _Atomic bool g_stop;
+static _Atomic bool g_worker_failed;
 static _Atomic unsigned long long g_tried;
 static bs_mutex_t g_found_mtx = BS_MUTEX_INIT;
 static bool g_found;
@@ -1611,6 +2226,7 @@ typedef struct {
 	uint64_t records, rot;
 	_Atomic uint64_t next;    /* rotated record index dealt to workers */
 	_Atomic int live;         /* workers still scanning (exhaustion detect) */
+	_Atomic bool failed;      /* allocation/decode failure: never exhaustion */
 } PoolRun;
 static PoolRun g_pool;
 static bool g_pool_active;
@@ -1659,6 +2275,9 @@ static void *pool_worker(void *vp) {
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
 	if (!c || !ranks) {
 		free(c); free(ranks);
+		atomic_store(&g_pool.failed, true);
+		atomic_store(&g_worker_failed, true);
+		atomic_store(&g_stop, true);
 		atomic_fetch_sub(&g_pool.live, 1);
 		return NULL;
 	}
@@ -1671,7 +2290,9 @@ static void *pool_worker(void *vp) {
 		uint64_t n = PCHUNK;
 		if (i0 + n > g_pool.records) n = g_pool.records - i0;
 		if (!pool_read_ranks(g_pool.rot + i0, n, ranks, &scratch)) {
-			if (!g_warn[0]) snprintf(g_warn, sizeof g_warn, "pool record read failed; scan is partial");
+			atomic_store(&g_pool.failed, true);
+			atomic_store(&g_worker_failed, true);
+			atomic_store(&g_stop, true);
 			break;
 		}
 		/* drop corrupt out-of-space ranks instead of trusting them */
@@ -1713,7 +2334,11 @@ static void *worker(void *vp) {
 	WorkerArgs *w = (WorkerArgs *)vp;
 	const Config *g = w->g;
 	Ctx *c = calloc(1, sizeof(Ctx));
-	if (!c) return NULL;
+	if (!c) {
+		atomic_store(&g_worker_failed, true);
+		atomic_store(&g_stop, true);
+		return NULL;
+	}
 	c->g = g;
 	uint64_t k = w->start + (uint64_t)w->tid;
 	uint64_t step = (uint64_t)g->threads;
@@ -1766,11 +2391,11 @@ static double file_age_seconds(const char *path) {
 	return bs_file_age_seconds(path);
 }
 
-/* Open + validate the config's .bspool. Fatal problems come back as an error
- * message (the mod stops a pool search rather than degrading to a full-space
- * search); a catalog fingerprint difference is only a warning because every
- * hit is still re-verified against the CURRENT profile's filters. */
-static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t errsz) {
+/* Open + validate the config's .bspool. A profile/catalog difference is
+ * fatal: membership proves the embedded criteria only against the snapshot
+ * that built the pool, and overlay route composition depends on the same
+ * ordered tag/booster pools. */
+static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 	FILE *f = fopen(g->poolFile, "rb");
 	if (!f) { snprintf(err, errsz, "pool: cannot open %s", g->poolFile); return false; }
 	BspoolHeader h;
@@ -1796,9 +2421,54 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 	uint64_t records = h.records;
 	if (records == 0) { snprintf(err, errsz, "pool: no seed records"); fclose(f); return false; }
 	uint64_t cfgHash = 0;
-	if (pool_hash_catalog_file(cfgPath, &cfgHash) && cfgHash != h.catalogHash) {
-		snprintf(g_warn, sizeof g_warn,
-				"pool was built on a different pool/unlock snapshot; hits are re-verified in-game");
+	if (!pool_hash_catalog_file(cfgPath, &cfgHash)) {
+		snprintf(err, errsz, "pool: cannot fingerprint the current profile snapshot");
+		fclose(f);
+		return false;
+	}
+	if (cfgHash != h.catalogHash) {
+		snprintf(err, errsz,
+				"pool: profile/unlock snapshot differs; rebuild the pool with this native_search.cfg");
+		fclose(f);
+		return false;
+	}
+	g->npoolRouteRules = 0;
+	for (int r = 0; r < h.nrouteTagRules; r++) {
+		if (!h.routeTagRules[r].collect) continue;
+		int idx = -1;
+		for (int i = 0; i < g->ntags; i++) {
+			if (!strcmp(g->tagKey[i], h.routeTagRules[r].key)) { idx = i; break; }
+		}
+		if (idx < 0 || g->npoolRouteRules >= MAX_POOL_ROUTE_RULES) {
+			snprintf(err, errsz, "pool: embedded tag route is not available in this profile");
+			fclose(f);
+			return false;
+		}
+		int j = g->npoolRouteRules++;
+		g->poolRouteRules[j].poolIndex = idx;
+		g->poolRouteRules[j].minAnte = h.routeTagRules[r].minAnte;
+		g->poolRouteRules[j].maxAnte = h.routeTagRules[r].maxAnte;
+		g->poolRouteRules[j].minCount = h.routeTagRules[r].minCount;
+		g->poolRouteRules[j].collect = 1;
+	}
+	g->npoolLegendRules = 0;
+	for (int r = 0; r < h.nrouteLegendRules; r++) {
+		int idx = -1;
+		for (int i = 0; i < g->njoker[4]; i++) {
+			if (!strcmp(g->jokerKey[4][i], h.routeLegendRules[r].key)) { idx = i; break; }
+		}
+		if (!g->soulAllowed || idx < 0 || !g->jokerAvail[4][idx]
+				|| g->npoolLegendRules >= MAX_POOL_LEGEND_RULES) {
+			snprintf(err, errsz, "pool: embedded legendary route is not available in this profile");
+			fclose(f);
+			return false;
+		}
+		int j = g->npoolLegendRules++;
+		g->poolLegendRules[j].poolIndex = idx;
+		g->poolLegendRules[j].minAnte = h.routeLegendRules[r].minAnte;
+		g->poolLegendRules[j].maxAnte = h.routeLegendRules[r].maxAnte;
+		g->poolLegendRules[j].neg = h.routeLegendRules[r].neg;
+		g->poolLegendRules[j].soulDepth = h.routeLegendRules[r].soulDepth;
 	}
 	if (!h.complete) {
 		snprintf(g_warn, sizeof g_warn, "pool scan is incomplete (%llu records committed)",
@@ -1818,7 +2488,7 @@ static bool pool_open(const Config *g, const char *cfgPath, char *err, size_t er
 	return true;
 }
 
-static int mode_search(const Config *g, const char *cfgPath, const char *statusPath,
+static int mode_search(Config *g, const char *cfgPath, const char *statusPath,
 		const char *stopPath, const char *hbPath) {
 	char tmp[1024];
 	snprintf(tmp, sizeof tmp, "%s.tmp", statusPath);
@@ -1840,18 +2510,29 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 	uint64_t entropy = splitmix64((uint64_t)(g->entropy * 4096.0) ^ 0xB5A7A7EDULL ^ (uint64_t)g->session);
 	uint64_t start = entropy % SEEDSPACE;
 	int n = g->threads < 1 ? 1 : (g->threads > 64 ? 64 : g->threads);
+	atomic_store(&g_worker_failed, false);
 	if (g_pool_active) {
 		g_pool.rot = entropy % g_pool.records;
 		atomic_init(&g_pool.next, 0);
-		atomic_init(&g_pool.live, n);
+		atomic_init(&g_pool.live, 0);
+		atomic_init(&g_pool.failed, false);
 	}
 	bs_thread_t th[64];
 	WorkerArgs wa[64];
+	int made = 0;
 	for (int i = 0; i < n; i++) {
 		wa[i].g = g;
 		wa[i].tid = i;
 		wa[i].start = start;
-		bs_thread_create(&th[i], g_pool_active ? pool_worker : worker, &wa[i]);
+		if (g_pool_active) atomic_fetch_add(&g_pool.live, 1);
+		if (bs_thread_create(&th[i], g_pool_active ? pool_worker : worker, &wa[i]) != 0) {
+			if (g_pool_active) atomic_fetch_sub(&g_pool.live, 1);
+			atomic_store(&g_stop, true);
+			for (int j = 0; j < made; j++) bs_thread_join(th[j]);
+			write_status(statusPath, tmp, true, "worker thread creation failed");
+			return 1;
+		}
+		made++;
 	}
 	time_t t0 = time(NULL);
 	bool joined = false;
@@ -1860,9 +2541,13 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 		if (bs_file_exists(stopPath)) atomic_store(&g_stop, true);
 		/* a fully dealt pool with no hit is a definitive verdict, not a retry */
 		if (g_pool_active && atomic_load(&g_pool.live) == 0) {
-			for (int i = 0; i < n; i++) bs_thread_join(th[i]);
+			for (int i = 0; i < made; i++) bs_thread_join(th[i]);
 			joined = true;
 			if (g_found) break;
+			if (atomic_load(&g_pool.failed)) {
+				write_status(statusPath, tmp, true, "pool: record decode/read failed");
+				return 1;
+			}
 			write_status(statusPath, tmp, true,
 					"pool: no seed in the pool matches the active filters");
 			return 3;
@@ -1872,14 +2557,20 @@ static int mode_search(const Config *g, const char *cfgPath, const char *statusP
 		if (difftime(time(NULL), t0) > 20 && file_age_seconds(hbPath) > 30.0) {
 			atomic_store(&g_stop, true);
 			write_status(statusPath, tmp, true, "heartbeat lost");
-			for (int i = 0; i < n; i++) bs_thread_join(th[i]);
+			for (int i = 0; i < made; i++) bs_thread_join(th[i]);
 			return 2;
 		}
 		if (difftime(time(NULL), t0) > 6 * 3600) atomic_store(&g_stop, true); /* hard cap */
 		write_status(statusPath, tmp, false, NULL);
 	}
 	if (!joined) {
-		for (int i = 0; i < n; i++) bs_thread_join(th[i]);
+		for (int i = 0; i < made; i++) bs_thread_join(th[i]);
+	}
+	if (atomic_load(&g_worker_failed)) {
+		write_status(statusPath, tmp, true, g_pool_active
+				? "pool: worker allocation or record read failed"
+				: "native worker allocation failed");
+		return 1;
 	}
 	write_status(statusPath, tmp, true, NULL);
 	return 0;
@@ -1898,6 +2589,7 @@ static int mode_fixture(const Config *g, const char *seedfile) {
 	FILE *f = fopen(seedfile, "r");
 	if (!f) { fprintf(stderr, "cannot open %s\n", seedfile); return 1; }
 	Ctx *c = calloc(1, sizeof(Ctx));
+	if (!c) { fprintf(stderr, "cannot allocate fixture context\n"); fclose(f); return 1; }
 	c->g = g;
 	char seeds[ILV][9];
 	double hseed[ILV], hfirst[ILV];
@@ -2006,7 +2698,22 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	if (!strcmp(argv[1], "search") && argc == 6) return mode_search(&g, argv[2], argv[3], argv[4], argv[5]);
-	if (!strcmp(argv[1], "fixture") && argc == 4) return mode_fixture(&g, argv[3]);
+	if (!strcmp(argv[1], "fixture") && argc == 4) {
+		/* Fixture candidates are supplied explicitly, but a configured pool is
+		 * still opened so its embedded blind-skip route composes exactly as it
+		 * does in an interactive restricted search. */
+		if (g.poolFile[0] && !pool_open(&g, argv[2], err, sizeof err)) {
+			fprintf(stderr, "%s\n", err);
+			return 1;
+		}
+		int rc = mode_fixture(&g, argv[3]);
+		if (g_pool_active) {
+			int fd = g_pool.reader.fd;
+			bspool_reader_destroy(&g_pool.reader);
+			bs_close(fd);
+		}
+		return rc;
+	}
 	if (!strcmp(argv[1], "verifychecks")) return mode_verifychecks(&g);
 	if (!strcmp(argv[1], "bench") && argc == 4) return mode_bench(&g, atoi(argv[3]));
 	fprintf(stderr, "bad arguments\n");

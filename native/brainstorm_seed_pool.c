@@ -44,7 +44,7 @@ typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
 typedef struct {
 	char key[MAX_KEY];
 	int poolIndex;
-	int minAnte, maxAnte, minCount;
+	int minAnte, maxAnte, minCount, collect;
 } PoolTagRule;
 
 typedef struct {
@@ -66,6 +66,10 @@ typedef struct {
 	PoolFormat format;
 	int ntagRules;
 	PoolTagRule tagRules[POOL_MAX_TAG_RULES];
+	int nbaseTagRules;
+	PoolTagRule baseTagRules[POOL_MAX_TAG_RULES];
+	int nbaseLegendaryRules;
+	PoolLegendaryRule baseLegendaryRules[MAX_POOL_LEGEND_RULES];
 	PoolLegendaryRule legendary;
 	int minTagAnte, maxTagAnte, maxAnte;
 	int firstKind; /* 1 = Joker4, 2 = Tag<firstAnte> */
@@ -115,6 +119,8 @@ typedef struct {
 	PoolStream jokerResample[MAX_RESAMPLE];
 	PoolStream tag[POOL_MAX_ANTE + 1];
 	PoolStream tagResample[POOL_MAX_ANTE + 1][MAX_RESAMPLE];
+	int tagRoll[POOL_MAX_ANTE + 1][2];
+	uint8_t tagRollDone[POOL_MAX_ANTE + 1][2];
 	PoolStream shopPack[POOL_MAX_ANTE + 1];
 	PoolStream soulT[POOL_MAX_ANTE + 1], soulS[POOL_MAX_ANTE + 1];
 	PoolStream ediSoul[POOL_MAX_ANTE + 1];
@@ -154,6 +160,26 @@ static bool pool_parse_int(const char *s, int *out) {
 	long v = strtol(s, &end, 10);
 	if (errno || !end || *end || v < INT32_MIN || v > INT32_MAX) return false;
 	*out = (int)v;
+	return true;
+}
+
+static bool pool_parse_hex64(const char *s, uint64_t *out) {
+	if (!s || !*s || *s == '-') return false;
+	errno = 0;
+	char *end = NULL;
+	unsigned long long v = strtoull(s, &end, 16);
+	if (errno || !end || *end) return false;
+	*out = (uint64_t)v;
+	return true;
+}
+
+static bool pool_parse_double(const char *s, double *out) {
+	if (!s || !*s) return false;
+	errno = 0;
+	char *end = NULL;
+	double v = strtod(s, &end);
+	if (errno || !end || *end || !isfinite(v)) return false;
+	*out = v;
 	return true;
 }
 
@@ -350,6 +376,7 @@ bad_value:
 
 	for (int i = 0; i < p->ntagRules; i++) {
 		PoolTagRule *r = &p->tagRules[i];
+		r->collect = p->collectTags;
 		if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE
 				|| r->minCount < 1 || r->minCount > 2 * (r->maxAnte - r->minAnte + 1)) {
 			snprintf(err, errsz, "bad range/count for tag rule %s", r->key);
@@ -364,6 +391,10 @@ bad_value:
 	}
 	if (p->legendary.used) {
 		PoolLegendaryRule *r = &p->legendary;
+		if (!g->soulAllowed) {
+			snprintf(err, errsz, "The Soul is banned in this snapshot");
+			return false;
+		}
 		if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE) {
 			snprintf(err, errsz, "bad range for legendary rule %s", r->key);
 			return false;
@@ -445,7 +476,11 @@ static int pool_pick_culled(PoolCtx *c, PoolStream *first, const char *firstKey,
 	return idx > 0 ? idx - 1 : -1;
 }
 
-static int pool_roll_tag(PoolCtx *c, int ante) {
+static int pool_roll_tag_at(PoolCtx *c, int ante, int blind) {
+	if (ante < 1 || ante > POOL_MAX_ANTE || blind < 0 || blind > 1) return -1;
+	if (c->tagRollDone[ante][blind]) return c->tagRoll[ante][blind];
+	if (blind == 1 && !c->tagRollDone[ante][0]
+			&& pool_roll_tag_at(c, ante, 0) < 0) return -1;
 	const Config *g = c->g;
 	const PoolPlan *p = c->p;
 	int idx = pool_psr_n(c, pool_stream_next(c, &c->tag[ante], p->kTag[ante]), g->ntags);
@@ -457,7 +492,10 @@ static int pool_roll_tag(PoolCtx *c, int ante) {
 		if (isnan(sv)) return -1;
 		idx = pool_psr_n(c, sv, g->ntags);
 	}
-	return idx > 0 ? idx - 1 : -1;
+	idx = idx > 0 ? idx - 1 : -1;
+	c->tagRoll[ante][blind] = idx;
+	c->tagRollDone[ante][blind] = 1;
+	return idx;
 }
 
 static void pool_label_add(char *label, size_t cap, const char *fmt, ...) {
@@ -470,6 +508,38 @@ static void pool_label_add(char *label, size_t cap, const char *fmt, ...) {
 	va_end(ap);
 }
 
+/* Refiltering is an intersection on one physical route, not merely a second
+ * independent predicate pass. Replay the source pool's cumulative collected
+ * tag rules so the new Soul/pack criteria see the same missing shops. */
+static bool pool_apply_base_route(PoolCtx *c) {
+	const PoolPlan *p = c->p;
+	int counts[POOL_MAX_TAG_RULES] = { 0 };
+	for (int ante = 1; ante <= p->maxAnte; ante++) {
+		for (int blind = 0; blind < 2; blind++) {
+			int needRoll = 0;
+			for (int r = 0; r < p->nbaseTagRules; r++) {
+				const PoolTagRule *rule = &p->baseTagRules[r];
+				if (rule->collect && counts[r] < rule->minCount
+						&& ante >= rule->minAnte && ante <= rule->maxAnte) {
+					needRoll = 1; break;
+				}
+			}
+			if (!needRoll) continue;
+			int idx = pool_roll_tag_at(c, ante, blind);
+			if (idx < 0) return false;
+			for (int r = 0; r < p->nbaseTagRules; r++) {
+				const PoolTagRule *rule = &p->baseTagRules[r];
+				if (!rule->collect || counts[r] >= rule->minCount
+						|| ante < rule->minAnte || ante > rule->maxAnte
+						|| idx != rule->poolIndex) continue;
+				counts[r]++;
+				if (blind == 0) c->skipSm[ante] = 1; else c->skipBig[ante] = 1;
+			}
+		}
+	}
+	return true;
+}
+
 static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap) {
 	const PoolPlan *p = c->p;
 	int counts[POOL_MAX_TAG_RULES] = { 0 };
@@ -477,14 +547,14 @@ static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap) {
 	int remaining = p->ntagRules;
 	for (int ante = p->minTagAnte; ante <= p->maxTagAnte; ante++) {
 		for (int blind = 0; blind < 2; blind++) {
-			int idx = pool_roll_tag(c, ante);
+			int idx = pool_roll_tag_at(c, ante, blind);
 			if (idx < 0) return false;
 			for (int r = 0; r < p->ntagRules; r++) {
 				const PoolTagRule *rule = &p->tagRules[r];
 				if (counts[r] >= rule->minCount || ante < rule->minAnte || ante > rule->maxAnte
 						|| idx != rule->poolIndex) continue;
 				counts[r]++;
-				if (p->collectTags) {
+				if (rule->collect) {
 					if (blind == 0) c->skipSm[ante] = 1;
 					else c->skipBig[ante] = 1;
 				}
@@ -517,7 +587,8 @@ static void pool_sim_packs(PoolCtx *c, int ante) {
 	if (c->packsGen[ante] != c->gen) {
 		c->packsGen[ante] = c->gen;
 		c->packsN[ante] = 0;
-		if (ante == c->forcedAnte) c->packIdx[ante][c->packsN[ante]++] = PACK_FORCED;
+		if (g->forceBuffoon && ante == c->forcedAnte)
+			c->packIdx[ante][c->packsN[ante]++] = PACK_FORCED;
 	}
 	int max = pool_pack_max_slots(c, ante);
 	while (c->packsN[ante] < max) {
@@ -525,6 +596,7 @@ static void pool_sim_packs(PoolCtx *c, int ante) {
 		double cumulative = 0.0;
 		int pick = -1;
 		for (int i = 0; i < g->nboost; i++) {
+			if (!g->boostAvail[i]) continue;
 			cumulative += g->boostW[i];
 			if (cumulative >= poll && cumulative - g->boostW[i] <= poll) { pick = i; break; }
 		}
@@ -552,11 +624,49 @@ static bool pool_precheck_legendary(PoolCtx *c) {
 	return second == p->legendary.poolIndex;
 }
 
+static int pool_legend_rule_count(const PoolPlan *p) {
+	return p->nbaseLegendaryRules + (p->legendary.used ? 1 : 0);
+}
+
+static const PoolLegendaryRule *pool_legend_rule_at(const PoolPlan *p, int i) {
+	return i < p->nbaseLegendaryRules ? &p->baseLegendaryRules[i] : &p->legendary;
+}
+
+/* All refilter stages constrain one cumulative Soul sequence. Resolve the
+ * owned legendary for Soul #1 and (when needed) Soul #2 once, then apply every
+ * source/current rule to those same picks. */
+static bool pool_precheck_all_legendaries(PoolCtx *c) {
+	const Config *g = c->g;
+	const PoolPlan *p = c->p;
+	int nrules = pool_legend_rule_count(p);
+	if (!nrules) return true;
+	int first = pool_pick_culled(c, &c->joker4, "Joker4", c->jokerResample,
+			g->jokerAvail[4], g->njoker[4]);
+	if (first < 0) return false;
+	c->firstLegendaryIdx = first;
+	int needSecond = 0;
+	for (int i = 0; i < nrules; i++)
+		if (pool_legend_rule_at(p, i)->soulDepth == 2) needSecond = 1;
+	int second = -1;
+	if (needSecond) {
+		uint8_t avail[MAX_JOKERS];
+		memcpy(avail, g->jokerAvail[4], sizeof avail);
+		avail[first] = 0;
+		second = pool_pick_culled(c, &c->joker4, "Joker4", c->jokerResample,
+				avail, g->njoker[4]);
+		if (second < 0) return false;
+	}
+	for (int i = 0; i < nrules; i++) {
+		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+		if ((r->soulDepth == 1 ? first : second) != r->poolIndex) return false;
+	}
+	return true;
+}
+
 static bool pool_check_first_soul(PoolCtx *c, char *label, size_t labelCap) {
 	const Config *g = c->g;
 	const PoolPlan *p = c->p;
 	const PoolLegendaryRule *rule = &p->legendary;
-	bool blackHoleFound = false;
 	for (int ante = 1; ante <= rule->maxAnte; ante++) {
 		pool_sim_packs(c, ante);
 		for (int slot = 0; slot < c->packsN[ante]; slot++) {
@@ -566,11 +676,17 @@ static bool pool_check_first_soul(PoolCtx *c, char *label, size_t labelCap) {
 			int cards = g->boostCards[pi];
 			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
 			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
+			bool soulInPack = false, blackHoleInPack = false;
 			for (int card = 0; card < cards; card++) {
-				bool soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-				if (soulKind == 2 && !blackHoleFound) {
+				bool soul = false;
+				if (!soulInPack)
+					soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
+				if (soulKind == 2 && !blackHoleInPack) {
 					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-					if (blackHole) { blackHoleFound = true; soul = false; }
+					if (blackHole) {
+						if (g->blackHoleAllowed) blackHoleInPack = true;
+						soul = false;
+					}
 				}
 				if (!soul) continue;
 				if (ante < rule->minAnte) return false;
@@ -614,7 +730,7 @@ static bool pool_check_second_soul(PoolCtx *c, char *label, size_t labelCap) {
 				if (soulKind == 2 && !blackHoleInPack) {
 					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
 					if (blackHole) {
-						blackHoleInPack = true;
+						if (g->blackHoleAllowed) blackHoleInPack = true;
 						soul = false;
 					}
 				}
@@ -646,6 +762,78 @@ static bool pool_check_second_soul(PoolCtx *c, char *label, size_t labelCap) {
 	return false;
 }
 
+/* Locate the first two Souls once on the final cumulative collected-tag
+ * route, including the per-pack Soul/Black-Hole gates and the edition roll
+ * consumed whenever a Soul is used. Every inherited and current rule is then
+ * checked against the corresponding exact Soul event. */
+static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
+	const Config *g = c->g;
+	const PoolPlan *p = c->p;
+	int nrules = pool_legend_rule_count(p), needDepth = 0, maxAnte = 0;
+	if (!nrules) return true;
+	for (int i = 0; i < nrules; i++) {
+		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+		if (r->soulDepth > needDepth) needDepth = r->soulDepth;
+		if (r->maxAnte > maxAnte) maxAnte = r->maxAnte;
+	}
+	int found = 0, eventAnte[3] = { 0 }, eventSlot[3] = { 0 };
+	double eventEdition[3] = { 0.0 };
+	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
+		pool_sim_packs(c, ante);
+		for (int slot = 0; slot < c->packsN[ante] && found < needDepth; slot++) {
+			int pi = c->packIdx[ante][slot];
+			if (pi < 0 || !g->boostSoul[pi]) continue;
+			int soulKind = g->boostSoul[pi], cards = g->boostCards[pi];
+			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
+			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
+			bool soulInPack = false, blackHoleInPack = false;
+			for (int card = 0; card < cards && found < needDepth; card++) {
+				bool soul = false;
+				if (!soulInPack)
+					soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
+				if (soulKind == 2 && !blackHoleInPack) {
+					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
+					if (blackHole) {
+						if (g->blackHoleAllowed) blackHoleInPack = true;
+						soul = false;
+					}
+				}
+				if (!soul) continue;
+				soulInPack = true;
+				found++;
+				eventAnte[found] = ante;
+				eventSlot[found] = slot + 1;
+				eventEdition[found] = pool_psr(c, pool_stream_next(c,
+						&c->ediSoul[ante], p->kEdiSoul[ante]));
+			}
+		}
+	}
+	if (found < needDepth) return false;
+	for (int i = 0; i < nrules; i++) {
+		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+		int depth = r->soulDepth;
+		if (eventAnte[depth] < r->minAnte || eventAnte[depth] > r->maxAnte
+				|| (r->requireNegative && eventEdition[depth] <= 0.997)) return false;
+	}
+	if (p->legendary.used) {
+		const PoolLegendaryRule *r = &p->legendary;
+		if (r->soulDepth == 2) {
+			const char *firstKey = c->firstLegendaryIdx >= 0
+					&& c->firstLegendaryIdx < g->njoker[4]
+					? g->jokerKey[4][c->firstLegendaryIdx] : "?";
+			pool_label_add(label, labelCap,
+					"%sSoul1(%s)=A%dP%d Soul2(%s)=A%dP%d",
+					label && label[0] ? " " : "", firstKey, eventAnte[1],
+					eventSlot[1], r->key, eventAnte[2], eventSlot[2]);
+		} else {
+			pool_label_add(label, labelCap, "%s%s=A%dP%d",
+					label && label[0] ? " " : "", r->key,
+					eventAnte[1], eventSlot[1]);
+		}
+	}
+	return true;
+}
+
 static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 		double hfirst, char *label, size_t labelCap) {
 	const PoolPlan *p = c->p;
@@ -654,6 +842,7 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	c->hashedSeed = hseed;
 	memset(c->skipSm, 0, sizeof c->skipSm);
 	memset(c->skipBig, 0, sizeof c->skipBig);
+	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
 	if (label && labelCap) label[0] = 0;
 	if (p->firstKind == 1) {
 		c->joker4.state = hfirst;
@@ -664,18 +853,14 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	}
 	/* Specific legendary selection is independent of tag/pack streams and
 	 * rejects ~80% of vanilla candidates before the expensive route walk. */
-	if (!pool_precheck_legendary(c)) return false;
+	if (!pool_precheck_all_legendaries(c)) return false;
+	if (p->nbaseTagRules && !pool_apply_base_route(c)) return false;
 	if (p->ntagRules && !pool_check_tags(c, label, labelCap)) return false;
 	c->forcedAnte = 1;
 	for (int ante = 1; ante <= p->maxAnte; ante++) {
 		if (pool_pack_max_slots(c, ante) > 0) { c->forcedAnte = ante; break; }
 	}
-	if (p->legendary.used) {
-		bool soulsOk = p->legendary.soulDepth == 2
-				? pool_check_second_soul(c, label, labelCap)
-				: pool_check_first_soul(c, label, labelCap);
-		if (!soulsOk) return false;
-	}
+	if (!pool_check_all_souls(c, label, labelCap)) return false;
 	return true;
 }
 
@@ -910,6 +1095,28 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		if (lw < 0 || lw >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += lw;
 	}
+	for (int i = 0; i < p->nbaseTagRules; i++) {
+		const PoolTagRule *r = &p->baseTagRules[i];
+		int rw = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+				"route_tag %s %s %d %d %d\n", r->collect ? "collect" : "observe",
+				r->key, r->minAnte, r->maxAnte, r->minCount);
+		if (rw < 0 || rw >= (int)(sizeof buf - (size_t)n)) {
+			snprintf(err, errsz, "binary header overflow from cumulative refilter route");
+			return false;
+		}
+		n += rw;
+	}
+	for (int i = 0; i < p->nbaseLegendaryRules; i++) {
+		const PoolLegendaryRule *r = &p->baseLegendaryRules[i];
+		int rw = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+				"route_legendary %s %d %d %d %d\n", r->key,
+				r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
+		if (rw < 0 || rw >= (int)(sizeof buf - (size_t)n)) {
+			snprintf(err, errsz, "binary header overflow from cumulative legendary route");
+			return false;
+		}
+		n += rw;
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "tag %s %d %d %d\n",
@@ -942,7 +1149,6 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
 			records, dataBytes, complete, POOL_HEADER_SIZE);
 	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
-	n += w;
 	int64_t at = bs_ftello(f);
 	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
 			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
@@ -1017,8 +1223,22 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	fprintf(f, "cursor %" PRIu64 "\noutput_bytes %" PRIu64 "\n", s->cursor, s->outputBytes);
 	fprintf(f, "matched %" PRIu64 "\nscanned %" PRIu64 "\nelapsed_seconds %.9f\ndone %d\nend\n",
 			s->matched, s->scanned, s->elapsed, s->done);
-	if (fflush(f) != 0 || bs_fsync_file(f) != 0 || fclose(f) != 0 || bs_rename_overwrite(tmp, path) != 0) {
-		snprintf(err, errsz, "cannot commit state: %s", strerror(errno));
+	/* Always close the temporary stream, including after a flush/fsync error.
+	 * Apart from leaking a descriptor, leaving it open prevents cleanup or
+	 * replacement on Windows. Preserve the first useful errno for the caller. */
+	int saved = 0;
+	if (ferror(f) || fflush(f) != 0) saved = errno ? errno : EIO;
+	if (!saved && bs_fsync_file(f) != 0) saved = errno ? errno : EIO;
+	if (fclose(f) != 0 && !saved) saved = errno ? errno : EIO;
+	if (saved) {
+		remove(tmp);
+		snprintf(err, errsz, "cannot commit state: %s", strerror(saved));
+		return false;
+	}
+	if (bs_rename_overwrite(tmp, path) != 0) {
+		saved = errno ? errno : EIO;
+		remove(tmp);
+		snprintf(err, errsz, "cannot commit state: %s", strerror(saved));
 		return false;
 	}
 	return true;
@@ -1030,28 +1250,63 @@ static bool pool_load_state(const char *path, const PoolPlan *p, PoolState *s,
 	if (!f) return false;
 	memset(s, 0, sizeof *s);
 	int version = 0, sawEnd = 0;
+	enum {
+		SS_VERSION = 1u << 0, SS_CATALOG = 1u << 1, SS_CRITERIA = 1u << 2,
+		SS_RANGE_START = 1u << 3, SS_RANGE_END = 1u << 4, SS_CURSOR = 1u << 5,
+		SS_OUTPUT = 1u << 6, SS_MATCHED = 1u << 7, SS_SCANNED = 1u << 8,
+		SS_ELAPSED = 1u << 9, SS_DONE = 1u << 10
+	};
+	const unsigned required = (1u << 11) - 1;
+	unsigned seen = 0;
 	uint64_t ch = 0, qh = 0, rs = 0, re = 0;
 	char line[256];
 	while (fgets(line, sizeof line, f)) {
 		char *sp = line;
 		char *d = pool_tok(&sp), *v = pool_tok(&sp);
 		if (!d) continue;
-		if (!strcmp(d, "BRAINSTORM_SEED_POOL_STATE")) { if (!pool_parse_int(v, &version)) goto bad; }
-		else if (!strcmp(d, "catalog_hash")) ch = strtoull(v, NULL, 16);
-		else if (!strcmp(d, "criteria_hash")) qh = strtoull(v, NULL, 16);
-		else if (!strcmp(d, "range_start")) { if (!pool_parse_u64(v, &rs)) goto bad; }
-		else if (!strcmp(d, "range_end")) { if (!pool_parse_u64(v, &re)) goto bad; }
-		else if (!strcmp(d, "cursor")) { if (!pool_parse_u64(v, &s->cursor)) goto bad; }
-		else if (!strcmp(d, "output_bytes")) { if (!pool_parse_u64(v, &s->outputBytes)) goto bad; }
-		else if (!strcmp(d, "matched")) { if (!pool_parse_u64(v, &s->matched)) goto bad; }
-		else if (!strcmp(d, "scanned")) { if (!pool_parse_u64(v, &s->scanned)) goto bad; }
-		else if (!strcmp(d, "elapsed_seconds")) s->elapsed = v ? strtod(v, NULL) : 0.0;
-		else if (!strcmp(d, "done")) { if (!pool_parse_int(v, &s->done)) goto bad; }
-		else if (!strcmp(d, "end")) sawEnd = 1;
+		unsigned bit = 0;
+		if (!strcmp(d, "BRAINSTORM_SEED_POOL_STATE")) {
+			bit = SS_VERSION; if (!pool_parse_int(v, &version)) goto bad;
+		} else if (!strcmp(d, "catalog_hash")) {
+			bit = SS_CATALOG; if (!pool_parse_hex64(v, &ch)) goto bad;
+		} else if (!strcmp(d, "criteria_hash")) {
+			bit = SS_CRITERIA; if (!pool_parse_hex64(v, &qh)) goto bad;
+		} else if (!strcmp(d, "range_start")) {
+			bit = SS_RANGE_START; if (!pool_parse_u64(v, &rs)) goto bad;
+		} else if (!strcmp(d, "range_end")) {
+			bit = SS_RANGE_END; if (!pool_parse_u64(v, &re)) goto bad;
+		} else if (!strcmp(d, "cursor")) {
+			bit = SS_CURSOR; if (!pool_parse_u64(v, &s->cursor)) goto bad;
+		} else if (!strcmp(d, "output_bytes")) {
+			bit = SS_OUTPUT; if (!pool_parse_u64(v, &s->outputBytes)) goto bad;
+		} else if (!strcmp(d, "matched")) {
+			bit = SS_MATCHED; if (!pool_parse_u64(v, &s->matched)) goto bad;
+		} else if (!strcmp(d, "scanned")) {
+			bit = SS_SCANNED; if (!pool_parse_u64(v, &s->scanned)) goto bad;
+		} else if (!strcmp(d, "elapsed_seconds")) {
+			bit = SS_ELAPSED; if (!pool_parse_double(v, &s->elapsed)) goto bad;
+		} else if (!strcmp(d, "done")) {
+			bit = SS_DONE; if (!pool_parse_int(v, &s->done)) goto bad;
+		} else if (!strcmp(d, "end")) {
+			if (v) goto bad;
+			sawEnd = 1;
+			continue;
+		} else {
+			goto bad;
+		}
+		if ((seen & bit) || pool_tok(&sp)) goto bad;
+		seen |= bit;
 	}
 	fclose(f);
-	if (version != POOL_SCHEMA || !sawEnd || ch != p->catalogHash || qh != p->criteriaHash
-			|| rs != p->start || re != p->start + p->count || s->cursor < rs || s->cursor > re) {
+	if (seen != required || version != POOL_SCHEMA || !sawEnd
+			|| ch != p->catalogHash || qh != p->criteriaHash
+			|| rs != p->start || re != p->start + p->count || s->cursor < rs || s->cursor > re
+			|| s->scanned != s->cursor - rs || s->matched > s->scanned
+			|| !isfinite(s->elapsed) || s->elapsed < 0.0 || (s->done != 0 && s->done != 1)
+			|| s->done != (s->cursor == re)
+			|| (p->format == POOL_BINARY && s->outputBytes < POOL_HEADER_SIZE)
+			|| (p->format == POOL_COUNT && s->outputBytes != 0)
+			|| s->outputBytes > (uint64_t)INT64_MAX) {
 		snprintf(err, errsz, "state does not match this model, criteria, or range");
 		return false;
 	}
@@ -1086,6 +1341,17 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n",
 			p->refilterDepth, p->sourceRecords, p->sourceCriteriaHash,
 			p->sourcePoolId[0] ? p->sourcePoolId : "-");
+	for (int i = 0; i < p->nbaseTagRules; i++) {
+		const PoolTagRule *r = &p->baseTagRules[i];
+		fprintf(f, "source_route_tag %s %s %d %d %d\n",
+				r->collect ? "collect" : "observe", r->key,
+				r->minAnte, r->maxAnte, r->minCount);
+	}
+	for (int i = 0; i < p->nbaseLegendaryRules; i++) {
+		const PoolLegendaryRule *r = &p->baseLegendaryRules[i];
+		fprintf(f, "source_route_legendary %s %d %d %d %d\n", r->key,
+				r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		fprintf(f, "tag %s %d %d %d\n", r->key, r->minAnte, r->maxAnte, r->minCount);
@@ -1147,7 +1413,9 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		if (p->format != POOL_COUNT) {
 			out = fopen(output, "r+b");
 			if (!out) { fprintf(stderr, "cannot open output for resume: %s\n", strerror(errno)); return 1; }
-			if (bs_ftruncate_file(out, (int64_t)state.outputBytes) != 0
+			int64_t actualBytes = bs_file_size(out);
+			if (actualBytes < 0 || (uint64_t)actualBytes < state.outputBytes
+					|| bs_ftruncate_file(out, (int64_t)state.outputBytes) != 0
 					|| bs_fseeko(out, (int64_t)state.outputBytes, SEEK_SET) != 0) {
 				fprintf(stderr, "cannot restore committed output boundary: %s\n", strerror(errno)); fclose(out); return 1;
 			}
@@ -1260,7 +1528,7 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 	return 130;
 }
 
-static bool pool_prepare_refilter(PoolPlan *p, const char *input,
+static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *input,
 		const char *output, FILE **inputFile, char *err, size_t errsz) {
 	FILE *f = fopen(input, "rb");
 	if (!f) { snprintf(err, errsz, "cannot open input pool %s: %s", input, strerror(errno)); return false; }
@@ -1286,6 +1554,64 @@ static bool pool_prepare_refilter(PoolPlan *p, const char *input,
 	if (h.catalogHash != p->catalogHash) {
 		snprintf(err, errsz, "input pool was built from a different pool/unlock snapshot");
 		fclose(f); return false;
+	}
+	if (h.nrouteTagRules + p->ntagRules > POOL_MAX_TAG_RULES) {
+		snprintf(err, errsz, "source + new tag routes exceed the %d-rule cumulative limit",
+				POOL_MAX_TAG_RULES);
+		fclose(f); return false;
+	}
+	for (int i = 0; i < h.nrouteTagRules; i++) {
+		PoolTagRule *r = &p->baseTagRules[p->nbaseTagRules++];
+		snprintf(r->key, sizeof r->key, "%s", h.routeTagRules[i].key);
+		r->minAnte = h.routeTagRules[i].minAnte;
+		r->maxAnte = h.routeTagRules[i].maxAnte;
+		r->minCount = h.routeTagRules[i].minCount;
+		r->collect = h.routeTagRules[i].collect;
+		r->poolIndex = pool_find_tag(g, r->key);
+		if (r->poolIndex < 0) {
+			snprintf(err, errsz, "source route tag %s is not in this snapshot", r->key);
+			fclose(f); return false;
+		}
+		if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
+	}
+	for (int i = 0; i < h.nrouteLegendRules; i++) {
+		if (p->nbaseLegendaryRules >= MAX_POOL_LEGEND_RULES) {
+			snprintf(err, errsz, "source pool has too many cumulative Soul rules");
+			fclose(f); return false;
+		}
+		PoolLegendaryRule *r = &p->baseLegendaryRules[p->nbaseLegendaryRules++];
+		snprintf(r->key, sizeof r->key, "%s", h.routeLegendRules[i].key);
+		r->minAnte = h.routeLegendRules[i].minAnte;
+		r->maxAnte = h.routeLegendRules[i].maxAnte;
+		r->requireNegative = h.routeLegendRules[i].neg;
+		r->soulDepth = h.routeLegendRules[i].soulDepth;
+		r->used = 1;
+		r->poolIndex = pool_find_legendary(g, r->key);
+		if (!g->soulAllowed || r->poolIndex < 0 || !g->jokerAvail[4][r->poolIndex]) {
+			snprintf(err, errsz, "source legendary %s is unavailable in this snapshot", r->key);
+			fclose(f); return false;
+		}
+		if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
+		if (p->legendary.used && p->legendary.soulDepth == r->soulDepth
+				&& (strcmp(p->legendary.key, r->key)
+					|| p->legendary.maxAnte < r->minAnte
+					|| r->maxAnte < p->legendary.minAnte)) {
+			snprintf(err, errsz,
+					"new and source rules conflict for Soul #%d", r->soulDepth);
+			fclose(f); return false;
+		}
+	}
+	if (p->nbaseLegendaryRules) {
+		p->firstKind = 1;
+		p->firstAnte = 0;
+		snprintf(p->firstKey, sizeof p->firstKey, "Joker4");
+	}
+	for (int a = 1; a <= p->maxAnte; a++) {
+		snprintf(p->kTag[a], sizeof p->kTag[a], "Tag%d", a);
+		snprintf(p->kShopPack[a], sizeof p->kShopPack[a], "shop_pack%d", a);
+		snprintf(p->kSoulT[a], sizeof p->kSoulT[a], "soul_Tarot%d", a);
+		snprintf(p->kSoulS[a], sizeof p->kSoulS[a], "soul_Spectral%d", a);
+		snprintf(p->kEdiSoul[a], sizeof p->kEdiSoul[a], "edisou%d", a);
 	}
 	int64_t size = bs_file_size(f);
 	if (size < 0 || (h.encoding == BSPOOL_ENCODING_U64
@@ -1365,7 +1691,8 @@ static int pool_mode_export(const char *input, const char *output) {
 		fprintf(stderr, "%s\n", fileBytes < 0 ? "cannot stat pool" : err); fclose(in); return 1;
 	}
 	/* "wb": exported seed lists are diffed/grepped byte-exactly by the tests */
-	FILE *out = !strcmp(output, "-") ? stdout : fopen(output, "wb");
+	bool outputIsStdout = !strcmp(output, "-");
+	FILE *out = outputIsStdout ? stdout : fopen(output, "wb");
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
 	uint64_t ranks[16384];
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
@@ -1375,7 +1702,7 @@ static int pool_mode_export(const char *input, const char *output) {
 		if (!bspool_reader_read(&reader, record, n, ranks, &scratch)) {
 			fprintf(stderr, "cannot decode pool at record %" PRIu64 "\n", record);
 			bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader);
-			if (out != stdout) fclose(out); fclose(in); return 1;
+			if (!outputIsStdout) fclose(out); fclose(in); return 1;
 		}
 		for (uint64_t i = 0; i < n; i++) {
 			char seed[9];
@@ -1385,7 +1712,7 @@ static int pool_mode_export(const char *input, const char *output) {
 		record += n;
 	}
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader);
-	if (out != stdout && fclose(out) != 0) { fprintf(stderr, "cannot close export\n"); fclose(in); return 1; }
+	if (!outputIsStdout && fclose(out) != 0) { fprintf(stderr, "cannot close export\n"); fclose(in); return 1; }
 	fclose(in);
 	fprintf(stderr, "exported %" PRIu64 " seeds%s (space %s, pool_id %s%s%s)\n",
 			records, complete ? " from a complete pool" : " from an incomplete pool",
@@ -1798,7 +2125,7 @@ int main(int argc, char **argv) {
 	plan.outputRangeStart = plan.start;
 	plan.outputRangeEnd = plan.start + plan.count;
 	FILE *inputFile = NULL;
-	if (refilter && !pool_prepare_refilter(&plan, argv[4], argv[5], &inputFile, err, sizeof err)) {
+	if (refilter && !pool_prepare_refilter(&catalog, &plan, argv[4], argv[5], &inputFile, err, sizeof err)) {
 		fprintf(stderr, "input pool error: %s\n", err);
 		return 1;
 	}

@@ -103,7 +103,8 @@ def read_pool_header(path):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
-        elif parts[0] in ("tag", "legendary", "soul_depth", "tag_route"):
+        elif parts[0] in ("tag", "route_tag", "legendary", "route_legendary",
+                          "soul_depth", "tag_route"):
             out["criteria"].append(line)
         elif parts[0] == "end":
             break
@@ -194,7 +195,7 @@ def start_job(kind, data, snap):
             text = crit.text("binary", count)
         if input_pool and os.path.abspath(input_pool) == os.path.abspath(out):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
-        JOB.update(runner=core.Runner(snap.modelver4_copy(), text, out, input_pool),
+        JOB.update(runner=core.Runner(snap.current_model_copy(), text, out, input_pool),
                    kind=kind, started=time.time(), summary=crit.summary(),
                    error="")
 

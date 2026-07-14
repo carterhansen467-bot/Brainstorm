@@ -125,7 +125,12 @@ local function buildSnapshot(case, session, entropy)
 		snap.voucherPool[#snap.voucherPool + 1] = base
 		snap.voucherPool[#snap.voucherPool + 1] = { key = "v_upg_" .. i, requires = true }
 	end
-	snap.game = { banned_keys = { j_r1_5 = true }, pool_flags = {} }
+	-- Exercise model-5 availability: one booster is absent and a banned Black
+	-- Hole still consumes/overwrites its Spectral roll without suppressing the
+	-- next card's Black Hole roll.
+	snap.game = { banned_keys = {
+		j_r1_5 = true, p_arcana_normal_1 = true, c_black_hole = true,
+	}, pool_flags = {} }
 	local ar = defaultAutoreroll()
 	for k, v in pairs(case.ar or {}) do ar[k] = v end
 	local ma = defaultMultiAnte()

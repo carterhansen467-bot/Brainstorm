@@ -89,6 +89,7 @@ function Brainstorm.passesAllFilters(seed_found)
 	-- pack scan in step 2.5 (order swap is safe: independent streams;
 	-- searchForSoul is ignored in Anywhere mode).
 	if not legAnywhere and ((ar.searchForSoul and ar.searchForSoul > 0) or (ar.searchLegendary and ar.searchLegendary ~= "")) then
+		if G.GAME.banned_keys and G.GAME.banned_keys.c_soul then return false end
 		local needed = math.max(ar.searchForSoul or 0, 1)
 		local last_soul_found = false
 		for i = 1, needed do
@@ -157,7 +158,25 @@ function Brainstorm.passesAllFilters(seed_found)
 	-- filtered tag/soul means SKIPPING that blind, and a skipped blind's shop
 	-- never opens (skip_blind goes straight to the next blind select), so its
 	-- two get_pack picks are never drawn. See skipsFromFilters.
-	Brainstorm.setPackSkipAssumption(seed_found, Brainstorm.skipsFromFilters(tagLoc))
+	local filterSkipSm, filterSkipBig = Brainstorm.skipsFromFilters(tagLoc)
+	local finalSkipSm, finalSkipBig = filterSkipSm, filterSkipBig
+	if ar.seedPoolFile and ar.seedPoolFile ~= "" and Brainstorm.readPoolHeader then
+		local poolPath = Brainstorm.seedPoolPath and Brainstorm.seedPoolPath()
+		local poolHeader = poolPath and Brainstorm.readPoolHeader(poolPath)
+		if not poolHeader then return false end
+		local poolOK
+		-- Active tag/classic-Soul predicates were just read on their own pass.
+		-- Rewind so the pool's embedded rules replay the same per-blind rolls
+		-- from the beginning, then rewind once more for downstream overlays.
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+		poolOK, finalSkipSm, finalSkipBig = Brainstorm.evaluatePoolCriteria(
+			seed_found, poolHeader, filterSkipSm, filterSkipBig)
+		if not poolOK then return false end
+		-- The pool oracle and active filters share a route but each starts its
+		-- independent RNG streams at advance one.
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+	end
+	Brainstorm.setPackSkipAssumption(seed_found, finalSkipSm, finalSkipBig)
 	-- 2.5) Legendary ANYWHERE (antes 1-8): scan each ante's spawned Arcana /
 	-- Spectral packs for the run's FIRST Soul (see checkLegendaryAnywhere).
 	local legLoc = nil
@@ -967,7 +986,9 @@ function Brainstorm.buildCulledPools()
 	-- ipairs order as its inline fallback => bit-identical float sum.
 	local cume = 0
 	for _, v in ipairs(G.P_CENTER_POOLS['Booster']) do
-		cume = cume + (v.weight or 1)
+		if not (G.GAME.banned_keys and G.GAME.banned_keys[v.key]) then
+			cume = cume + (v.weight or 1)
+		end
 	end
 	c.boosterCume = cume
 	-- Per-ante culled tag arrays (min_ante makes eligibility ante-dependent).
@@ -1014,6 +1035,8 @@ function Brainstorm.tag_is_eligible(v, ante)
 		return false
 	end
 	if v.min_ante and v.min_ante > ante then return false end
+	if v.no_pool_flag and G.GAME.pool_flags[v.no_pool_flag] then return false end
+	if v.yes_pool_flag and not G.GAME.pool_flags[v.yes_pool_flag] then return false end
 	return not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])
 end
 
@@ -1071,7 +1094,7 @@ end
 -- last), then use the Soul in that same ante.
 -- ===========================================================================
 function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negative)
-	local bh_found = false
+	if G.GAME.banned_keys and G.GAME.banned_keys.c_soul then return false end
 	for ante = 1, 8 do
 		local packs = Brainstorm.getSimulatedPacks(seed_found, ante, 6)
 		for slot = 1, #packs do
@@ -1080,16 +1103,23 @@ function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negat
 			if kind == 'Arcana' or kind == 'Spectral' then
 				local stype = (kind == 'Arcana') and 'Tarot' or 'Spectral'
 				local ncards = Brainstorm.packCardCount(center)
+				local soul_in_pack, bh_in_pack = false, false
 				for card = 1, ncards do
-					local soul = pseudorandom(Brainstorm.pseudoseed('soul_' .. stype .. ante .. seed_found)) > 0.997
-					if kind == 'Spectral' and not bh_found then
+					local soul = false
+					if not soul_in_pack then
+						soul = pseudorandom(Brainstorm.pseudoseed('soul_' .. stype .. ante .. seed_found)) > 0.997
+					end
+					if kind == 'Spectral' and not bh_in_pack then
 						local bh = pseudorandom(Brainstorm.pseudoseed('soul_' .. stype .. ante .. seed_found)) > 0.997
 						if bh then
-							bh_found = true
+							if not (G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) then
+								bh_in_pack = true
+							end
 							soul = false -- black hole overwrites the soul on this card
 						end
 					end
 					if soul then
+						soul_in_pack = true
 						local filtered = Brainstorm.getJokerCulledPool(4)
 						local chosen = pseudorandom_element(filtered, Brainstorm.pseudoseed("Joker4" .. seed_found))
 						local it = 1
@@ -1281,6 +1311,175 @@ Brainstorm.FORCED_BUFFOON = { key = "p_buffoon_normal_?", kind = "Buffoon", forc
 --     ante-1 Small; anywhere = this seed's match, from its TagA<n>Sm|Big).
 -- Everything else is assumed played -- unfiltered skips are on the player.
 -- Pure given settings + tagLoc (no RNG). Returns skipSm, skipBig arrays.
+function Brainstorm.mergeSkipRoutes(a, b)
+	if not a then return b end
+	if not b then return a end
+	local out = {}
+	for ante = 1, 39 do out[ante] = a[ante] or b[ante] or nil end
+	return out
+end
+
+-- Replay the cumulative route embedded in a .bspool header. Each rule selects
+-- its first required matching occurrences, exactly like the external scanner;
+-- observe-only stages count toward membership but do not remove shops.
+function Brainstorm.poolRouteSkips(seed_found, header)
+	local rules = header and header.route_tags or nil
+	if not rules or #rules == 0 then return nil, nil end
+	local counts, sm, big = {}, nil, nil
+	for i = 1, #rules do counts[i] = 0 end
+	for ante = 1, 39 do
+		local rolled = nil
+		for blind = 1, 2 do
+			local need = false
+			for i, rule in ipairs(rules) do
+				if rule.collect and counts[i] < rule.count
+						and ante >= rule.minAnte and ante <= rule.maxAnte then
+					need = true; break
+				end
+			end
+			if need then
+				rolled = Brainstorm.rollTag(seed_found, ante)
+				for i, rule in ipairs(rules) do
+					if rule.collect and counts[i] < rule.count
+							and ante >= rule.minAnte and ante <= rule.maxAnte
+							and rolled == rule.key then
+						counts[i] = counts[i] + 1
+						if blind == 1 then sm = sm or {}; sm[ante] = true
+						else big = big or {}; big[ante] = true end
+					end
+				end
+			end
+		end
+	end
+	return sm, big
+end
+
+-- Independent in-game oracle for the criteria embedded in a pool. This is a
+-- main-thread safety rail: native membership is fast, while this replay uses
+-- Balatro's own Lua RNG/pools to reject any model or transfer error before a
+-- seed is applied. It also returns the cumulative skips for overlay filters.
+function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayBig)
+	local routeRules = header.route_tags or {}
+	local maxTagAnte = 0
+	for _, r in ipairs(routeRules) do maxTagAnte = math.max(maxTagAnte, r.maxAnte) end
+	local rolls = {}
+	for ante = 1, maxTagAnte do
+		rolls[ante] = {
+			Brainstorm.rollTag(seed_found, ante),
+			Brainstorm.rollTag(seed_found, ante),
+		}
+	end
+	-- route_tags is cumulative: readPoolHeader appends the current stage's
+	-- `tag` lines to all inherited `route_tag` lines. Recheck every stage,
+	-- including observe-only rules, so this really is an independent safety
+	-- oracle rather than trusting source-pool membership for older stages.
+	for _, rule in ipairs(routeRules) do
+		local count = 0
+		for ante = rule.minAnte, rule.maxAnte do
+			for blind = 1, 2 do
+				if rolls[ante] and rolls[ante][blind] == rule.key then count = count + 1 end
+			end
+		end
+		if count < rule.count then return false end
+	end
+	local routeCounts, sm, big = {}, nil, nil
+	for i = 1, #routeRules do routeCounts[i] = 0 end
+	for ante = 1, maxTagAnte do
+		for blind = 1, 2 do
+			for i, rule in ipairs(routeRules) do
+				if rule.collect and routeCounts[i] < rule.count
+						and ante >= rule.minAnte and ante <= rule.maxAnte
+						and rolls[ante][blind] == rule.key then
+					routeCounts[i] = routeCounts[i] + 1
+					if blind == 1 then sm = sm or {}; sm[ante] = true
+					else big = big or {}; big[ante] = true end
+				end
+			end
+		end
+	end
+	local finalSm = Brainstorm.mergeSkipRoutes(sm, overlaySm)
+	local finalBig = Brainstorm.mergeSkipRoutes(big, overlayBig)
+
+	local legendaryRules = header.pool_legendaries or {}
+	if #legendaryRules == 0 and header.legendary then legendaryRules = { header.legendary } end
+	if #legendaryRules == 0 then return true, finalSm, finalBig end
+	if G.GAME.banned_keys and G.GAME.banned_keys.c_soul then return false end
+	Brainstorm.setPackSkipAssumption(seed_found, finalSm, finalBig)
+
+	local function pickLegendary(forbidden)
+		local pool = Brainstorm.getJokerCulledPool(4)
+		if forbidden then
+			local copy = {}
+			for i, key in ipairs(pool) do copy[i] = (key == forbidden) and 'UNAVAILABLE' or key end
+			pool = copy
+		end
+		local chosen = pseudorandom_element(pool, Brainstorm.pseudoseed("Joker4" .. seed_found))
+		local it = 1
+		while chosen == 'UNAVAILABLE' do
+			it = it + 1
+			chosen = pseudorandom_element(pool,
+				Brainstorm.pseudoseed("Joker4_resample" .. it .. seed_found))
+		end
+		return chosen
+	end
+
+	local maxDepth, maxAnte = 1, 0
+	for _, rule in ipairs(legendaryRules) do
+		maxDepth = math.max(maxDepth, rule.soulDepth or 1)
+		maxAnte = math.max(maxAnte, rule.maxAnte)
+	end
+	local picked = { pickLegendary() }
+	if maxDepth == 2 then picked[2] = pickLegendary(picked[1]) end
+	for _, rule in ipairs(legendaryRules) do
+		if picked[rule.soulDepth or 1] ~= rule.key then return false end
+	end
+
+	local soulNumber, events = 0, {}
+	for ante = 1, maxAnte do
+		local packs = Brainstorm.getSimulatedPacks(seed_found, ante, 6)
+		for _, center in ipairs(packs) do
+			local kind = center and not center.forced and center.kind or nil
+			if kind == 'Arcana' or kind == 'Spectral' then
+				local stype = kind == 'Arcana' and 'Tarot' or 'Spectral'
+				local soulInPack, blackHoleInPack = false, false
+				for _ = 1, Brainstorm.packCardCount(center) do
+					local soul = false
+					if not soulInPack then
+						soul = pseudorandom(Brainstorm.pseudoseed(
+							'soul_' .. stype .. ante .. seed_found)) > 0.997
+					end
+					if kind == 'Spectral' and not blackHoleInPack then
+						local blackHole = pseudorandom(Brainstorm.pseudoseed(
+							'soul_' .. stype .. ante .. seed_found)) > 0.997
+						if blackHole then
+							if not (G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) then
+								blackHoleInPack = true
+							end
+							soul = false
+						end
+					end
+					if soul then
+						soulInPack = true
+						soulNumber = soulNumber + 1
+						events[soulNumber] = { ante = ante,
+							edition = pseudorandom(Brainstorm.pseudoseed(
+								"edisou" .. ante .. seed_found)) }
+					end
+				end
+			end
+			if soulNumber >= maxDepth then break end
+		end
+		if soulNumber >= maxDepth then break end
+	end
+	if soulNumber < maxDepth then return false end
+	for _, rule in ipairs(legendaryRules) do
+		local event = events[rule.soulDepth or 1]
+		if not event or event.ante < rule.minAnte or event.ante > rule.maxAnte
+				or (rule.negative and event.edition <= 0.997) then return false end
+	end
+	return true, finalSm, finalBig
+end
+
 function Brainstorm.skipsFromFilters(tagLoc)
 	local ar = Brainstorm.SETTINGS.autoreroll
 	local sm, big = nil, nil
@@ -1327,17 +1526,17 @@ end
 function Brainstorm.setPackSkipAssumption(seed_found, skipSm, skipBig)
 	local sig = ""
 	if skipSm then
-		for a = 1, 8 do if skipSm[a] then sig = sig .. "s" .. a end end
+		for a = 1, 39 do if skipSm[a] then sig = sig .. "s" .. a end end
 	end
 	if skipBig then
-		for a = 1, 8 do if skipBig[a] then sig = sig .. "b" .. a end end
+		for a = 1, 39 do if skipBig[a] then sig = sig .. "b" .. a end end
 	end
 	local sim = Brainstorm._packSim
 	if sim and sim.seed == seed_found and sim.sig == sig and sim.rs == Brainstorm.random_state then
 		return
 	end
 	local forcedAnte = 1
-	for a = 1, 8 do
+	for a = 1, 39 do
 		if anteShopCount(a, skipSm, skipBig) > 0 then
 			forcedAnte = a
 			break
@@ -1346,6 +1545,7 @@ function Brainstorm.setPackSkipAssumption(seed_found, skipSm, skipBig)
 	Brainstorm._packSim = {
 		seed = seed_found, sig = sig, rs = Brainstorm.random_state,
 		skipSm = skipSm or false, skipBig = skipBig or false, forcedAnte = forcedAnte,
+		forceBuffoon = not (G.GAME.banned_keys and G.GAME.banned_keys.p_buffoon_normal_1),
 	}
 end
 
@@ -1386,7 +1586,8 @@ function Brainstorm.getSimulatedPacks(seed_found, ante, count)
 	local sim = Brainstorm._packSim
 	if not sim or sim.seed ~= seed_found or sim.rs ~= Brainstorm.random_state then
 		sim = { seed = seed_found, sig = "", rs = Brainstorm.random_state,
-			skipSm = false, skipBig = false, forcedAnte = 1 }
+			skipSm = false, skipBig = false, forcedAnte = 1,
+			forceBuffoon = not (G.GAME.banned_keys and G.GAME.banned_keys.p_buffoon_normal_1) }
 		Brainstorm._packSim = sim
 	end
 	local maxSlots = 2 * anteShopCount(ante, sim.skipSm, sim.skipBig)
@@ -1394,7 +1595,9 @@ function Brainstorm.getSimulatedPacks(seed_found, ante, count)
 	local out = sim[ante]
 	if not out then
 		out = {}
-		if ante == sim.forcedAnte and maxSlots > 0 then out[1] = Brainstorm.FORCED_BUFFOON end
+		if sim.forceBuffoon and ante == sim.forcedAnte and maxSlots > 0 then
+			out[1] = Brainstorm.FORCED_BUFFOON
+		end
 		sim[ante] = out
 	end
 	if #out >= count then return out end
@@ -1405,7 +1608,9 @@ function Brainstorm.getSimulatedPacks(seed_found, ante, count)
 	if not cume then
 		cume = 0
 		for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
-			cume = cume + (v.weight or 1)
+			if not (G.GAME.banned_keys and G.GAME.banned_keys[v.key]) then
+				cume = cume + (v.weight or 1)
+			end
 		end
 	end
 	while #out < count do
@@ -1413,8 +1618,10 @@ function Brainstorm.getSimulatedPacks(seed_found, ante, count)
 		local poll = pseudorandom(Brainstorm.pseudoseed("shop_pack" .. ante .. seed_found)) * cume
 		local it = 0
 		for k, v in ipairs(G.P_CENTER_POOLS['Booster']) do
-			it = it + (v.weight or 1)
-			if it >= poll and it - (v.weight or 1) <= poll then out[#out + 1] = v; break end
+			if not (G.GAME.banned_keys and G.GAME.banned_keys[v.key]) then
+				it = it + (v.weight or 1)
+				if it >= poll and it - (v.weight or 1) <= poll then out[#out + 1] = v; break end
+			end
 		end
 		if #out == n0 then out[#out + 1] = false end -- can't happen; guards the loop
 	end
@@ -1748,6 +1955,7 @@ function Brainstorm.buildSearchSnapshot(session)
 		-- requiresOk resolves the discovery-based culling HERE (profile
 		-- collection state); min_ante keeps the ante-dependent culling.
 		snap.tagPool[i] = { key = v.key, sort_id = v.sort_id, min_ante = v.min_ante,
+			no_pool_flag = v.no_pool_flag, yes_pool_flag = v.yes_pool_flag,
 			requiresOk = (not v.requires) and true
 				or ((G.P_CENTERS and G.P_CENTERS[v.requires] and G.P_CENTERS[v.requires].discovered) and true or false) }
 	end
@@ -1930,9 +2138,14 @@ function Brainstorm.updateAutoReroll(dt)
 				else
 					Brainstorm.logSeedMismatch(res)
 					Brainstorm.stopNativeSearch()
-					-- A calibrated helper should never diverge; don't trust it
-					-- again this session, let the Lua threads take over.
-					A.nativeFailed = true
+					-- A calibrated helper should never diverge. A pool search is
+					-- native-only, so surface the embedded-criteria failure instead
+					-- of describing it as a missing helper on the next frame.
+					if arS.seedPoolFile and arS.seedPoolFile ~= "" then
+						A.poolAbort = "pool: in-game verification rejected the native result"
+					else
+						A.nativeFailed = true
+					end
 				end
 			end
 		end
@@ -2141,12 +2354,48 @@ function Brainstorm.readPoolHeader(path)
 	local nativefs = require("nativefs")
 	local raw = nativefs.read(path, 1024)
 	if not raw or not raw:match("^BRAINSTORM_SEED_POOL ") then return nil end
-	local h = {}
+	local h = { tags = {}, route_tags = {}, pool_legendaries = {} }
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
-		if k == "records" or k == "complete" or k == "soul_depth" then h[k] = tonumber(v)
-		elseif k == "space" or k == "pool_id" or k == "label" then h[k] = v end
+		if k == "records" or k == "complete" or k == "soul_depth"
+				or k == "modelver" or k == "refilter_depth" then h[k] = tonumber(v)
+		elseif k == "space" or k == "pool_id" or k == "label"
+				or k == "catalog_hash" or k == "tag_route" then h[k] = v
+		elseif k == "tag" then
+			local key, lo, hi, count = v:match("^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)$")
+			if key then h.tags[#h.tags + 1] = {
+				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count),
+			} end
+		elseif k == "legendary" then
+			local key, lo, hi, neg = v:match("^(%S+)%s+(%d+)%s+(%d+)%s*(%d*)$")
+			if key then h.legendary = {
+				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi),
+				negative = tonumber(neg) == 1,
+			} end
+		elseif k == "route_legendary" then
+			local key, lo, hi, neg, depth = v:match(
+				"^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)$")
+			if key then h.pool_legendaries[#h.pool_legendaries + 1] = {
+				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi),
+				negative = tonumber(neg) == 1, soulDepth = tonumber(depth),
+			} end
+		elseif k == "route_tag" then
+			local mode, key, lo, hi, count = v:match("^(%S+)%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)$")
+			if key then h.route_tags[#h.route_tags + 1] = {
+				collect = mode == "collect", key = key, minAnte = tonumber(lo),
+				maxAnte = tonumber(hi), count = tonumber(count),
+			} end
+		end
+	end
+	local collect = h.tag_route ~= "observe"
+	for _, rule in ipairs(h.tags) do
+		rule.collect = collect
+		h.route_tags[#h.route_tags + 1] = rule
+	end
+	if h.legendary then
+		h.legendary.soulDepth = h.soul_depth or 1
+		h.pool_legendaries[#h.pool_legendaries + 1] = h.legendary
 	end
 	return h
 end
@@ -2163,9 +2412,14 @@ function Brainstorm.poolInfoString(name)
 	end
 	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
 	if h.space == "total" then bits[#bits + 1] = "all typeable seeds" end
-	if h.soul_depth == 2 then bits[#bits + 1] = "Soul #2 only" end
+	local hasSoul2 = false
+	for _, rule in ipairs(h.pool_legendaries or {}) do
+		if rule.soulDepth == 2 then hasSoul2 = true; break end
+	end
+	if hasSoul2 then bits[#bits + 1] = "Soul #2 only" end
 	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
 	bits[#bits + 1] = (h.complete == 1) and "complete" or "PARTIAL SCAN"
+	bits[#bits + 1] = "+ current filters"
 	return table.concat(bits, "  |  ")
 end
 
@@ -2213,7 +2467,9 @@ function Brainstorm.buildNativeConfigText(session)
 	local L = {}
 	local bad = false
 	local function ck(k)
-		if type(k) ~= "string" or k == "" or k:find("%s") then bad = true; return "-" end
+		if type(k) ~= "string" or k == "" or #k > 63 or k:find("%s") then
+			bad = true; return "-"
+		end
 		return k
 	end
 	local function add(...) L[#L + 1] = table.concat({ ... }, " ") end
@@ -2221,11 +2477,10 @@ function Brainstorm.buildNativeConfigText(session)
 
 	add("session", tostring(session))
 	add("threads", tostring(Brainstorm.getSearchThreadCount()))
-	-- Bumped whenever the RNG/shop MODEL changes OR a directive appears that an
-	-- older binary would silently ignore: the helper must refuse the config
-	-- instead of degrading. 3 = skip-aware physical shop layout (ease_ante
-	-- boss-shop fix); 4 = seed-pool restriction (poolfile) support.
-	add("modelver", "4")
+	-- Model 5 composes a selected pool's collected-tag route with overlay
+	-- filters and snapshots booster/Soul bans. Older helpers would silently
+	-- evaluate a different route, so the version handshake must reject them.
+	add("modelver", "5")
 	add("entropy", g17((love.timer and love.timer.getTime and love.timer.getTime() or os.clock()) * 1000))
 	add("soul", tostring(ar.searchForSoul or 0))
 	add("legendary", (ar.searchLegendary and ar.searchLegendary ~= "") and ck(ar.searchLegendary) or "-")
@@ -2276,6 +2531,9 @@ function Brainstorm.buildNativeConfigText(session)
 		else
 			reqOk = (G.P_CENTERS and G.P_CENTERS[v.requires] and G.P_CENTERS[v.requires].discovered) and 1 or 0
 		end
+		if v.no_pool_flag and G.GAME.pool_flags[v.no_pool_flag] then reqOk = 0 end
+		if v.yes_pool_flag and not G.GAME.pool_flags[v.yes_pool_flag] then reqOk = 0 end
+		if G.GAME.banned_keys and G.GAME.banned_keys[v.key] then reqOk = 0 end
 		add("tagdef", ck(v.key), tostring(reqOk), tostring(v.min_ante or 0))
 	end
 	for _, v in ipairs(G.P_CENTER_POOLS["Voucher"]) do
@@ -2294,8 +2552,12 @@ function Brainstorm.buildNativeConfigText(session)
 	for _, v in ipairs(G.P_CENTER_POOLS["Booster"]) do
 		local soulkind = (v.kind == "Arcana") and "A" or (v.kind == "Spectral") and "S" or "N"
 		add("boostdef", ck(v.key), g17(v.weight or 1), (v.kind == "Buffoon") and "1" or "0",
-			tostring(Brainstorm.packCardCount(v)), soulkind)
+			tostring(Brainstorm.packCardCount(v)), soulkind,
+			(G.GAME.banned_keys and G.GAME.banned_keys[v.key]) and "0" or "1")
 	end
+	add("specialdef",
+		(G.GAME.banned_keys and G.GAME.banned_keys.c_soul) and "0" or "1",
+		(G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) and "0" or "1")
 
 	for _, line in ipairs(Brainstorm.buildNativeChecks()) do L[#L + 1] = line end
 	add("end")

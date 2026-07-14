@@ -27,7 +27,7 @@ sh "$BUILD"
 
 # The snapshot on disk may predate the current config protocol; the catalog
 # data (pools/checks) is version-independent, so rewrite only the handshake.
-sed 's/^modelver [0-9][0-9]*$/modelver 4/' "$SNAPSHOT" > "$OUT/snapshot.cfg"
+cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 SNAPSHOT="$OUT/snapshot.cfg"
 ${CC:-clang} -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread \
 	-o "$OUT/seed_pool_compat$EXE" tests/seed_pool_compat.c -lm

@@ -12,26 +12,29 @@
 2. Install [Lovely](https://github.com/ethangreen-dev/lovely-injector/releases) for
    Windows: put its `version.dll` in the Balatro game folder (right-click Balatro
    in Steam → Manage → Browse local files).
-3. Get this fork into your mods folder (paste into a Command Prompt):
+3. Easiest: download **`brainstorm-windows-full.zip`** from this fork's
+   [releases](https://github.com/carterhansen467-bot/Brainstorm/releases), then
+   extract its `Brainstorm` folder into `%AppData%\Balatro\Mods`. It contains
+   the mod, both matching native helpers, and the standalone Seed Pool Builder.
+
+   To use Git instead, paste this into a Command Prompt:
 
    ```bat
    cd %AppData%\Balatro\Mods
    git clone -b joker-search-experiment https://github.com/carterhansen467-bot/Brainstorm.git Brainstorm
    ```
 
-   No git? On the repo page pick the `joker-search-experiment` branch →
-   Code → Download ZIP, and extract it into `%AppData%\Balatro\Mods`. The mod
-   finds its own folder at launch, so the ZIP's default folder name
-   (`Brainstorm-joker-search-experiment`) works as-is — renaming it to
-   `Brainstorm` is tidier but optional.
-4. **For the fast native search and seed pools** (optional but recommended):
-   download `brainstorm-windows-x64.zip` from this fork's
-   [releases](https://github.com/carterhansen467-bot/Brainstorm/releases) and
-   follow its `INSTALL.txt` (two `.exe` files go into the mod folder's
-   `native\` subfolder, the Seed Pool Builder goes next to them). If Windows blocks a downloaded
-   file: right-click → Properties → check **Unblock**, or choose
-   "More info → Run anyway" on the SmartScreen prompt.
+   A branch source ZIP also works, but it does not contain the compiled Windows
+   helpers; add `brainstorm-windows-helpers-x64.zip` from the same release.
+4. If Windows blocks a downloaded `.exe`: right-click → Properties → check
+   **Unblock**, or choose "More info → Run anyway" on the SmartScreen prompt.
 5. Reload the game to activate the mod.
+
+To update a ZIP installation, quit Balatro and copy the new release's
+`Brainstorm` contents over the active mod folder, choosing **Replace** for
+matching files. Do not delete your `seed_pools` folder, `settings.lua`, or
+`native_search.cfg`. The full package is safest because model-sensitive Lua
+and native files are updated together.
 
 ### Macos
 
@@ -329,7 +332,7 @@ records), and both are shown by the Seed Pool Builder and the in-game
 selector — two people holding the same pool see the same id.
 
 `tag_route collect` selects the first required matching tag occurrences as
-actual blind skips. Those missing shops are fed into the Model-3 physical pack
+actual blind skips. Those missing shops are fed into the source-verified physical pack
 simulation before Souls are checked. `observe` requires the tags but assumes
 their blinds are played. Legendary rules default to exact depth 1.
 `soul_depth 2` is exclusive: the first Soul must yield a different legendary,
@@ -374,9 +377,9 @@ accept and re-run. If macOS blocks the double-click because the file came
 from the internet, right-click it and choose **Open** the first time. On
 Windows the app doesn't compile anything -- it uses the prebuilt
 `brainstorm_seed_pool.exe` from the release zip and will say so if it's
-missing. The app also needs `native_search.cfg`, which Brainstorm writes the
-first time you toggle an auto-reroll in-game (Ctrl+A on, then off); the page
-will tell you if it's missing. Prefer a terminal UI? The same tool exists as
+missing. The app also needs a current `native_search.cfg`, which Brainstorm
+writes when you toggle an auto-reroll in-game (Ctrl+A on, then off); the page
+will tell you if it is missing or stale. Prefer a terminal UI? The same tool exists as
 `python3 tools/brainstorm_pool_builder.py` (arrow-key menus, curses;
 macOS/Linux only -- Windows Python has no curses, use the browser UI).
 
@@ -400,18 +403,25 @@ back to the Lua thread search -- they need the native helper (macOS: built by
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
 their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model
 version, the criteria that built it, and a fingerprint of the unlock/pool
-snapshot it was scanned against. If the recipient's unlock state differs, the
-search still runs -- every hit is re-verified against *their* profile before
-being applied -- but the pool's own guarantees (e.g. "Perkeo by ante 6")
-were computed against the builder's snapshot, and the helper logs a warning
-noting the difference.
+snapshot it was scanned against. The recipient must have the same model and
+ordered profile/unlock snapshot; otherwise the helper refuses the pool and asks
+for a rebuild. A warning is not sufficient here because booster bans, tag pool
+order, and legendary availability can change the pool's guarantees.
 
-Overlay-filter caveat: in-game filters are evaluated with the same blind-skip
-conventions the normal search uses; they do not yet merge the pool's own
-collected-tag skip route into pack/joker predictions. Pools carry their
-criteria in the header so that composition can be added later.
+Pool criteria and current in-game filters are evaluated on one cumulative
+route. Every collected tag from every refilter stage removes its actual shop;
+inherited Soul #1/#2 constraints are then rechecked on that final route before
+a hit can be returned. The main-thread Lua filter independently repeats those
+embedded tag, pack, Soul, Ante, edition, and legendary checks before applying
+the seed.
 
-To compare the generalized engine with the established Model-3 path over
+**Model 5 migration:** pools made by a model-4 helper cannot be searched or
+refiltered by model 5 because the old files did not capture booster/Soul bans
+or cumulative routes. They can still be exported or converted, but must be
+rebuilt for trustworthy in-game use. After updating, launch Balatro, toggle
+Ctrl+A on and off once to refresh `native_search.cfg`, then rebuild the pool.
+
+To compare the generalized engine with the established reference path over
 their overlapping A1-A8 semantics, and to exercise the in-game pool search
 end-to-end (member hit + definitive exhaustion):
 

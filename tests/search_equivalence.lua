@@ -166,7 +166,9 @@ local function buildSnapshot(case, session, entropy)
 		snap.voucherPool[#snap.voucherPool + 1] = { key = "v_upg_" .. i, requires = true }
 	end
 
-	snap.game = { banned_keys = { j_r1_5 = true }, pool_flags = {} }
+	snap.game = { banned_keys = {
+		j_r1_5 = true, p_arcana_normal_1 = true, c_black_hole = true,
+	}, pool_flags = {} }
 
 	local ar = defaultAutoreroll()
 	for k, v in pairs(case.ar or {}) do ar[k] = v end
