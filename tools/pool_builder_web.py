@@ -66,6 +66,10 @@ def criteria_from_json(data, snap):
     if space not in (s[0] for s in core.SPACES):
         raise ValueError("Unknown seed space %r" % space)
     c.space = space
+    c.shard_total = clamp_int(data.get("shardTotal", 1), 1, 256)
+    if c.shard_total not in core.SHARD_COUNTS:
+        raise ValueError("Distributed parts must be one of %s" % (core.SHARD_COUNTS,))
+    c.shard_index = clamp_int(data.get("shardIndex", 1), 1, c.shard_total)
     name = re.sub(r"[^A-Za-z0-9._+-]", "-", str(data.get("name", "")).strip())
     if name:
         c.name, c.name_edited = name, True
@@ -94,7 +98,8 @@ def read_pool_header(path):
         if not parts:
             continue
         if parts[0] in ("records", "complete", "modelver", "pool_id", "space", "encoding",
-                        "refilter_depth", "source_pool_id"):
+                        "refilter_depth", "source_pool_id", "range_start", "range_end",
+                        "merged_parts"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
@@ -128,6 +133,9 @@ def list_pools():
             "refilter_depth": int(head.get("refilter_depth", "0") or 0),
             "source_pool_id": head.get("source_pool_id", ""),
             "encoding": head.get("encoding", ""),
+            "range_start": int(head.get("range_start", "0") or 0),
+            "range_end": int(head.get("range_end", "0") or 0),
+            "merged_parts": int(head.get("merged_parts", "0") or 0),
         })
     return pools
 
@@ -170,10 +178,12 @@ def start_job(kind, data, snap):
                 raise ValueError("Finish the selected pool before filtering it again.")
             input_pool = candidate
             crit.space = head.get("space", "natural")
+            if crit.shard_total > 1:
+                raise ValueError("Distributed parts apply to Balatro's seed space, not an input pool.")
         if kind == "estimate":
             sample = clamp_int(data.get("sample", 100_000_000), 100_000, SEEDCAP)
             out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-            text = crit.text("count", sample)
+            text = crit.text("count", sample, apply_shard=False)
         else:
             os.makedirs(core.POOL_DIR, exist_ok=True)
             out = os.path.join(core.POOL_DIR, crit.pool_name() + ".bspool")
@@ -186,6 +196,41 @@ def start_job(kind, data, snap):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
         JOB.update(runner=core.Runner(snap.modelver4_copy(), text, out, input_pool),
                    kind=kind, started=time.time(), summary=crit.summary(),
+                   error="")
+
+
+def start_merge_job(data):
+    with LOCK:
+        r = JOB["runner"]
+        if r is not None and not r.done():
+            raise ValueError("A scan or merge is already running.")
+        names = []
+        for value in data.get("pools", []):
+            name = os.path.basename(str(value))
+            if name and name not in names:
+                names.append(name)
+        if len(names) < 2:
+            raise ValueError("Select at least two completed shard pools.")
+        inputs = []
+        for name in names:
+            path = os.path.join(core.POOL_DIR, name)
+            head = read_pool_header(path)
+            if not name.endswith(".bspool") or not os.path.isfile(path):
+                raise ValueError("A selected pool no longer exists: %s" % name)
+            if head.get("complete") != "1":
+                raise ValueError("Finish %s before merging it." % name)
+            inputs.append(path)
+        base = re.sub(r"[^A-Za-z0-9._+-]", "-", str(data.get("name", "")).strip())
+        if base.lower().endswith(".bspool"):
+            base = base[:-7]
+        if not base:
+            base = "merged-pool"
+        os.makedirs(core.POOL_DIR, exist_ok=True)
+        output = os.path.join(core.POOL_DIR, base + ".bspool")
+        if os.path.exists(output):
+            raise ValueError("That output already exists. Pick a different merged-pool name.")
+        JOB.update(runner=core.MergeRunner(inputs, output), kind="merge",
+                   started=time.time(), summary="Merging %d shard pools" % len(inputs),
                    error="")
 
 
@@ -296,6 +341,18 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
     <input type="text" id="name" placeholder="(automatic)" size="22">
   </div>
   <div class="row">
+    <label>Split across computers</label>
+    <select id="shardTotal">
+      <option value="1">Do not split</option>
+      <option value="2">2 parts</option><option value="4">4 parts</option>
+      <option value="8">8 parts</option><option value="16">16 parts</option>
+      <option value="32">32 parts</option><option value="64">64 parts</option>
+      <option value="128">128 parts</option><option value="256">256 parts</option>
+    </select>
+    <label>This computer runs part</label><select id="shardIndex"><option value="1">1</option></select>
+    <span class="tagc" id="shardHint"></span>
+  </div>
+  <div class="row">
     <button onclick="run('estimate')" id="btnEst">Estimate size &amp; time (fast)</button>
     <button class="go" onclick="run('build')" id="btnBuild">Build pool</button>
     <button class="warn" onclick="stopJob()" id="btnStop" disabled>Pause scan</button>
@@ -313,6 +370,17 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
   </div>
   <div id="log"></div>
   <div id="result"></div>
+</div>
+
+<div class="card"><h2>3 &middot; Merge distributed parts</h2>
+  <div class="row">
+    <span class="tagc">Check two or more completed pools below. Their criteria and ranges are validated before merging.</span>
+  </div>
+  <div class="row">
+    <label>Merged pool name</label><input type="text" id="mergeName" value="merged-pool" size="22">
+    <button id="btnMerge" onclick="mergePools()">Merge selected parts</button>
+  </div>
+  <div id="mergeError" class="part"></div>
 </div>
 
 <div class="card"><h2>Your seed pools <span class="tagc">(drop the .bspool file
@@ -358,6 +426,7 @@ function criteria(){
     rules, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
 	space:$("space").value, inputPool:$("inputPool").value,
+	shardTotal:+$("shardTotal").value, shardIndex:+$("shardIndex").value,
 	name:$("name").value };
 }
 
@@ -371,6 +440,20 @@ function updateSpaceHint(){
     : "";
 }
 
+function updateShard(){
+  const total = +$("shardTotal").value || 1;
+  const old = Math.min(+$("shardIndex").value || 1, total);
+  $("shardIndex").innerHTML = Array.from({length:total}, (_,i)=>
+    `<option value="${i+1}">${i+1}</option>`).join("");
+  $("shardIndex").value = old;
+  const full = $("space").value === "total" ? 2901713047668 : 1785793904896;
+  const selected = +$("count").value || full;
+  const limit = Math.min(selected, full), index = +$("shardIndex").value;
+  const start = Math.floor(limit*(index-1)/total), end = Math.floor(limit*index/total);
+  $("shardHint").textContent = total === 1 ? ""
+    : `exact ranks ${fmt(start)}–${fmt(end-1)} (${fmt(end-start)} seeds)`;
+}
+
 async function run(kind){
   $("error").textContent = "";
   $("result").textContent = "";
@@ -380,6 +463,14 @@ async function run(kind){
   if (j.error) $("error").textContent = j.error;
 }
 async function stopJob(){ await fetch("/api/stop", {method:"POST"}); }
+async function mergePools(){
+  $("mergeError").textContent = "";
+  const pools = [...document.querySelectorAll(".mergePick:checked")].map(x=>x.value);
+  const r = await fetch("/api/merge", {method:"POST", body:JSON.stringify({
+    pools, name:$("mergeName").value})});
+  const j = await r.json();
+  if (j.error) $("mergeError").textContent = j.error;
+}
 
 function showResult(j){
   const m = j.manifest || {};
@@ -397,6 +488,9 @@ function showResult(j){
           + `~${fmtBytes(+(m.projected_compressed_bytes || m.projected_u64_bytes))} compressed file.`;
     if (+m.seeds_per_second)
       out += `\\nFull scan at this speed: ~${fmtSecs((+m.seedspace || 1785793904896) / +m.seeds_per_second)}.`;
+  } else if (j.kind === "merge") {
+    out = `Done! ${fmt(j.matched||0)} seeds merged into seed_pools/${j.output}.\n`
+        + `The source shard files were not changed.`;
   } else {
     out = `Done! ${fmt(+m.matched||j.matched)} seeds saved to seed_pools/${j.output}.\\n`
         + `It now shows up in the in-game Seed Pool selector. Share that one file `
@@ -422,17 +516,22 @@ async function tick(){
 	if ([...$("inputPool").options].some(o=>o.value===selectedPool)) $("inputPool").value=selectedPool;
 	const fromPool = !!$("inputPool").value;
 	if (fromPool) $("space").value = $("inputPool").selectedOptions[0].dataset.space || "natural";
+	if (fromPool) $("shardTotal").value = "1";
 	$("count").disabled = fromPool;
 	$("space").disabled = fromPool;
+	$("shardTotal").disabled = fromPool;
+	$("shardIndex").disabled = fromPool;
 	updateSpaceHint();
+	updateShard();
   $("legRange").style.display = $("legendary").value ? "" : "none";
   const job = j.job;
   const running = !!job.running;
   $("btnEst").disabled = running; $("btnBuild").disabled = running;
+  $("btnMerge").disabled = running;
   $("btnStop").disabled = !running;
   if (running || job.rc !== undefined){
     $("progressCard").style.display = "";
-    $("progTitle").textContent = (job.kind==="estimate"?"Estimating: ":"Building: ")
+    $("progTitle").textContent = (job.kind==="estimate"?"Estimating: ":job.kind==="merge"?"Merging: ":"Building: ")
       + (job.summary||"");
     const frac = job.total ? job.scanned/job.total : 0;
     $("fill").style.width = (100*frac).toFixed(1)+"%";
@@ -445,6 +544,7 @@ async function tick(){
   }
   if (lastRunning && !running && job.rc !== undefined) showResult(job);
   lastRunning = running;
+  const mergeSelected = new Set([...document.querySelectorAll(".mergePick:checked")].map(x=>x.value));
   $("pools").innerHTML = j.pools.length ? j.pools.map(p=>{
     const st = p.complete ? '<span class="ok">complete</span>'
       : (p.resumable ? '<span class="part">paused &mdash; resumable</span>'
@@ -457,14 +557,21 @@ async function tick(){
       + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${p.source_pool_id.slice(0,8)}` : "")
       + `</span>` : "";
     const enc = p.encoding === "u64le" ? ` <span class="part">legacy format</span>` : "";
-    return `<div class="pool"><b>${p.name}</b>${lbl}${idb}${sp}${src}${enc} &mdash; `
+    const merged = p.merged_parts ? ` <span class="tagc">merged ${p.merged_parts} parts</span>` : "";
+    const range = p.range_end > p.range_start
+      ? ` <span class="tagc">ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}</span>` : "";
+    const pick = p.complete ? `<input type="checkbox" class="mergePick" value="${p.name}" ${mergeSelected.has(p.name)?"checked":""}> ` : "";
+    return `<div class="pool">${pick}<b>${p.name}</b>${lbl}${idb}${sp}${src}${enc}${merged} &mdash; `
       + `${fmt(p.records)} seeds, ${fmtBytes(p.bytes)} &mdash; ${st}<br>`
-      + `<span class="tagc">${p.criteria.join(" &middot; ")}</span></div>`;
+      + `<span class="tagc">${p.criteria.join(" &middot; ")}${range}</span></div>`;
   }).join("") : "none yet";
 }
 addEventListener("load", ()=>{
-  $("space").addEventListener("change", updateSpaceHint);
-  updateSpaceHint();
+  $("space").addEventListener("change", ()=>{updateSpaceHint(); updateShard();});
+  $("count").addEventListener("change", updateShard);
+  $("shardTotal").addEventListener("change", updateShard);
+  $("shardIndex").addEventListener("change", updateShard);
+  updateSpaceHint(); updateShard();
   tick(); setInterval(tick, 1000);
 });
 </script></body></html>
@@ -516,6 +623,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/run":
             try:
                 start_job(data.get("kind", "build"), data.get("criteria", {}), self.snap)
+                self._json({"ok": True})
+            except (ValueError, OSError) as e:
+                self._json({"error": str(e)}, 200)
+        elif self.path == "/api/merge":
+            try:
+                start_merge_job(data)
                 self._json({"ok": True})
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)

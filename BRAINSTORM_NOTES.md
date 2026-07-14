@@ -744,6 +744,24 @@ time the tab re-renders, even though the underlying saved value is untouched.
     - `tests/seed_pool_soul_depth.sh` proves depth-1/depth-2 result sets are
       disjoint, fixtures expose both pack locations, metadata round-trips,
       and the criteria fingerprints differ on macOS and Windows CI.
+22. **Distributed exhaustive shards** (`distributed-pool-shards-experiment`):
+    - Builder criteria now derive exact half-open rank ranges from a selected
+      part number/count. Floor boundaries cover natural or total seed spaces
+      exactly once even when the division is uneven; automatic filenames add
+      `part-N-of-M` so machines do not overwrite one another's result.
+    - `brainstorm_seed_pool merge` accepts two or more complete parts in any
+      order, sorts them by range, and requires identical model, catalog/profile,
+      space, route, and criteria fingerprints plus contiguous non-overlapping
+      ranges. Every input block checksum and every rank's declared range are
+      verified before the output is finalized.
+    - Schema-2 blocks are verified and copied without recompression; legacy
+      u64 shards are decoded into compressed blocks. Nested merges retain the
+      leaf `merged_parts` count. The resulting range/content pool ID equals a
+      monolithic scan, while gaps, overlaps, mismatches, and corrupt transfers
+      fail without leaving a usable output.
+    - The standalone browser builder exposes shard assignment and checkbox
+      merging. CI compares a four-way uneven split with a monolithic scan and
+      exercises nested merging plus all rejection paths on macOS and Windows.
 
 ## Not yet built (next steps)
 

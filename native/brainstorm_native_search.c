@@ -1142,7 +1142,7 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
 enum { BSPOOL_ENCODING_U64 = 1, BSPOOL_ENCODING_DELTA_BLOCKS = 2 };
 
 typedef struct {
-	int schema, modelver, complete, headerBytes, encoding;
+	int schema, modelver, complete, headerBytes, encoding, mergedParts;
 	uint64_t seedspace, rangeStart, rangeEnd, records, dataBytes;
 	uint64_t catalogHash, criteriaHash;
 	char charset[64];
@@ -1254,6 +1254,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		else if (!strcmp(d, "tag_route")) { v = pool_tok(&sp); h->route = (v && !strcmp(v, "observe")) ? 0 : 1; }
 		else if (!strcmp(d, "pool_id")) { v = pool_tok(&sp); if (v) snprintf(h->poolId, sizeof h->poolId, "%s", v); }
 		else if (!strcmp(d, "refilter_depth")) { v = pool_tok(&sp); h->refilterDepth = v ? atoi(v) : 0; }
+		else if (!strcmp(d, "merged_parts")) { v = pool_tok(&sp); h->mergedParts = v ? atoi(v) : 0; }
 		else if (!strcmp(d, "label")) {
 			/* rest of the line, spaces included */
 			while (*sp == ' ' || *sp == '\t') sp++;

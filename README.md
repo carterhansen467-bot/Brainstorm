@@ -256,6 +256,54 @@ The adjacent `.state` is an atomic checkpoint containing the committed cursor
 and byte boundary; rerun the identical command to resume safely after Ctrl+C
 or a crash. The adjacent `.manifest` records the criteria and final statistics.
 
+#### Split one exhaustive search across computers
+
+The Seed Pool Builder can divide a scope into 2–256 exact, non-overlapping
+parts. Choose the same criteria, seed space, scope, and **Split across
+computers** count on every machine, then assign a different **part** to each.
+For example, for every natural seed with Perkeo from the first Soul in antes
+1–6, select Perkeo, antes 1–6, Entire seed space, 4 parts, and run parts 1, 2,
+3, and 4 on four computers.
+
+Part boundaries use integer half-open ranges:
+
+```text
+start = floor(seed_count * (part - 1) / parts)
+end   = floor(seed_count * part / parts)
+```
+
+Consequently every rank is searched exactly once even when the space does not
+divide evenly. Output names automatically gain `part-N-of-M`. All machines
+must use the same `native_search.cfg` pool/unlock snapshot; copying the
+coordinator's snapshot to the other Brainstorm folders is the simplest way to
+guarantee this. A mismatch is rejected during merge rather than silently
+combining different results.
+
+When every part is complete, check them in the builder's **Merge distributed
+parts** section and choose an output name. The command-line equivalent accepts
+two or more inputs in any order:
+
+```sh
+./native/brainstorm_seed_pool merge seed_pools/perkeo-a1-6-full.bspool \
+  seed_pools/perkeo-a1-6-part-1-of-4.bspool \
+  seed_pools/perkeo-a1-6-part-2-of-4.bspool \
+  seed_pools/perkeo-a1-6-part-3-of-4.bspool \
+  seed_pools/perkeo-a1-6-part-4-of-4.bspool
+```
+
+The merger verifies completion, model, profile/catalog fingerprint, seed
+space, criteria fingerprint, checksums, and contiguous non-overlapping ranges.
+It refuses gaps, overlaps, corrupted parts, or pools built for different
+filters. The merged file receives the same pool ID and membership that one
+computer scanning the combined range would have produced; source files are
+never changed. Combining unrelated pools as an OR-union is intentionally not
+allowed because no single embedded criterion would truthfully describe every
+record.
+
+On Windows the standalone `Seed Pool Builder.exe` exposes both controls. The
+equivalent Command Prompt command begins with
+`native\brainstorm_seed_pool.exe merge ...`.
+
 Small pools can instead use `format text` for one seed per line. A completed
 binary pool can be exported later with:
 
@@ -311,6 +359,8 @@ leaves the machine) where you can:
   pressing **Pause scan**) stops at a checkpoint; pressing Build again with
   the same name resumes exactly where it left off -- safe across reboots,
   so a days-long full-space scan can be done in sittings;
+- split an exhaustive scope into non-overlapping numbered parts for multiple
+  computers, then validate and merge the finished shard files in the same app;
 - see every finished pool with its embedded criteria, its name, and its
   **pool id** -- a short fingerprint also shown by the in-game selector, so
   two people can confirm they're holding the same pool. Finished pools land

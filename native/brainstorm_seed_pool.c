@@ -1394,8 +1394,16 @@ static int pool_mode_export(const char *input, const char *output) {
 	return 0;
 }
 
-static bool pool_write_converted_header(FILE *f, const unsigned char original[POOL_HEADER_SIZE],
-		uint64_t records, uint64_t dataBytes, int complete, char *err, size_t errsz) {
+typedef struct {
+	int overrideRange;
+	uint64_t rangeStart, rangeEnd;
+	const char *poolId, *label;
+	int mergedParts;
+} PoolHeaderRewrite;
+
+static bool pool_write_repacked_header(FILE *f, const unsigned char original[POOL_HEADER_SIZE],
+		uint64_t records, uint64_t dataBytes, int complete,
+		const PoolHeaderRewrite *rewrite, char *err, size_t errsz) {
 	unsigned char out[POOL_HEADER_SIZE];
 	char work[POOL_HEADER_SIZE + 1];
 	memcpy(work, original, POOL_HEADER_SIZE); work[POOL_HEADER_SIZE] = 0;
@@ -1418,6 +1426,10 @@ static bool pool_write_converted_header(FILE *f, const unsigned char original[PO
 		} else if (!strcmp(d, "encoding")) replacement = "encoding delta-varint-blocks-v1";
 		else if (!strcmp(d, "records") || !strcmp(d, "data_bytes") || !strcmp(d, "complete")
 				|| !strcmp(d, "header_bytes")) replacement = NULL;
+		else if (rewrite && rewrite->overrideRange
+				&& (!strcmp(d, "range_start") || !strcmp(d, "range_end")
+					|| !strcmp(d, "pool_id") || !strcmp(d, "label")
+					|| !strcmp(d, "merged_parts"))) replacement = NULL;
 		else replacement = line;
 		if (replacement) {
 			size_t n = strlen(replacement);
@@ -1425,6 +1437,16 @@ static bool pool_write_converted_header(FILE *f, const unsigned char original[PO
 			memcpy(out + used, replacement, n); used += n; out[used++] = '\n';
 		}
 		line = nl ? nl + 1 : NULL;
+	}
+	if (rewrite && rewrite->overrideRange) {
+		char merged[384];
+		int m = snprintf(merged, sizeof merged,
+				"range_start %" PRIu64 "\nrange_end %" PRIu64 "\npool_id %s\nlabel %s\nmerged_parts %d\n",
+				rewrite->rangeStart, rewrite->rangeEnd,
+				rewrite->poolId ? rewrite->poolId : "-",
+				rewrite->label ? rewrite->label : "merged-pool", rewrite->mergedParts);
+		if (m < 0 || (size_t)m > sizeof out - used) { snprintf(err, errsz, "merged pool header overflow"); return false; }
+		memcpy(out + used, merged, (size_t)m); used += (size_t)m;
 	}
 	char tail[192];
 	int n = snprintf(tail, sizeof tail,
@@ -1435,7 +1457,7 @@ static bool pool_write_converted_header(FILE *f, const unsigned char original[PO
 	int64_t at = bs_ftello(f);
 	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(out, 1, sizeof out, f) != sizeof out
 			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
-		snprintf(err, errsz, "cannot update converted pool header: %s", strerror(errno)); return false;
+		snprintf(err, errsz, "cannot update pool header: %s", strerror(errno)); return false;
 	}
 	return true;
 }
@@ -1473,7 +1495,7 @@ static int pool_mode_convert(const char *input, const char *output) {
 	FILE *out = fopen(output, "w+b");
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
 	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
-			|| !pool_write_converted_header(out, original, h.records, 0, 0, err, sizeof err)) {
+			|| !pool_write_repacked_header(out, original, h.records, 0, 0, NULL, err, sizeof err)) {
 		fprintf(stderr, "%s\n", err); fclose(out); bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
 	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
@@ -1500,8 +1522,8 @@ static int pool_mode_convert(const char *input, const char *output) {
 		uint64_t finalBytes = 0;
 		if (dataEnd < POOL_HEADER_SIZE || !pool_append_index(out, h.space, h.records,
 				(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err)
-				|| !pool_write_converted_header(out, original, h.records,
-						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, err, sizeof err)) {
+				|| !pool_write_repacked_header(out, original, h.records,
+						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, NULL, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); goto fail;
 		}
 		if (fclose(out) != 0) { out = NULL; fprintf(stderr, "cannot close converted pool\n"); goto fail_no_out; }
@@ -1519,6 +1541,217 @@ fail_no_out:
 	return 1;
 }
 
+typedef struct {
+	const char *path;
+	FILE *file;
+	BspoolHeader header;
+	BspoolReader reader;
+	uint64_t fileBytes;
+} PoolMergePart;
+
+static int pool_merge_part_compare(const void *a, const void *b) {
+	const PoolMergePart *x = a, *y = b;
+	return x->header.rangeStart < y->header.rangeStart ? -1
+			: x->header.rangeStart > y->header.rangeStart;
+}
+
+static void pool_compute_merged_id(const BspoolHeader *h, uint64_t rangeStart,
+		uint64_t rangeEnd, uint64_t records, char out[24]) {
+	char buf[192];
+	int n = snprintf(buf, sizeof buf, "%016" PRIx64 "%016" PRIx64 "%" PRIu64 "-%" PRIu64 "%s%" PRIu64 "1",
+			h->catalogHash, h->criteriaHash, rangeStart, rangeEnd,
+			space_name(h->space), records);
+	uint64_t hash = pool_hash_update(UINT64_C(1469598103934665603), buf, (size_t)n);
+	snprintf(out, 24, "%016" PRIx64, hash);
+}
+
+static void pool_output_label(const char *path, char out[136]) {
+	const char *base = path;
+	for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+	size_t n = strlen(base);
+	if (n > 7 && !strcmp(base + n - 7, ".bspool")) n -= 7;
+	if (n >= 136) n = 135;
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)base[i];
+		out[i] = (isalnum(c) || c == '.' || c == '_' || c == '+' || c == '-') ? (char)c : '-';
+	}
+	out[n] = 0;
+	if (!out[0]) snprintf(out, 136, "merged-pool");
+}
+
+static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
+		uint64_t *written, char *err, size_t errsz) {
+	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
+	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS) {
+		for (uint64_t b = 0; b < part->reader.nblocks; b++) {
+			const BspoolBlockIndex *e = &part->reader.blocks[b];
+			if (!bspool_decode_block(&part->reader, b, &scratch)) {
+				snprintf(err, errsz, "cannot decode or verify %s block %" PRIu64, part->path, b); goto fail;
+			}
+			for (uint32_t i = 0; i < e->count; i++) if (scratch.ranks[i] < part->header.rangeStart
+					|| scratch.ranks[i] >= part->header.rangeEnd) {
+				snprintf(err, errsz, "%s contains a rank outside its declared shard range", part->path); goto fail;
+			}
+			unsigned char header[BSPOOL_BLOCK_HEADER_SIZE];
+			if (bs_pread(part->reader.fd, header, sizeof header, (int64_t)e->offset) != (int64_t)sizeof header
+					|| fwrite(header, 1, sizeof header, out) != sizeof header
+					|| (e->payloadBytes && fwrite(scratch.bytes, 1, e->payloadBytes, out) != e->payloadBytes)) {
+				snprintf(err, errsz, "cannot copy verified block from %s", part->path); goto fail;
+			}
+			*written += e->count;
+		}
+	} else {
+		uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
+		unsigned char encoded[POOL_OUTPUT_BUFFER], header[BSPOOL_BLOCK_HEADER_SIZE];
+		for (uint64_t record = 0; record < part->header.records;) {
+			uint64_t n = part->header.records - record;
+			if (n > POOL_OUTPUT_BUFFER / 8) n = POOL_OUTPUT_BUFFER / 8;
+			if (!bspool_reader_read(&part->reader, record, n, ranks, &scratch)) {
+				snprintf(err, errsz, "cannot decode %s at record %" PRIu64, part->path, record); goto fail;
+			}
+			for (uint64_t i = 0; i < n; i++) if (ranks[i] < part->header.rangeStart
+					|| ranks[i] >= part->header.rangeEnd) {
+				snprintf(err, errsz, "%s contains a rank outside its declared shard range", part->path); goto fail;
+			}
+			size_t payload = pool_encode_rank_block((unsigned char *)ranks, (uint32_t)n, encoded, header);
+			if (fwrite(header, 1, sizeof header, out) != sizeof header
+					|| fwrite(encoded, 1, payload, out) != payload) {
+				snprintf(err, errsz, "cannot write merged output"); goto fail;
+			}
+			record += n; *written += n;
+		}
+	}
+	bspool_scratch_destroy(&scratch);
+	return true;
+fail:
+	bspool_scratch_destroy(&scratch);
+	return false;
+}
+
+static bool pool_write_merge_manifest(const char *output, const PoolMergePart *parts,
+		int ninputs, int leafParts, uint64_t rangeStart, uint64_t rangeEnd, uint64_t records,
+		uint64_t fileBytes, const char *poolId, const char *label) {
+	char path[1024];
+	if (snprintf(path, sizeof path, "%s.manifest", output) >= (int)sizeof path) return false;
+	FILE *f = fopen(path, "w");
+	if (!f) return false;
+	fprintf(f, "BRAINSTORM_SEED_POOL_MERGE %d\nmodelver %d\nencoding delta-varint-blocks-v1\n",
+			BSPOOL_SCHEMA, parts[0].header.modelver);
+	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\npool_id %s\nlabel %s\n",
+			parts[0].header.catalogHash, parts[0].header.criteriaHash, poolId, label);
+	fprintf(f, "space %s\nseedspace %" PRIu64 "\nrange_start %" PRIu64
+			"\nrange_end %" PRIu64 "\nrecords %" PRIu64 "\nmerged_parts %d\nfile_bytes %" PRIu64 "\n",
+			space_name(parts[0].header.space), parts[0].header.seedspace,
+			rangeStart, rangeEnd, records, leafParts, fileBytes);
+	for (int i = 0; i < ninputs; i++) fprintf(f,
+			"input %s %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
+			parts[i].header.poolId[0] ? parts[i].header.poolId : "-",
+			parts[i].header.rangeStart, parts[i].header.rangeEnd,
+			parts[i].header.records, parts[i].path);
+	fprintf(f, "complete 1\nend\n");
+	return fclose(f) == 0;
+}
+
+static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
+	if (ninputs < 2) { fprintf(stderr, "merge needs at least two input pools\n"); return 2; }
+	if (bs_file_exists(output)) { fprintf(stderr, "output already exists; choose a new filename\n"); return 1; }
+	PoolMergePart *parts = calloc((size_t)ninputs, sizeof *parts);
+	if (!parts) { fprintf(stderr, "cannot allocate merge input table\n"); return 1; }
+	char err[256] = "";
+	int opened = 0, rc = 1;
+	uint64_t totalRecords = 0;
+	for (int i = 0; i < ninputs; i++) {
+		PoolMergePart *p = &parts[i]; p->path = inputs[i];
+		p->file = fopen(p->path, "rb");
+		if (!p->file) { snprintf(err, sizeof err, "cannot open %s: %s", p->path, strerror(errno)); goto done; }
+		opened++;
+		if (!bspool_read_header(p->file, &p->header, err, sizeof err)) goto done;
+		if (!p->header.complete) { snprintf(err, sizeof err, "%s is incomplete", p->path); goto done; }
+		if (p->header.rangeStart >= p->header.rangeEnd || p->header.rangeEnd > p->header.seedspace) {
+			snprintf(err, sizeof err, "%s has an invalid shard range", p->path); goto done;
+		}
+		int64_t bytes = bs_file_size(p->file);
+		if (bytes < 0 || (p->header.encoding == BSPOOL_ENCODING_U64
+				&& (uint64_t)bytes != (uint64_t)p->header.headerBytes + p->header.records * 8u)
+				|| !bspool_reader_init(&p->reader, fileno(p->file), &p->header,
+						(uint64_t)(bytes < 0 ? 0 : bytes), err, sizeof err)) goto done;
+		p->fileBytes = (uint64_t)bytes;
+		if (UINT64_MAX - totalRecords < p->header.records) { snprintf(err, sizeof err, "merged record count overflows"); goto done; }
+		totalRecords += p->header.records;
+	}
+	qsort(parts, (size_t)ninputs, sizeof *parts, pool_merge_part_compare);
+	for (int i = 1; i < ninputs; i++) {
+		const BspoolHeader *a = &parts[0].header, *b = &parts[i].header;
+		if (b->modelver != a->modelver || b->catalogHash != a->catalogHash
+				|| b->criteriaHash != a->criteriaHash || b->space != a->space
+				|| b->seedspace != a->seedspace || b->route != a->route) {
+			snprintf(err, sizeof err, "%s is not compatible with %s (model, profile, space, or criteria differ)",
+					parts[i].path, parts[0].path); goto done;
+		}
+		if (parts[i - 1].header.rangeEnd != b->rangeStart) {
+			snprintf(err, sizeof err, "shard ranges are not contiguous: %s ends at %" PRIu64
+					" but %s starts at %" PRIu64,
+					parts[i - 1].path, parts[i - 1].header.rangeEnd, parts[i].path, b->rangeStart);
+			goto done;
+		}
+	}
+	unsigned char original[POOL_HEADER_SIZE];
+	if (bs_pread(fileno(parts[0].file), original, sizeof original, 0) != (int64_t)sizeof original) {
+		snprintf(err, sizeof err, "cannot preserve source pool header"); goto done;
+	}
+	FILE *out = fopen(output, "w+b");
+	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
+	uint64_t rangeStart = parts[0].header.rangeStart;
+	uint64_t rangeEnd = parts[ninputs - 1].header.rangeEnd;
+	char poolId[24], label[136];
+	pool_compute_merged_id(&parts[0].header, rangeStart, rangeEnd, totalRecords, poolId);
+	pool_output_label(output, label);
+	int mergedParts = 0;
+	for (int i = 0; i < ninputs; i++) mergedParts += parts[i].header.mergedParts > 0
+			? parts[i].header.mergedParts : 1;
+	PoolHeaderRewrite rewrite = { 1, rangeStart, rangeEnd, poolId, label, mergedParts };
+	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
+			|| !pool_write_repacked_header(out, original, totalRecords, 0, 0,
+					&rewrite, err, sizeof err)) { fclose(out); remove(output); goto done; }
+	uint64_t written = 0;
+	for (int i = 0; i < ninputs; i++) {
+		if (!pool_merge_write_part(out, &parts[i], &written, err, sizeof err)) {
+			fclose(out); remove(output); goto done;
+		}
+		fprintf(stderr, "merged=%d/%d records=%" PRIu64 "/%" PRIu64 "\n",
+				i + 1, ninputs, written, totalRecords);
+	}
+	int64_t dataEnd = bs_ftello(out);
+	uint64_t finalBytes = 0;
+	/* Do not allow short-circuiting to skip fclose: Windows cannot remove a
+	 * failed output while it is open. */
+	bool finalOk = written == totalRecords && dataEnd >= POOL_HEADER_SIZE;
+	if (finalOk) finalOk = pool_append_index(out, parts[0].header.space, totalRecords,
+			(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err);
+	if (finalOk) finalOk = pool_write_repacked_header(out, original, totalRecords,
+			(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, &rewrite, err, sizeof err);
+	int closeRc = fclose(out);
+	if (!finalOk || closeRc != 0) {
+		if (!err[0]) snprintf(err, sizeof err, "cannot finalize merged pool");
+		remove(output); goto done;
+	}
+	if (!pool_write_merge_manifest(output, parts, ninputs, mergedParts, rangeStart, rangeEnd,
+			totalRecords, finalBytes, poolId, label))
+		fprintf(stderr, "warning: merged pool is complete but its optional manifest could not be written\n");
+	fprintf(stderr, "merged %d compatible shards: range=%" PRIu64 "-%" PRIu64
+			" records=%" PRIu64 " size=%.3f GB pool_id=%s\n",
+			ninputs, rangeStart, rangeEnd, totalRecords, (double)finalBytes / 1e9, poolId);
+	rc = 0;
+done:
+	if (rc && err[0]) fprintf(stderr, "merge error: %s\n", err);
+	for (int i = 0; i < opened; i++) {
+		bspool_reader_destroy(&parts[i].reader);
+		if (parts[i].file) fclose(parts[i].file);
+	}
+	free(parts);
+	return rc;
+}
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
@@ -1526,14 +1759,16 @@ static void pool_usage(const char *prog) {
 			"  %s refilter <native-snapshot.cfg> <pool-criteria.cfg> <input.bspool> <output.bspool>\n"
 			"  %s fixture <native-snapshot.cfg> <pool-criteria.cfg> <seed-file>\n"
 			"  %s export <input.bspool> <output.txt|->\n"
-			"  %s convert <legacy-input.bspool> <compressed-output.bspool>\n",
-			prog, prog, prog, prog, prog);
+			"  %s convert <legacy-input.bspool> <compressed-output.bspool>\n"
+			"  %s merge <output.bspool> <part1.bspool> <part2.bspool> [more parts...]\n",
+			prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
 	bs_platform_init();
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "convert")) return pool_mode_convert(argv[2], argv[3]);
+	if (argc >= 5 && !strcmp(argv[1], "merge")) return pool_mode_merge(argv[2], argc - 3, argv + 3);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);
