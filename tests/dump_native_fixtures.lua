@@ -118,6 +118,8 @@ local function buildSnapshot(case, session, entropy)
 	snap.tagPool[3].min_ante = 2
 	snap.tagPool[7].requiresOk = false
 	snap.tagPool[11].key = "tag_charm"
+	snap.tagPool[12].key = "tag_ethereal"
+	snap.tagPool[12].min_ante = 2
 	snap.voucherPool = {}
 	for i = 1, 16 do
 		local base = { key = "v_base_" .. i }
@@ -194,6 +196,13 @@ local CASES = {
 	{ name = "legendary anywhere", ar = { searchLegendary = "j_perkeo", searchLegendaryAnywhere = true } },
 	{ name = "legendary anywhere negative", ar = { searchLegendary = "j_triboulet", searchLegendaryAnywhere = true,
 			searchNegativeLegendary = true } },
+	-- Model 6: taking these tags replaces the skipped blind's missing shop
+	-- with an immediate Soul-capable reward pack. The legendary scan must see
+	-- that reward at its true chronological position, not only shop packs.
+	{ name = "leg anywhere + collected Charm reward", ar = { searchTag = "tag_charm", searchTagAnywhere = true,
+			searchLegendary = "j_perkeo", searchLegendaryAnywhere = true } },
+	{ name = "leg anywhere + collected Ethereal reward", ar = { searchTag = "tag_ethereal", searchTagAnywhere = true,
+			searchLegendary = "j_perkeo", searchLegendaryAnywhere = true } },
 	{ name = "leg anywhere + tag anywhere + jokers", ar = { searchTag = "tag_charm", searchTagAnywhere = true,
 			searchLegendary = "j_perkeo", searchLegendaryAnywhere = true, jokerSearchMatchAny = true,
 			jokerSlotData = {

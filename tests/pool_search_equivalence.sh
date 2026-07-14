@@ -65,7 +65,7 @@ write_search_cfg() {
 	{
 		echo "session 1"
 		echo "threads 4"
-		echo "modelver 5"
+		echo "modelver 6"
 		echo "entropy 98765.25"
 		echo "soul 0"
 		echo "legendary $legendary"
@@ -139,6 +139,30 @@ rc=0
 grep -q '^E pool: profile/unlock snapshot differs' "$OUT/status" \
 	|| { echo "FAIL: profile mismatch was not a pool-fatal error"; cat "$OUT/status"; exit 1; }
 echo "PASS: profile/catalog mismatch is rejected before searching"
+
+# Model 5 did not include collected tag rewards in its Soul timeline. A helper
+# must reject that pool rather than reinterpret its existing membership under
+# Model 6.
+cp "$OUT/pool.bspool" "$OUT/model5.bspool"
+python3 - "$OUT/model5.bspool" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p, "r+b") as f:
+    data = f.read(1024)
+    old, new = b"modelver 6\n", b"modelver 5\n"
+    assert data.count(old) == 1
+    f.seek(0); f.write(data.replace(old, new, 1))
+PY
+write_search_cfg j_perkeo "$OUT/search_model5.cfg" "$OUT/model5.bspool"
+date +%s > "$OUT/hb"
+rm -f "$OUT/status" "$OUT/stop"
+rc=0
+"./native/brainstorm_native_search$EXE" search "$OUT/search_model5.cfg" \
+	"$OUT/status" "$OUT/stop" "$OUT/hb" || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: Model-5 pool returned $rc"; cat "$OUT/status"; exit 1; }
+grep -q '^E pool: built with model 5, this helper is model 6' "$OUT/status" \
+	|| { echo "FAIL: stale pool did not report a model mismatch"; cat "$OUT/status"; exit 1; }
+echo "PASS: stale Model-5 pool is rejected before searching"
 
 # A decode/checksum failure must never be mislabeled as definitive pool
 # exhaustion. Corrupt one payload byte and require a fatal read verdict.

@@ -769,19 +769,40 @@ time the tab re-renders, even though the underlying saved value is untouched.
       Soul/Black-Hole bans; tag pool flags and forced-Buffoon availability are
       resolved. Banned boosters cannot be selected. Soul and Black Hole gates
       reset per pack with the game's same-card overwrite behavior.
-    - Headers carry cumulative `route_tag` and `route_legendary` stages.
-      Refiltering in either order evaluates one final physical shop route and
-      rechecks inherited exact Soul #1/#2 target, Ante, and edition rules.
-      Native and production Lua independently apply that same route through
-      the criteria engine's full Ante-39 range.
+    - Headers carry cumulative `route_tag` and `route_legendary` stages. Every
+      refilter evaluates one final physical shop route and rechecks inherited
+      exact Soul #1/#2 target, Ante, and edition rules. Native and production
+      Lua independently apply that same route through the criteria engine's
+      full Ante-39 range.
     - Model/profile mismatches, malformed config/header/state files, payload
       checksums, duplicate compressed ranks, ranks outside a shard range,
       allocation/thread failures, and partial reads all fail closed. A decode
       failure can never be mislabeled as definitive pool exhaustion.
     - Short `0`/`O`/1–7-character seeds are verified against production Lua;
-      both refilter orders equal a one-pass combined scan; compression,
-      conversion, pause/resume, four-way merge, restricted search, and all 36
-      existing filter cases run in CI on macOS and Windows.
+      refilters remain exact source-set intersections under their cumulative
+      route; compression, conversion, pause/resume, four-way merge, restricted
+      search, and all 36 existing filter cases run in CI on macOS and Windows.
+
+24. **Model-6 collected tag-reward Soul route**
+    (`seed-pool-integrity-audit`, 2026-07-14):
+    - Legendary and exact Soul-depth searches now walk one chronological route:
+      the prior Boss entry shop (antes 2+), then each played Small/Big shop or
+      the immediate reward opened by a collected Charm/Ethereal Tag. Charm uses
+      the snapshotted Mega Arcana definition; Ethereal uses the snapshotted
+      normal Spectral definition. Both share Balatro's per-Ante Soul streams
+      with shop packs at their real event positions.
+    - Only required occurrences inside each tag rule's inclusive Ante window
+      are collected. Earlier copies of the same tag are observed RNG outcomes,
+      not skips, so they cannot remove an earlier legendary-bearing shop.
+      `tag_route observe` never removes a shop or creates a reward.
+    - The native in-game search, external scanner/refilter, and production Lua
+      safety oracle carry the same reward route. Found labels distinguish shop
+      slots (`A3P4`) from tag rewards (`A3CharmSm`, `A4EtherealBig`).
+    - `modelver` is 6 and stale snapshots/pools fail closed. Regression fixtures
+      require actual Charm and Ethereal reward hits, compare C with production
+      Lua, enforce source-set intersection when a later route change could make
+      outside seeds newly valid, and prove A3+ tag rules cannot alter an A1-A2
+      legendary result.
 
 ## Not yet built (next steps)
 

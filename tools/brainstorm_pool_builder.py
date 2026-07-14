@@ -57,7 +57,7 @@ SPACES = [
 ]
 MAX_TAG_RULES = 16
 MAX_ANTE = 39
-MODEL_VERSION = 5
+MODEL_VERSION = 6
 
 # Friendly names, mirroring Brainstorm_UI's SearchTagList (fallback: raw key).
 TAG_NAMES = {
@@ -99,6 +99,7 @@ class Snapshot:
         self.has_specialdef = False
         self.has_boostdef = False
         self.bad_boostdef = False
+        self.tag_reward_defs = {}
         self.tags = []        # (key, reqOk, minAnte)
         self.legendaries = [] # (key, avail)
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -115,6 +116,12 @@ class Snapshot:
                 elif parts[0] == "boostdef":
                     self.has_boostdef = True
                     self.bad_boostdef = self.bad_boostdef or len(parts) != 7
+                    if len(parts) == 7 and parts[1] in (
+                            "p_arcana_mega_1", "p_spectral_normal_1"):
+                        try:
+                            self.tag_reward_defs[parts[1]] = (int(parts[4]), parts[5])
+                        except ValueError:
+                            self.bad_boostdef = True
                 elif parts[0] == "specialdef" and len(parts) == 3:
                     self.has_specialdef = True
 
@@ -127,12 +134,17 @@ class Snapshot:
     def current_model_copy(self):
         """Return a current snapshot or refuse stale catalog semantics.
 
-        Model 5 adds booster/Soul availability, so changing only the version
-        number would fabricate missing profile data and can produce a false
-        pool. Launch one in-game native search to refresh native_search.cfg.
+        Model 6 uses the snapshotted Charm/Ethereal reward-pack definitions in
+        the chronological Soul route, so changing only the version number can
+        fabricate profile data and produce a false pool. Launch one in-game
+        native search to refresh native_search.cfg.
         """
+        rewards_ok = (self.tag_reward_defs.get("p_arcana_mega_1", (0, ""))[0] > 0
+                      and self.tag_reward_defs.get("p_arcana_mega_1", (0, ""))[1] == "A"
+                      and self.tag_reward_defs.get("p_spectral_normal_1", (0, ""))[0] > 0
+                      and self.tag_reward_defs.get("p_spectral_normal_1", (0, ""))[1] == "S")
         if (self.modelver == MODEL_VERSION and self.has_specialdef and self.has_boostdef
-                and not self.bad_boostdef):
+                and not self.bad_boostdef and rewards_ok):
             return self.path
         raise ValueError("native_search.cfg is stale or missing current profile data. "
                          "Launch Balatro, toggle Ctrl+A on and off once, then "
@@ -239,7 +251,7 @@ class Criteria:
             parts.append(s)
         if self.legendary:
             s = ("Negative " if self.leg_neg else "") + joker_name(self.legendary)
-            s += " second Soul only" if self.leg_second_soul else " first Soul"
+            s += " second reachable Soul only" if self.leg_second_soul else " first reachable Soul"
             s += " (antes %d-%d)" % (self.leg_min, self.leg_max)
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
@@ -444,7 +456,7 @@ class App:
                            get=lambda: c.leg_second_soul,
                            set=self._set_leg_second_soul,
                            on="ON -- target must be from Soul #2",
-                           off="OFF -- target must be from Soul #1"))
+                           off="OFF -- target must be from the first reachable Soul"))
             f.append(Field("number", "  Earliest ante", get=lambda: c.leg_min,
                            set=self._set_leg_min, lo=1, hi=MAX_ANTE))
             f.append(Field("number", "  Latest ante", get=lambda: c.leg_max,

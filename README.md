@@ -94,10 +94,12 @@ You can edit the Auto-Reroll parameters in the Brainstorm in-game settings page.
 Two more toggles on the main Brainstorm tab: **Tag: any blind, antes 1-8**
 matches the searched tag on any Small/Big blind up to ante 8 (labels like
 `TagA3Big` -- skip that blind to take the tag). **Legendary: any pack, antes
-1-8** finds the run's first Soul in any Arcana/Spectral pack up to ante 8
-(labels like `LegA7P5` = ante 7, pack slot 5; open that ante's Arcana/Spectral
-packs in slot order and use the Soul there). Combine with the Negative toggle
-to hunt natural negative legendaries.
+1-8** finds the run's first Soul across the Arcana/Spectral packs you can
+actually open up to ante 8. That route includes reachable shop packs and any
+immediate Charm/Ethereal reward taken by the active tag filter. Labels such as
+`LegA7P5` identify a shop-pack slot; `LegA4CharmBig` or
+`LegA3EtherealSm` identify the reward opened by skipping that blind. Combine
+with the Negative toggle to hunt natural negative legendaries.
 
 ### Deep search: Anywhere mode + wildcards
 On the **Multi-Ante** tab, toggle **Anywhere (Antes 1-8)** to search every ante
@@ -332,9 +334,15 @@ records), and both are shown by the Seed Pool Builder and the in-game
 selector — two people holding the same pool see the same id.
 
 `tag_route collect` selects the first required matching tag occurrences as
-actual blind skips. Those missing shops are fed into the source-verified physical pack
-simulation before Souls are checked. `observe` requires the tags but assumes
-their blinds are played. Legendary rules default to exact depth 1.
+actual blind skips. Those missing shops are fed into the source-verified
+physical pack simulation before Souls are checked. Taking a Charm or Ethereal
+Tag also inserts its forced Mega Arcana or Spectral reward at that exact point
+in the route, so a legendary may come from either a reachable shop pack or one
+of those collected rewards. `observe` requires the tags but assumes their
+blinds are played, so it neither removes a shop nor opens a tag reward.
+Occurrences outside a tag rule's Ante window are never collected: for example,
+a Negative Tag requested only in antes 3-9 cannot remove a Perkeo shop in ante
+1 or 2. Legendary rules default to exact depth 1.
 `soul_depth 2` is exclusive: the first Soul must yield a different legendary,
 be used, and remain owned; the target must come from the second Soul in a
 later pack. A seed with the target on Soul #1 does not match depth 2. Showman,
@@ -415,11 +423,21 @@ a hit can be returned. The main-thread Lua filter independently repeats those
 embedded tag, pack, Soul, Ante, edition, and legendary checks before applying
 the seed.
 
-**Model 5 migration:** pools made by a model-4 helper cannot be searched or
-refiltered by model 5 because the old files did not capture booster/Soul bans
-or cumulative routes. They can still be exported or converted, but must be
-rebuilt for trustworthy in-game use. After updating, launch Balatro, toggle
-Ctrl+A on and off once to refresh `native_search.cfg`, then rebuild the pool.
+A refilter always remains a strict subset of its input `.bspool`; it never
+invents or searches seeds outside that file. Collected tags can change the
+first/second Soul route, so filter order matters to the available candidate
+set: for an exhaustive “tag plus legendary” result, build the tag pool first
+and then refilter for the legendary, or scan both requirements together. If a
+legendary-only pool is the input, adding a collected tag correctly revalidates
+its members but cannot recover outside seeds that the new route would have made
+valid.
+
+**Model 6 migration:** pools made by model 5 or older cannot be searched or
+refiltered by model 6. Model 6 adds collected Charm/Ethereal rewards to the
+chronological Soul route; accepting an older pool would silently omit possible
+Soul #1/#2 events. Old pools can still be exported, but must be rebuilt for
+trustworthy in-game use. After updating, launch Balatro, toggle Ctrl+A on and
+off once to refresh `native_search.cfg`, then rebuild the pool.
 
 To compare the generalized engine with the established reference path over
 their overlapping A1-A8 semantics, and to exercise the in-game pool search

@@ -29,6 +29,20 @@ for cfg in "$OUT"/case*.cfg; do
 	fi
 done
 
+# Exact equality alone could let both implementations accidentally omit tag
+# rewards. Require the generated corpus to contain accepted first-Soul hits
+# sourced from each Model-6 reward type.
+if grep -Eq 'LegA[0-9]+Charm(Sm|Big)' "$OUT"/case*.expected; then
+	echo "PASS collected Charm reward produced a legendary hit"
+else
+	echo "FAIL no collected Charm reward legendary hit in fixtures"; fail=1
+fi
+if grep -Eq 'LegA[0-9]+Ethereal(Sm|Big)' "$OUT"/case*.expected; then
+	echo "PASS collected Ethereal reward produced a legendary hit"
+else
+	echo "FAIL no collected Ethereal reward legendary hit in fixtures"; fail=1
+fi
+
 # Malformed/truncated snapshots are external files and must fail cleanly,
 # never dereference a missing token or degrade to an accept-all search.
 awk 'BEGIN { changed=0 }
@@ -45,6 +59,12 @@ if "./native/brainstorm_native_search$EXE" verifychecks "$OUT/malformed-number.c
 	echo "FAIL malformed numeric value was accepted"; fail=1
 else
 	echo "PASS malformed numeric value rejected cleanly"
+fi
+sed 's/^modelver 6$/modelver 5/' "$OUT/case1.cfg" > "$OUT/stale-model.cfg"
+if "./native/brainstorm_native_search$EXE" verifychecks "$OUT/stale-model.cfg" >/dev/null 2>&1; then
+	echo "FAIL stale Model-5 config was accepted"; fail=1
+else
+	echo "PASS stale Model-5 config rejected cleanly"
 fi
 if [ "$fail" = 0 ]; then echo "NATIVE EQUIVALENCE: ALL PASS"; else echo "NATIVE EQUIVALENCE: FAILURES"; fi
 exit $fail

@@ -163,10 +163,10 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
 }
 
 /* ----------------------------------------------------------------- config */
-#define MODELVER 5 /* RNG/shop model + config protocol version; must match the
-                    * config's modelver. 5 adds pool-route composition and
-                    * serializes booster/Soul availability. An older binary
-                    * would silently ignore those semantics, so reject it. */
+#define MODELVER 6 /* RNG/shop model + config protocol version; must match the
+                    * config's modelver. 6 interleaves collected Charm/Ethereal
+                    * reward packs with the reachable shop-pack route. An older
+                    * binary would silently ignore those Soul events, so reject it. */
 #define MAX_POOL_ROUTE_RULES 16
 #define MAX_POOL_LEGEND_RULES 2
 #define MAX_SEARCH_ANTE 39
@@ -197,6 +197,7 @@ typedef struct {
 	int nboost; char boostKey[MAX_BOOST][MAX_KEY]; double boostW[MAX_BOOST];
 	uint8_t boostBuf[MAX_BOOST], boostAvail[MAX_BOOST]; int boostCards[MAX_BOOST];
 	uint8_t boostSoul[MAX_BOOST]; /* 0 none, 1 Arcana(Tarot), 2 Spectral */
+	int tagRewardCards[3]; /* indexed by boostSoul kind: Charm=1, Ethereal=2 */
 	double boostCume;
 	int soulAllowed, blackHoleAllowed, forceBuffoon, sawSpecialDef;
 	/* joker-search derived */
@@ -333,8 +334,11 @@ typedef struct {
 	 * get_pack picks never roll. forcedAnte = first ante that still opens a
 	 * shop; that shop's slot 1 is the run's forced normal Buffoon. */
 	uint8_t skipSm[MAX_SEARCH_ANTE + 1], skipBig[MAX_SEARCH_ANTE + 1]; int forcedAnte;
+	/* Soul-capable pack opened immediately in place of a collected blind's shop:
+	 * 1 = Charm/Mega Arcana, 2 = Ethereal/Spectral. A plain skipped blind is 0. */
+	uint8_t rewardSm[MAX_SEARCH_ANTE + 1], rewardBig[MAX_SEARCH_ANTE + 1];
 	char label[64];
-	char legloc[16];
+	char legloc[24];
 } Ctx;
 
 static const char *K_CDT[9] = { 0, "cdt1", "cdt2", "cdt3", "cdt4", "cdt5", "cdt6", "cdt7", "cdt8" };
@@ -482,6 +486,78 @@ static void sim_packs(Ctx *c, int a, int count) {
 	}
 }
 
+/* Charm/Ethereal tags do more than remove a shop: skip_blind immediately
+ * opens their reward pack at that blind choice, before the next reachable
+ * shop. Those packs consume the same per-Ante Soul streams as shop packs. */
+static int tag_reward_kind(const Config *g, int tagIndex) {
+	if (tagIndex < 0 || tagIndex >= g->ntags) return 0;
+	if (!strcmp(g->tagKey[tagIndex], "tag_charm")) return 1;
+	if (!strcmp(g->tagKey[tagIndex], "tag_ethereal")) return 2;
+	return 0;
+}
+
+static int tag_reward_kind_key(const char *key) {
+	if (key && !strcmp(key, "tag_charm")) return 1;
+	if (key && !strcmp(key, "tag_ethereal")) return 2;
+	return 0;
+}
+
+typedef struct {
+	int soulKind, cards;
+	int shopSlot; /* 1-based flattened physical shop-pack slot; 0 for tag reward */
+	int blind;    /* -1 shop, 0 Small reward, 1 Big reward */
+} SoulPackEvent;
+
+static void append_shop_pair(const Ctx *c, int ante, int *cursor,
+		SoulPackEvent events[8], int *n) {
+	const Config *g = c->g;
+	for (int i = 0; i < 2 && *cursor < c->packs_n[ante]; i++) {
+		int slot = (*cursor)++;
+		int pi = c->pack_idx[ante][slot];
+		SoulPackEvent *e = &events[(*n)++];
+		e->soulKind = pi >= 0 ? g->boostSoul[pi] : 0;
+		e->cards = pi >= 0 ? g->boostCards[pi] : 0;
+		e->shopSlot = slot + 1;
+		e->blind = -1;
+	}
+}
+
+static void append_tag_reward(const Ctx *c, int kind, int blind,
+		SoulPackEvent events[8], int *n) {
+	if (!kind) return;
+	SoulPackEvent *e = &events[(*n)++];
+	e->soulKind = kind;
+	e->cards = c->g->tagRewardCards[kind];
+	e->shopSlot = 0;
+	e->blind = blind;
+}
+
+/* Build one Ante's opened-pack timeline. Antes 2+ begin with the previous
+ * boss's entry shop; each played Small/Big then contributes its two shop pack
+ * offers, while a skipped Charm/Ethereal blind contributes its immediate tag
+ * reward instead. Shop-pack RNG advances remain compressed across skips. */
+static int soul_pack_events(Ctx *c, int ante, SoulPackEvent events[8]) {
+	sim_packs(c, ante, 6);
+	int cursor = 0, n = 0;
+	if (ante >= 2) append_shop_pair(c, ante, &cursor, events, &n);
+	if (c->skipSm[ante]) append_tag_reward(c, c->rewardSm[ante], 0, events, &n);
+	else append_shop_pair(c, ante, &cursor, events, &n);
+	if (c->skipBig[ante]) append_tag_reward(c, c->rewardBig[ante], 1, events, &n);
+	else append_shop_pair(c, ante, &cursor, events, &n);
+	return n;
+}
+
+static void soul_event_location(char *out, size_t outsz, int ante,
+		const SoulPackEvent *event) {
+	if (event->blind < 0) {
+		snprintf(out, outsz, "LegA%dP%d", ante, event->shopSlot);
+	} else {
+		snprintf(out, outsz, "LegA%d%s%s", ante,
+				event->soulKind == 1 ? "Charm" : "Ethereal",
+				event->blind == 0 ? "Sm" : "Big");
+	}
+}
+
 /* One ante's joker sequence: shop slots then (separately) buffoon-pack cards.
  * Mirrors simulateShopJokers / simulatePackJokers including the rarity-skip
  * and the needNeg edition rolls. seqKey[i] == NULL means "pick skipped". */
@@ -621,7 +697,14 @@ static bool apply_pool_route(Ctx *c) {
 						|| a > g->poolRouteRules[r].maxAnte
 						|| idx != g->poolRouteRules[r].poolIndex) continue;
 				counts[r]++;
-				if (blind == 0) c->skipSm[a] = 1; else c->skipBig[a] = 1;
+				int reward = tag_reward_kind(g, idx);
+				if (blind == 0) {
+					c->skipSm[a] = 1;
+					if (reward) c->rewardSm[a] = (uint8_t)reward;
+				} else {
+					c->skipBig[a] = 1;
+					if (reward) c->rewardBig[a] = (uint8_t)reward;
+				}
 			}
 		}
 	}
@@ -674,11 +757,11 @@ static bool check_pool_legend_rules(Ctx *c) {
 	int found = 0, eventAnte[3] = { 0 };
 	double eventEdition[3] = { 0.0 };
 	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
-		sim_packs(c, ante, 6);
-		for (int slot = 0; slot < c->packs_n[ante] && found < needDepth; slot++) {
-			int pi = c->pack_idx[ante][slot];
-			if (pi < 0 || !g->boostSoul[pi]) continue;
-			int kind = g->boostSoul[pi], cards = g->boostCards[pi];
+		SoulPackEvent packs[8];
+		int npacks = soul_pack_events(c, ante, packs);
+		for (int slot = 0; slot < npacks && found < needDepth; slot++) {
+			int kind = packs[slot].soulKind, cards = packs[slot].cards;
+			if (!kind) continue;
 			Stream *stream = kind == 1 ? &c->soulT[ante] : &c->soulS[ante];
 			char soulKey[32];
 			snprintf(soulKey, sizeof soulKey, "soul_%s%d",
@@ -716,22 +799,18 @@ static bool check_pool_legend_rules(Ctx *c) {
 	return true;
 }
 
-/* checkLegendaryAnywhere: the run's FIRST Soul across antes 1-8 (see the Lua
- * original for the full source-verified model: per-card 'soul_'..type..ante
- * rolls, Spectral cards roll twice with black-hole OVERWRITING the soul,
- * later spectral cards skip the second roll once a black hole exists, first
- * Soul's legendary = first bare-'Joker4' advance, edition = 'edisou'..ante). */
+/* checkLegendaryAnywhere: the run's FIRST Soul across chronological collected
+ * Charm/Ethereal rewards and reachable shop packs in antes 1-8. */
 static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	const Config *g = c->g;
 	if (!g->soulAllowed) return false;
 	for (int a = 1; a <= 8; a++) {
-		sim_packs(c, a, 6);
-		for (int slot = 0; slot < c->packs_n[a]; slot++) {
-			int pi = c->pack_idx[a][slot];
-			if (pi < 0) continue; /* forced buffoon / none: not soulable */
-			int sk = g->boostSoul[pi];
+		SoulPackEvent packs[8];
+		int npacks = soul_pack_events(c, a, packs);
+		for (int slot = 0; slot < npacks; slot++) {
+			int sk = packs[slot].soulKind;
 			if (!sk) continue;
-			int ncards = g->boostCards[pi];
+			int ncards = packs[slot].cards;
 			Stream *ss = (sk == 1) ? &c->soulT[a] : &c->soulS[a];
 			const char *skey = (sk == 1) ? K_SOULT[a] : K_SOULS[a];
 			bool soul_in_pack = false, bh_in_pack = false;
@@ -758,7 +837,7 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 							&& psr(c, stream_next(c, &c->edisouA[a], K_EDISOUA[a])) <= 0.997) {
 						return false;
 					}
-					snprintf(c->legloc, sizeof c->legloc, "LegA%dP%d", a, slot + 1);
+					soul_event_location(c->legloc, sizeof c->legloc, a, &packs[slot]);
 					*locOut = c->legloc;
 					return true;
 				}
@@ -855,7 +934,7 @@ static bool passes_prepared(Ctx *c) {
 		bool last = false;
 		for (int i = 0; i < needed; i++) {
 			bool found = false;
-			for (int j = 0; j < 5; j++) {
+			for (int j = 0; j < g->tagRewardCards[1]; j++) {
 				if (psr(c, stream_next(c, &c->soulT[1], K_SOULT[1])) > 0.997) found = true;
 			}
 			last = found;
@@ -905,17 +984,29 @@ static bool passes_prepared(Ctx *c) {
 	 * skipping the matched blind. */
 	memset(c->skipSm, 0, sizeof c->skipSm);
 	memset(c->skipBig, 0, sizeof c->skipBig);
+	memset(c->rewardSm, 0, sizeof c->rewardSm);
+	memset(c->rewardBig, 0, sizeof c->rewardBig);
 	if (!apply_pool_route(c)) return false;
-	if (!legAnywhere && (g->soulCount > 0 || g->legendary[0])) c->skipSm[1] = 1;
+	if (!legAnywhere && (g->soulCount > 0 || g->legendary[0])) {
+		c->skipSm[1] = 1;
+		c->rewardSm[1] = 1; /* classic filter's Ante-1 Charm-tag convention */
+	}
 	if (g->tag[0]) {
+		int reward = tag_reward_kind_key(g->tag);
 		if (g->tagAnywhere) {
 			int a = atoi(tagLoc + 4); /* "TagA<n>Sm|Big" */
 			if (a >= 1 && a <= 8) {
-				if (tagLoc[strlen(tagLoc) - 1] == 'm') c->skipSm[a] = 1;
-				else c->skipBig[a] = 1;
+				if (tagLoc[strlen(tagLoc) - 1] == 'm') {
+					c->skipSm[a] = 1;
+					if (reward) c->rewardSm[a] = (uint8_t)reward;
+				} else {
+					c->skipBig[a] = 1;
+					if (reward) c->rewardBig[a] = (uint8_t)reward;
+				}
 			}
 		} else {
 			c->skipSm[1] = 1;
+			if (reward) c->rewardSm[1] = (uint8_t)reward;
 		}
 	}
 	resolve_forced_pack_ante(c);
@@ -1418,11 +1509,21 @@ bad_value:
 		if (g->boostCards[i] <= 0) {
 			g->boostCards[i] = strstr(g->boostKey[i], "mega") ? 4 : (strstr(g->boostKey[i], "jumbo") ? 4 : 2);
 		}
+		/* Tag rewards force these centers directly, even when a challenge removes
+		 * them from the random shop pool, so availability does not gate metadata. */
+		if (!strcmp(g->boostKey[i], "p_arcana_mega_1") && g->boostSoul[i] == 1)
+			g->tagRewardCards[1] = g->boostCards[i];
+		if (!strcmp(g->boostKey[i], "p_spectral_normal_1") && g->boostSoul[i] == 2)
+			g->tagRewardCards[2] = g->boostCards[i];
 		if (!strcmp(g->boostKey[i], "p_buffoon_normal_1") && g->boostAvail[i])
 			g->forceBuffoon = 1;
 	}
 	if (g->nboost == 0 || g->boostCume <= 0.0) {
 		snprintf(err, errsz, "config has no available booster packs");
+		return false;
+	}
+	if (g->tagRewardCards[1] <= 0 || g->tagRewardCards[2] <= 0) {
+		snprintf(err, errsz, "config is missing Charm/Ethereal reward-pack metadata");
 		return false;
 	}
 	if (g->packSlots <= 0) g->packSlots = 2;

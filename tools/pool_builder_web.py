@@ -304,6 +304,8 @@ scan pauses at a checkpoint and the Build button resumes it.</div>
       <span class="tagc">Exclusive: use Soul #1 and keep its different Legendary.</span>
     </span>
   </div>
+  <div class="tagc">Souls are checked in chronological order across reachable
+  shop packs and collected Charm/Ethereal tag rewards.</div>
   <div id="rules"></div>
   <div class="row"><button class="mini" onclick="addRule()">+ add a tag requirement</button></div>
   <div class="row">

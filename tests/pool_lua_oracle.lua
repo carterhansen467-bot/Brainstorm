@@ -125,19 +125,28 @@ end
 
 for seed in read(seedsPath):gmatch("[^\r\n]+") do
 	Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
-	local overlaySm, overlayBig, overlayOK = nil, nil, not overlayTag
+	local overlaySm, overlayBig, overlayRewardSm, overlayRewardBig, overlayOK =
+		nil, nil, nil, nil, not overlayTag
 	if overlayTag then
 		for ante = 1, 8 do
 			if Brainstorm.rollTag(seed, ante) == overlayTag then
-				overlaySm, overlayOK = { [ante] = true }, true; break
+				overlaySm, overlayOK = { [ante] = true }, true
+				if Brainstorm.tagSoulRewardKey(overlayTag) then
+					overlayRewardSm = { [ante] = overlayTag }
+				end
+				break
 			end
 			if Brainstorm.rollTag(seed, ante) == overlayTag then
-				overlayBig, overlayOK = { [ante] = true }, true; break
+				overlayBig, overlayOK = { [ante] = true }, true
+				if Brainstorm.tagSoulRewardKey(overlayTag) then
+					overlayRewardBig = { [ante] = overlayTag }
+				end
+				break
 			end
 		end
 		Brainstorm.random_state = { hashed_seed = pseudohash(seed) }
 	end
 	local ok = overlayOK and Brainstorm.evaluatePoolCriteria(
-		seed, header, overlaySm, overlayBig)
+		seed, header, overlaySm, overlayBig, overlayRewardSm, overlayRewardBig)
 	print(seed .. " " .. (ok and "1" or "0"))
 end

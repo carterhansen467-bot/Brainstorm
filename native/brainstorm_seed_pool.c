@@ -14,7 +14,8 @@
  *     non-target legendary remains owned until the second Soul is used.
  * Matched tags can either be observed or collected.  Collecting selects the
  * first required occurrences as blind skips before physical packs/Souls are
- * simulated, matching Brainstorm's Model-3 shop layout.
+ * simulated. Model 6 also opens collected Charm/Ethereal reward packs at the
+ * skipped blind, in chronological order with the shops that remain reachable.
  * ======================================================================== */
 
 #define BRAINSTORM_NATIVE_CORE_ONLY
@@ -127,6 +128,7 @@ typedef struct {
 	uint64_t packsGen[POOL_MAX_ANTE + 1];
 	int packsN[POOL_MAX_ANTE + 1], packIdx[POOL_MAX_ANTE + 1][6];
 	uint8_t skipSm[POOL_MAX_ANTE + 1], skipBig[POOL_MAX_ANTE + 1];
+	uint8_t rewardSm[POOL_MAX_ANTE + 1], rewardBig[POOL_MAX_ANTE + 1];
 	int forcedAnte;
 	int firstLegendaryIdx;
 } PoolCtx;
@@ -533,7 +535,14 @@ static bool pool_apply_base_route(PoolCtx *c) {
 						|| ante < rule->minAnte || ante > rule->maxAnte
 						|| idx != rule->poolIndex) continue;
 				counts[r]++;
-				if (blind == 0) c->skipSm[ante] = 1; else c->skipBig[ante] = 1;
+				int reward = tag_reward_kind(c->g, idx);
+				if (blind == 0) {
+					c->skipSm[ante] = 1;
+					if (reward) c->rewardSm[ante] = (uint8_t)reward;
+				} else {
+					c->skipBig[ante] = 1;
+					if (reward) c->rewardBig[ante] = (uint8_t)reward;
+				}
 			}
 		}
 	}
@@ -555,8 +564,14 @@ static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap) {
 						|| idx != rule->poolIndex) continue;
 				counts[r]++;
 				if (rule->collect) {
-					if (blind == 0) c->skipSm[ante] = 1;
-					else c->skipBig[ante] = 1;
+					int reward = tag_reward_kind(c->g, idx);
+					if (blind == 0) {
+						c->skipSm[ante] = 1;
+						if (reward) c->rewardSm[ante] = (uint8_t)reward;
+					} else {
+						c->skipBig[ante] = 1;
+						if (reward) c->rewardBig[ante] = (uint8_t)reward;
+					}
 				}
 				if (wroteRule[r]) {
 					pool_label_add(label, labelCap, ",A%d%s", ante, blind == 0 ? "Sm" : "Big");
@@ -604,24 +619,50 @@ static void pool_sim_packs(PoolCtx *c, int ante) {
 	}
 }
 
-static bool pool_precheck_legendary(PoolCtx *c) {
+static void pool_append_shop_pair(const PoolCtx *c, int ante, int *cursor,
+		SoulPackEvent events[8], int *n) {
 	const Config *g = c->g;
-	const PoolPlan *p = c->p;
-	if (!p->legendary.used) return true;
-	int first = pool_pick_culled(c, &c->joker4, "Joker4", c->jokerResample,
-			g->jokerAvail[4], g->njoker[4]);
-	c->firstLegendaryIdx = first;
-	if (p->legendary.soulDepth == 1) return first == p->legendary.poolIndex;
-	/* Exclusive depth 2: a target on Soul #1 is deliberately rejected. The
-	 * first non-target legendary stays owned, so its fixed pool slot becomes
-	 * UNAVAILABLE and Balatro's normal Joker4_resample streams apply. */
-	if (first < 0 || first == p->legendary.poolIndex) return false;
-	uint8_t avail[MAX_JOKERS];
-	memcpy(avail, g->jokerAvail[4], sizeof avail);
-	avail[first] = 0;
-	int second = pool_pick_culled(c, &c->joker4, "Joker4", c->jokerResample,
-			avail, g->njoker[4]);
-	return second == p->legendary.poolIndex;
+	for (int i = 0; i < 2 && *cursor < c->packsN[ante]; i++) {
+		int slot = (*cursor)++;
+		int pi = c->packIdx[ante][slot];
+		SoulPackEvent *e = &events[(*n)++];
+		e->soulKind = pi >= 0 ? g->boostSoul[pi] : 0;
+		e->cards = pi >= 0 ? g->boostCards[pi] : 0;
+		e->shopSlot = slot + 1;
+		e->blind = -1;
+	}
+}
+
+static void pool_append_tag_reward(const PoolCtx *c, int kind, int blind,
+		SoulPackEvent events[8], int *n) {
+	if (!kind) return;
+	SoulPackEvent *e = &events[(*n)++];
+	e->soulKind = kind;
+	e->cards = c->g->tagRewardCards[kind];
+	e->shopSlot = 0;
+	e->blind = blind;
+}
+
+static int pool_soul_pack_events(PoolCtx *c, int ante, SoulPackEvent events[8]) {
+	pool_sim_packs(c, ante);
+	int cursor = 0, n = 0;
+	if (ante >= 2) pool_append_shop_pair(c, ante, &cursor, events, &n);
+	if (c->skipSm[ante]) pool_append_tag_reward(c, c->rewardSm[ante], 0, events, &n);
+	else pool_append_shop_pair(c, ante, &cursor, events, &n);
+	if (c->skipBig[ante]) pool_append_tag_reward(c, c->rewardBig[ante], 1, events, &n);
+	else pool_append_shop_pair(c, ante, &cursor, events, &n);
+	return n;
+}
+
+static void pool_soul_event_label(char *out, size_t outsz, int ante,
+		const SoulPackEvent *event) {
+	if (event->blind < 0) {
+		snprintf(out, outsz, "A%dP%d", ante, event->shopSlot);
+	} else {
+		snprintf(out, outsz, "A%d%s%s", ante,
+				event->soulKind == 1 ? "Charm" : "Ethereal",
+				event->blind == 0 ? "Sm" : "Big");
+	}
 }
 
 static int pool_legend_rule_count(const PoolPlan *p) {
@@ -663,105 +704,6 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
 	return true;
 }
 
-static bool pool_check_first_soul(PoolCtx *c, char *label, size_t labelCap) {
-	const Config *g = c->g;
-	const PoolPlan *p = c->p;
-	const PoolLegendaryRule *rule = &p->legendary;
-	for (int ante = 1; ante <= rule->maxAnte; ante++) {
-		pool_sim_packs(c, ante);
-		for (int slot = 0; slot < c->packsN[ante]; slot++) {
-			int pi = c->packIdx[ante][slot];
-			if (pi < 0 || !g->boostSoul[pi]) continue;
-			int soulKind = g->boostSoul[pi];
-			int cards = g->boostCards[pi];
-			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
-			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
-			bool soulInPack = false, blackHoleInPack = false;
-			for (int card = 0; card < cards; card++) {
-				bool soul = false;
-				if (!soulInPack)
-					soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-				if (soulKind == 2 && !blackHoleInPack) {
-					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-					if (blackHole) {
-						if (g->blackHoleAllowed) blackHoleInPack = true;
-						soul = false;
-					}
-				}
-				if (!soul) continue;
-				if (ante < rule->minAnte) return false;
-				if (rule->requireNegative
-						&& pool_psr(c, pool_stream_next(c, &c->ediSoul[ante], p->kEdiSoul[ante])) <= 0.997) return false;
-				pool_label_add(label, labelCap, "%s%s=A%dP%d",
-						label && label[0] ? " " : "", rule->key, ante, slot + 1);
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-/* Exact second-Soul route. A Soul suppresses further Soul rolls while the
- * cards from that pack coexist, so Soul #2 must come from a later pack. Pack
- * cleanup clears that temporary used_jokers gate. Spectral Black Hole has
- * the analogous per-pack gate and can overwrite a Soul rolled on the same
- * card. The first Soul is used, advancing both Joker4 (prechecked above) and
- * its edition stream; its spawned legendary remains owned for Soul #2. */
-static bool pool_check_second_soul(PoolCtx *c, char *label, size_t labelCap) {
-	const Config *g = c->g;
-	const PoolPlan *p = c->p;
-	const PoolLegendaryRule *rule = &p->legendary;
-	int soulNumber = 0, firstAnte = 0, firstSlot = 0;
-	for (int ante = 1; ante <= rule->maxAnte; ante++) {
-		pool_sim_packs(c, ante);
-		for (int slot = 0; slot < c->packsN[ante]; slot++) {
-			int pi = c->packIdx[ante][slot];
-			if (pi < 0 || !g->boostSoul[pi]) continue;
-			int soulKind = g->boostSoul[pi];
-			int cards = g->boostCards[pi];
-			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
-			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
-			bool soulInPack = false, blackHoleInPack = false;
-			for (int card = 0; card < cards; card++) {
-				bool soul = false;
-				if (!soulInPack) {
-					soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-				}
-				if (soulKind == 2 && !blackHoleInPack) {
-					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-					if (blackHole) {
-						if (g->blackHoleAllowed) blackHoleInPack = true;
-						soul = false;
-					}
-				}
-				if (!soul) continue;
-				soulInPack = true;
-				soulNumber++;
-				/* Using every Soul creates a legendary and therefore always polls
-				 * edisou<ante>, even when only Soul #2's edition is constrained. */
-				double editionPoll = pool_psr(c, pool_stream_next(c,
-						&c->ediSoul[ante], p->kEdiSoul[ante]));
-				if (soulNumber == 1) {
-					firstAnte = ante;
-					firstSlot = slot + 1;
-					continue;
-				}
-				if (ante < rule->minAnte) return false;
-				if (rule->requireNegative && editionPoll <= 0.997) return false;
-				const char *firstKey = (c->firstLegendaryIdx >= 0
-						&& c->firstLegendaryIdx < g->njoker[4])
-						? g->jokerKey[4][c->firstLegendaryIdx] : "?";
-				pool_label_add(label, labelCap,
-						"%sSoul1(%s)=A%dP%d Soul2(%s)=A%dP%d",
-						label && label[0] ? " " : "", firstKey, firstAnte,
-						firstSlot, rule->key, ante, slot + 1);
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 /* Locate the first two Souls once on the final cumulative collected-tag
  * route, including the per-pack Soul/Black-Hole gates and the edition roll
  * consumed whenever a Soul is used. Every inherited and current rule is then
@@ -776,21 +718,21 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 		if (r->soulDepth > needDepth) needDepth = r->soulDepth;
 		if (r->maxAnte > maxAnte) maxAnte = r->maxAnte;
 	}
-	int found = 0, eventAnte[3] = { 0 }, eventSlot[3] = { 0 };
+	int found = 0, eventAnte[3] = { 0 };
+	SoulPackEvent eventPack[3] = { 0 };
 	double eventEdition[3] = { 0.0 };
 	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
-		pool_sim_packs(c, ante);
-		for (int slot = 0; slot < c->packsN[ante] && found < needDepth; slot++) {
-			int pi = c->packIdx[ante][slot];
-			if (pi < 0 || !g->boostSoul[pi]) continue;
-			int soulKind = g->boostSoul[pi], cards = g->boostCards[pi];
+		SoulPackEvent packs[8];
+		int npacks = pool_soul_pack_events(c, ante, packs);
+		for (int slot = 0; slot < npacks && found < needDepth; slot++) {
+			int soulKind = packs[slot].soulKind, cards = packs[slot].cards;
+			if (!soulKind) continue;
 			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
 			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
 			bool soulInPack = false, blackHoleInPack = false;
 			for (int card = 0; card < cards && found < needDepth; card++) {
-				bool soul = false;
-				if (!soulInPack)
-					soul = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
+				bool soul = !soulInPack
+						&& pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
 				if (soulKind == 2 && !blackHoleInPack) {
 					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
 					if (blackHole) {
@@ -802,7 +744,7 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 				soulInPack = true;
 				found++;
 				eventAnte[found] = ante;
-				eventSlot[found] = slot + 1;
+				eventPack[found] = packs[slot];
 				eventEdition[found] = pool_psr(c, pool_stream_next(c,
 						&c->ediSoul[ante], p->kEdiSoul[ante]));
 			}
@@ -817,18 +759,19 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 	}
 	if (p->legendary.used) {
 		const PoolLegendaryRule *r = &p->legendary;
+		char loc1[32], loc2[32];
+		pool_soul_event_label(loc1, sizeof loc1, eventAnte[1], &eventPack[1]);
 		if (r->soulDepth == 2) {
 			const char *firstKey = c->firstLegendaryIdx >= 0
 					&& c->firstLegendaryIdx < g->njoker[4]
 					? g->jokerKey[4][c->firstLegendaryIdx] : "?";
+			pool_soul_event_label(loc2, sizeof loc2, eventAnte[2], &eventPack[2]);
 			pool_label_add(label, labelCap,
-					"%sSoul1(%s)=A%dP%d Soul2(%s)=A%dP%d",
-					label && label[0] ? " " : "", firstKey, eventAnte[1],
-					eventSlot[1], r->key, eventAnte[2], eventSlot[2]);
+					"%sSoul1(%s)=%s Soul2(%s)=%s",
+					label && label[0] ? " " : "", firstKey, loc1, r->key, loc2);
 		} else {
-			pool_label_add(label, labelCap, "%s%s=A%dP%d",
-					label && label[0] ? " " : "", r->key,
-					eventAnte[1], eventSlot[1]);
+			pool_label_add(label, labelCap, "%s%s=%s",
+					label && label[0] ? " " : "", r->key, loc1);
 		}
 	}
 	return true;
@@ -842,6 +785,8 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	c->hashedSeed = hseed;
 	memset(c->skipSm, 0, sizeof c->skipSm);
 	memset(c->skipBig, 0, sizeof c->skipBig);
+	memset(c->rewardSm, 0, sizeof c->rewardSm);
+	memset(c->rewardBig, 0, sizeof c->rewardBig);
 	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
 	if (label && labelCap) label[0] = 0;
 	if (p->firstKind == 1) {
