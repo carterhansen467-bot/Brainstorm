@@ -133,9 +133,9 @@ jobs:
              folder and choose Replace for matching files. Keep seed_pools,
              settings.lua, and native_search.cfg.
           3. Launch Balatro and toggle Ctrl+A on and off once. This refreshes
-             native_search.cfg for model 5 and your current unlock profile.
-          4. Model-4 .bspool files must be rebuilt before search/refilter use.
-             They may still be exported or converted.
+             native_search.cfg for model 6 and your current unlock profile.
+          4. Model-5 and older .bspool files must be rebuilt before
+             search/refilter use. They may still be exported.
 
           The Lua mod, native helpers, and Seed Pool Builder in this package
           are one tested version. Do not mix them with files from an older
