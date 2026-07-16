@@ -168,7 +168,11 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
                     * reward packs with the reachable shop-pack route. An older
                     * binary would silently ignore those Soul events, so reject it. */
 #define MAX_POOL_ROUTE_RULES 16
-#define MAX_POOL_LEGEND_RULES 2
+/* Canonical cumulative Soul rules: at most one per exact depth (1, 2) plus up
+ * to two distinct-key either-depth rules -- more than that cannot be satisfied
+ * by the run's first two Souls. soulDepth 0 encodes "either Soul #1 or #2". */
+#define MAX_POOL_LEGEND_RULES 4
+#define SOUL_DEPTH_ANY 0
 #define MAX_SEARCH_ANTE 39
 
 typedef struct {
@@ -736,10 +740,17 @@ static bool check_pool_legend_rules(Ctx *c) {
 	int first = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
 			g->jokerAvail[4], g->njoker[4], -1);
 	if (first < 0) return false;
+	/* Either-depth rules resolve deterministically: the exclusive Soul #2 pick
+	 * can never repeat Soul #1's legendary, so the target is at depth 1 iff it
+	 * IS the first pick, otherwise it must be the second. */
+	int resolved[MAX_POOL_LEGEND_RULES];
 	int needDepth = 1, maxAnte = 0;
 	for (int i = 0; i < g->npoolLegendRules; i++) {
-		if (g->poolLegendRules[i].soulDepth > needDepth)
-			needDepth = g->poolLegendRules[i].soulDepth;
+		int d = g->poolLegendRules[i].soulDepth;
+		if (d == SOUL_DEPTH_ANY)
+			d = g->poolLegendRules[i].poolIndex == first ? 1 : 2;
+		resolved[i] = d;
+		if (d > needDepth) needDepth = d;
 		if (g->poolLegendRules[i].maxAnte > maxAnte)
 			maxAnte = g->poolLegendRules[i].maxAnte;
 	}
@@ -750,7 +761,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 		if (second < 0) return false;
 	}
 	for (int i = 0; i < g->npoolLegendRules; i++) {
-		int chosen = g->poolLegendRules[i].soulDepth == 1 ? first : second;
+		int chosen = resolved[i] == 1 ? first : second;
 		if (chosen != g->poolLegendRules[i].poolIndex) return false;
 	}
 
@@ -791,7 +802,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 	}
 	if (found < needDepth) return false;
 	for (int i = 0; i < g->npoolLegendRules; i++) {
-		int depth = g->poolLegendRules[i].soulDepth;
+		int depth = resolved[i];
 		if (eventAnte[depth] < g->poolLegendRules[i].minAnte
 				|| eventAnte[depth] > g->poolLegendRules[i].maxAnte
 				|| (g->poolLegendRules[i].neg && eventEdition[depth] <= 0.997)) return false;
@@ -1653,7 +1664,8 @@ typedef struct {
 	int nrouteTagRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount, collect; }
 		routeTagRules[BSPOOL_MAX_TAG_RULES];
-	struct { int used; char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; } legendary;
+	int nlegendaries; /* current-stage rule (0 or 1) */
+	struct { char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; } legendaries[1];
 	int nrouteLegendRules;
 	struct { char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; }
 		routeLegendRules[MAX_POOL_LEGEND_RULES];
@@ -1694,13 +1706,18 @@ static bool pool_header_no_more(char **sp) { return pool_tok(sp) == NULL; }
 
 /* Legendary constraints from successive refilter stages describe the same
  * physical Soul #1/#2 sequence. Canonicalize them to at most one intersected
- * rule per depth; conflicting targets or disjoint Ante windows mean the pool
- * header cannot describe any valid seed on one cumulative route. */
+ * rule per (depth, key); conflicting exact-depth targets or disjoint Ante
+ * windows mean the pool header cannot describe any valid seed on one
+ * cumulative route. Either-depth (soulDepth 0) rules with different keys can
+ * both be satisfied -- one per Soul -- so they stay separate entries. */
 static bool bspool_add_legend_rule(BspoolHeader *h, const char *key,
 		int minAnte, int maxAnte, int neg, int soulDepth) {
 	for (int i = 0; i < h->nrouteLegendRules; i++) {
 		if (h->routeLegendRules[i].soulDepth != soulDepth) continue;
-		if (strcmp(h->routeLegendRules[i].key, key)) return false;
+		if (strcmp(h->routeLegendRules[i].key, key)) {
+			if (soulDepth == SOUL_DEPTH_ANY) continue;
+			return false;
+		}
 		if (minAnte > h->routeLegendRules[i].minAnte)
 			h->routeLegendRules[i].minAnte = minAnte;
 		if (maxAnte < h->routeLegendRules[i].maxAnte)
@@ -1768,7 +1785,6 @@ static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
 static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz) {
 	memset(h, 0, sizeof *h);
 	h->route = 1;
-	h->legendary.soulDepth = 1;
 	char buf[BSPOOL_HEADER_SIZE + 1];
 	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
 	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
@@ -1786,7 +1802,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		| HS_SEEDSPACE | HS_RANGE_START | HS_RANGE_END | HS_CATALOG
 		| HS_CRITERIA | HS_RECORDS | HS_COMPLETE | HS_HEADER_BYTES;
 	unsigned seen = 0;
-	int sawEnd = 0, malformed = 0, sawSoulDepth = 0;
+	int sawEnd = 0, malformed = 0, sawSoulDepthFor = -1;
 	char encoding[32] = "";
 	while (cur && *cur && !sawEnd) {
 		char *nl = strchr(cur, '\n');
@@ -1927,29 +1943,38 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 					|| !pool_header_int(b, &ib) || !pool_header_int(n, &in)
 					|| !pool_header_int(depth, &id) || !pool_header_no_more(&sp)
 					|| ia < 1 || ib < ia || ib > BSPOOL_MAX_ANTE
-					|| (in != 0 && in != 1) || id < 1 || id > 2
+					|| (in != 0 && in != 1) || id < SOUL_DEPTH_ANY || id > 2
 					|| !bspool_add_legend_rule(h, k, ia, ib, in, id)) malformed = 1;
 		}
 		else if (!strcmp(d, "legendary")) {
 			char *k = pool_tok(&sp);
 			char *a = pool_tok(&sp), *b = pool_tok(&sp), *n = pool_tok(&sp);
 			int ia, ib, in = 0;
-			if (!h->legendary.used && k && strlen(k) < MAX_KEY
+			if (!h->nlegendaries && k && strlen(k) < MAX_KEY
 					&& pool_header_int(a, &ia) && pool_header_int(b, &ib)
 					&& (!n || pool_header_int(n, &in)) && (in == 0 || in == 1)
 					&& pool_header_no_more(&sp)) {
-				h->legendary.used = 1;
-				snprintf(h->legendary.key, MAX_KEY, "%s", k);
-				h->legendary.minAnte = ia;
-				h->legendary.maxAnte = ib;
-				h->legendary.neg = in;
+				int i = h->nlegendaries++;
+				snprintf(h->legendaries[i].key, MAX_KEY, "%s", k);
+				h->legendaries[i].minAnte = ia;
+				h->legendaries[i].maxAnte = ib;
+				h->legendaries[i].neg = in;
+				h->legendaries[i].soulDepth = 1;
 			} else malformed = 1;
 		}
 		else if (!strcmp(d, "soul_depth")) {
+			/* Applies to the preceding legendary line; at most one each. */
 			v = pool_tok(&sp);
-			if (sawSoulDepth || !pool_header_int(v, &h->legendary.soulDepth)
-					|| !pool_header_no_more(&sp)) malformed = 1;
-			sawSoulDepth = 1;
+			int depth = 0;
+			if (!h->nlegendaries || sawSoulDepthFor == h->nlegendaries - 1
+					|| !v || !pool_header_no_more(&sp)
+					|| !(!strcmp(v, "any") ? (depth = SOUL_DEPTH_ANY, true)
+						: (pool_header_int(v, &depth)
+							&& depth >= 1 && depth <= 2))) malformed = 1;
+			else {
+				sawSoulDepthFor = h->nlegendaries - 1;
+				h->legendaries[sawSoulDepthFor].soulDepth = depth;
+			}
 		}
 		else if (!strcmp(d, "end")) {
 			if (!pool_header_no_more(&sp)) malformed = 1;
@@ -1957,8 +1982,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		}
 	}
 	if (!(seen & HS_MAGIC)) { snprintf(err, errsz, "not a Brainstorm seed pool"); return false; }
-	if (malformed || (seen & required) != required
-			|| (sawSoulDepth && !h->legendary.used)) {
+	if (malformed || (seen & required) != required) {
 		snprintf(err, errsz, "pool header is malformed or missing required metadata"); return false;
 	}
 	if (h->schema != BSPOOL_SCHEMA_LEGACY && h->schema != BSPOOL_SCHEMA) {
@@ -2019,16 +2043,19 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 			snprintf(err, errsz, "pool has an invalid embedded tag route"); return false;
 		}
 	}
-	if (h->legendary.used && (h->legendary.minAnte < 1
-			|| h->legendary.maxAnte < h->legendary.minAnte
-			|| h->legendary.maxAnte > BSPOOL_MAX_ANTE
-			|| h->legendary.soulDepth < 1 || h->legendary.soulDepth > 2)) {
-		snprintf(err, errsz, "pool has an invalid embedded legendary rule"); return false;
-	}
-	if (h->legendary.used && !bspool_add_legend_rule(h, h->legendary.key,
-			h->legendary.minAnte, h->legendary.maxAnte, h->legendary.neg,
-			h->legendary.soulDepth)) {
-		snprintf(err, errsz, "pool has conflicting cumulative legendary rules"); return false;
+	for (int i = 0; i < h->nlegendaries; i++) {
+		if (h->legendaries[i].minAnte < 1
+				|| h->legendaries[i].maxAnte < h->legendaries[i].minAnte
+				|| h->legendaries[i].maxAnte > BSPOOL_MAX_ANTE
+				|| h->legendaries[i].soulDepth < SOUL_DEPTH_ANY
+				|| h->legendaries[i].soulDepth > 2) {
+			snprintf(err, errsz, "pool has an invalid embedded legendary rule"); return false;
+		}
+		if (!bspool_add_legend_rule(h, h->legendaries[i].key,
+				h->legendaries[i].minAnte, h->legendaries[i].maxAnte,
+				h->legendaries[i].neg, h->legendaries[i].soulDepth)) {
+			snprintf(err, errsz, "pool has conflicting cumulative legendary rules"); return false;
+		}
 	}
 	return true;
 }

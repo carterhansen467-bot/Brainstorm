@@ -9,9 +9,12 @@
  * The initial constraint compiler deliberately covers the route-sensitive
  * primitives already source-verified by Brainstorm:
  *   - multiple tag keys, each with an inclusive ante range and count;
- *   - an exact Soul depth (first or second) yielding a chosen legendary in
- *     an ante range. Second-Soul mode assumes the first Soul is used and its
- *     non-target legendary remains owned until the second Soul is used.
+ *   - one legendary rule over the run's first two Souls, with an ante range
+ *     and a Soul search depth: 1 (the first Soul only, default) or "any"
+ *     (up to two Souls deep -- the first Soul, or failing that the second).
+ *     Whenever the target must come from Soul #2 the route assumes Soul #1
+ *     is used and its non-target legendary remains owned. Legacy exclusive
+ *     soul_depth 2 pools remain readable and refilterable.
  * Matched tags can either be observed or collected.  Collecting selects the
  * first required occurrences as blind skips before physical packs/Souls are
  * simulated. Model 6 also opens collected Charm/Ethereal reward packs at the
@@ -54,8 +57,12 @@ typedef struct {
 	int poolIndex;
 	int minAnte, maxAnte;
 	int requireNegative;
-	int soulDepth; /* exact depth: 1 (default) or 2 */
+	int soulDepth; /* 1 (default), 2, or SOUL_DEPTH_ANY (either Soul) */
 } PoolLegendaryRule;
+
+static const char *pool_soul_depth_str(int depth) {
+	return depth == SOUL_DEPTH_ANY ? "any" : depth == 2 ? "2" : "1";
+}
 
 typedef struct {
 	int schema, sawEnd;
@@ -71,7 +78,8 @@ typedef struct {
 	PoolTagRule baseTagRules[POOL_MAX_TAG_RULES];
 	int nbaseLegendaryRules;
 	PoolLegendaryRule baseLegendaryRules[MAX_POOL_LEGEND_RULES];
-	PoolLegendaryRule legendary;
+	int nlegendary; /* current-stage rule (0 or 1) */
+	PoolLegendaryRule legendary[1];
 	int minTagAnte, maxTagAnte, maxAnte;
 	int firstKind; /* 1 = Joker4, 2 = Tag<firstAnte> */
 	int firstAnte;
@@ -130,7 +138,10 @@ typedef struct {
 	uint8_t skipSm[POOL_MAX_ANTE + 1], skipBig[POOL_MAX_ANTE + 1];
 	uint8_t rewardSm[POOL_MAX_ANTE + 1], rewardBig[POOL_MAX_ANTE + 1];
 	int forcedAnte;
-	int firstLegendaryIdx;
+	int firstLegendaryIdx, secondLegendaryIdx;
+	/* Per-rule Soul depth after either-depth resolution (base rules first,
+	 * then current-stage rules; set by pool_precheck_all_legendaries). */
+	int legendResolved[MAX_POOL_LEGEND_RULES + 2];
 } PoolCtx;
 
 typedef struct {
@@ -204,14 +215,15 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 				r->key, r->minAnte, r->maxAnte, r->minCount);
 		h = pool_hash_update(h, line, (size_t)n);
 	}
-	if (p->legendary.used) {
-		const PoolLegendaryRule *r = &p->legendary;
+	for (int i = 0; i < p->nlegendary; i++) {
+		const PoolLegendaryRule *r = &p->legendary[i];
 		n = snprintf(line, sizeof line, "legendary %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->requireNegative);
 		h = pool_hash_update(h, line, (size_t)n);
 		/* Preserve every existing depth-1 pool/state fingerprint. */
 		if (r->soulDepth != 1) {
-			n = snprintf(line, sizeof line, "soul_depth %d\n", r->soulDepth);
+			n = snprintf(line, sizeof line, "soul_depth %s\n",
+					pool_soul_depth_str(r->soulDepth));
 			h = pool_hash_update(h, line, (size_t)n);
 		}
 	}
@@ -245,7 +257,7 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 	p->chunk = UINT64_C(16384);
 	p->format = POOL_BINARY;
 	p->minTagAnte = POOL_MAX_ANTE + 1;
-	p->legendary.soulDepth = 1;
+	p->legendary[0].soulDepth = 1;
 	FILE *f = fopen(path, "r");
 	if (!f) { snprintf(err, errsz, "cannot open criteria %s", path); return false; }
 	char line[512];
@@ -319,11 +331,11 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 					|| !pool_parse_int(pool_tok(&sp), &r->maxAnte)
 					|| !pool_parse_int(pool_tok(&sp), &r->minCount)) goto bad_value;
 		} else if (!strcmp(d, "legendary")) {
-			if (p->legendary.used) {
+			if (p->nlegendary) {
 				snprintf(err, errsz, "criteria line %d: only one legendary rule is supported", lineno);
 				goto fail;
 			}
-			PoolLegendaryRule *r = &p->legendary;
+			PoolLegendaryRule *r = &p->legendary[p->nlegendary++];
 			r->used = 1;
 			char *key = pool_tok(&sp);
 			if (!key || strlen(key) >= sizeof r->key) goto bad_value;
@@ -333,7 +345,14 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 			char *neg = pool_tok(&sp);
 			if (neg && !pool_parse_int(neg, &r->requireNegative)) goto bad_value;
 		} else if (!strcmp(d, "soul_depth")) {
-			if (!pool_parse_int(pool_tok(&sp), &p->legendary.soulDepth)) goto bad_value;
+			/* Applies to the most recent legendary rule (or, for
+			 * compatibility with older single-rule files, the first rule
+			 * even when the directive precedes its legendary line). */
+			PoolLegendaryRule *r =
+				&p->legendary[p->nlegendary ? p->nlegendary - 1 : 0];
+			char *v = pool_tok(&sp);
+			if (v && !strcmp(v, "any")) r->soulDepth = SOUL_DEPTH_ANY;
+			else if (!pool_parse_int(v, &r->soulDepth)) goto bad_value;
 		} else if (!strcmp(d, "end")) {
 			p->sawEnd = 1;
 			break;
@@ -370,8 +389,8 @@ bad_value:
 	if (p->checkpoint < p->chunk) p->checkpoint = p->chunk;
 	p->resume = !!p->resume;
 	p->collectTags = !!p->collectTags;
-	if (p->ntagRules == 0 && !p->legendary.used) { snprintf(err, errsz, "criteria has no predicates"); return false; }
-	if (!p->legendary.used && p->legendary.soulDepth != 1) {
+	if (p->ntagRules == 0 && !p->nlegendary) { snprintf(err, errsz, "criteria has no predicates"); return false; }
+	if (!p->nlegendary && p->legendary[0].soulDepth != 1) {
 		snprintf(err, errsz, "soul_depth requires a legendary rule");
 		return false;
 	}
@@ -391,27 +410,30 @@ bad_value:
 		if (r->minAnte < p->minTagAnte) p->minTagAnte = r->minAnte;
 		if (r->maxAnte > p->maxTagAnte) p->maxTagAnte = r->maxAnte;
 	}
-	if (p->legendary.used) {
-		PoolLegendaryRule *r = &p->legendary;
+	if (p->nlegendary) {
 		if (!g->soulAllowed) {
 			snprintf(err, errsz, "The Soul is banned in this snapshot");
 			return false;
 		}
-		if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE) {
-			snprintf(err, errsz, "bad range for legendary rule %s", r->key);
-			return false;
+		for (int i = 0; i < p->nlegendary; i++) {
+			PoolLegendaryRule *r = &p->legendary[i];
+			if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE) {
+				snprintf(err, errsz, "bad range for legendary rule %s", r->key);
+				return false;
+			}
+			if (r->soulDepth != SOUL_DEPTH_ANY
+					&& (r->soulDepth < 1 || r->soulDepth > 2)) {
+				snprintf(err, errsz, "soul_depth must be 1, 2, or any");
+				return false;
+			}
+			r->requireNegative = !!r->requireNegative;
+			r->poolIndex = pool_find_legendary(g, r->key);
+			if (r->poolIndex < 0 || !g->jokerAvail[4][r->poolIndex]) {
+				snprintf(err, errsz, "legendary %s is unavailable in this snapshot", r->key);
+				return false;
+			}
+			if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
 		}
-		if (r->soulDepth < 1 || r->soulDepth > 2) {
-			snprintf(err, errsz, "soul_depth must be 1 or 2");
-			return false;
-		}
-		r->requireNegative = !!r->requireNegative;
-		r->poolIndex = pool_find_legendary(g, r->key);
-		if (r->poolIndex < 0 || !g->jokerAvail[4][r->poolIndex]) {
-			snprintf(err, errsz, "legendary %s is unavailable in this snapshot", r->key);
-			return false;
-		}
-		p->maxAnte = r->maxAnte;
 		p->firstKind = 1;
 		snprintf(p->firstKey, sizeof p->firstKey, "Joker4");
 	} else {
@@ -666,16 +688,19 @@ static void pool_soul_event_label(char *out, size_t outsz, int ante,
 }
 
 static int pool_legend_rule_count(const PoolPlan *p) {
-	return p->nbaseLegendaryRules + (p->legendary.used ? 1 : 0);
+	return p->nbaseLegendaryRules + p->nlegendary;
 }
 
 static const PoolLegendaryRule *pool_legend_rule_at(const PoolPlan *p, int i) {
-	return i < p->nbaseLegendaryRules ? &p->baseLegendaryRules[i] : &p->legendary;
+	return i < p->nbaseLegendaryRules ? &p->baseLegendaryRules[i]
+			: &p->legendary[i - p->nbaseLegendaryRules];
 }
 
 /* All refilter stages constrain one cumulative Soul sequence. Resolve the
  * owned legendary for Soul #1 and (when needed) Soul #2 once, then apply every
- * source/current rule to those same picks. */
+ * source/current rule to those same picks. Either-depth rules resolve
+ * deterministically: the exclusive Soul #2 pick can never repeat Soul #1's
+ * legendary, so the target is at depth 1 iff it IS the first pick. */
 static bool pool_precheck_all_legendaries(PoolCtx *c) {
 	const Config *g = c->g;
 	const PoolPlan *p = c->p;
@@ -685,9 +710,15 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
 			g->jokerAvail[4], g->njoker[4]);
 	if (first < 0) return false;
 	c->firstLegendaryIdx = first;
+	c->secondLegendaryIdx = -1;
 	int needSecond = 0;
-	for (int i = 0; i < nrules; i++)
-		if (pool_legend_rule_at(p, i)->soulDepth == 2) needSecond = 1;
+	for (int i = 0; i < nrules; i++) {
+		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+		int d = r->soulDepth;
+		if (d == SOUL_DEPTH_ANY) d = r->poolIndex == first ? 1 : 2;
+		c->legendResolved[i] = d;
+		if (d == 2) needSecond = 1;
+	}
 	int second = -1;
 	if (needSecond) {
 		uint8_t avail[MAX_JOKERS];
@@ -696,10 +727,11 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
 		second = pool_pick_culled(c, &c->joker4, "Joker4", c->jokerResample,
 				avail, g->njoker[4]);
 		if (second < 0) return false;
+		c->secondLegendaryIdx = second;
 	}
 	for (int i = 0; i < nrules; i++) {
 		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
-		if ((r->soulDepth == 1 ? first : second) != r->poolIndex) return false;
+		if ((c->legendResolved[i] == 1 ? first : second) != r->poolIndex) return false;
 	}
 	return true;
 }
@@ -715,7 +747,7 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 	if (!nrules) return true;
 	for (int i = 0; i < nrules; i++) {
 		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
-		if (r->soulDepth > needDepth) needDepth = r->soulDepth;
+		if (c->legendResolved[i] > needDepth) needDepth = c->legendResolved[i];
 		if (r->maxAnte > maxAnte) maxAnte = r->maxAnte;
 	}
 	int found = 0, eventAnte[3] = { 0 };
@@ -753,25 +785,30 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 	if (found < needDepth) return false;
 	for (int i = 0; i < nrules; i++) {
 		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
-		int depth = r->soulDepth;
+		int depth = c->legendResolved[i];
 		if (eventAnte[depth] < r->minAnte || eventAnte[depth] > r->maxAnte
 				|| (r->requireNegative && eventEdition[depth] <= 0.997)) return false;
 	}
-	if (p->legendary.used) {
-		const PoolLegendaryRule *r = &p->legendary;
+	if (p->nlegendary) {
 		char loc1[32], loc2[32];
 		pool_soul_event_label(loc1, sizeof loc1, eventAnte[1], &eventPack[1]);
-		if (r->soulDepth == 2) {
+		int currentSecond = 0;
+		for (int i = p->nbaseLegendaryRules; i < nrules; i++)
+			if (c->legendResolved[i] == 2) currentSecond = 1;
+		if (currentSecond) {
 			const char *firstKey = c->firstLegendaryIdx >= 0
 					&& c->firstLegendaryIdx < g->njoker[4]
 					? g->jokerKey[4][c->firstLegendaryIdx] : "?";
+			const char *secondKey = c->secondLegendaryIdx >= 0
+					&& c->secondLegendaryIdx < g->njoker[4]
+					? g->jokerKey[4][c->secondLegendaryIdx] : "?";
 			pool_soul_event_label(loc2, sizeof loc2, eventAnte[2], &eventPack[2]);
 			pool_label_add(label, labelCap,
 					"%sSoul1(%s)=%s Soul2(%s)=%s",
-					label && label[0] ? " " : "", firstKey, loc1, r->key, loc2);
+					label && label[0] ? " " : "", firstKey, loc1, secondKey, loc2);
 		} else {
 			pool_label_add(label, labelCap, "%s%s=%s",
-					label && label[0] ? " " : "", r->key, loc1);
+					label && label[0] ? " " : "", p->legendary[0].key, loc1);
 		}
 	}
 	return true;
@@ -1069,15 +1106,15 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
-	if (p->legendary.used) {
-		const PoolLegendaryRule *r = &p->legendary;
+	for (int i = 0; i < p->nlegendary; i++) {
+		const PoolLegendaryRule *r = &p->legendary[i];
 		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "legendary %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->requireNegative);
 		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 		if (r->soulDepth != 1) {
 			w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
-					"soul_depth %d\n", r->soulDepth);
+					"soul_depth %s\n", pool_soul_depth_str(r->soulDepth));
 			if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 			n += w;
 		}
@@ -1301,12 +1338,15 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 		const PoolTagRule *r = &p->tagRules[i];
 		fprintf(f, "tag %s %d %d %d\n", r->key, r->minAnte, r->maxAnte, r->minCount);
 	}
-	if (p->legendary.used) fprintf(f, "%s_soul_legendary %s %d %d %d\n",
-			p->legendary.soulDepth == 2 ? "second" : "first",
-			p->legendary.key, p->legendary.minAnte, p->legendary.maxAnte,
-			p->legendary.requireNegative);
-	if (p->legendary.used && p->legendary.soulDepth != 1)
-		fprintf(f, "soul_depth %d\n", p->legendary.soulDepth);
+	for (int i = 0; i < p->nlegendary; i++) {
+		const PoolLegendaryRule *r = &p->legendary[i];
+		fprintf(f, "%s_soul_legendary %s %d %d %d\n",
+				r->soulDepth == 2 ? "second"
+					: r->soulDepth == SOUL_DEPTH_ANY ? "either" : "first",
+				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		if (r->soulDepth != 1)
+			fprintf(f, "soul_depth %s\n", pool_soul_depth_str(r->soulDepth));
+	}
 	fprintf(f, "elapsed_seconds %.6f\nseeds_per_second %.3f\nmatch_rate %.12g\n", s->elapsed,
 			s->elapsed > 0.0 ? (double)s->scanned / s->elapsed : 0.0, rate);
 	if (!p->refilter) {
@@ -1537,13 +1577,19 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 			fclose(f); return false;
 		}
 		if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
-		if (p->legendary.used && p->legendary.soulDepth == r->soulDepth
-				&& (strcmp(p->legendary.key, r->key)
-					|| p->legendary.maxAnte < r->minAnte
-					|| r->maxAnte < p->legendary.minAnte)) {
-			snprintf(err, errsz,
-					"new and source rules conflict for Soul #%d", r->soulDepth);
-			fclose(f); return false;
+		/* Static conflicts are only provable between exact-depth rules: an
+		 * either-depth rule can settle on whichever Soul the other rule does
+		 * not claim, so those combinations are left to evaluation. */
+		for (int j = 0; j < p->nlegendary; j++) {
+			const PoolLegendaryRule *cur = &p->legendary[j];
+			if (cur->soulDepth == SOUL_DEPTH_ANY || r->soulDepth == SOUL_DEPTH_ANY) continue;
+			if (cur->soulDepth != r->soulDepth) continue;
+			if (strcmp(cur->key, r->key)
+					|| cur->maxAnte < r->minAnte || r->maxAnte < cur->minAnte) {
+				snprintf(err, errsz,
+						"new and source rules conflict for Soul #%d", r->soulDepth);
+				fclose(f); return false;
+			}
 		}
 	}
 	if (p->nbaseLegendaryRules) {

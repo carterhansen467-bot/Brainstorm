@@ -804,6 +804,56 @@ time the tab re-renders, even though the underlying saved value is untouched.
       outside seeds newly valid, and prove A3+ tag rules cannot alter an A1-A2
       legendary result.
 
+25. **Soul search depth: "2 Souls deep" (`soul_depth any`)**
+    (`seed-pool-integrity-audit`, 2026-07-16; reworked same day after user
+    clarification — the depth is how DEEP to search for ONE legendary, not a
+    way to target multiple legendaries):
+    - Semantics: `soul_depth 1` (default) = the target must be the run's
+      first Soul. `soul_depth any` (internally depth 0; UI: "2 Souls deep")
+      = the target may come from the first Soul OR, failing that, the second
+      — e.g. Perkeo antes 1-6 at 2 deep includes seeds where you use a
+      non-Perkeo first Soul, keep its joker, and Soul #2 is Perkeo. Legacy
+      `soul_depth 2` (exclusive second-Soul ONLY, item 21) is still parsed
+      everywhere so existing pools stay readable/refilterable, but the UIs
+      no longer generate it. A criteria stage holds ONE legendary rule (a
+      second `legendary` line is a parse error again).
+    - Either-depth resolution is deterministic, not a search: the exclusive
+      Soul #2 pick can never repeat Soul #1's legendary, so the target is at
+      depth 1 iff it IS the first bare-`Joker4` pick, else it must be pick 2.
+      Therefore `any` = exact disjoint union of the depth-1 and depth-2 pools
+      (asserted in tests: 39207 + 771 = 39978 on the 5M CI sample) across
+      scanner, in-game searcher (`check_pool_legend_rules`), and production
+      Lua (`evaluatePoolCriteria`); `route_legendary` headers carry depth 0.
+    - NO modelver bump (still 6): depth-1 and legacy soul_depth-2 criteria
+      keep byte-identical fingerprints/headers (verified old-vs-new binaries:
+      same pool_id, same membership), and `soul_depth any` pools make OLD
+      binaries fail closed in `bspool_read_header` ("malformed" — verified
+      against a HEAD build). `MAX_POOL_LEGEND_RULES` 2 -> 4; the header
+      canonicalizer keeps distinct-key either-depth route rules as separate
+      entries (refilter chains can legitimately hold e.g. inherited
+      Perkeo-any + current Triboulet@2, which composes to Perkeo@1+Trib@2).
+      Refilter static conflict checks only apply between exact-depth rules.
+      Manifests write first/second/either_soul_legendary.
+    - Web builder UI: first card renamed to "Seed Filter Settings"; the
+      "Second Soul only" checkbox became a "search [1 Soul deep / 2 Souls
+      deep]" select (emits `soul_depth any`; legacy `legSecondSoul` JSON
+      still maps to 2). FIXED long-standing dropdown bugs: the 1s /api/state
+      poll rewrote `inputPool`'s options and `updateShard()` rebuilt
+      `shardIndex` every tick, closing/resetting those menus while open —
+      `setOptions()` now skips focused selects and unchanged option lists,
+      and the pool list only re-renders on change (checkbox clicks no longer
+      eaten). TUI mirrors the same two-option depth cycle. Auto-names:
+      `-2souls` (any), `-soul2` kept for legacy value.
+    - tests/seed_pool_soul_depth.sh: exact union/disjointness any = 1 ∪ 2;
+      second-legendary-line rejection; refilter(any, Trib@2) ==
+      refilter(depth1, Trib@2) with members ⊆ depth1 and the inherited
+      route_legendary depth-0 line intact; production-Lua accept/reject both
+      ways incl. the composed pool; pool-restricted searcher hit +
+      definitive exhaustion under a conflicting overlay. All preexisting
+      harnesses green (native/search/pool-search/refilter/compression/
+      shard-merge/compat, Lua old-vs-new), ASan+UBSan clean, zig Windows
+      cross-build OK.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

@@ -1481,16 +1481,26 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 		return chosen
 	end
 
-	local maxDepth, maxAnte = 1, 0
+	local maxAnte = 0
 	for _, rule in ipairs(legendaryRules) do
-		maxDepth = math.max(maxDepth, rule.soulDepth or 1)
 		maxAnte = math.max(maxAnte, rule.maxAnte)
 	end
+	-- Either-depth rules (soulDepth 0) resolve deterministically: the
+	-- exclusive Soul #2 pick can never repeat Soul #1's legendary, so the
+	-- target is at depth 1 iff it IS the first pick.
 	local picked = { pickLegendary() }
-	if maxDepth == 2 then picked[2] = pickLegendary(picked[1]) end
-	for _, rule in ipairs(legendaryRules) do
-		if picked[rule.soulDepth or 1] ~= rule.key then return false end
+	local resolved, needSecond = {}, false
+	for i, rule in ipairs(legendaryRules) do
+		local depth = rule.soulDepth or 1
+		if depth == 0 then depth = (picked[1] == rule.key) and 1 or 2 end
+		resolved[i] = depth
+		if depth == 2 then needSecond = true end
 	end
+	if needSecond then picked[2] = pickLegendary(picked[1]) end
+	for i, rule in ipairs(legendaryRules) do
+		if picked[resolved[i]] ~= rule.key then return false end
+	end
+	local maxDepth = needSecond and 2 or 1
 
 	local soulNumber, events = 0, {}
 	for ante = 1, maxAnte do
@@ -1532,8 +1542,8 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 		if soulNumber >= maxDepth then break end
 	end
 	if soulNumber < maxDepth then return false end
-	for _, rule in ipairs(legendaryRules) do
-		local event = events[rule.soulDepth or 1]
+	for i, rule in ipairs(legendaryRules) do
+		local event = events[resolved[i]]
 		if not event or event.ante < rule.minAnte or event.ante > rule.maxAnte
 				or (rule.negative and event.edition <= 0.997) then return false end
 	end
@@ -2474,11 +2484,11 @@ function Brainstorm.readPoolHeader(path)
 	local nativefs = require("nativefs")
 	local raw = nativefs.read(path, 1024)
 	if not raw or not raw:match("^BRAINSTORM_SEED_POOL ") then return nil end
-	local h = { tags = {}, route_tags = {}, pool_legendaries = {} }
+	local h = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
-		if k == "records" or k == "complete" or k == "soul_depth"
+		if k == "records" or k == "complete"
 				or k == "modelver" or k == "refilter_depth" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
 				or k == "catalog_hash" or k == "tag_route" then h[k] = v
@@ -2489,10 +2499,14 @@ function Brainstorm.readPoolHeader(path)
 			} end
 		elseif k == "legendary" then
 			local key, lo, hi, neg = v:match("^(%S+)%s+(%d+)%s+(%d+)%s*(%d*)$")
-			if key then h.legendary = {
+			if key then h.legendaries[#h.legendaries + 1] = {
 				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi),
 				negative = tonumber(neg) == 1,
 			} end
+		elseif k == "soul_depth" then
+			-- applies to the preceding legendary line; 0 = either Soul
+			local rule = h.legendaries[#h.legendaries]
+			if rule then rule.soulDepth = (v == "any") and 0 or tonumber(v) end
 		elseif k == "route_legendary" then
 			local key, lo, hi, neg, depth = v:match(
 				"^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)$")
@@ -2513,9 +2527,9 @@ function Brainstorm.readPoolHeader(path)
 		rule.collect = collect
 		h.route_tags[#h.route_tags + 1] = rule
 	end
-	if h.legendary then
-		h.legendary.soulDepth = h.soul_depth or 1
-		h.pool_legendaries[#h.pool_legendaries + 1] = h.legendary
+	for _, rule in ipairs(h.legendaries) do
+		rule.soulDepth = rule.soulDepth or 1
+		h.pool_legendaries[#h.pool_legendaries + 1] = rule
 	end
 	return h
 end
@@ -2532,11 +2546,15 @@ function Brainstorm.poolInfoString(name)
 	end
 	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
 	if h.space == "total" then bits[#bits + 1] = "all typeable seeds" end
-	local hasSoul2 = false
+	local hasSoul1, hasSoul2, hasEither = false, false, false
 	for _, rule in ipairs(h.pool_legendaries or {}) do
-		if rule.soulDepth == 2 then hasSoul2 = true; break end
+		local depth = rule.soulDepth or 1
+		if depth == 2 then hasSoul2 = true
+		elseif depth == 0 then hasEither = true
+		else hasSoul1 = true end
 	end
-	if hasSoul2 then bits[#bits + 1] = "Soul #2 only" end
+	if hasEither then bits[#bits + 1] = "Soul #1 or #2"
+	elseif hasSoul2 then bits[#bits + 1] = hasSoul1 and "Souls #1 & #2" or "Soul #2 only" end
 	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
 	bits[#bits + 1] = (h.complete == 1) and "complete" or "PARTIAL SCAN"
 	bits[#bits + 1] = "+ current filters"

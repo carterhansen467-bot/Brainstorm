@@ -151,6 +151,14 @@ class Snapshot:
                          "reopen the Seed Pool Builder.")
 
 
+# Soul search depth in UI order. 1 = the first Soul only; 0 ("any") = up to
+# two Souls deep -- the first Soul, or failing that the second. The legacy
+# exclusive value 2 (second Soul ONLY) is engine-readable but not offered.
+SOUL_DEPTHS = [1, 0]
+SOUL_DEPTH_LABELS = ["1 Soul deep (the first Soul)",
+                     "2 Souls deep (first or second Soul)"]
+
+
 class Criteria:
     """Everything the criteria file expresses, held as UI state."""
 
@@ -159,7 +167,7 @@ class Criteria:
         self.leg_min = 1
         self.leg_max = 8
         self.leg_neg = False
-        self.leg_second_soul = False  # exact Soul #2; never first-or-second
+        self.leg_soul_depth = 1  # 1 = first Soul only, 0 = up to 2 Souls deep
         self.tag_rules = []      # [key, min, max, count]
         self.route_collect = True
         self.threads = 0         # 0 = auto
@@ -188,7 +196,9 @@ class Criteria:
             b = self.legendary.replace("j_", "")
             if self.leg_neg:
                 b = "neg-" + b
-            if self.leg_second_soul:
+            if self.leg_soul_depth == 0:
+                b += "-2souls"
+            elif self.leg_soul_depth == 2:
                 b += "-soul2"
             b += "-a%d" % self.leg_min if self.leg_min == self.leg_max \
                 else "-a%d-%d" % (self.leg_min, self.leg_max)
@@ -237,8 +247,10 @@ class Criteria:
             lines.append("legendary %s %d %d %d"
                          % (self.legendary, self.leg_min, self.leg_max,
                             1 if self.leg_neg else 0))
-            if self.leg_second_soul:
-                lines.append("soul_depth 2")
+            if self.leg_soul_depth == 0:
+                lines.append("soul_depth any")
+            elif self.leg_soul_depth != 1:
+                lines.append("soul_depth %d" % self.leg_soul_depth)
         lines.append("end")
         return "\n".join(lines) + "\n"
 
@@ -249,9 +261,12 @@ class Criteria:
             s += " x%d" % cnt if cnt > 1 else ""
             s += " (antes %d-%d)" % (lo, hi)
             parts.append(s)
+        depth_text = {1: " within 1 Soul (the first)",
+                      0: " within 2 Souls (first or second)",
+                      2: " second reachable Soul only"}
         if self.legendary:
             s = ("Negative " if self.leg_neg else "") + joker_name(self.legendary)
-            s += " second reachable Soul only" if self.leg_second_soul else " first reachable Soul"
+            s += depth_text.get(self.leg_soul_depth, "")
             s += " (antes %d-%d)" % (self.leg_min, self.leg_max)
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
@@ -452,11 +467,10 @@ class App:
         f.append(Field("cycle", "Legendary", options=legopts,
                        idx=legidx, set=self._set_leg))
         if c.legendary:
-            f.append(Field("toggle", "  Second Soul only (exclusive)",
-                           get=lambda: c.leg_second_soul,
-                           set=self._set_leg_second_soul,
-                           on="ON -- target must be from Soul #2",
-                           off="OFF -- target must be from the first reachable Soul"))
+            depth_idx = SOUL_DEPTHS.index(c.leg_soul_depth) \
+                if c.leg_soul_depth in SOUL_DEPTHS else 0
+            f.append(Field("cycle", "  Search depth", options=SOUL_DEPTH_LABELS,
+                           idx=depth_idx, set=self._set_leg_depth))
             f.append(Field("number", "  Earliest ante", get=lambda: c.leg_min,
                            set=self._set_leg_min, lo=1, hi=MAX_ANTE))
             f.append(Field("number", "  Latest ante", get=lambda: c.leg_max,
@@ -512,8 +526,8 @@ class App:
     def _set_leg_neg(self, v):
         self.crit.leg_neg = v
 
-    def _set_leg_second_soul(self, v):
-        self.crit.leg_second_soul = v
+    def _set_leg_depth(self, i):
+        self.crit.leg_soul_depth = SOUL_DEPTHS[i]
 
     def _set_route(self, v):
         self.crit.route_collect = v
@@ -863,11 +877,18 @@ def main():
     if "--headless-criteria" in sys.argv:
         c = Criteria()
         c.legendary = "j_perkeo"
-        c.leg_second_soul = True
+        c.leg_soul_depth = 2  # legacy exclusive value stays writable
         c.leg_min, c.leg_max = 7, 7
         c.tag_rules.append(["tag_rare", 1, 8, 1])
         sys.stdout.write(c.text("binary", 0))
         print("# auto name: %s" % c.pool_name(), file=sys.stderr)
+        c2 = Criteria()
+        c2.legendary = "j_perkeo"
+        c2.leg_soul_depth = 0
+        assert "soul_depth any" in c2.text("binary", 0)
+        assert "2souls" in c2.pool_name()
+        sys.stdout.write(c2.text("binary", 0))
+        print("# auto name: %s" % c2.pool_name(), file=sys.stderr)
         return 0
     problems = preflight()
     if problems:

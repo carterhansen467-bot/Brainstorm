@@ -91,11 +91,14 @@ package.loaded["love.thread"] = true
 assert(load(workerSrc, "worker"))(serialize(snap), fileText, 0, 1)
 
 local raw = read(poolPath):sub(1, 1024)
-local header = { tags = {}, route_tags = {}, pool_legendaries = {} }
+local header = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
 for line in raw:gmatch("[^\n%z]+") do
 	local key, rest = line:match("^(%S+)%s*(.-)%s*$")
 	if key == "tag_route" then header.tag_route = rest
-	elseif key == "soul_depth" then header.soul_depth = tonumber(rest)
+	elseif key == "soul_depth" then
+		-- applies to the preceding legendary line; 0 = either Soul
+		local rule = header.legendaries[#header.legendaries]
+		if rule then rule.soulDepth = (rest == "any") and 0 or tonumber(rest) end
 	elseif key == "tag" then
 		local k, lo, hi, count = rest:match("^(%S+) (%d+) (%d+) (%d+)$")
 		header.tags[#header.tags + 1] = { key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count) }
@@ -105,7 +108,9 @@ for line in raw:gmatch("[^\n%z]+") do
 			minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count) }
 	elseif key == "legendary" then
 		local k, lo, hi, neg = rest:match("^(%S+) (%d+) (%d+) (%d+)$")
-		header.legendary = { key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi), negative = neg == "1" }
+		header.legendaries[#header.legendaries + 1] = {
+			key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi), negative = neg == "1",
+		}
 	elseif key == "route_legendary" then
 		local k, lo, hi, neg, depth = rest:match("^(%S+) (%d+) (%d+) (%d+) (%d+)$")
 		header.pool_legendaries[#header.pool_legendaries + 1] = {
@@ -118,9 +123,9 @@ for _, rule in ipairs(header.tags) do
 	rule.collect = header.tag_route ~= "observe"
 	header.route_tags[#header.route_tags + 1] = rule
 end
-if header.legendary then
-	header.legendary.soulDepth = header.soul_depth or 1
-	header.pool_legendaries[#header.pool_legendaries + 1] = header.legendary
+for _, rule in ipairs(header.legendaries) do
+	rule.soulDepth = rule.soulDepth or 1
+	header.pool_legendaries[#header.pool_legendaries + 1] = rule
 end
 
 for seed in read(seedsPath):gmatch("[^\r\n]+") do

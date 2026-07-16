@@ -24,16 +24,17 @@ int main(int argc, char **argv) {
 	}
 	if (plan.ntagRules != 1 || plan.tagRules[0].minAnte != 1
 			|| plan.tagRules[0].maxAnte != 8 || plan.tagRules[0].minCount != 1
-			|| !plan.collectTags || !plan.legendary.used
-			|| plan.legendary.minAnte != 1 || plan.legendary.maxAnte != 8) {
+			|| !plan.collectTags || plan.nlegendary != 1
+			|| plan.legendary[0].soulDepth != 1
+			|| plan.legendary[0].minAnte != 1 || plan.legendary[0].maxAnte != 8) {
 		fprintf(stderr, "compat test requires one collected tag and one first-Soul legendary, both A1-A8\n");
 		return 2;
 	}
 
 	legacy = catalog;
 	legacy.soulCount = 0;
-	snprintf(legacy.legendary, sizeof legacy.legendary, "%s", plan.legendary.key);
-	legacy.negLegendary = plan.legendary.requireNegative;
+	snprintf(legacy.legendary, sizeof legacy.legendary, "%s", plan.legendary[0].key);
+	legacy.negLegendary = plan.legendary[0].requireNegative;
 	legacy.legAnywhere = 1;
 	snprintf(legacy.tag, sizeof legacy.tag, "%s", plan.tagRules[0].key);
 	legacy.tagAnywhere = 1;
