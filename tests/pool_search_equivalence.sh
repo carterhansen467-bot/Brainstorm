@@ -17,6 +17,7 @@ SNAPSHOT="${1:-native_search.cfg}"
 COUNT="${2:-3000000}"
 TAG="${TAG:-tag_rare}"
 OUT="${TMPDIR:-/tmp}/brainstorm_pool_search_equivalence"
+LUAJIT_BIN="${LUAJIT:-luajit}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -33,7 +34,7 @@ esac
 
 sh "$BUILD"
 
-cp "$SNAPSHOT" "$OUT/snapshot.cfg"
+"$LUAJIT_BIN" tests/align_snapshot_prng.lua "$SNAPSHOT" > "$OUT/snapshot.cfg"
 
 {
 	echo "poolver 1"
@@ -225,7 +226,7 @@ fi
 # embedded tag Ante window and legendary Ante window. This is the regression
 # for typed short seeds appearing one Ante off in-game.
 sed -n '1,200p' "$OUT/pool_total.txt" > "$OUT/total-lua.seeds"
-"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
 	"$OUT/snapshot.cfg" "$OUT/pool_total.bspool" "$OUT/total-lua.seeds" \
 	> "$OUT/total-lua.out"
 if grep -v ' 1$' "$OUT/total-lua.out" >/dev/null; then

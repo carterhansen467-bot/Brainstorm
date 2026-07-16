@@ -47,7 +47,7 @@
 #define MAX_JOKERS 256
 #define MAX_BOOST 64
 #define MAX_PACKF 16
-#define MAX_CHECKS 64
+#define MAX_CHECKS 80
 #define MAX_SLOTS 64      /* shop slots per ante */
 #define MAX_RESAMPLE 64   /* persistent resample streams per base key */
 #define MAX_SEQ 80        /* per-ante joker sequence entries */
@@ -100,8 +100,7 @@ typedef union { uint64_t u64; double d; } U64double;
 
 /* g_seed_fma: how the game's LuaJIT binary rounded d*pi+e in random_seed.
  * 1 = fused (single rounding), 0 = separate mul+add. Decided at startup by
- * the parity checks; -1 = undecided (both behave identically on the checks,
- * which means either is correct for the tested domain -- default plain). */
+ * parity checks that must unambiguously select exactly one mode. */
 static int g_seed_fma = 0;
 
 static inline double seed_step(double d) {
@@ -1619,15 +1618,24 @@ static int run_checks(const Config *g, char *firstFail, size_t fsz) {
 	return bad;
 }
 
-/* Decide g_seed_fma from the checks. Returns false if neither mode works. */
+/* Decide g_seed_fma from the checks. Both passing is unsafe: it means an old
+ * snapshot lacks a probe that distinguishes the modes, so choosing either can
+ * silently desync a later RNG stream. */
 static bool calibrate(const Config *g, char *err, size_t errsz) {
 	if (g->nchecks == 0) { g_seed_fma = 0; return true; } /* nothing to calibrate against */
-	char ff[128];
+	char plainFail[128] = "", fusedFail[128] = "";
 	g_seed_fma = 0;
-	if (run_checks(g, ff, sizeof ff) == 0) return true;
+	int plainBad = run_checks(g, plainFail, sizeof plainFail);
 	g_seed_fma = 1;
-	if (run_checks(g, ff, sizeof ff) == 0) return true;
-	snprintf(err, errsz, "parity checks failed in both fp modes (%s)", ff);
+	int fusedBad = run_checks(g, fusedFail, sizeof fusedFail);
+	if (!plainBad && fusedBad) { g_seed_fma = 0; return true; }
+	if (plainBad && !fusedBad) { g_seed_fma = 1; return true; }
+	if (!plainBad && !fusedBad) {
+		snprintf(err, errsz, "parity checks are ambiguous; regenerate native_search.cfg with the updated mod");
+		return false;
+	}
+	snprintf(err, errsz, "parity checks failed in both fp modes (plain: %s; fused: %s)",
+			plainFail, fusedFail);
 	return false;
 }
 

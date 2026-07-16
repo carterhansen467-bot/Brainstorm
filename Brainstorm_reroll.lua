@@ -2575,10 +2575,9 @@ end
 
 -- Parity checks: values computed with the GAME's own pseudohash /
 -- math.randomseed / math.random / round13. The helper refuses to search
--- unless it reproduces every one bit-for-bit. The 16 pr/prn pairs double as
--- calibration for the one FP detail that can differ per LuaJIT binary (fused
--- vs separate rounding in its PRNG seeding step) -- 64 seeding steps make an
--- undetected mismatch astronomically unlikely.
+-- unless it reproduces every one bit-for-bit. Fixed PRNG probes at the end
+-- deliberately distinguish fused from separate rounding in LuaJIT's seeding
+-- step; ordinary pseudohash-derived inputs can make both modes look correct.
 function Brainstorm.buildNativeChecks()
 	local L = {}
 	local function g17(x) return string.format("%.17g", x) end
@@ -2593,6 +2592,12 @@ function Brainstorm.buildNativeChecks()
 		L[#L + 1] = "check_pr " .. g17(h) .. " " .. g17(math.random())
 		math.randomseed(h)
 		L[#L + 1] = "check_prn " .. g17(h) .. " 24 " .. g17(math.random(24))
+	end
+	-- These values are known to differ between the two supported seeding
+	-- modes. Keep them in sync with tests/align_snapshot_prng.lua.
+	for _, h in ipairs({ 0.6051828282731726, 0.39349437354872258 }) do
+		math.randomseed(h)
+		L[#L + 1] = "check_pr " .. g17(h) .. " " .. g17(math.random())
 	end
 	return L
 end

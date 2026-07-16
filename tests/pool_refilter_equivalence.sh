@@ -8,6 +8,7 @@ COUNT="${2:-3000000}"
 TAG="${TAG:-tag_rare}"
 SPACE="${SPACE:-natural}"
 OUT="${TMPDIR:-/tmp}/brainstorm_pool_refilter_equivalence"
+LUAJIT_BIN="${LUAJIT:-luajit}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -19,7 +20,7 @@ case "$(uname -s)" in
 esac
 
 sh "$BUILD"
-cp "$SNAPSHOT" "$OUT/snapshot.cfg"
+"$LUAJIT_BIN" tests/align_snapshot_prng.lua "$SNAPSHOT" > "$OUT/snapshot.cfg"
 
 write_criteria() {
 	file="$1"
@@ -113,7 +114,7 @@ if [ "$HAS_ETHEREAL" -eq 1 ]; then
 		echo "FAIL: no accepted Ethereal reward-pack legendary hit"; exit 1
 	fi
 	sed -n '1,200p' "$OUT/ethereal.txt" > "$OUT/ethereal-lua.seeds"
-	"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+	"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
 		"$OUT/snapshot.cfg" "$OUT/ethereal.bspool" "$OUT/ethereal-lua.seeds" \
 		> "$OUT/ethereal-lua.out"
 	if grep -v ' 1$' "$OUT/ethereal-lua.out" >/dev/null; then
@@ -170,12 +171,12 @@ cmp "$OUT/refined.sorted.txt" "$OUT/overlay.sorted.txt"
 "./native/brainstorm_native_search$EXE" fixture "$OUT/reverse-overlay.cfg" "$OUT/legend-source.txt" \
 	| awk '$2 == 1 { print $1 }' | sort > "$OUT/reverse-overlay.sorted.txt"
 cmp "$OUT/reverse-expected.sorted.txt" "$OUT/reverse-overlay.sorted.txt"
-"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
 	"$OUT/snapshot.cfg" "$OUT/legend-source.bspool" "$OUT/legend-source.txt" "$TAG" \
 	| awk '$2 == 1 { print $1 }' | sort > "$OUT/reverse-lua-overlay.sorted.txt"
 cmp "$OUT/reverse-expected.sorted.txt" "$OUT/reverse-lua-overlay.sorted.txt"
 sed -n '1,200p' "$OUT/reverse-refined.txt" > "$OUT/reverse-lua.seeds"
-"${LUAJIT:-luajit}" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
 	"$OUT/snapshot.cfg" "$OUT/reverse-refined.bspool" "$OUT/reverse-lua.seeds" \
 	> "$OUT/reverse-lua.out"
 if grep -v ' 1$' "$OUT/reverse-lua.out" >/dev/null; then

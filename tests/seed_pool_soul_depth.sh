@@ -9,6 +9,7 @@ set -eu
 SNAPSHOT="${1:-native_search.cfg}"
 COUNT="${2:-5000000}"
 OUT="${TMPDIR:-/tmp}/brainstorm_seed_pool_soul_depth"
+LUAJIT_BIN="${LUAJIT:-luajit}"
 mkdir -p "$OUT"
 
 case "$(uname -s)" in
@@ -19,7 +20,10 @@ case "$(uname -s)" in
 esac
 
 sh "$BUILD"
-cp "$SNAPSHOT" "$OUT/snapshot.cfg"
+# The independent oracle may be a different LuaJIT build than Balatro's
+# embedded runtime. Rewrite only PRNG expectations in the temporary snapshot
+# so the C scanner and the Lua replay are calibrated to the same executable.
+"$LUAJIT_BIN" tests/align_snapshot_prng.lua "$SNAPSHOT" > "$OUT/snapshot.cfg"
 
 write_criteria() {
 	depth="$1"
@@ -151,7 +155,6 @@ HA=$(sed -n 's/^criteria_hash //p' "$OUT/depthany.bspool.manifest")
 # Independent oracle: production Brainstorm Lua replays the embedded header
 # against the same snapshot. This catches a shared C-model error that the
 # scanner-vs-scanner fixture checks above cannot see.
-LUAJIT_BIN="${LUAJIT:-luajit}"
 sed -n '1,200p' "$OUT/depth2.txt" > "$OUT/lua-depth2.seeds"
 sed -n '1,200p' "$OUT/depth1.txt" > "$OUT/lua-depth1.seeds"
 "$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua "$OUT/snapshot.cfg" \
