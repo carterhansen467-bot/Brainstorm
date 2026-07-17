@@ -84,8 +84,19 @@ echo "PASS M8111111 distinguishes required-Charm from canonical route"
 # required branch rather than silently treating Charm as already collected.
 SNAPSHOT=${SNAPSHOT:-$ROOT/native_search.cfg}
 if [[ -f "$SNAPSHOT" ]]; then
-	tmpdir=$(mktemp -d)
+	temp_root=${TMPDIR:-/tmp}
+	if [[ -n "${RUNNER_TEMP:-}" ]] && command -v cygpath >/dev/null 2>&1; then
+		temp_root=$(cygpath -u "$RUNNER_TEMP")
+	fi
+	tmpdir=$(mktemp -d "$temp_root/brainstorm-omen.XXXXXX")
 	trap 'rm -rf "$tmpdir"' EXIT
+	native_config_path() {
+		if command -v cygpath >/dev/null 2>&1; then
+			cygpath -m "$1"
+		else
+			printf '%s\n' "$1"
+		fi
+	}
 	expected_vouchers=$'v_overstock_norm\nv_overstock_plus\nv_clearance_sale\nv_liquidation\nv_hone\nv_glow_up\nv_reroll_surplus\nv_reroll_glut\nv_crystal_ball\nv_omen_globe\nv_telescope\nv_observatory\nv_grabber\nv_nacho_tong\nv_wasteful\nv_recyclomancy\nv_tarot_merchant\nv_tarot_tycoon\nv_planet_merchant\nv_planet_tycoon\nv_seed_money\nv_money_tree\nv_blank\nv_antimatter\nv_magic_trick\nv_illusion\nv_hieroglyph\nv_petroglyph\nv_directors_cut\nv_retcon\nv_paint_brush\nv_palette'
 	fixture_snapshot=$SNAPSHOT
 	actual_vouchers=$(awk '$1 == "vouchdef" { print $2 }' "$SNAPSHOT")
@@ -163,7 +174,7 @@ PY
 				'matchany 0' 'jslot 1 - 0' 'jslot 2 - 0' 'jslot 3 - 0' \
 				'maslots 0 0 0 0 0 0 0 0' 'mapacks 0 0 0 0 0 0 0 0' \
 				'packslots 2'
-			printf 'poolfile %s\n' "$pool"
+			printf 'poolfile %s\n' "$(native_config_path "$pool")"
 			grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$snapshot"
 			printf '%s\n' end
 		} > "$output"
@@ -178,7 +189,7 @@ PY
 				'matchany 0' 'jslot 1 - 0' 'jslot 2 - 0' 'jslot 3 - 0' \
 				'maslots 0 0 0 0 0 0 0 0' 'mapacks 0 0 0 0 0 0 0 0' \
 				'packslots 2'
-			printf 'poolfile %s\n' "$pool"
+			printf 'poolfile %s\n' "$(native_config_path "$pool")"
 			grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$snapshot"
 			printf '%s\n' end
 		} > "$output"
