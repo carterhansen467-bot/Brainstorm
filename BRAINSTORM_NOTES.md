@@ -877,6 +877,20 @@ time the tab re-renders, even though the underlying saved value is untouched.
       intersection, checks Builder discovery/status, and enforces provisional
       exhaustion semantics end to end.
 
+27. **Vanilla-settable seed space** (`seed-pool-integrity-audit`, 2026-07-16):
+    - Added `space settable`: every length-1-through-8 seed over
+      `123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ`. It includes `O` but excludes `0`,
+      matching what vanilla's seed box can preserve instead of silently
+      changing `0` to `O`. Its exact size is `35^1 + ... + 35^8 =
+      2,318,107,019,760`.
+    - Existing numeric space IDs remain stable (`natural=0`, `total=1`);
+      `settable=2` keeps total-space checkpoints and pool identities compatible.
+      The distinct charset remains the authoritative `.bspool` rank contract.
+    - The web and curses builders, manifests, in-game pool description,
+      refilter/merge readers, and organizer all recognize the new space.
+      End-to-end tests build, export, refilter, and restricted-search a
+      settable pool while asserting that no decoded seed contains `0`.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

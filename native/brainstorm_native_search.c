@@ -141,7 +141,7 @@ static inline int lj_random_n(PRNG *rs, int n) {
 static double pseudohash_ks(const char *key, const char *seed) {
 	char buf[96];
 	size_t kl = strlen(key);
-	size_t sl = strlen(seed); /* 8 for natural seeds; 1..8 in a total-space pool */
+	size_t sl = strlen(seed); /* 8 natural; 1..8 in either expanded space */
 	memcpy(buf, key, kl);
 	memcpy(buf + kl, seed, sl);
 	int len = (int)(kl + sl);
@@ -258,17 +258,24 @@ static void make_seed(uint64_t k, char out[9]) {
 	out[8] = 0;
 }
 
-/* The natural space above is what the game GENERATES. The "total" space is
- * everything its seed box ACCEPTS typed in: 0-9 A-Z (0 and O included),
- * lengths 1..8. Ranks order seeds shortest-first; within a length the digit
- * order is little-endian, same convention as make_seed. Only .bspool files
- * carry a space choice -- live full-space searches stay natural, since they
- * hunt seeds the game can actually deal. */
+/* The natural space above is what the game GENERATES. "settable" is every
+ * seed vanilla's seed box can preserve: 1-9 A-Z (O included, 0 excluded),
+ * lengths 1..8. "total" adds 0, which vanilla remaps to O but Brainstorm can
+ * pass directly to start_run when Illegal Seed Input is enabled. Ranks order
+ * variable-length seeds shortest-first; within a length the digit order is
+ * little-endian, same convention as make_seed. Only .bspool files carry a
+ * space choice -- live full-space searches stay natural, since they hunt
+ * seeds the game can actually deal. */
+static const char CHARSET_SETTABLE[] = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+#define CHARSET_SETTABLE_N 35
+static const uint64_t SEEDSPACE_SETTABLE = 2318107019760ULL; /* 35^1 + ... + 35^8 */
+
 static const char CHARSET_TOTAL[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 #define CHARSET_TOTAL_N 36
 static const uint64_t SEEDSPACE_TOTAL = 2901713047668ULL; /* 36^1 + ... + 36^8 */
 
-enum { SPACE_NATURAL = 0, SPACE_TOTAL = 1 };
+/* Keep SPACE_TOTAL=1 for checkpoint/header compatibility with existing pools. */
+enum { SPACE_NATURAL = 0, SPACE_TOTAL = 1, SPACE_SETTABLE = 2 };
 
 /* the last two are used by the pool-builder translation unit only */
 #if defined(__GNUC__) || defined(__clang__)
@@ -277,32 +284,40 @@ enum { SPACE_NATURAL = 0, SPACE_TOTAL = 1 };
 #define BS_MAYBE_UNUSED
 #endif
 static uint64_t space_size(int space) {
-	return space == SPACE_TOTAL ? SEEDSPACE_TOTAL : SEEDSPACE;
+	if (space == SPACE_TOTAL) return SEEDSPACE_TOTAL;
+	if (space == SPACE_SETTABLE) return SEEDSPACE_SETTABLE;
+	return SEEDSPACE;
 }
 BS_MAYBE_UNUSED static const char *space_charset(int space) {
-	return space == SPACE_TOTAL ? CHARSET_TOTAL : CHARSET;
+	if (space == SPACE_TOTAL) return CHARSET_TOTAL;
+	if (space == SPACE_SETTABLE) return CHARSET_SETTABLE;
+	return CHARSET;
 }
 BS_MAYBE_UNUSED static const char *space_name(int space) {
-	return space == SPACE_TOTAL ? "total" : "natural";
+	if (space == SPACE_TOTAL) return "total";
+	if (space == SPACE_SETTABLE) return "settable";
+	return "natural";
 }
 
 /* rank -> seed in a given space; returns the seed's length. The length clamp
  * only matters for corrupt out-of-space ranks (callers validate first). */
 static int make_seed_in(int space, uint64_t k, char out[9]) {
-	if (space != SPACE_TOTAL) {
+	if (space == SPACE_NATURAL) {
 		make_seed(k, out);
 		return 8;
 	}
-	uint64_t block = CHARSET_TOTAL_N;
+	const char *charset = space == SPACE_SETTABLE ? CHARSET_SETTABLE : CHARSET_TOTAL;
+	uint64_t base = space == SPACE_SETTABLE ? CHARSET_SETTABLE_N : CHARSET_TOTAL_N;
+	uint64_t block = base;
 	int len = 1;
 	while (len < 8 && k >= block) {
 		k -= block;
-		block *= CHARSET_TOTAL_N;
+		block *= base;
 		len++;
 	}
 	for (int i = 0; i < len; i++) {
-		out[i] = CHARSET_TOTAL[k % CHARSET_TOTAL_N];
-		k /= CHARSET_TOTAL_N;
+		out[i] = charset[k % base];
+		k /= base;
 	}
 	out[len] = 0;
 	return len;
@@ -804,13 +819,14 @@ typedef struct {
 
 typedef struct {
 	int found, purchases;
-	int maxAnte, requireOmen, requirePoolLegends, omenIndex;
+	int maxAnte, requireOmen, requirePoolLegends, requireActiveLegend, omenIndex;
 	uint64_t purchased;
 	uint8_t purchaseAnte[MAX_VOUCH], purchaseVisit[MAX_VOUCH];
 } CtxVoucherBest;
 
 static void reset_pool_legend_streams(Ctx *c);
 static bool check_pool_legend_rules(Ctx *c);
+static bool check_legendary_anywhere(Ctx *c, const char **locOut);
 
 static bool pool_voucher_excluded(const Config *g, int index) {
 	for (int i = 0; i < g->npoolVoucherExclusions; i++)
@@ -874,14 +890,20 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 		if (matched == all && (!best->found || purchases < best->purchases)) {
 			if (best->requireOmen && (best->omenIndex < 0
 					|| !(purchased & (UINT64_C(1) << best->omenIndex)))) return;
-			if (best->requirePoolLegends) {
+			if (best->requirePoolLegends || best->requireActiveLegend) {
 				c->poolVoucherPurchased = purchased;
-				reset_pool_legend_streams(c);
-				if (!check_pool_legend_rules(c)) {
+				bool valid = true;
+				if (best->requirePoolLegends) {
 					reset_pool_legend_streams(c);
-					return;
+					valid = check_pool_legend_rules(c);
+				}
+				if (valid && best->requireActiveLegend) {
+					const char *unusedLocation = NULL;
+					reset_pool_legend_streams(c);
+					valid = check_legendary_anywhere(c, &unusedLocation);
 				}
 				reset_pool_legend_streams(c);
+				if (!valid) return;
 			}
 			best->found = 1;
 			best->purchases = purchases;
@@ -918,7 +940,8 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 	if (visible && needMore
 			&& (!best->found || purchases + 1 <= best->purchases)
 			&& !pool_voucher_excluded(g, index)) {
-		if ((best->requirePoolLegends || g->npoolRouteRules)
+		if ((best->requirePoolLegends || best->requireActiveLegend
+				|| g->npoolRouteRules)
 				&& (!strcmp(g->vouchKey[index], "v_hieroglyph")
 					|| !strcmp(g->vouchKey[index], "v_petroglyph")))
 			goto skip_pool_voucher_buy;
@@ -939,9 +962,10 @@ skip_pool_voucher_buy:
 }
 
 static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
-		int requirePoolLegends, int routeMaxAnte) {
+		int requirePoolLegends, int requireActiveLegend, int routeMaxAnte) {
 	const Config *g = c->g;
-	if (!g->npoolVoucherRules && !requireOmen && !requirePoolLegends) return true;
+	if (!g->npoolVoucherRules && !requireOmen
+			&& !requirePoolLegends && !requireActiveLegend) return true;
 	memset(c->voucher, 0, sizeof c->voucher);
 	memset(c->poolVoucherResample, 0, sizeof c->poolVoucherResample);
 	memset(c->poolVoucherVisits, 0, sizeof c->poolVoucherVisits);
@@ -953,6 +977,7 @@ static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
 		.maxAnte = routeMaxAnte,
 		.requireOmen = requireOmen,
 		.requirePoolLegends = requirePoolLegends,
+		.requireActiveLegend = requireActiveLegend,
 		.omenIndex = ctx_find_voucher(g, "v_omen_globe"),
 	};
 	if (best.maxAnte < g->poolVoucherMaxAnte) best.maxAnte = g->poolVoucherMaxAnte;
@@ -975,7 +1000,8 @@ static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
 }
 
 static bool check_pool_voucher_route(Ctx *c) {
-	return check_pool_voucher_route_mode(c, 0, 0, c->g->poolVoucherMaxAnte);
+	return check_pool_voucher_route_mode(c, 0, 0, 0,
+			c->g->poolVoucherMaxAnte);
 }
 
 /* Pool criteria and active overlay filters must each read their RNG streams
@@ -1114,7 +1140,8 @@ static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte) {
 			*reward = 1;
 			resolve_forced_pack_ante(c);
 			for (int omenAttempt = 0; omenAttempt < 2; omenAttempt++) {
-				if (!check_pool_voucher_route_mode(c, omenAttempt, 1, routeMaxAnte))
+				if (!check_pool_voucher_route_mode(c, omenAttempt, 1, 0,
+						routeMaxAnte))
 					continue;
 				reset_pool_legend_streams(c);
 				if (check_pool_legend_rules(c)) return true;
@@ -1201,6 +1228,11 @@ static bool try_active_targeted_charm(Ctx *c, const char **locOut) {
 			resolve_forced_pack_ante(c);
 			reset_pool_legend_streams(c);
 			if (check_legendary_anywhere(c, locOut)) return true;
+			if (check_pool_voucher_route_mode(c, 1,
+					g->npoolLegendRules > 0, 1, 8)) {
+				reset_pool_legend_streams(c);
+				if (check_legendary_anywhere(c, locOut)) return true;
+			}
 			*skip = oldSkip;
 			*reward = oldReward;
 			c->forcedAnte = oldForced;
@@ -1284,6 +1316,12 @@ static bool passes_prepared(Ctx *c) {
 	const Config *g = c->g;
 	c->label[0] = 0;
 	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
+	/* Voucher routes are candidate-local. A purchased-Omen fallback found for
+	 * one seed must never remain owned while the next fixture/search candidate
+	 * is evaluated (initially owned vouchers are tracked separately in Config). */
+	c->poolVoucherPurchased = 0;
+	memset(c->poolVoucherPurchaseAnte, 0, sizeof c->poolVoucherPurchaseAnte);
+	memset(c->poolVoucherPurchaseVisit, 0, sizeof c->poolVoucherPurchaseVisit);
 	bool legAnywhere = g->legAnywhere && g->legendary[0];
 	const char *tagLoc = NULL, *legLoc = NULL;
 	char tagLocBuf[12];
@@ -1384,7 +1422,8 @@ static bool passes_prepared(Ctx *c) {
 				if (rngMax > soulMaxAnte) soulMaxAnte = rngMax;
 			}
 			int voucherMaxAnte = soulMaxAnte > 8 ? 8 : soulMaxAnte;
-			bool recovered = check_pool_voucher_route_mode(c, 1, 1, voucherMaxAnte);
+			bool recovered = check_pool_voucher_route_mode(c, 1, 1, 0,
+					voucherMaxAnte);
 			if (recovered) {
 				reset_pool_legend_streams(c);
 				recovered = check_pool_legend_rules(c);
@@ -1401,8 +1440,16 @@ static bool passes_prepared(Ctx *c) {
 	}
 	/* 2.5) legendary ANYWHERE: first Soul across antes 1-8 */
 	if (legAnywhere) {
-		if (!check_legendary_anywhere(c, &legLoc)
-				&& !try_active_targeted_charm(c, &legLoc)) return false;
+		bool recovered = check_legendary_anywhere(c, &legLoc);
+		if (!recovered) {
+			recovered = check_pool_voucher_route_mode(c, 1,
+					g->npoolLegendRules > 0, 1, 8);
+			if (recovered) {
+				reset_pool_legend_streams(c);
+				recovered = check_legendary_anywhere(c, &legLoc);
+			}
+		}
+		if (!recovered && !try_active_targeted_charm(c, &legLoc)) return false;
 	}
 	/* 3) pack: ALL of ante 1's physical slots (Small+Big shops only -- the
 	 * post-boss shop is ante 2's -- minus assumed skips; the forced buffoon
@@ -1461,7 +1508,7 @@ static bool passes(Ctx *c) {
 #define ILV 8
 
 /* slen: shared length of every seed in the batch (8 for natural seeds;
- * total-space callers group same-length candidates before batching). */
+ * expanded-space callers group same-length candidates before batching). */
 static void batch_hash_seed_n(const char seeds[ILV][9], int slen, double *out) {
 	double num[ILV];
 	for (int i = 0; i < ILV; i++) num[i] = 1.0;
@@ -2102,7 +2149,7 @@ typedef struct {
 	uint64_t parentRecords, parentDataBytes, inputRecordStart, inputRecordEnd;
 	int parentCoverageComplete;
 	char charset[64];
-	int space;           /* SPACE_NATURAL / SPACE_TOTAL, derived from charset */
+	int space;           /* SPACE_*, derived from charset */
 	char label[136];     /* optional user-given pool name (may contain spaces) */
 	char poolId[24];     /* short shareable fingerprint, hex */
 	int refilterDepth;
@@ -2804,6 +2851,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	 * newer format should fail loudly, never decode to wrong seeds. */
 	if (!strcmp(h->charset, CHARSET)) h->space = SPACE_NATURAL;
 	else if (!strcmp(h->charset, CHARSET_TOTAL)) h->space = SPACE_TOTAL;
+	else if (!strcmp(h->charset, CHARSET_SETTABLE)) h->space = SPACE_SETTABLE;
 	else { snprintf(err, errsz, "pool charset differs"); return false; }
 	if (h->seedspace != space_size(h->space)) { snprintf(err, errsz, "pool seed space differs"); return false; }
 	if (h->rangeStart >= h->rangeEnd || h->rangeEnd > h->seedspace
@@ -3417,7 +3465,7 @@ static void *pool_worker(void *vp) {
 			if (ranks[i] < space_size(g_pool.space)) ranks[m++] = ranks[i];
 		}
 		uint64_t i = 0;
-		/* The batched hash needs uniform seed lengths; total-space pool
+		/* The batched hash needs uniform seed lengths; variable-length pool
 		 * records mix lengths, so those go through the serial path below
 		 * (pool searches are record-bounded -- batching is a full-space
 		 * scan optimization, not a correctness requirement). */

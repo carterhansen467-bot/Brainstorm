@@ -541,7 +541,8 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
           <div class="field"><label for="space">Seed space</label>
             <select id="space">
               <option value="natural">Natural seeds · 1.79 trillion</option>
-              <option value="total">All typeable seeds · 2.90 trillion</option>
+              <option value="settable">All vanilla-settable seeds · 2.32 trillion · no 0</option>
+              <option value="total">All possible seeds · 2.90 trillion · includes 0</option>
             </select></div>
           <div class="field"><label for="count">Scan scope</label>
             <select id="count">
@@ -778,14 +779,27 @@ function criteria(){
 	name:$("name").value };
 }
 
+function spaceInfo(space){
+  if (space === "settable") return {
+    size:2318107019760,
+    name:"All vanilla-settable seeds",
+    all:"Entire vanilla-settable space (2.32 trillion — can take days)",
+    hint:"Includes O and seeds under 8 characters, but excludes 0 because vanilla changes 0 to O."
+  };
+  if (space === "total") return {
+    size:2901713047668,
+    name:"All possible seeds",
+    all:"Entire possible seed space (2.90 trillion — can take days)",
+    hint:"Includes seeds containing 0; those require Brainstorm's Illegal Seed Input support."
+  };
+  return {size:1785793904896, name:"Balatro's natural seeds",
+    all:"Entire natural seed space (1.79 trillion — can take days)", hint:""};
+}
+
 function updateSpaceHint(){
-  const total = $("space").value === "total";
-  $("optAll").textContent = total
-    ? "Entire typeable space (2.90 trillion — can take days)"
-    : "Entire seed space (1.79 trillion — can take days)";
-  $("spaceHint").textContent = total
-    ? "Seeds with 0/O or under 8 characters never occur naturally — they only exist typed in."
-    : "";
+  const info = spaceInfo($("space").value);
+  $("optAll").textContent = info.all;
+  $("spaceHint").textContent = info.hint;
 }
 
 function selectedText(id){
@@ -827,7 +841,7 @@ function updateSummary(){
 
   const fromPool = !!c.inputPool;
   $("sumSource").textContent = fromPool ? c.inputPool
-    : (c.space === "total" ? "All typeable seeds" : "Balatro's natural seeds");
+    : spaceInfo(c.space).name;
   $("sumScope").textContent = fromPool ? "Entire input pool" : selectedText("count").replace(" · quick test", "");
   if (c.shardTotal > 1) $("sumScope").textContent += ` · part ${c.shardIndex} of ${c.shardTotal}`;
   $("sumThreads").textContent = c.threads ? `${c.threads} threads` : "Automatic threads";
@@ -840,7 +854,7 @@ function updateShard(){
   setOptions($("shardIndex"), Array.from({length:total}, (_,i)=>
     `<option value="${i+1}">${i+1}</option>`).join(""), false);
   if ($("shardIndex").options.length === total) $("shardIndex").value = old;
-  const full = $("space").value === "total" ? 2901713047668 : 1785793904896;
+  const full = spaceInfo($("space").value).size;
   const selected = +$("count").value || full;
   const limit = Math.min(selected, full), index = +$("shardIndex").value;
   const start = Math.floor(limit*(index-1)/total), end = Math.floor(limit*index/total);
@@ -923,7 +937,8 @@ function renderPoolCard(p, mergeSelected){
   const statusClass = p.status === "complete" || (p.complete && p.coverage_complete)
     ? "ok" : "part";
   const idb = p.pool_id ? ` · id ${esc(p.pool_id.slice(0,8))}` : "";
-  const sp = p.space === "total" ? " · all typeable" : "";
+  const sp = p.space === "settable" ? " · vanilla-settable (no 0)"
+    : p.space === "total" ? " · all possible (includes 0)" : "";
   const lbl = (p.label && (p.label + ".bspool") !== p.name)
     ? ` · “${esc(p.label)}”` : "";
   const src = p.refilter_depth ? ` · refilter ${p.refilter_depth}`

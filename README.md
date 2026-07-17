@@ -163,15 +163,19 @@ Unlike the in-game first-hit search, it never samples, wraps, or stops after
 one match. It can combine multiple ranged tag constraints with an exact
 first- or second-Soul legendary constraint and write every match.
 
-Two seed spaces are supported:
+Three seed spaces are supported:
 
 - **natural** (default): `34^8 = 1,785,793,904,896` eight-character seeds
   over the game's generation alphabet (no `0`, no `O`) — every seed the game
   can actually deal you.
+- **settable** (`space settable`): `35^1 + ... + 35^8 =
+  2,318,107,019,760` seeds — every seed vanilla's seed box can preserve.
+  This adds `O` and 1-7 character seeds while excluding `0`, because vanilla
+  changes every typed or pasted `0` to `O`.
 - **total** (`space total` in the criteria): `36^1 + ... + 36^8 =
-  2,901,713,047,668` seeds — everything the seed box *accepts typed in*,
-  adding `0`/`O` and 1-7 character seeds. Those extra ~1.1 trillion seeds
-  never occur naturally; they only exist if someone types them.
+  2,901,713,047,668` seeds — every possible set seed, including `0`, `O`,
+  and 1-7 character seeds. A seed containing `0` requires Brainstorm's
+  **Illegal Seed Input** option because vanilla input would change it.
 
 The scanner reads two inputs:
 
@@ -257,9 +261,10 @@ filters such as exact joker positions.
   next-filter.cfg seed_pools/input.bspool seed_pools/refined.bspool
 ```
 
-Only complete pools from the same model and unlock/pool snapshot are
-accepted. Natural and all-typeable pools are both supported, and the source
-pool decides the seed space. The output must have a different filename.
+Pools with checksummed committed seeds from the same model and unlock/pool
+snapshot are accepted, including paused or split snapshots. Natural,
+vanilla-settable, and total pools are supported, and the source pool decides
+the seed space. The output must have a different filename.
 Derived headers/manifests retain the source pool ID, criteria fingerprint,
 record count, and refilter depth.
 The adjacent `.state` is an atomic checkpoint containing the committed cursor
@@ -333,7 +338,7 @@ soul_depth 1|2|any
 voucher <key> <inclusive-min-ante> <inclusive-max-ante>
 voucher_exclude <key>
 tag_route collect|observe
-space natural|total
+space natural|settable|total
 label <any name, spaces allowed>
 ```
 
@@ -385,9 +390,10 @@ leaves the machine) where you can:
   refilter processes only its checksummed committed seeds and keeps its
   provisional lineage explicit;
 - choose the **seed space**: natural seeds only (the 1.79 trillion the game
-  can deal you), or all typeable seeds (2.90 trillion -- adds seeds with
-  `0`/`O` and seeds shorter than 8 characters, which only exist typed into
-  the seed box);
+  can deal you), every vanilla-settable seed (2.32 trillion — adds `O` and
+  short seeds but excludes `0`), or every possible seed (2.90 trillion —
+  includes `0` and requires Brainstorm's Illegal Seed Input support for
+  affected results);
 - press **Estimate** to sample 100M seeds and see the projected pool size
   and how long the full scan would take on your machine;
 - press **Build pool** and watch live progress. Closing the window (or

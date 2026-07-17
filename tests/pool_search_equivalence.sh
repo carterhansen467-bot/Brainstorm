@@ -192,7 +192,100 @@ grep -q '^E pool: record decode/read failed' "$OUT/status" \
 	|| { echo "FAIL: corrupt pool was reported as exhaustion"; cat "$OUT/status"; exit 1; }
 echo "PASS: pool corruption is fatal, never false exhaustion"
 
-# --- total-space pool: typed-only seeds are first-class members -------------
+# --- vanilla-settable space: variable-length seeds, never a zero ------------
+{
+	echo "poolver 1"
+	echo "threads 4"
+	echo "start 0"
+	echo "count $COUNT"
+	echo "checkpoint $COUNT"
+	echo "chunk 16384"
+	echo "resume 0"
+	echo "format binary"
+	echo "tag_route collect"
+	echo "space settable"
+	echo "label CI vanilla-settable pool"
+	echo "tag $TAG 1 8 1"
+	echo "legendary j_perkeo 1 8"
+	echo "end"
+} > "$OUT/criteria_settable.cfg"
+
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+	"$OUT/criteria_settable.cfg" "$OUT/pool_settable.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/pool_settable.bspool" \
+	"$OUT/pool_settable.txt"
+
+head -c 1024 "$OUT/pool_settable.bspool" | tr -d '\0' > "$OUT/header_settable.txt"
+grep -q "^space settable$" "$OUT/header_settable.txt" \
+	|| { echo "FAIL: header lacks 'space settable'"; exit 1; }
+grep -q "^charset 123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$" "$OUT/header_settable.txt" \
+	|| { echo "FAIL: settable pool has the wrong alphabet"; exit 1; }
+grep -q "^seedspace 2318107019760$" "$OUT/header_settable.txt" \
+	|| { echo "FAIL: settable pool has the wrong rank count"; exit 1; }
+SRECORDS=$(wc -l < "$OUT/pool_settable.txt" | tr -d ' ')
+[ "$SRECORDS" -gt 0 ] || { echo "FAIL: settable-space pool is empty; grow seed-count"; exit 1; }
+if grep -q '0' "$OUT/pool_settable.txt"; then
+	echo "FAIL: vanilla-settable pool exported a seed containing 0"
+	exit 1
+fi
+if [ -n "$(awk 'length($0) == 8 && $0 !~ /O/' "$OUT/pool_settable.txt")" ]; then
+	echo "FAIL: early settable-space ranks must still be short or contain O"
+	exit 1
+fi
+
+write_search_cfg j_perkeo "$OUT/search_settable.cfg" "$OUT/pool_settable.bspool"
+date +%s > "$OUT/hb"
+rm -f "$OUT/status" "$OUT/stop"
+"./native/brainstorm_native_search$EXE" search "$OUT/search_settable.cfg" \
+	"$OUT/status" "$OUT/stop" "$OUT/hb"
+SSEED=$(sed -n 's/^R \([A-Z0-9]*\) .*/\1/p' "$OUT/status")
+[ -n "$SSEED" ] || { echo "FAIL: settable-space pool search found nothing"; cat "$OUT/status"; exit 1; }
+case "$SSEED" in *0*) echo "FAIL: settable-space hit contains 0: $SSEED"; exit 1;; esac
+grep -qx "$SSEED" "$OUT/pool_settable.txt" \
+	|| { echo "FAIL: hit $SSEED is not a settable-pool member"; exit 1; }
+echo "$SSEED" > "$OUT/hit_settable.seed"
+SFIX=$("./native/brainstorm_native_search$EXE" fixture \
+	"$OUT/search_settable.cfg" "$OUT/hit_settable.seed")
+case "$SFIX" in
+	"$SSEED 1"*) ;;
+	*) echo "FAIL: fixture rejects the settable-space hit: $SFIX"; exit 1 ;;
+esac
+echo "PASS: vanilla-settable pool hit $SSEED contains no 0 and is one of $SRECORDS members"
+
+# Refiltering must inherit the source's rank alphabet rather than falling back
+# to the criteria file's default natural space.
+REFILTER_TAG=$(awk -v primary="$TAG" \
+	'$1 == "tagdef" && $3 == 1 && $2 != primary { print $2; exit }' \
+	"$OUT/snapshot.cfg")
+[ -n "$REFILTER_TAG" ] || REFILTER_TAG=$TAG
+{
+	echo "poolver 1"
+	echo "threads 4"
+	echo "start 0"
+	echo "count all"
+	echo "checkpoint 16384"
+	echo "chunk 16384"
+	echo "resume 0"
+	echo "format binary"
+	echo "tag_route observe"
+	echo "tag $REFILTER_TAG 1 8 1"
+	echo "end"
+} > "$OUT/criteria_settable_refilter.cfg"
+"./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
+	"$OUT/criteria_settable_refilter.cfg" "$OUT/pool_settable.bspool" \
+	"$OUT/pool_settable_refiltered.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/pool_settable_refiltered.bspool" \
+	"$OUT/pool_settable_refiltered.txt"
+head -c 1024 "$OUT/pool_settable_refiltered.bspool" | tr -d '\0' \
+	| grep -q '^space settable$' \
+	|| { echo "FAIL: settable refilter lost its source seed space"; exit 1; }
+if grep -q '0' "$OUT/pool_settable_refiltered.txt"; then
+	echo "FAIL: settable refilter exported a seed containing 0"
+	exit 1
+fi
+echo "PASS: refiltered settable pool preserves the no-zero rank space"
+
+# --- total-space pool: all possible seeds are first-class members -----------
 # Ranks 0..$COUNT of the total space are all seeds SHORTER than 8 characters
 # (lengths 1-4 cover the first ~1.7M ranks alone), so every member -- and the
 # eventual hit -- is a seed the game only reaches typed in. Also proves the
@@ -224,7 +317,7 @@ grep -Eq "^pool_id [0-9a-f]{16}$" "$OUT/header_total.txt" || { echo "FAIL: heade
 TRECORDS=$(wc -l < "$OUT/pool_total.txt" | tr -d ' ')
 [ "$TRECORDS" -gt 0 ] || { echo "FAIL: total-space pool is empty; grow seed-count"; exit 1; }
 if [ -n "$(awk 'length($0) == 8 && $0 !~ /[0O]/' "$OUT/pool_total.txt")" ]; then
-	echo "FAIL: pool over total-space ranks 0..$COUNT must contain only typed-only seeds"
+	echo "FAIL: pool over early total-space ranks must contain only non-natural seeds"
 	exit 1
 fi
 
@@ -236,7 +329,7 @@ sed -n '1,200p' "$OUT/pool_total.txt" > "$OUT/total-lua.seeds"
 	"$OUT/snapshot.cfg" "$OUT/pool_total.bspool" "$OUT/total-lua.seeds" \
 	> "$OUT/total-lua.out"
 if grep -v ' 1$' "$OUT/total-lua.out" >/dev/null; then
-	echo "FAIL: production Lua rejects a typed short-seed pool member"; exit 1
+	echo "FAIL: production Lua rejects a possible short-seed pool member"; exit 1
 fi
 
 write_search_cfg j_perkeo "$OUT/search_total.cfg" "$OUT/pool_total.bspool"
@@ -253,7 +346,7 @@ case "$TFIX" in
 	"$TSEED 1"*) ;;
 	*) echo "FAIL: fixture rejects the total-space pool hit: $TFIX"; exit 1 ;;
 esac
-echo "PASS: total-space pool hit $TSEED (typed-only) is a member of the $TRECORDS-record pool and passes filters"
+echo "PASS: total-space pool hit $TSEED (non-natural) is a member of the $TRECORDS-record pool and passes filters"
 
 write_search_cfg j_triboulet "$OUT/search_total_none.cfg" "$OUT/pool_total.bspool"
 date +%s > "$OUT/hb"

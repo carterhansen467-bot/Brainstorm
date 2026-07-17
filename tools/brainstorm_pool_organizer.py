@@ -71,8 +71,10 @@ FNV32_PRIME = 16777619
 MASK64 = (1 << 64) - 1
 
 NATURAL_CHARSET = "123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+SETTABLE_CHARSET = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TOTAL_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 NATURAL_SEEDSPACE = 1785793904896
+SETTABLE_SEEDSPACE = 2318107019760
 TOTAL_SEEDSPACE = 2901713047668
 
 KIND_NAMES = {1: "tag", 2: "legendary", 3: "voucher"}
@@ -161,19 +163,23 @@ def rank_to_seed(rank: int, charset: str) -> str:
             chars.append(charset[value % 34])
             value //= 34
         return "".join(chars)
-    if charset != TOTAL_CHARSET:
+    if charset == SETTABLE_CHARSET:
+        base = 35
+    elif charset == TOTAL_CHARSET:
+        base = 36
+    else:
         raise PoolError("unknown seed charset")
-    block = 36
+    block = base
     length = 1
     value = rank
     while length < 8 and value >= block:
         value -= block
-        block *= 36
+        block *= base
         length += 1
     chars = []
     for _ in range(length):
-        chars.append(charset[value % 36])
-        value //= 36
+        chars.append(charset[value % base])
+        value //= base
     return "".join(chars)
 
 
@@ -379,6 +385,10 @@ class BSPoolReader:
             expected_space = NATURAL_SEEDSPACE
             self.space_name = "natural"
             self.space_index = 0
+        elif self.charset == SETTABLE_CHARSET:
+            expected_space = SETTABLE_SEEDSPACE
+            self.space_name = "settable"
+            self.space_index = 2
         elif self.charset == TOTAL_CHARSET:
             expected_space = TOTAL_SEEDSPACE
             self.space_name = "total"

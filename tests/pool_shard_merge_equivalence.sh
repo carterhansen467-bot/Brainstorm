@@ -118,8 +118,11 @@ fi
 python3 - <<'PY'
 import sys
 sys.path.insert(0, "tools")
-from brainstorm_pool_builder import Criteria, SEEDSPACE, SEEDSPACE_TOTAL
-for space, limit in (("natural", SEEDSPACE), ("total", SEEDSPACE_TOTAL)):
+from brainstorm_pool_builder import (Criteria, SEEDSPACE, SEEDSPACE_SETTABLE,
+                                     SEEDSPACE_TOTAL)
+for space, limit in (("natural", SEEDSPACE),
+                     ("settable", SEEDSPACE_SETTABLE),
+                     ("total", SEEDSPACE_TOTAL)):
     for parts in (2, 4, 8, 16, 256):
         prior = 0
         for index in range(1, parts + 1):

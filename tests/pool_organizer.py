@@ -109,7 +109,8 @@ def hash_fields(kind, a, b, c, d):
     return independent_fnv64(payload)
 
 
-def write_bsp3(path, complete=False):
+def write_bsp3(path, complete=False, charset=organizer.NATURAL_CHARSET,
+               seedspace=organizer.NATURAL_SEEDSPACE, space="natural"):
     ranks = [0, 1, 2, 3]
     # Rank 1 is deliberately ambiguous. Rank 3 has only opaque future
     # metadata, so unmatched handling is also exercised.
@@ -131,9 +132,9 @@ def write_bsp3(path, complete=False):
         "modelver 6",
         "encoding delta-varint-events-v1",
         "header_bytes 8192",
-        "charset %s" % organizer.NATURAL_CHARSET,
-        "seedspace %d" % organizer.NATURAL_SEEDSPACE,
-        "space natural",
+        "charset %s" % charset,
+        "seedspace %d" % seedspace,
+        "space %s" % space,
         "range_start 0",
         "range_end 100",
         "catalog_hash aaaaaaaaaaaaaaaa",
@@ -250,6 +251,26 @@ class OrganizerRegression(unittest.TestCase):
                          ["11111111", "21111111", "31111111", "41111111"])
         self.assertEqual(len(decoded[1]["occurrences"]), 3)
         self.assertFalse(decoded[3]["occurrences"][0]["known"])
+
+    def test_settable_space_maps_every_rank_without_zero(self):
+        self.assertEqual(organizer.rank_to_seed(0, organizer.SETTABLE_CHARSET), "1")
+        self.assertEqual(organizer.rank_to_seed(
+            organizer.SETTABLE_CHARSET.index("O"), organizer.SETTABLE_CHARSET), "O")
+        self.assertEqual(organizer.rank_to_seed(35, organizer.SETTABLE_CHARSET), "11")
+        self.assertEqual(organizer.rank_to_seed(
+            organizer.SETTABLE_SEEDSPACE - 1, organizer.SETTABLE_CHARSET),
+            "ZZZZZZZZ")
+
+        path = os.path.join(self.temp.name, "settable.bspool")
+        write_bsp3(path, charset=organizer.SETTABLE_CHARSET,
+                   seedspace=organizer.SETTABLE_SEEDSPACE, space="settable")
+        reader = organizer.BSPoolReader(path)
+        self.assertEqual(reader.space_name, "settable")
+        self.assertEqual(reader.space_index, 2)
+        seeds = [reader.seed(record.rank)
+                 for record in reader.iter_records()]
+        self.assertEqual(seeds, ["1", "2", "3", "4"])
+        self.assertFalse(any("0" in seed for seed in seeds))
 
     def test_split_requires_choice_and_unmatched_policy_then_roundtrips(self):
         output_dir = os.path.join(self.temp.name, "split")

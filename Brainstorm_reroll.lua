@@ -3049,7 +3049,11 @@ function Brainstorm.poolInfoString(name)
 		bits[#bits + 1] = '"' .. h.label .. '"'
 	end
 	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
-	if h.space == "total" then bits[#bits + 1] = "all typeable seeds" end
+	if h.space == "settable" then
+		bits[#bits + 1] = "all vanilla-settable seeds (no 0)"
+	elseif h.space == "total" then
+		bits[#bits + 1] = "all possible seeds (includes 0)"
+	end
 	local hasSoul1, hasSoul2, hasEither = false, false, false
 	for _, rule in ipairs(h.pool_legendaries or {}) do
 		local depth = rule.soulDepth or 1

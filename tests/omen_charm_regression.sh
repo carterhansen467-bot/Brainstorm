@@ -160,6 +160,21 @@ PY
 			printf '%s\n' end
 		} > "$output"
 	}
+	write_active_legend_overlay() {
+		local snapshot=$1 pool=$2 legendary=$3 output=$4
+		{
+			printf '%s\n' \
+				'session 1' 'threads 1' 'modelver 6' 'entropy 1' \
+				'soul 0' "legendary $legendary" 'neglegendary 0' 'tag -' \
+				'voucher -' 'voucherante 1' 'taganywhere 0' 'leganywhere 1' \
+				'matchany 0' 'jslot 1 - 0' 'jslot 2 - 0' 'jslot 3 - 0' \
+				'maslots 0 0 0 0 0 0 0 0' 'mapacks 0 0 0 0 0 0 0 0' \
+				'packslots 2'
+			printf 'poolfile %s\n' "$pool"
+			grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$snapshot"
+			printf '%s\n' end
+		} > "$output"
+	}
 
 	write_scan_criteria "$(seed_rank M8111111)" \
 		'legendary j_chicot 1 small 4 big 0 charm' "$tmpdir/charm-scan.cfg"
@@ -180,6 +195,47 @@ PY
 		"$tmpdir/purchased.seed" > "$tmpdir/purchased-overlay.out"
 	grep -q '^1SNK1111 1 ' "$tmpdir/purchased-overlay.out" \
 		|| fail "in-game pool loader did not replay a purchased-Omen branch"
+
+	# Also exercise purchased Omen as the ACTIVE in-game filter over a pool
+	# that only contributes an observed tag route. The embedded-Legendary path
+	# above already had voucher fallback; this distinct path prevents active
+	# legAnywhere from silently dropping purchase-dependent Souls.
+	active_source_tag=
+	while read -r candidate_tag; do
+		printf '%s\n' \
+			'poolver 1' 'threads 1' 'start 0' 'count 1' \
+			'checkpoint 8' 'chunk 8' 'resume 0' 'format binary' \
+			'tag_route observe' "tag $candidate_tag 1 8 1" 'end' \
+			> "$tmpdir/active-probe.cfg"
+		if "$ROOT/native/brainstorm_seed_pool" fixture "$tmpdir/base.cfg" \
+				"$tmpdir/active-probe.cfg" "$tmpdir/purchased.seed" \
+				> "$tmpdir/active-probe.out" 2>/dev/null \
+				&& grep -q '^1SNK1111 1 ' "$tmpdir/active-probe.out"; then
+			active_source_tag=$candidate_tag
+			break
+		fi
+	done < <(awk '$1 == "tagdef" { print $2 }' "$tmpdir/base.cfg")
+	[[ -n "$active_source_tag" ]] \
+		|| fail "could not find an observed source tag for the active Omen fixture"
+	printf '%s\n' \
+		'poolver 1' 'threads 1' "start $(seed_rank 1SNK1111)" 'count 1' \
+		'checkpoint 8' 'chunk 8' 'resume 0' 'format binary' \
+		'tag_route observe' "tag $active_source_tag 1 8 1" 'end' \
+		> "$tmpdir/active-source.cfg"
+	"$ROOT/native/brainstorm_seed_pool" scan "$tmpdir/base.cfg" \
+		"$tmpdir/active-source.cfg" "$tmpdir/active-source.bspool" \
+		>/dev/null 2>/dev/null
+	grep -q '^records 1$' "$tmpdir/active-source.bspool" \
+		|| fail "active purchased-Omen fixture seed left its source pool"
+	write_active_legend_overlay "$tmpdir/base.cfg" "$tmpdir/active-source.bspool" \
+		j_chicot "$tmpdir/active-purchased-overlay.cfg"
+	"$ROOT/native/brainstorm_native_search" fixture \
+		"$tmpdir/active-purchased-overlay.cfg" "$tmpdir/purchased.seed" \
+		> "$tmpdir/active-purchased-overlay.out"
+	grep -q '^1SNK1111 1 LegA3ShopBoss$' "$tmpdir/active-purchased-overlay.out" \
+		|| fail "active in-game Legendary filter missed its purchased-Omen route"
+	echo "PASS active Legendary overlay searches the purchased-Omen route"
+
 	"$LUAJIT_BIN" "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/omen.cfg" "$tmpdir/charm.bspool" "$tmpdir/seeds" \
 		> "$tmpdir/charm-lua.out"

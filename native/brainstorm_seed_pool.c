@@ -80,7 +80,7 @@ typedef struct {
 	int schema, sawEnd;
 	int outputSchema, headerBytes;
 	int threads, resume, collectTags;
-	int space; /* SPACE_NATURAL (default) or SPACE_TOTAL */
+	int space; /* SPACE_NATURAL (default), SPACE_SETTABLE, or SPACE_TOTAL */
 	char label[136]; /* optional shareable pool name; not part of criteriaHash */
 	uint64_t start, count, checkpoint, chunk;
 	int countAll;
@@ -522,6 +522,7 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 		} else if (!strcmp(d, "space")) {
 			char *v = pool_tok(&sp);
 			if (v && !strcmp(v, "natural")) p->space = SPACE_NATURAL;
+			else if (v && !strcmp(v, "settable")) p->space = SPACE_SETTABLE;
 			else if (v && !strcmp(v, "total")) p->space = SPACE_TOTAL;
 			else goto bad_value;
 		} else if (!strcmp(d, "label")) {
@@ -1752,19 +1753,24 @@ static bool pool_batch_selftest(const PoolPlan *p) {
 			if (hf[i] != pseudohash_ks(p->firstKey, seeds[i])) return false;
 		}
 	}
-	/* Total-space batches run at every seed length; prove each length's
+	/* Variable-length spaces run at every seed length; prove each alphabet's
 	 * batched hash against the serial reference too. */
-	for (int slen = 1; slen <= 8; slen++) {
-		uint64_t base = 0;
-		for (int l = 1; l < slen; l++) base = (base + 1) * CHARSET_TOTAL_N;
-		for (int i = 0; i < ILV; i++) {
-			if (make_seed_in(SPACE_TOTAL, base + (uint64_t)i * 31 % 36, seeds[i]) != slen) return false;
-		}
-		batch_hash_seed_n(seeds, slen, hs);
-		batch_hash_key_n(p->firstKey, seeds, slen, hf);
-		for (int i = 0; i < ILV; i++) {
-			if (hs[i] != pseudohash_ks("", seeds[i])) return false;
-			if (hf[i] != pseudohash_ks(p->firstKey, seeds[i])) return false;
+	const int variableSpaces[] = { SPACE_SETTABLE, SPACE_TOTAL };
+	for (size_t si = 0; si < sizeof variableSpaces / sizeof variableSpaces[0]; si++) {
+		int space = variableSpaces[si];
+		uint64_t alphabet = space == SPACE_SETTABLE ? CHARSET_SETTABLE_N : CHARSET_TOTAL_N;
+		for (int slen = 1; slen <= 8; slen++) {
+			uint64_t base = 0;
+			for (int l = 1; l < slen; l++) base = (base + 1) * alphabet;
+			for (int i = 0; i < ILV; i++) {
+				if (make_seed_in(space, base + (uint64_t)i * 31 % alphabet, seeds[i]) != slen) return false;
+			}
+			batch_hash_seed_n(seeds, slen, hs);
+			batch_hash_key_n(p->firstKey, seeds, slen, hf);
+			for (int i = 0; i < ILV; i++) {
+				if (hs[i] != pseudohash_ks("", seeds[i])) return false;
+				if (hf[i] != pseudohash_ks(p->firstKey, seeds[i])) return false;
+			}
 		}
 	}
 	return true;
@@ -2113,7 +2119,7 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
 
 static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf,
 		unsigned char *encoded, size_t *used, uint64_t rank, const char seed[9]) {
-	size_t slen = strlen(seed); /* 8 in the natural space, 1..8 in total */
+	size_t slen = strlen(seed); /* 8 natural, 1..8 in expanded spaces */
 	size_t record = s->p->format == POOL_BINARY ? 8u : slen + 1;
 	if (*used + record > POOL_OUTPUT_BUFFER && !pool_flush_hits(s, buf, encoded, used)) return false;
 	if (s->p->format == POOL_BINARY) {

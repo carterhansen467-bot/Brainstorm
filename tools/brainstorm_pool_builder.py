@@ -99,12 +99,17 @@ POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 POOL_HEADER_PREFIX_BYTES = 1024
 POOL_HEADER_MAX_BYTES = 256 * 1024
 SEEDSPACE = 1785793904896  # 34^8: seeds the game's generator can deal
-# 36^1 + ... + 36^8: every seed the game ACCEPTS typed in -- adds 0/O and
-# 1-7 character seeds. Only reachable by typing, never by rerolling.
+# 35^1 + ... + 35^8: every seed vanilla's seed box preserves -- adds O and
+# 1-7 character seeds, but excludes 0 because vanilla remaps it to O.
+SEEDSPACE_SETTABLE = 2318107019760
+# 36^1 + ... + 36^8: all possible set seeds, including 0. Seeds containing 0
+# require Brainstorm's Illegal Seed Input support instead of vanilla input.
 SEEDSPACE_TOTAL = 2901713047668
 SPACES = [
     ("natural", "Natural (34^8 -- seeds the game deals)", SEEDSPACE),
-    ("total", "All typeable (adds 0/O + short seeds)", SEEDSPACE_TOTAL),
+    ("settable", "All vanilla-settable (no 0; adds O + short seeds)",
+     SEEDSPACE_SETTABLE),
+    ("total", "All possible (includes 0/O + short seeds)", SEEDSPACE_TOTAL),
 ]
 MAX_TAG_RULES = 16
 MAX_VOUCHER_RULES = 8
@@ -308,14 +313,14 @@ class Criteria:
         self.route_collect = True
         self.threads = 0         # 0 = auto
         self.scope = 0           # index into SCOPES
-        self.space = "natural"   # SPACES key: "natural" or "total"
+        self.space = "natural"   # one of the SPACES keys above
         self.shard_total = 1     # exact non-overlapping distributed parts
         self.shard_index = 1     # this machine's 1-based part
         self.name = ""           # "" = auto
         self.name_edited = False
 
     def seedspace(self):
-        return SEEDSPACE_TOTAL if self.space == "total" else SEEDSPACE
+        return next(limit for key, _label, limit in SPACES if key == self.space)
 
     def predicates(self):
         return (bool(self.legendary) or bool(self.tag_rules)
@@ -352,7 +357,9 @@ class Criteria:
             if self.leg_source != "any":
                 b += "-" + self.leg_source
             bits.append(b)
-        if self.space == "total":
+        if self.space == "settable":
+            bits.append("settable")
+        elif self.space == "total":
             bits.append("total")
         return re.sub(r"[^A-Za-z0-9._+-]", "-", "_".join(bits)) or "pool"
 
@@ -449,8 +456,10 @@ class Criteria:
             s += ")"
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
-        if self.space == "total":
-            out += " [all typeable seeds]"
+        if self.space == "settable":
+            out += " [all vanilla-settable seeds; no 0]"
+        elif self.space == "total":
+            out += " [all possible seeds; includes 0]"
         if self.shard_total > 1:
             out += " [part %d of %d]" % (self.shard_index, self.shard_total)
         return out

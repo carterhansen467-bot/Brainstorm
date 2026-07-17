@@ -44,6 +44,18 @@ assert "soul_depth any\n" in text
 assert core.tag_location_count(2, "big", 4, "small") == 4
 assert "A1 Big through A3 Boss" in criteria.summary()
 
+# The middle seed-space option covers every seed vanilla can preserve while
+# excluding 0, which vanilla silently remaps to O.
+settable = web.criteria_from_json({
+    "legendary": "j_perkeo",
+    "space": "settable",
+}, Snapshot())
+assert settable.seedspace() == core.SEEDSPACE_SETTABLE == 2318107019760
+assert "space settable\n" in settable.text("binary", 0)
+assert "settable" in settable.pool_name()
+assert "no 0" in settable.summary()
+assert settable.shard_bounds(0) == (0, core.SEEDSPACE_SETTABLE)
+
 # Existing callers/tests that still construct four-field tag rows retain the
 # full Small-through-Big window and the compact legacy-compatible line.
 legacy = core.Criteria()
@@ -64,7 +76,7 @@ for bad in (
         raise AssertionError("invalid human route window was accepted")
 
 for element_id in ("legMinPhase", "legMaxPhase", "legSource",
-                   "rminphase", "rmaxphase"):
+                   "rminphase", "rmaxphase", 'value="settable"'):
     assert element_id in web.PAGE
 
 print("pool builder exact locations: ok")
