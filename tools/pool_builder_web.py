@@ -103,9 +103,9 @@ def read_pool_header(path):
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("records", "complete", "modelver", "pool_id", "space", "encoding",
+        if parts[0] in ("records", "complete", "coverage_complete", "modelver", "pool_id", "space", "encoding",
                         "refilter_depth", "source_pool_id", "range_start", "range_end",
-                        "merged_parts"):
+                        "merged_parts", "source_complete", "source_coverage_complete"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
@@ -132,6 +132,7 @@ def list_pools():
             "bytes": os.path.getsize(path),
             "records": int(head.get("records", "0") or 0),
             "complete": head.get("complete") == "1",
+            "coverage_complete": head.get("coverage_complete", head.get("complete")) == "1",
             "resumable": state.get("done") == "0",
             "criteria": head.get("criteria", []),
             "label": head.get("label", ""),
@@ -181,8 +182,8 @@ def start_job(kind, data, snap):
             head = read_pool_header(candidate)
             if not input_name.endswith(".bspool") or not os.path.isfile(candidate):
                 raise ValueError("The selected input pool no longer exists.")
-            if head.get("complete") != "1":
-                raise ValueError("Finish the selected pool before filtering it again.")
+            if int(head.get("records", "0") or 0) <= 0:
+                raise ValueError("The selected pool has no committed seeds to process yet.")
             input_pool = candidate
             crit.space = head.get("space", "natural")
             if crit.shard_total > 1:
@@ -757,7 +758,10 @@ async function tick(){
     for (let i=1;i<=CAT.cpus;i++) th.add(new Option(i,i));
   }
 	setOptions($("inputPool"), `<option value="">Balatro's seed space</option>` +
-	  j.pools.filter(p=>p.complete).map(p=>`<option value="${esc(p.name)}" data-space="${esc(p.space)}">${esc(p.name)} (${fmt(p.records)} seeds)</option>`).join(""), true);
+	  j.pools.filter(p=>p.records > 0).map(p=>{
+	    const state = p.coverage_complete ? "" : " · recorded snapshot";
+	    return `<option value="${esc(p.name)}" data-space="${esc(p.space)}">${esc(p.name)} (${fmt(p.records)} seeds${state})</option>`;
+	  }).join(""), true);
 	const fromPool = !!$("inputPool").value;
 	if (fromPool) $("space").value = $("inputPool").selectedOptions[0].dataset.space || "natural";
 	if (fromPool) $("shardTotal").value = "1";
@@ -798,8 +802,9 @@ async function tick(){
   lastRunning = running;
   const mergeSelected = new Set([...document.querySelectorAll(".mergePick:checked")].map(x=>x.value));
   const poolsHtml = j.pools.length ? j.pools.map(p=>{
-    const statusText = p.complete ? "Complete" : (p.resumable ? "Paused · resumable" : "Partial");
-    const statusClass = p.complete ? "ok" : "part";
+    const statusText = !p.complete ? (p.resumable ? "Paused · resumable" : "Partial")
+      : p.coverage_complete ? "Complete" : "Filtered snapshot · source incomplete";
+    const statusClass = p.complete && p.coverage_complete ? "ok" : "part";
     const idb = p.pool_id ? ` · id ${esc(p.pool_id.slice(0,8))}` : "";
     const sp = p.space === "total" ? " · all typeable" : "";
     const lbl = (p.label && (p.label + ".bspool") !== p.name)

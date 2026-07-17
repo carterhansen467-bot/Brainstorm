@@ -443,7 +443,11 @@ class App:
         if os.path.isdir(POOL_DIR):
             for fn in sorted(os.listdir(POOL_DIR)):
                 path = os.path.join(POOL_DIR, fn)
-                if fn.endswith(".bspool") and read_pool_header(path).get("complete") == "1":
+                head = read_pool_header(path) if fn.endswith(".bspool") else {}
+                # Committed blocks are independently checksummed and readable
+                # before a scan finishes. Refiltering a paused pool is a
+                # snapshot operation over only those currently recorded seeds.
+                if fn.endswith(".bspool") and int(head.get("records", "0") or 0) > 0:
                     self.input_pools.append(path)
         self.input_idx = 0
         if "j_perkeo" in self.legendaries:

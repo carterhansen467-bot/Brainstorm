@@ -401,12 +401,15 @@ native helper only considers seeds recorded in the pool -- your other active
 Brainstorm filters still apply on top of it, and each search starts at a
 random position in the pool so repeat searches surface different seeds.
 
-Because the pool file is the complete match set, a pool search that covers
-every record without a hit is a definitive verdict: the mod stops and reports
-that no seed in the pool matches the current filters (instead of silently
-searching the full seed space). For the same reason, pool searches never fall
-back to the Lua thread search -- they need the native helper (macOS: built by
-`native/build.sh`; Windows: the release-zip exes).
+For a pool with complete source coverage, a search that covers every record
+without a hit is a definitive verdict: the mod stops and reports that no seed
+in the pool matches the current filters. Paused and otherwise incomplete pools
+can also be selected or refiltered; only their checksummed, committed records
+are processed. Exhausting one of those snapshots is explicitly provisional,
+and every derived pool retains `coverage_complete 0` even after its own
+refilter finishes. Pool searches never fall back to the full-space Lua thread
+search -- that could return a seed outside the selected pool. They require the
+native helper (macOS: built by `native/build.sh`; Windows: release-zip exes).
 
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
 their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model
@@ -431,6 +434,11 @@ and then refilter for the legendary, or scan both requirements together. If a
 legendary-only pool is the input, adding a collected tag correctly revalidates
 its members but cannot recover outside seeds that the new route would have made
 valid.
+
+Refiltering a paused pool is a snapshot operation: it processes exactly the
+records committed when the operation starts. The standalone Builder labels the
+result as a filtered snapshot whose source is incomplete, so it cannot be
+mistaken for an exhaustive result over the source's full declared range.
 
 **Model 6 migration:** pools made by model 5 or older cannot be searched or
 refiltered by model 6. Model 6 adds collected Charm/Ethereal rewards to the

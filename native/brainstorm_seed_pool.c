@@ -92,6 +92,7 @@ typedef struct {
 	uint64_t catalogHash, criteriaHash;
 	int refilter, refilterDepth;
 	uint64_t sourceCriteriaHash, sourceRecords, sourceRangeStart, sourceRangeEnd;
+	int sourceComplete, sourceCoverageComplete;
 	char sourcePoolId[24];
 	uint64_t outputRangeStart, outputRangeEnd;
 	int inputFd;
@@ -105,9 +106,10 @@ typedef struct {
  * doesn't change identity. Final once the scan completes. */
 static void pool_compute_id(const PoolPlan *p, uint64_t records, int complete, char out[24]) {
 	char buf[192];
+	int coverageComplete = complete && (!p->refilter || p->sourceCoverageComplete);
 	int n = snprintf(buf, sizeof buf, "%016" PRIx64 "%016" PRIx64 "%" PRIu64 "-%" PRIu64 "%s%" PRIu64 "%d",
 			p->catalogHash, p->criteriaHash, p->outputRangeStart, p->outputRangeEnd,
-			space_name(p->space), records, complete);
+			space_name(p->space), records, coverageComplete);
 	uint64_t h = pool_hash_update(UINT64_C(1469598103934665603), buf, (size_t)n);
 	snprintf(out, 24, "%016" PRIx64, h);
 }
@@ -232,6 +234,14 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 				p->sourceCriteriaHash, p->sourceRecords, p->sourceRangeStart,
 				p->sourceRangeEnd, p->space);
 		h = pool_hash_update(h, line, (size_t)n);
+		/* Keep every existing complete-source refilter fingerprint stable. A
+		 * provisional snapshot is a different input truth even if its current
+		 * record count happens to match another source. */
+		if (!p->sourceCoverageComplete) {
+			n = snprintf(line, sizeof line, "source_incomplete %s\n",
+					p->sourcePoolId[0] ? p->sourcePoolId : "-");
+			h = pool_hash_update(h, line, (size_t)n);
+		}
 	}
 	return h;
 }
@@ -1058,6 +1068,7 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	 * consumer can later compose the pool's tag route with overlay filters. */
 	char poolId[24];
 	pool_compute_id(p, records, complete, poolId);
+	int coverageComplete = complete && (!p->refilter || p->sourceCoverageComplete);
 	int n = snprintf((char *)buf, sizeof buf,
 			"BRAINSTORM_SEED_POOL %d\n"
 			"modelver %d\nencoding delta-varint-blocks-v1\ncharset %s\nseedspace %" PRIu64 "\n"
@@ -1121,15 +1132,18 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	if (p->refilter) {
 		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
-				"refilter_depth %d\nsource_criteria_hash %016" PRIx64 "\nsource_records %" PRIu64 "\nsource_pool_id %s\n",
+				"refilter_depth %d\nsource_criteria_hash %016" PRIx64 "\nsource_records %" PRIu64 "\nsource_pool_id %s\n"
+				"source_complete %d\nsource_coverage_complete %d\n",
 				p->refilterDepth, p->sourceCriteriaHash, p->sourceRecords,
-				p->sourcePoolId[0] ? p->sourcePoolId : "-");
+				p->sourcePoolId[0] ? p->sourcePoolId : "-",
+				p->sourceComplete, p->sourceCoverageComplete);
 		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
 	int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
-			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
-			records, dataBytes, complete, POOL_HEADER_SIZE);
+			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\ncoverage_complete %d\n"
+			"header_bytes %d\nend\n",
+			records, dataBytes, complete, coverageComplete, POOL_HEADER_SIZE);
 	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
 	int64_t at = bs_ftello(f);
 	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
@@ -1315,14 +1329,18 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 	fprintf(f, "charset %s\nseedspace %" PRIu64 "\nspace %s\n",
 			space_charset(p->space), space_size(p->space), space_name(p->space));
 	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->outputRangeStart, p->outputRangeEnd);
-	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\n", s->scanned, s->matched, s->done);
+	int coverageComplete = s->done && (!p->refilter || p->sourceCoverageComplete);
+	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\ncoverage_complete %d\n",
+			s->scanned, s->matched, s->done, coverageComplete);
 	fprintf(f, "format %s\nrecord_order block-sorted\ntag_route %s\n",
 			p->format == POOL_BINARY ? "delta-varint-blocks-v1" : p->format == POOL_TEXT ? "seed-text" : "count-only",
 			p->collectTags ? "collect-first-required" : "observe");
 	if (p->refilter) fprintf(f,
-			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n",
+			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n"
+			"source_complete %d\nsource_coverage_complete %d\n",
 			p->refilterDepth, p->sourceRecords, p->sourceCriteriaHash,
-			p->sourcePoolId[0] ? p->sourcePoolId : "-");
+			p->sourcePoolId[0] ? p->sourcePoolId : "-",
+			p->sourceComplete, p->sourceCoverageComplete);
 	for (int i = 0; i < p->nbaseTagRules; i++) {
 		const PoolTagRule *r = &p->baseTagRules[i];
 		fprintf(f, "source_route_tag %s %s %d %d %d\n",
@@ -1532,10 +1550,6 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 		snprintf(err, errsz, "input pool model %d != scanner model %d", h.modelver, MODELVER);
 		fclose(f); return false;
 	}
-	if (!h.complete) {
-		snprintf(err, errsz, "input pool is incomplete; finish its scan before refiltering");
-		fclose(f); return false;
-	}
 	if (h.catalogHash != p->catalogHash) {
 		snprintf(err, errsz, "input pool was built from a different pool/unlock snapshot");
 		fclose(f); return false;
@@ -1606,7 +1620,7 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 	}
 	int64_t size = bs_file_size(f);
 	if (size < 0 || (h.encoding == BSPOOL_ENCODING_U64
-			&& (uint64_t)size != (uint64_t)h.headerBytes + h.records * 8u)
+			&& (uint64_t)size < (uint64_t)h.headerBytes + h.records * 8u)
 			|| !bspool_reader_init(&p->inputReader, fileno(f), &h,
 					(uint64_t)(size < 0 ? 0 : size), err, errsz)) {
 		if (!err[0]) snprintf(err, errsz, "input pool size does not match its committed record count");
@@ -1623,6 +1637,8 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 	p->sourceRecords = h.records;
 	p->sourceRangeStart = h.rangeStart;
 	p->sourceRangeEnd = h.rangeEnd;
+	p->sourceComplete = h.complete;
+	p->sourceCoverageComplete = h.coverageComplete;
 	snprintf(p->sourcePoolId, sizeof p->sourcePoolId, "%s", h.poolId);
 	p->space = h.space;
 	p->start = 0;

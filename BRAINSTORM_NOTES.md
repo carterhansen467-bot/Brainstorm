@@ -854,6 +854,29 @@ time the tab re-renders, even though the underlying saved value is untouched.
       shard-merge/compat, Lua old-vs-new), ASan+UBSan clean, zig Windows
       cross-build OK.
 
+26. **Paused-pool snapshot refiltering** (`seed-pool-overhaul`, 2026-07-16):
+    - The native refilter accepts incomplete schema-1/2 pools and reads only
+      their committed record boundary. Schema-2 reconstructs its index from
+      independently checksummed blocks and ignores an uncommitted crash tail;
+      legacy u64 input likewise requires at least the committed byte count.
+    - `complete` now describes whether this file's own operation finished,
+      while `coverage_complete` describes whether its ancestry covers the
+      declared source. A completed refilter of a paused source is therefore
+      `complete 1`, `coverage_complete 0`; direct-parent completion/coverage
+      are embedded and provisional ancestry propagates through later stages.
+    - Pool identities distinguish provisional snapshots without changing any
+      existing complete-source fingerprints. The web and curses Builders offer
+      every pool with at least one committed record as an input and label
+      provisional derivatives rather than requiring the source scan to finish.
+    - In-game exhaustion of a complete-coverage pool remains definitive exit 3.
+      Exhaustion of a provisional snapshot is exit 4 with a dedicated user
+      message saying only the currently recorded seeds were checked. It never
+      falls back to the unrestricted seed space.
+    - `tests/pool_partial_refilter_equivalence.sh` synthesizes a deterministic
+      two-block paused file, proves its refilter is the exact source-set
+      intersection, checks Builder discovery/status, and enforces provisional
+      exhaustion semantics end to end.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

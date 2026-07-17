@@ -1658,7 +1658,7 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
 enum { BSPOOL_ENCODING_U64 = 1, BSPOOL_ENCODING_DELTA_BLOCKS = 2 };
 
 typedef struct {
-	int schema, modelver, complete, headerBytes, encoding, mergedParts;
+	int schema, modelver, complete, coverageComplete, headerBytes, encoding, mergedParts;
 	uint64_t seedspace, rangeStart, rangeEnd, records, dataBytes;
 	uint64_t catalogHash, criteriaHash;
 	char charset[64];
@@ -1804,7 +1804,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		HS_CHARSET = 1u << 3, HS_SEEDSPACE = 1u << 4, HS_RANGE_START = 1u << 5,
 		HS_RANGE_END = 1u << 6, HS_CATALOG = 1u << 7, HS_CRITERIA = 1u << 8,
 		HS_RECORDS = 1u << 9, HS_DATA_BYTES = 1u << 10, HS_COMPLETE = 1u << 11,
-		HS_HEADER_BYTES = 1u << 12
+		HS_HEADER_BYTES = 1u << 12, HS_COVERAGE_COMPLETE = 1u << 13
 	};
 	const unsigned required = HS_MAGIC | HS_MODEL | HS_ENCODING | HS_CHARSET
 		| HS_SEEDSPACE | HS_RANGE_START | HS_RANGE_END | HS_CATALOG
@@ -1881,6 +1881,14 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 			v = pool_tok(&sp); if ((seen & HS_COMPLETE) || !pool_header_int(v, &h->complete)
 					|| !pool_header_no_more(&sp) || (h->complete != 0 && h->complete != 1)) malformed = 1;
 			seen |= HS_COMPLETE;
+		}
+		else if (!strcmp(d, "coverage_complete")) {
+			v = pool_tok(&sp);
+			if ((seen & HS_COVERAGE_COMPLETE)
+					|| !pool_header_int(v, &h->coverageComplete)
+					|| !pool_header_no_more(&sp)
+					|| (h->coverageComplete != 0 && h->coverageComplete != 1)) malformed = 1;
+			seen |= HS_COVERAGE_COMPLETE;
 		}
 		else if (!strcmp(d, "header_bytes")) {
 			v = pool_tok(&sp); if ((seen & HS_HEADER_BYTES) || !pool_header_int(v, &h->headerBytes)
@@ -1999,6 +2007,14 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		return false;
 	}
 	if (!sawEnd) { snprintf(err, errsz, "pool header has no end marker"); return false; }
+	/* Older schemas used `complete` for both local file finalization and
+	 * exhaustive source coverage. New refilters can finish processing a
+	 * paused source while remaining provisional, so the two facts are now
+	 * distinct. Missing coverage_complete preserves the legacy meaning. */
+	if (!(seen & HS_COVERAGE_COMPLETE)) h->coverageComplete = h->complete;
+	if (h->coverageComplete && !h->complete) {
+		snprintf(err, errsz, "unfinished pool cannot claim complete coverage"); return false;
+	}
 	if (!strcmp(encoding, "u64le")) h->encoding = BSPOOL_ENCODING_U64;
 	else if (!strcmp(encoding, "delta-varint-blocks-v1")) h->encoding = BSPOOL_ENCODING_DELTA_BLOCKS;
 	else { snprintf(err, errsz, "pool encoding '%s' is unsupported", encoding); return false; }
@@ -2366,6 +2382,7 @@ typedef struct {
 } PoolRun;
 static PoolRun g_pool;
 static bool g_pool_active;
+static bool g_pool_coverage_complete;
 
 typedef struct {
 	const Config *g;
@@ -2606,8 +2623,8 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		g->poolLegendRules[j].neg = h.routeLegendRules[r].neg;
 		g->poolLegendRules[j].soulDepth = h.routeLegendRules[r].soulDepth;
 	}
-	if (!h.complete) {
-		snprintf(g_warn, sizeof g_warn, "pool scan is incomplete (%llu records committed)",
+	if (!h.coverageComplete) {
+		snprintf(g_warn, sizeof g_warn, "pool coverage is incomplete (%llu records currently available)",
 				(unsigned long long)records);
 	}
 	int fd = bs_dup(fileno(f));
@@ -2620,6 +2637,7 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 	}
 	g_pool.space = h.space;
 	g_pool.records = records;
+	g_pool_coverage_complete = h.coverageComplete != 0;
 	g_pool_active = true;
 	return true;
 }
@@ -2675,7 +2693,9 @@ static int mode_search(Config *g, const char *cfgPath, const char *statusPath,
 	while (!atomic_load(&g_stop)) {
 		bs_sleep_ms(200);
 		if (bs_file_exists(stopPath)) atomic_store(&g_stop, true);
-		/* a fully dealt pool with no hit is a definitive verdict, not a retry */
+		/* Dealing every recorded seed is definitive only when the pool covers
+		 * its entire declared source. A paused source can prove no match among
+		 * current records, never that future committed records contain none. */
 		if (g_pool_active && atomic_load(&g_pool.live) == 0) {
 			for (int i = 0; i < made; i++) bs_thread_join(th[i]);
 			joined = true;
@@ -2684,9 +2704,14 @@ static int mode_search(Config *g, const char *cfgPath, const char *statusPath,
 				write_status(statusPath, tmp, true, "pool: record decode/read failed");
 				return 1;
 			}
+			if (g_pool_coverage_complete) {
+				write_status(statusPath, tmp, true,
+						"pool: no seed in the pool matches the active filters");
+				return 3;
+			}
 			write_status(statusPath, tmp, true,
-					"pool: no seed in the pool matches the active filters");
-			return 3;
+					"pool: no matching seed among currently recorded seeds; source coverage is incomplete");
+			return 4;
 		}
 		/* heartbeat: the mod touches hbPath every ~2s while searching; if the
 		 * game died without writing the stop file, exit instead of orphaning. */

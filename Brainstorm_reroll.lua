@@ -2230,7 +2230,9 @@ function Brainstorm.updateAutoReroll(dt)
 	if arS.seedPoolFile and arS.seedPoolFile ~= "" then
 		local reason = nil
 		if A.poolAbort then
-			reason = A.poolAbort:find("no seed in the pool")
+			reason = A.poolAbort:find("currently recorded seeds")
+					and "No match among the seeds recorded so far (source pool is incomplete)"
+				or A.poolAbort:find("no seed in the pool")
 					and "No seed in the pool matches these filters"
 				or "Seed pool error (see console/log)"
 		elseif not Brainstorm.seedPoolPath() then
@@ -2488,7 +2490,7 @@ function Brainstorm.readPoolHeader(path)
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
-		if k == "records" or k == "complete"
+		if k == "records" or k == "complete" or k == "coverage_complete"
 				or k == "modelver" or k == "refilter_depth" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
 				or k == "catalog_hash" or k == "tag_route" then h[k] = v
@@ -2556,7 +2558,13 @@ function Brainstorm.poolInfoString(name)
 	if hasEither then bits[#bits + 1] = "Soul #1 or #2"
 	elseif hasSoul2 then bits[#bits + 1] = hasSoul1 and "Souls #1 & #2" or "Soul #2 only" end
 	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
-	bits[#bits + 1] = (h.complete == 1) and "complete" or "PARTIAL SCAN"
+	if h.complete ~= 1 then
+		bits[#bits + 1] = "PARTIAL SCAN"
+	elseif h.coverage_complete == 0 then
+		bits[#bits + 1] = "FILTERED SNAPSHOT (source incomplete)"
+	else
+		bits[#bits + 1] = "complete"
+	end
 	bits[#bits + 1] = "+ current filters"
 	return table.concat(bits, "  |  ")
 end
