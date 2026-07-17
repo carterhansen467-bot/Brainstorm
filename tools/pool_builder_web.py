@@ -43,6 +43,18 @@ def criteria_from_json(data, snap):
     c.legendary = legend
     c.leg_min = clamp_int(data.get("legMin", 1), 1, core.MAX_ANTE)
     c.leg_max = clamp_int(data.get("legMax", 8), c.leg_min, core.MAX_ANTE)
+    c.leg_min_phase = str(data.get("legMinPhase", "small"))
+    c.leg_max_phase = str(data.get("legMaxPhase", "big"))
+    if c.leg_min_phase not in core.PHASES or c.leg_max_phase not in core.PHASES:
+        raise ValueError("Unknown Legendary route point.")
+    if core.route_position(c.leg_min, c.leg_min_phase) > core.route_position(
+            c.leg_max, c.leg_max_phase):
+        raise ValueError("Legendary route start must come before its route end.")
+    if c.leg_max == core.MAX_ANTE and c.leg_max_phase == "boss":
+        raise ValueError("The final supported Ante cannot end at Boss because its shop uses the next RNG Ante.")
+    c.leg_source = str(data.get("legSource", "any"))
+    if c.leg_source not in core.LEGENDARY_SOURCES:
+        raise ValueError("Unknown Legendary pack source.")
     c.leg_neg = bool(data.get("legNeg"))
     # "1" = first Soul only, "any" = up to 2 Souls deep; "2"/legSecondSoul
     # kept for older clients (legacy exclusive second-Soul pools).
@@ -59,11 +71,19 @@ def criteria_from_json(data, snap):
             raise ValueError("Unknown or locked tag %r" % key)
         lo = clamp_int(rule.get("min", 1), 1, core.MAX_ANTE)
         hi = clamp_int(rule.get("max", 8), lo, core.MAX_ANTE)
+        min_phase = str(rule.get("minPhase", "small"))
+        max_phase = str(rule.get("maxPhase", "big"))
+        if min_phase not in core.TAG_PHASES or max_phase not in core.TAG_PHASES:
+            raise ValueError("Unknown tag blind location.")
+        if core.route_position(lo, min_phase) > core.route_position(hi, max_phase):
+            raise ValueError("%s route start must come before its route end."
+                             % core.TAG_NAMES.get(key, key))
         if min_ante.get(key, 0) > hi:
             raise ValueError("%s cannot appear before ante %d"
                              % (core.TAG_NAMES.get(key, key), min_ante[key]))
-        cnt = clamp_int(rule.get("count", 1), 1, 2 * (hi - lo + 1))
-        c.tag_rules.append([key, lo, hi, cnt])
+        cnt = clamp_int(rule.get("count", 1), 1,
+                        core.tag_location_count(lo, min_phase, hi, max_phase))
+        c.tag_rules.append([key, lo, hi, cnt, min_phase, max_phase])
     if not c.predicates():
         raise ValueError("Pick a legendary or add at least one tag requirement.")
     c.route_collect = data.get("route", "collect") != "observe"
@@ -93,79 +113,20 @@ def clamp_int(v, lo, hi):
 # ---------------------------------------------------------------- pools ----
 
 def read_pool_header(path):
-    raw = core.read_pool_header_text(path)
-    if not raw:
-        return {}
-    out = {"criteria": []}
-    for line in raw.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        if parts[0] == "BRAINSTORM_SEED_POOL":
-            out["schema"] = parts[1] if len(parts) > 1 else ""
-        if parts[0] in ("records", "complete", "coverage_complete", "modelver",
-                        "pool_id", "space", "encoding",
-                        "refilter_depth", "source_pool_id", "range_start", "range_end",
-                        "merged_parts", "source_complete", "source_coverage_complete",
-                        "header_bytes", "family_id", "segment_id", "stage_hash",
-                        "lineage_id", "derivation_id", "snapshot_id",
-                        "membership_digest", "metadata_digest", "scan_cursor",
-                        "input_cursor", "parent_snapshot_id", "parent_segment_id",
-                        "parent_records", "parent_data_bytes", "parent_coverage_complete",
-                        "input_record_start", "input_record_end", "shard_index", "shard_total"):
-            out[parts[0]] = parts[1] if len(parts) > 1 else ""
-        elif parts[0] == "label":
-            out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
-        elif parts[0] in ("tag", "route_tag", "legendary", "route_legendary",
-                          "soul_depth", "tag_route"):
-            out["criteria"].append(line)
-        elif parts[0] == "end":
-            break
-    return out
+    return core.read_pool_header(path)
 
 
 def list_pools():
-    pools = []
-    if not os.path.isdir(core.POOL_DIR):
-        return pools
-    for fn in sorted(os.listdir(core.POOL_DIR)):
-        if not fn.endswith(".bspool"):
-            continue
-        path = os.path.join(core.POOL_DIR, fn)
-        head = read_pool_header(path)
-        state = core.read_state(path + ".state")
-        pool = {
-            "name": fn,
-            "bytes": os.path.getsize(path),
-            "records": int(head.get("records", "0") or 0),
-            "complete": head.get("complete") == "1",
-            "coverage_complete": head.get("coverage_complete", head.get("complete")) == "1",
-            "resumable": state.get("done") == "0",
-            "criteria": head.get("criteria", []),
-            "label": head.get("label", ""),
-            "pool_id": head.get("pool_id", ""),
-            "space": head.get("space", "natural"),
-            "refilter_depth": int(head.get("refilter_depth", "0") or 0),
-            "source_pool_id": head.get("source_pool_id", ""),
-            "encoding": head.get("encoding", ""),
-            "range_start": int(head.get("range_start", "0") or 0),
-            "range_end": int(head.get("range_end", "0") or 0),
-            "merged_parts": int(head.get("merged_parts", "0") or 0),
-        }
-        for key in ("family_id", "segment_id", "stage_hash", "lineage_id",
-                    "derivation_id", "snapshot_id", "membership_digest",
-                    "metadata_digest", "parent_snapshot_id", "parent_segment_id"):
-            if key in head:
-                pool[key] = head[key]
-        for key in ("schema", "header_bytes", "scan_cursor", "input_cursor",
-                    "parent_records", "parent_data_bytes", "input_record_start",
-                    "input_record_end", "shard_index", "shard_total"):
-            if key in head:
-                pool[key] = int(head[key] or 0)
-        if "parent_coverage_complete" in head:
-            pool["parent_coverage_complete"] = head["parent_coverage_complete"] == "1"
-        pools.append(pool)
-    return pools
+    return core.read_pool_library(core.POOL_DIR)[0]
+
+
+def list_pool_groups():
+    return core.read_pool_library(core.POOL_DIR)[1]
+
+
+def pool_library():
+    """Read once so flat and grouped API views describe the same snapshot."""
+    return core.read_pool_library(core.POOL_DIR)
 
 
 # ------------------------------------------------------------------ job ----
@@ -330,11 +291,11 @@ select:disabled, input:disabled { opacity:.48; cursor:not-allowed; }
   border:1px solid #353a50; border-radius:10px; background:#11141e; color:#d9d5e1;
   font-size:13px; font-weight:600; cursor:pointer; }
 .check input { width:17px; height:17px; margin:0; accent-color:var(--purple); }
-#legRange { display:grid; grid-template-columns:1.6fr .7fr .7fr 1fr; gap:12px;
+#legRange { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px;
   grid-column:1 / -1; padding:14px; border:1px solid var(--line-soft); border-radius:12px;
   background:#11141e; }
 #rules { display:grid; gap:9px; }
-.rule { display:grid; grid-template-columns:minmax(160px, 1.7fr) .65fr .65fr .65fr auto;
+.rule { display:grid; grid-template-columns:minmax(150px, 1.5fr) .55fr .55fr .65fr .55fr .65fr auto;
   gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
   border-radius:12px; background:#11141e; }
 .rule-field { display:grid; gap:5px; min-width:0; }
@@ -397,6 +358,17 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .library-head h2 { margin:0; font-size:19px; }
 .library-head p { margin:4px 0 0; color:var(--muted); font-size:13px; }
 .pool-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:11px; }
+.pool-family { grid-column:1 / -1; display:grid; gap:12px; padding:14px;
+  border:1px solid #2b3043; border-radius:15px; background:#0e1119; }
+.pool-family-head { display:flex; justify-content:space-between; gap:12px; align-items:baseline; }
+.pool-family-head h3 { margin:0; color:#e5dfed; font-size:14px; }
+.pool-family-head span { color:var(--faint); font:10px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.pool-lineage { display:grid; gap:8px; }
+.pool-lineage + .pool-lineage { padding-top:12px; border-top:1px solid var(--line-soft); }
+.pool-lineage-head { display:flex; flex-wrap:wrap; gap:7px; align-items:baseline; color:#bcb6ca;
+  font-size:11px; font-weight:800; }
+.pool-lineage-head span { color:var(--faint); font-weight:500; }
+.pool-lineage-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:11px; }
 .pool { position:relative; min-width:0; padding:15px; border:1px solid var(--line-soft);
   border-radius:13px; background:#11141e; font-size:12px; }
 .pool-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
@@ -409,6 +381,9 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .status.part { background:#3b3017; color:#f4d46b; }
 .pool-meta { margin-top:9px; color:#a19dad; }
 .pool-criteria { margin-top:9px; color:#757286; line-height:1.45; overflow-wrap:anywhere; }
+.pool-relation { margin-top:8px; color:#aaa5b7; }
+.pool-update { margin-top:9px; padding:8px 10px; border:1px solid #675829;
+  border-radius:9px; background:#29230f; color:#f2d77a; }
 .empty-library { grid-column:1 / -1; padding:30px; text-align:center; border:1px dashed #34394e;
   border-radius:13px; color:var(--faint); }
 .merge-panel { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }
@@ -429,7 +404,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .rule { grid-template-columns:1fr 1fr; }
   .rule .rule-field:first-child { grid-column:1 / -1; }
   .rule button { grid-column:1 / -1; }
-  .pool-grid { grid-template-columns:1fr; }
+  .pool-grid, .pool-lineage-grid { grid-template-columns:1fr; }
   .merge-panel { grid-template-columns:1fr; }
   .library-head { display:block; }
 }
@@ -468,7 +443,17 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
                 <option value="any">First or second Soul</option>
               </select></div>
             <div class="field"><label for="legMin">From ante</label><input type="number" id="legMin" min="1" max="39" value="1"></div>
+            <div class="field"><label for="legMinPhase">From route point</label><select id="legMinPhase">
+              <option value="small">Small Blind</option><option value="big">Big Blind</option><option value="boss">Boss Blind shop</option>
+            </select></div>
             <div class="field"><label for="legMax">Through ante</label><input type="number" id="legMax" min="1" max="39" value="8"></div>
+            <div class="field"><label for="legMaxPhase">Through route point</label><select id="legMaxPhase">
+              <option value="small">Small Blind</option><option value="big" selected>Big Blind</option><option value="boss">Boss Blind shop</option>
+            </select></div>
+            <div class="field"><label for="legSource">Soul pack source</label><select id="legSource">
+              <option value="any">Shop or collected tag</option><option value="shop">Shop packs only</option>
+              <option value="charm">Charm Tag reward only</option><option value="ethereal">Ethereal Tag reward only</option>
+            </select></div>
             <label class="check"><input type="checkbox" id="legNeg"> Require Negative</label>
           </div>
           <div class="hint full">Souls are checked chronologically across reachable shop packs and collected Charm or Ethereal rewards.</div>
@@ -496,7 +481,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
         <div class="field-grid">
           <div class="field full"><label for="inputPool">Search within</label>
             <select id="inputPool"><option value="">Balatro's seed space</option></select>
-            <span class="hint">Choose a finished pool to filter it again with narrower criteria.</span></div>
+            <span class="hint">Choose any pool with recorded seeds—including a paused pool—to filter its current snapshot.</span></div>
           <div class="field"><label for="space">Seed space</label>
             <select id="space">
               <option value="natural">Natural seeds · 1.79 trillion</option>
@@ -623,7 +608,9 @@ function addRule(key){
   div.innerHTML = `<div class="rule-field"><span class="label">Tag</span><select class="rkey">${opts}</select></div>
     <div class="rule-field"><span class="label">Minimum</span><input type="number" class="rcount" min="1" max="16" value="1"></div>
     <div class="rule-field"><span class="label">From ante</span><input type="number" class="rmin" min="1" max="39" value="1"></div>
+    <div class="rule-field"><span class="label">From blind</span><select class="rminphase"><option value="small">Small</option><option value="big">Big</option></select></div>
     <div class="rule-field"><span class="label">Through ante</span><input type="number" class="rmax" min="1" max="39" value="8"></div>
+    <div class="rule-field"><span class="label">Through blind</span><select class="rmaxphase"><option value="small">Small</option><option value="big" selected>Big</option></select></div>
     <button type="button" class="mini" onclick="removeRule(this)">Remove</button>`;
   if (key) div.querySelector(".rkey").value = key;
   const empty = $("rules").querySelector(".empty-rules");
@@ -644,9 +631,13 @@ function criteria(){
     key: r.querySelector(".rkey").value,
     count: +r.querySelector(".rcount").value,
     min: +r.querySelector(".rmin").value,
-    max: +r.querySelector(".rmax").value }));
+    minPhase: r.querySelector(".rminphase").value,
+    max: +r.querySelector(".rmax").value,
+    maxPhase: r.querySelector(".rmaxphase").value }));
   return { legendary: $("legendary").value,
     legMin:+$("legMin").value, legMax:+$("legMax").value,
+    legMinPhase:$("legMinPhase").value, legMaxPhase:$("legMaxPhase").value,
+    legSource:$("legSource").value,
     legNeg:$("legNeg").checked, legSoulDepth:$("legDepth").value,
     rules, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
@@ -677,11 +668,13 @@ function updateSummary(){
   if (c.legendary) {
     let legendary = selectedText("legendary");
     if (c.legNeg) legendary = "Negative " + legendary;
-    pieces.push(legendary + (c.legSoulDepth === "any" ? " in either of 2 Souls" : " in the first Soul"));
+    const source = c.legSource === "any" ? "" : ` · ${selectedText("legSource")}`;
+    pieces.push(legendary + (c.legSoulDepth === "any" ? " in either of 2 Souls" : " in the first Soul")
+      + ` · A${c.legMin} ${c.legMinPhase}–A${c.legMax} ${c.legMaxPhase}${source}`);
   }
   for (const r of c.rules) {
     const tag = CAT.tags.find(t=>t.key === r.key);
-    pieces.push(`${r.count}× ${(tag && tag.name) || r.key} · antes ${r.min}–${r.max}`);
+    pieces.push(`${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`);
   }
   $("sumFilter").textContent = pieces.length ? pieces.join(" + ") : "Choose a Legendary or tag";
   $("readyPill").textContent = pieces.length ? "Ready" : "Needs filter";
@@ -759,6 +752,79 @@ function showResult(j){
   $("result").textContent = out;
 }
 
+function inputPoolOptions(groups){
+  let html = `<option value="">Balatro's seed space</option>`;
+  for (const family of (groups || [])) {
+    for (const lineage of family.lineages) {
+      const available = lineage.pools.filter(p=>p.records > 0);
+      if (!available.length) continue;
+      const groupLabel = family.legacy ? family.label
+        : `${family.label} · ${lineage.label}`;
+      html += `<optgroup label="${esc(groupLabel)}">` + available.map(p=>{
+        const state = p.status === "complete" ? ""
+          : p.status === "provisional" ? " · provisional snapshot"
+          : p.resumable ? " · paused snapshot" : " · incomplete snapshot";
+        const update = p.update_available ? ` · +${fmt(p.new_records)} source seeds` : "";
+        return `<option value="${esc(p.name)}" data-space="${esc(p.space)}">${esc(p.name)} (${fmt(p.records)} seeds${state}${update})</option>`;
+      }).join("") + `</optgroup>`;
+    }
+  }
+  return html;
+}
+
+function renderPoolCard(p, mergeSelected){
+  const statusText = p.status_label || (!p.complete
+    ? (p.resumable ? "Paused · resumable" : "Incomplete snapshot")
+    : p.coverage_complete ? "Complete" : "Provisional · source snapshot");
+  const statusClass = p.status === "complete" || (p.complete && p.coverage_complete)
+    ? "ok" : "part";
+  const idb = p.pool_id ? ` · id ${esc(p.pool_id.slice(0,8))}` : "";
+  const sp = p.space === "total" ? " · all typeable" : "";
+  const lbl = (p.label && (p.label + ".bspool") !== p.name)
+    ? ` · “${esc(p.label)}”` : "";
+  const src = p.refilter_depth ? ` · refilter ${p.refilter_depth}`
+    + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${esc(p.source_pool_id.slice(0,8))}` : "") : "";
+  const enc = p.encoding === "u64le" ? " · legacy format" : "";
+  const merged = p.merged_parts ? ` · merged ${p.merged_parts} parts` : "";
+  const range = p.range_end > p.range_start
+    ? ` · ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}` : "";
+  const pick = p.complete
+    ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>`
+    : "";
+  const criteriaText = p.criteria.length ? p.criteria.map(esc).join(" · ") : "No embedded criteria";
+  let relation = "";
+  if (p.parent_name) {
+    relation = `<div class="pool-relation">Derived from ${esc(p.parent_name)}`
+      + (p.parent_records ? ` at ${fmt(p.parent_records)} recorded seeds` : "") + `.</div>`;
+  } else if (p.parent_segment_id) {
+    relation = `<div class="pool-relation">Parent segment ${esc(p.parent_segment_id.slice(0,8))} is not in this folder.</div>`;
+  }
+  const update = p.update_available
+    ? `<div class="pool-update">Update available: the source now has ${fmt(p.new_records)} new recorded seeds. This pool still uses its pinned snapshot; automatic incremental updating is coming later.</div>`
+    : "";
+  return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
+    + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
+    + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}</div>`
+    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}</article>`;
+}
+
+function renderPoolLibrary(groups, pools, mergeSelected){
+  if (!pools.length)
+    return '<div class="empty-library">No seed pools yet. Build one and it will appear here automatically.</div>';
+  return (groups || []).map(family=>{
+    const familyCount = family.lineages.reduce((n, lineage)=>n + lineage.pools.length, 0);
+    const familyId = family.family_id
+      ? `<span>family ${esc(family.family_id.slice(0,8))}</span>` : `<span>no lineage metadata</span>`;
+    const lineages = family.lineages.map(lineage=>{
+      const lineageId = lineage.lineage_id
+        ? `<span>lineage ${esc(lineage.lineage_id.slice(0,8))}</span>` : "";
+      return `<section class="pool-lineage"><div class="pool-lineage-head">${esc(lineage.label)} · ${esc(lineage.display_name)} ${lineageId}</div>`
+        + `<div class="pool-lineage-grid">${lineage.pools.map(p=>renderPoolCard(p, mergeSelected)).join("")}</div></section>`;
+    }).join("");
+    return `<section class="pool-family"><div class="pool-family-head"><h3>${esc(family.label)} (${familyCount})</h3>${familyId}</div>${lineages}</section>`;
+  }).join("");
+}
+
 async function tick(){
   let j;
   try {
@@ -777,11 +843,7 @@ async function tick(){
     const th = $("threads");
     for (let i=1;i<=CAT.cpus;i++) th.add(new Option(i,i));
   }
-	setOptions($("inputPool"), `<option value="">Balatro's seed space</option>` +
-	  j.pools.filter(p=>p.records > 0).map(p=>{
-	    const state = p.coverage_complete ? "" : " · recorded snapshot";
-	    return `<option value="${esc(p.name)}" data-space="${esc(p.space)}">${esc(p.name)} (${fmt(p.records)} seeds${state})</option>`;
-	  }).join(""), true);
+	setOptions($("inputPool"), inputPoolOptions(j.pool_groups || []), true);
 	const fromPool = !!$("inputPool").value;
 	if (fromPool) $("space").value = $("inputPool").selectedOptions[0].dataset.space || "natural";
 	if (fromPool) $("shardTotal").value = "1";
@@ -821,27 +883,7 @@ async function tick(){
   }
   lastRunning = running;
   const mergeSelected = new Set([...document.querySelectorAll(".mergePick:checked")].map(x=>x.value));
-  const poolsHtml = j.pools.length ? j.pools.map(p=>{
-    const statusText = !p.complete ? (p.resumable ? "Paused · resumable" : "Partial")
-      : p.coverage_complete ? "Complete" : "Filtered snapshot · source incomplete";
-    const statusClass = p.complete && p.coverage_complete ? "ok" : "part";
-    const idb = p.pool_id ? ` · id ${esc(p.pool_id.slice(0,8))}` : "";
-    const sp = p.space === "total" ? " · all typeable" : "";
-    const lbl = (p.label && (p.label + ".bspool") !== p.name)
-      ? ` · “${esc(p.label)}”` : "";
-    const src = p.refilter_depth ? ` · refilter ${p.refilter_depth}`
-      + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${esc(p.source_pool_id.slice(0,8))}` : "") : "";
-    const enc = p.encoding === "u64le" ? " · legacy format" : "";
-    const merged = p.merged_parts ? ` · merged ${p.merged_parts} parts` : "";
-    const range = p.range_end > p.range_start
-      ? ` · ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}` : "";
-    const pick = p.complete ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>` : "";
-    const criteriaText = p.criteria.length ? p.criteria.map(esc).join(" · ") : "No embedded criteria";
-    return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
-      + `<span class="status ${statusClass}">${statusText}</span></div>`
-      + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}</div>`
-      + `<div class="pool-criteria">${criteriaText}${range}</div></article>`;
-  }).join("") : '<div class="empty-library">No seed pools yet. Build one and it will appear here automatically.</div>';
+  const poolsHtml = renderPoolLibrary(j.pool_groups || [], j.pools, mergeSelected);
   // Rebuild the list only when it changed: a 1s innerHTML rewrite eats the
   // click that is toggling a merge checkbox.
   if ($("pools").dataset.rendered !== poolsHtml){
@@ -893,10 +935,12 @@ class Handler(BaseHTTPRequestHandler):
                     for k, ma in self.snap.usable_tags()]
             legendaries = [{"key": k, "name": core.joker_name(k)}
                            for k in self.snap.usable_legendaries()]
+            pools, pool_groups = pool_library()
             self._json({
                 "catalog": {"tags": tags, "legendaries": legendaries,
                             "cpus": os.cpu_count() or 8},
-                "pools": list_pools(),
+                "pools": pools,
+                "pool_groups": pool_groups,
                 "job": job_state(),
             })
         else:

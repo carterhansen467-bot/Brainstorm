@@ -159,6 +159,31 @@ class Snapshot:
 SOUL_DEPTHS = [1, 0]
 SOUL_DEPTH_LABELS = ["1 Soul deep (the first Soul)",
                      "2 Souls deep (first or second Soul)"]
+PHASES = ["small", "big", "boss"]
+TAG_PHASES = ["small", "big"]
+PHASE_LABELS = {"small": "Small", "big": "Big", "boss": "Boss"}
+LEGENDARY_SOURCES = ["any", "shop", "charm", "ethereal"]
+LEGENDARY_SOURCE_LABELS = ["Any pack source", "Shop packs only",
+                           "Charm Tag reward only", "Ethereal Tag reward only"]
+
+
+def route_position(ante, phase):
+    """Chronological human route coordinate: Small -> Big -> Boss."""
+    return int(ante) * 3 + {"small": 0, "big": 1, "boss": 2}[phase]
+
+
+def tag_rule_parts(rule):
+    """Accept older four-field UI/test rules while adding blind boundaries."""
+    key, lo, hi, count = rule[:4]
+    min_phase = rule[4] if len(rule) > 4 else "small"
+    max_phase = rule[5] if len(rule) > 5 else "big"
+    return key, lo, hi, count, min_phase, max_phase
+
+
+def tag_location_count(lo, min_phase, hi, max_phase):
+    return sum(route_position(lo, min_phase) <= route_position(ante, phase)
+               <= route_position(hi, max_phase)
+               for ante in range(lo, hi + 1) for phase in TAG_PHASES)
 
 
 class Criteria:
@@ -167,10 +192,14 @@ class Criteria:
     def __init__(self):
         self.legendary = ""      # "" = none
         self.leg_min = 1
+        self.leg_min_phase = "small"
         self.leg_max = 8
+        self.leg_max_phase = "big"
+        self.leg_source = "any"
+        self.leg_human_location = True
         self.leg_neg = False
         self.leg_soul_depth = 1  # 1 = first Soul only, 0 = up to 2 Souls deep
-        self.tag_rules = []      # [key, min, max, count]
+        self.tag_rules = []      # [key, min, max, count, min_phase, max_phase]
         self.route_collect = True
         self.threads = 0         # 0 = auto
         self.scope = 0           # index into SCOPES
@@ -188,9 +217,12 @@ class Criteria:
 
     def auto_name(self):
         bits = []
-        for key, lo, hi, cnt in self.tag_rules:
+        for rule in self.tag_rules:
+            key, lo, hi, cnt, min_phase, max_phase = tag_rule_parts(rule)
             b = key.replace("tag_", "")
             b += "-a%d" % lo if lo == hi else "-a%d-%d" % (lo, hi)
+            if min_phase != "small" or max_phase != "big":
+                b += "-%s-%s" % (min_phase, max_phase)
             if cnt > 1:
                 b += "x%d" % cnt
             bits.append(b)
@@ -204,6 +236,9 @@ class Criteria:
                 b += "-soul2"
             b += "-a%d" % self.leg_min if self.leg_min == self.leg_max \
                 else "-a%d-%d" % (self.leg_min, self.leg_max)
+            b += "-%s-%s" % (self.leg_min_phase, self.leg_max_phase)
+            if self.leg_source != "any":
+                b += "-" + self.leg_source
             bits.append(b)
         if self.space == "total":
             bits.append("total")
@@ -243,12 +278,23 @@ class Criteria:
         if self.space != "natural":
             lines.append("space %s" % self.space)
         lines.append("label %s" % self.pool_name())
-        for key, lo, hi, cnt in self.tag_rules:
-            lines.append("tag %s %d %d %d" % (key, lo, hi, cnt))
+        for rule in self.tag_rules:
+            key, lo, hi, cnt, min_phase, max_phase = tag_rule_parts(rule)
+            if min_phase == "small" and max_phase == "big":
+                lines.append("tag %s %d %d %d" % (key, lo, hi, cnt))
+            else:
+                lines.append("tag %s %d %s %d %s %d"
+                             % (key, lo, min_phase, hi, max_phase, cnt))
         if self.legendary:
-            lines.append("legendary %s %d %d %d"
-                         % (self.legendary, self.leg_min, self.leg_max,
-                            1 if self.leg_neg else 0))
+            if self.leg_human_location:
+                lines.append("legendary %s %d %s %d %s %d %s"
+                             % (self.legendary, self.leg_min, self.leg_min_phase,
+                                self.leg_max, self.leg_max_phase,
+                                1 if self.leg_neg else 0, self.leg_source))
+            else:
+                lines.append("legendary %s %d %d %d"
+                             % (self.legendary, self.leg_min, self.leg_max,
+                                1 if self.leg_neg else 0))
             if self.leg_soul_depth == 0:
                 lines.append("soul_depth any")
             elif self.leg_soul_depth != 1:
@@ -258,10 +304,12 @@ class Criteria:
 
     def summary(self):
         parts = []
-        for key, lo, hi, cnt in self.tag_rules:
+        for rule in self.tag_rules:
+            key, lo, hi, cnt, min_phase, max_phase = tag_rule_parts(rule)
             s = TAG_NAMES.get(key, key)
             s += " x%d" % cnt if cnt > 1 else ""
-            s += " (antes %d-%d)" % (lo, hi)
+            s += " (A%d %s through A%d %s)" % (
+                lo, PHASE_LABELS[min_phase], hi, PHASE_LABELS[max_phase])
             parts.append(s)
         depth_text = {1: " within 1 Soul (the first)",
                       0: " within 2 Souls (first or second)",
@@ -269,7 +317,13 @@ class Criteria:
         if self.legendary:
             s = ("Negative " if self.leg_neg else "") + joker_name(self.legendary)
             s += depth_text.get(self.leg_soul_depth, "")
-            s += " (antes %d-%d)" % (self.leg_min, self.leg_max)
+            s += " (A%d %s through A%d %s" % (
+                self.leg_min, PHASE_LABELS[self.leg_min_phase],
+                self.leg_max, PHASE_LABELS[self.leg_max_phase])
+            if self.leg_source != "any":
+                s += ", %s" % LEGENDARY_SOURCE_LABELS[
+                    LEGENDARY_SOURCES.index(self.leg_source)].replace(" only", "")
+            s += ")"
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
         if self.space == "total":
@@ -436,6 +490,249 @@ def read_pool_header(path):
     return out
 
 
+POOL_CRITERIA_FIELDS = (
+    "tag", "route_tag", "legendary", "route_legendary", "soul_depth",
+    "tag_route",
+)
+POOL_IDENTITY_FIELDS = (
+    "family_id", "segment_id", "stage_hash", "lineage_id",
+    "derivation_id", "snapshot_id", "membership_digest",
+    "metadata_digest", "parent_snapshot_id", "parent_segment_id",
+)
+POOL_INTEGER_FIELDS = (
+    "schema", "header_bytes", "records", "refilter_depth", "range_start",
+    "range_end", "merged_parts", "scan_cursor", "input_cursor",
+    "parent_records", "parent_data_bytes", "input_record_start",
+    "input_record_end", "shard_index", "shard_total",
+)
+
+
+def _pool_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pool_identity(value):
+    """Return a usable identity value, treating native zero IDs as absent."""
+    value = str(value or "").strip()
+    if not value or value == "-":
+        return ""
+    compact = value.lower()
+    if compact.startswith("0x"):
+        compact = compact[2:]
+    if compact and all(ch == "0" for ch in compact):
+        return ""
+    return value
+
+
+class PoolInfo:
+    """A browser/TUI-safe view of one pool's header and checkpoint state.
+
+    Older pools deliberately remain valid: fields introduced with schema 3
+    are optional, and their absence puts the file in the legacy library group
+    instead of hiding it.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.header = {}
+        self.criteria = []
+        raw = read_pool_header_text(path)
+        for line in raw.splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            key = parts[0]
+            value = parts[1].strip() if len(parts) == 2 else ""
+            if key == "BRAINSTORM_SEED_POOL":
+                self.header["schema"] = value
+            elif key in POOL_CRITERIA_FIELDS:
+                self.criteria.append(line)
+            elif key != "end":
+                self.header[key] = value
+            if key == "end":
+                break
+        self.state = read_state(path + ".state")
+
+    def as_dict(self):
+        h = self.header
+        complete = h.get("complete") == "1"
+        coverage_complete = h.get("coverage_complete", h.get("complete")) == "1"
+        resumable = self.state.get("done") == "0"
+        if not complete:
+            status = "paused" if resumable else "incomplete"
+            status_label = "Paused · resumable" if resumable else "Incomplete snapshot"
+        elif not coverage_complete:
+            status = "provisional"
+            status_label = "Provisional · source snapshot"
+        else:
+            status = "complete"
+            status_label = "Complete"
+
+        try:
+            byte_count = os.path.getsize(self.path)
+        except OSError:
+            byte_count = 0
+        pool = {
+            "name": os.path.basename(self.path),
+            "bytes": byte_count,
+            "records": _pool_int(h.get("records")),
+            "complete": complete,
+            "coverage_complete": coverage_complete,
+            "resumable": resumable,
+            "status": status,
+            "status_label": status_label,
+            "criteria": list(self.criteria),
+            "label": h.get("label", ""),
+            "pool_id": h.get("pool_id", ""),
+            "space": h.get("space", "natural"),
+            "source_pool_id": h.get("source_pool_id", ""),
+            "encoding": h.get("encoding", ""),
+            "parent_name": "",
+            "parent_current_records": 0,
+            "update_available": False,
+            "new_records": 0,
+        }
+        for key in POOL_INTEGER_FIELDS:
+            if key in h:
+                pool[key] = _pool_int(h[key])
+        for key in POOL_IDENTITY_FIELDS:
+            if key in h:
+                pool[key] = h[key]
+        for key in ("parent_coverage_complete", "source_complete",
+                    "source_coverage_complete"):
+            if key in h:
+                pool[key] = h[key] == "1"
+        pool["legacy"] = not (
+            _pool_identity(pool.get("family_id"))
+            and _pool_identity(pool.get("lineage_id"))
+        )
+        return pool
+
+
+def _pool_display_name(pool):
+    label = str(pool.get("label") or "").strip()
+    if label and label + ".bspool" != pool["name"]:
+        return label
+    name = pool["name"]
+    return name[:-7] if name.lower().endswith(".bspool") else name
+
+
+def _link_pool_parents(pools):
+    """Add best-effort direct-parent and append-update information in place."""
+    segment_sources = {}
+    pool_id_sources = {}
+    for pool in pools:
+        family = _pool_identity(pool.get("family_id"))
+        segment = _pool_identity(pool.get("segment_id"))
+        if family and segment:
+            segment_sources.setdefault((family, segment), []).append(pool)
+        pool_id = _pool_identity(pool.get("pool_id"))
+        if pool_id:
+            pool_id_sources.setdefault(pool_id, []).append(pool)
+
+    for pool in pools:
+        family = _pool_identity(pool.get("family_id"))
+        parent_segment = _pool_identity(pool.get("parent_segment_id"))
+        candidates = segment_sources.get((family, parent_segment), []) \
+            if family and parent_segment else []
+        # A segment is append-stable, so the largest visible snapshot is the
+        # useful current parent when several copies of that segment exist.
+        candidates = [item for item in candidates if item is not pool]
+        if not candidates:
+            source_id = _pool_identity(pool.get("source_pool_id"))
+            candidates = [item for item in pool_id_sources.get(source_id, [])
+                          if item is not pool] if source_id else []
+        if not candidates:
+            continue
+        parent = max(candidates, key=lambda item: (item.get("records", 0), item["name"]))
+        pool["parent_name"] = parent["name"]
+        pool["parent_current_records"] = parent.get("records", 0)
+        pinned = pool.get("parent_records", 0)
+        # Incremental updates are safe to advertise only for schema-3 lineage:
+        # legacy pool IDs can change as a paused file grows.
+        if (family and parent_segment and "parent_records" in pool
+                and pinned < parent.get("records", 0)):
+            pool["update_available"] = True
+            pool["new_records"] = parent["records"] - pinned
+
+
+def group_pool_library(pools):
+    """Group JSON-ready pool dictionaries by family, then lineage."""
+    family_buckets = {}
+    for pool in pools:
+        family_id = _pool_identity(pool.get("family_id"))
+        lineage_id = _pool_identity(pool.get("lineage_id"))
+        if not family_id or not lineage_id:
+            family_id = ""
+            lineage_id = ""
+        family_key = "family:" + family_id if family_id else "legacy"
+        lineage_key = "lineage:" + lineage_id if lineage_id else "legacy"
+        pool["family_key"] = family_key
+        pool["lineage_key"] = lineage_key
+        family = family_buckets.setdefault(family_key, {
+            "key": family_key,
+            "family_id": family_id,
+            "legacy": not bool(family_id),
+            "lineages": {},
+        })
+        family["lineages"].setdefault(lineage_key, {
+            "key": lineage_key,
+            "lineage_id": lineage_id,
+            "pools": [],
+        })["pools"].append(pool)
+
+    groups = []
+    for family in family_buckets.values():
+        lineages = []
+        family_pools = []
+        for lineage in family["lineages"].values():
+            lineage["pools"].sort(
+                key=lambda item: (item.get("range_start", 0), item["name"]))
+            family_pools.extend(lineage["pools"])
+            depth = min((item.get("refilter_depth", 0) for item in lineage["pools"]),
+                        default=0)
+            has_parent = any(item.get("parent_name") or item.get("parent_segment_id")
+                             for item in lineage["pools"])
+            if family["legacy"]:
+                lineage["label"] = "Older / standalone pools"
+            elif has_parent or depth:
+                lineage["label"] = "Filter pass %d" % max(depth, 1)
+            else:
+                lineage["label"] = "Original search"
+            lineage["display_name"] = _pool_display_name(lineage["pools"][0])
+            lineages.append(lineage)
+        lineages.sort(key=lambda item: (
+            min((pool.get("refilter_depth", 0) for pool in item["pools"]), default=0),
+            item["display_name"], item["key"],
+        ))
+        family["lineages"] = lineages
+        roots = [pool for pool in family_pools
+                 if not _pool_identity(pool.get("parent_segment_id"))
+                 and not _pool_identity(pool.get("source_pool_id"))]
+        representative = sorted(roots or family_pools,
+                                key=lambda item: (item.get("refilter_depth", 0),
+                                                  item["name"]))[0]
+        family["label"] = "Legacy pools" if family["legacy"] \
+            else _pool_display_name(representative)
+        groups.append(family)
+    groups.sort(key=lambda item: (item["legacy"], item["label"].lower(), item["key"]))
+    return groups
+
+
+def read_pool_library(pool_dir=POOL_DIR):
+    """Return ``(flat_pools, grouped_pools)`` for the standalone builder."""
+    pools = []
+    if os.path.isdir(pool_dir):
+        for name in sorted(os.listdir(pool_dir)):
+            if name.endswith(".bspool"):
+                pools.append(PoolInfo(os.path.join(pool_dir, name)).as_dict())
+    _link_pool_parents(pools)
+    return pools, group_pool_library(pools)
+
+
 def human_bytes(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -511,8 +808,20 @@ class App:
                            idx=depth_idx, set=self._set_leg_depth))
             f.append(Field("number", "  Earliest ante", get=lambda: c.leg_min,
                            set=self._set_leg_min, lo=1, hi=MAX_ANTE))
+            f.append(Field("cycle", "  Earliest route point",
+                           options=[PHASE_LABELS[p] for p in PHASES],
+                           idx=PHASES.index(c.leg_min_phase),
+                           set=self._set_leg_min_phase))
             f.append(Field("number", "  Latest ante", get=lambda: c.leg_max,
                            set=self._set_leg_max, lo=1, hi=MAX_ANTE))
+            f.append(Field("cycle", "  Latest route point",
+                           options=[PHASE_LABELS[p] for p in PHASES],
+                           idx=PHASES.index(c.leg_max_phase),
+                           set=self._set_leg_max_phase))
+            f.append(Field("cycle", "  Pack source",
+                           options=LEGENDARY_SOURCE_LABELS,
+                           idx=LEGENDARY_SOURCES.index(c.leg_source),
+                           set=self._set_leg_source))
             f.append(Field("toggle", "  Require Negative edition",
                            get=lambda: c.leg_neg, set=self._set_leg_neg))
         for i, rule in enumerate(c.tag_rules):
@@ -556,13 +865,36 @@ class App:
     def _set_leg_min(self, v):
         self.crit.leg_min = v
         self.crit.leg_max = max(self.crit.leg_max, v)
+        if route_position(self.crit.leg_min, self.crit.leg_min_phase) > \
+                route_position(self.crit.leg_max, self.crit.leg_max_phase):
+            self.crit.leg_max_phase = self.crit.leg_min_phase
 
     def _set_leg_max(self, v):
         self.crit.leg_max = v
         self.crit.leg_min = min(self.crit.leg_min, v)
+        if route_position(self.crit.leg_max, self.crit.leg_max_phase) < \
+                route_position(self.crit.leg_min, self.crit.leg_min_phase):
+            self.crit.leg_min_phase = self.crit.leg_max_phase
 
     def _set_leg_neg(self, v):
         self.crit.leg_neg = v
+
+    def _set_leg_min_phase(self, i):
+        self.crit.leg_min_phase = PHASES[i]
+        if route_position(self.crit.leg_min, self.crit.leg_min_phase) > \
+                route_position(self.crit.leg_max, self.crit.leg_max_phase):
+            self.crit.leg_max = self.crit.leg_min
+            self.crit.leg_max_phase = self.crit.leg_min_phase
+
+    def _set_leg_max_phase(self, i):
+        self.crit.leg_max_phase = PHASES[i]
+        if route_position(self.crit.leg_max, self.crit.leg_max_phase) < \
+                route_position(self.crit.leg_min, self.crit.leg_min_phase):
+            self.crit.leg_min = self.crit.leg_max
+            self.crit.leg_min_phase = self.crit.leg_max_phase
+
+    def _set_leg_source(self, i):
+        self.crit.leg_source = LEGENDARY_SOURCES[i]
 
     def _set_leg_depth(self, i):
         self.crit.leg_soul_depth = SOUL_DEPTHS[i]
@@ -599,7 +931,8 @@ class App:
     def _add_rule(self):
         used = {r[0] for r in self.crit.tag_rules}
         key = next((k for k in self.tag_keys if k not in used), self.tag_keys[0])
-        self.crit.tag_rules.append([key, max(1, self.tag_min_ante.get(key, 1)), 8, 1])
+        self.crit.tag_rules.append(
+            [key, max(1, self.tag_min_ante.get(key, 1)), 8, 1, "small", "big"])
 
     def _quit(self):
         raise KeyboardInterrupt
@@ -642,8 +975,10 @@ class App:
         if fld.kind == "text":
             return fld.get() + ".bspool"
         if fld.kind == "rule":
-            key, lo, hi, cnt = fld.rule
-            return "< %s >  antes %d-%d  count %d" % (TAG_NAMES.get(key, key), lo, hi, cnt)
+            key, lo, hi, cnt, min_phase, max_phase = tag_rule_parts(fld.rule)
+            return "< %s >  A%d %s - A%d %s  count %d" % (
+                TAG_NAMES.get(key, key), lo, PHASE_LABELS[min_phase],
+                hi, PHASE_LABELS[max_phase], cnt)
         return None
 
     # ------------------------------------------------------- interaction
@@ -658,7 +993,7 @@ class App:
         elif fld.kind == "rule":
             # left/right cycles the tag on the rule row; shift the ante
             # window / count on the sub-editor opened with enter.
-            key, lo, hi, cnt = fld.rule
+            key, lo, hi, cnt, _min_phase, _max_phase = tag_rule_parts(fld.rule)
             i = (self.tag_keys.index(key) + delta) % len(self.tag_keys)
             fld.rule[0] = self.tag_keys[i]
             fld.rule[1] = max(lo, self.tag_min_ante.get(fld.rule[0], 1), 1)
@@ -668,8 +1003,11 @@ class App:
     def edit_rule(self, fld):
         """Enter on a tag rule: small sub-loop editing antes/count."""
         rule = fld.rule
-        part = 0  # 0 min ante, 1 max ante, 2 count
-        labels = ["earliest ante", "latest ante", "minimum count"]
+        while len(rule) < 6:
+            rule.append("small" if len(rule) == 4 else "big")
+        part = 0  # min ante, min blind, max ante, max blind, count
+        labels = ["earliest ante", "earliest blind", "latest ante",
+                  "latest blind", "minimum count"]
         while True:
             self.status = "Editing %s -- %s: left/right change, tab next, enter done" \
                 % (TAG_NAMES.get(rule[0], rule[0]), labels[part])
@@ -678,18 +1016,32 @@ class App:
             if ch in (curses.KEY_ENTER, 10, 13, 27):
                 break
             if ch == 9:
-                part = (part + 1) % 3
+                part = (part + 1) % 5
             elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
                 d = 1 if ch == curses.KEY_RIGHT else -1
                 if part == 0:
                     rule[1] = max(1, min(MAX_ANTE, rule[1] + d))
                     rule[2] = max(rule[2], rule[1])
                 elif part == 1:
+                    i = (TAG_PHASES.index(rule[4]) + d) % len(TAG_PHASES)
+                    rule[4] = TAG_PHASES[i]
+                elif part == 2:
                     rule[2] = max(1, min(MAX_ANTE, rule[2] + d))
                     rule[1] = min(rule[1], rule[2])
+                elif part == 3:
+                    i = (TAG_PHASES.index(rule[5]) + d) % len(TAG_PHASES)
+                    rule[5] = TAG_PHASES[i]
                 else:
-                    span = 2 * (rule[2] - rule[1] + 1)
+                    span = tag_location_count(rule[1], rule[4], rule[2], rule[5])
                     rule[3] = max(1, min(span, rule[3] + d))
+
+                if route_position(rule[1], rule[4]) > route_position(rule[2], rule[5]):
+                    if part in (0, 1):
+                        rule[2], rule[5] = rule[1], rule[4]
+                    else:
+                        rule[1], rule[4] = rule[2], rule[5]
+                rule[3] = min(rule[3], tag_location_count(
+                    rule[1], rule[4], rule[2], rule[5]))
         self.status = ""
 
     def edit_text(self, fld):
@@ -719,10 +1071,22 @@ class App:
             return "Add a legendary or at least one tag requirement first."
         if self.input_idx and self.crit.shard_total > 1:
             return "Distributed parts currently apply to Balatro's seed space, not an input pool."
-        for key, lo, hi, cnt in self.crit.tag_rules:
+        if self.crit.legendary and route_position(
+                self.crit.leg_min, self.crit.leg_min_phase) > route_position(
+                    self.crit.leg_max, self.crit.leg_max_phase):
+            return "Legendary route start must come before its route end."
+        if self.crit.legendary and self.crit.leg_max == MAX_ANTE \
+                and self.crit.leg_max_phase == "boss":
+            return "The final supported Ante cannot end at Boss (its shop uses the next RNG Ante)."
+        for rule in self.crit.tag_rules:
+            key, lo, hi, cnt, min_phase, max_phase = tag_rule_parts(rule)
             pool_min = self.tag_min_ante.get(key, 0)
             if pool_min > hi:
                 return "%s cannot appear before ante %d." % (TAG_NAMES.get(key, key), pool_min)
+            if route_position(lo, min_phase) > route_position(hi, max_phase):
+                return "%s route start must come before its route end." % TAG_NAMES.get(key, key)
+            if cnt > tag_location_count(lo, min_phase, hi, max_phase):
+                return "%s count exceeds the selected blind window." % TAG_NAMES.get(key, key)
         return None
 
     def _do_estimate(self):
