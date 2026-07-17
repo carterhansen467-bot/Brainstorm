@@ -852,17 +852,32 @@ function create_tabs(args)
 							leftColumn,
 							rightColumn,
 						}},
-						-- Debug Mode centered beneath both columns.
+						-- Debug Mode + Illegal Seed Input centered beneath both columns.
 						{n = G.UIT.R, config = {align = "cm", padding = 0.05}, nodes = {
-							create_toggle({
-								label = "Debug Mode",
-								ref_table = Brainstorm.SETTINGS,
-								ref_value = "debug_mode",
-								callback = function(_set_toggle)
-									_RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
-									G.F_NO_ACHIEVEMENTS = Brainstorm.SETTINGS.debug_mode
-								end,
-							}),
+							{n = G.UIT.C, config = {align = "cm"}, nodes = {
+								create_toggle({
+									label = "Debug Mode",
+									ref_table = Brainstorm.SETTINGS,
+									ref_value = "debug_mode",
+									callback = function(_set_toggle)
+										_RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
+										G.F_NO_ACHIEVEMENTS = Brainstorm.SETTINGS.debug_mode
+									end,
+								}),
+							}},
+							{n = G.UIT.C, config = {align = "cm", minw = 0.6}, nodes = {}},
+							{n = G.UIT.C, config = {align = "cm"}, nodes = {
+								-- Lets the vanilla seed box accept '0' (see the wrappers at
+								-- the end of this file); off = stock input behavior.
+								create_toggle({
+									label = "Illegal Seed Input",
+									ref_table = Brainstorm.SETTINGS,
+									ref_value = "illegalSeedInput",
+									callback = function()
+										nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
+									end,
+								}),
+							}},
 						}},
 					},
 				}
@@ -1176,4 +1191,56 @@ function Brainstorm.showSeedSlotAlert(text)
 			return true
 		end,
 	}))
+end
+-- ===========================================================================
+-- Illegal seed input (gated by the "Illegal Seed Input" settings toggle)
+-- ---------------------------------------------------------------------------
+-- The game's seed box can't reproduce every seed a run can actually have:
+-- text_input_key's FIRST line remaps the '0' key to 'o' (and its corpus has
+-- no zero either), and the Paste Seed button replays the clipboard through
+-- that same handler one key at a time -- so a seed containing '0' (possible
+-- via Brainstorm total-space pools, which start runs through start_run
+-- directly) silently turns into a different seed when typed or pasted back
+-- in. The vanilla PLAY flow itself is already exact: start_setup_run hands
+-- G.setup_seed straight to start_run, which marks the run seeded. The
+-- keystroke filter is the ONLY gate, so nothing is added to the setup screen
+-- -- with the toggle on, the stock seed box simply accepts '0' (typed and
+-- via Paste Seed); with it off, input behavior is byte-for-byte vanilla.
+-- ===========================================================================
+
+-- Tag the vanilla seed box as it is built. create_text_input's args table IS
+-- the input's hook config (config.ref_table), so a marker added here is
+-- visible to the key handler below. "toggle" = honor the settings switch at
+-- keystroke time, so flipping it needs no menu rebuild.
+local orig_create_text_input = create_text_input
+function create_text_input(args)
+	if args and args.ref_table == G and args.ref_value == "setup_seed" then
+		args.bs_accept_zero = "toggle"
+	end
+	return orig_create_text_input(args)
+end
+
+-- Let '0' into tagged inputs. We must intercept BEFORE the original runs --
+-- its 0->'o' remap happens before any corpus/config check -- and insert the
+-- character ourselves, mirroring the original's corpus-accept branch (cursor
+-- transpose, insert, advance).
+local orig_text_input_key = G.FUNCS.text_input_key
+G.FUNCS.text_input_key = function(args)
+	local hook = G.CONTROLLER and G.CONTROLLER.text_input_hook
+	local hcfg = hook and hook.config and hook.config.ref_table
+	local zero_ok = hcfg and hcfg.bs_accept_zero
+	if zero_ok == "toggle" then zero_ok = Brainstorm.SETTINGS.illegalSeedInput end
+	if args and args.key == "0" and zero_ok then
+		-- Same lazy stash the original does on every key; its RETURN branch
+		-- reads orig_colour, which would be nil if '0' were the only key typed.
+		hcfg.orig_colour = hcfg.orig_colour or copy_table(hcfg.colour)
+		local text = hcfg.text
+		if hcfg.max_length > string.len(text.ref_table[text.ref_value]) then
+			TRANSPOSE_TEXT_INPUT(0)
+			MODIFY_TEXT_INPUT({ letter = "0", text_table = text, pos = text.current_position + 1 })
+			TRANSPOSE_TEXT_INPUT(1)
+		end
+		return
+	end
+	return orig_text_input_key(args)
 end
