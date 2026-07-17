@@ -13,9 +13,11 @@
    Windows: put its `version.dll` in the Balatro game folder (right-click Balatro
    in Steam → Manage → Browse local files).
 3. Easiest: download **`brainstorm-windows-full.zip`** from this fork's
-   [releases](https://github.com/carterhansen467-bot/Brainstorm/releases), then
-   extract its `Brainstorm` folder into `%AppData%\Balatro\Mods`. It contains
-   the mod, both matching native helpers, and the standalone Seed Pool Builder.
+   [releases](https://github.com/carterhansen467-bot/Brainstorm/releases),
+   extract the whole ZIP, and double-click **`Install or Update
+   Brainstorm.bat`**. It installs the mod, matching native helpers, and the
+   standalone Seed Pool Builder and Organizer into
+   `%AppData%\Balatro\Mods\Brainstorm`.
 
    To use Git instead, paste this into a Command Prompt:
 
@@ -24,17 +26,19 @@
    git clone -b joker-search-experiment https://github.com/carterhansen467-bot/Brainstorm.git Brainstorm
    ```
 
-   A branch source ZIP also works, but it does not contain the compiled Windows
-   helpers; add `brainstorm-windows-helpers-x64.zip` from the same release.
+   A branch source ZIP also works for development, but it does not contain the
+   compiled Windows helpers. For a normal install, use the full release.
 4. If Windows blocks a downloaded `.exe`: right-click → Properties → check
    **Unblock**, or choose "More info → Run anyway" on the SmartScreen prompt.
 5. Reload the game to activate the mod.
 
-To update a ZIP installation, quit Balatro and copy the new release's
-`Brainstorm` contents over the active mod folder, choosing **Replace** for
-matching files. Do not delete your `seed_pools` folder, `settings.lua`, or
-`native_search.cfg`. The full package is safest because model-sensitive Lua
-and native files are updated together.
+To update a ZIP installation—including the previous win-v9 layout—quit Balatro
+and the Seed Pool Builder or Organizer, extract the new full package, and run
+**`Install or Update Brainstorm.bat`**. The updater checks the package, replaces only shipped
+files, preserves `seed_pools`, `settings.lua`, `native_search.cfg`, and scan
+checkpoints, and removes the two obsolete duplicate executable locations. On
+the next launch, briefly toggle Ctrl+A on and off once to refresh the snapshot
+for the new version. `README-WINDOWS.txt` in the ZIP includes a manual fallback.
 
 ### Macos
 
@@ -322,8 +326,12 @@ Criteria directives currently supported are:
 
 ```text
 tag <key> <inclusive-min-ante> <inclusive-max-ante> <minimum-count>
+tag <key> <min-ante> <small|big> <max-ante> <small|big> <minimum-count>
 legendary <key> <inclusive-min-ante> <inclusive-max-ante> [require-negative]
-soul_depth 1|2
+legendary <key> <min-ante> <boss|small|big> <max-ante> <boss|small|big> <negative-0|1> <any|shop|charm|ethereal>
+soul_depth 1|2|any
+voucher <key> <inclusive-min-ante> <inclusive-max-ante>
+voucher_exclude <key>
 tag_route collect|observe
 space natural|total
 label <any name, spaces allowed>
@@ -351,16 +359,31 @@ selling or destroying the first legendary, or skipping the first Soul changes
 the pool and is outside this route convention. The ante window applies to the
 target Soul itself, so Soul #1 may occur before the window at depth 2.
 
+Voucher rules search the exact per-Ante offer streams and retain the route
+with the fewest purchases. An excluded voucher may appear, but the route may
+not require buying it; this makes exclusions suitable for merchant or upgrade
+paths the player refuses to take. Buying prerequisites dynamically changes
+later voucher pools, and voucher-only searches model repeated Antes from
+Hieroglyph and Petroglyph. In mixed Legendary searches, Omen Globe is the
+voucher whose purchase timing is composed into every later Arcana card. If the
+canonical pack route misses, the scanner also tests each actually rolled Charm
+Tag as one targeted five-card alternate and records when that skip is required.
+
 ### Seed Pool Builder app (no terminal knowledge needed)
 
 Double-click **`Seed Pool Builder.command`** in the mod folder (Windows:
-**`Seed Pool Builder.exe`** from the release zip, or `Seed Pool Builder.bat`
-if you have Python installed). It opens a point-and-click page in your
+**`Seed Pool Builder.bat`**, which launches the packaged app without requiring
+Python). It opens a point-and-click page in your
 browser (running only on your computer -- nothing is installed and nothing
 leaves the machine) where you can:
 
-- pick a legendary with an ante window and optional Negative, optionally
-  require it from the second Soul exclusively, and add any tag requirements;
+- pick a Legendary with an exact Ante/blind/source window and optional
+  Negative, choose first, second, or either Soul, and add exact tag windows;
+- add multiple voucher targets with Ante windows and purchase exclusions; the
+  result records the minimum qualifying buy route;
+- use a paused, split, or otherwise incomplete `.bspool` as an input—the
+  refilter processes only its checksummed committed seeds and keeps its
+  provisional lineage explicit;
 - choose the **seed space**: natural seeds only (the 1.79 trillion the game
   can deal you), or all typeable seeds (2.90 trillion -- adds seeds with
   `0`/`O` and seeds shorter than 8 characters, which only exist typed into
@@ -385,12 +408,26 @@ First-run notes: macOS may ask to install the Command Line Developer Tools
 accept and re-run. If macOS blocks the double-click because the file came
 from the internet, right-click it and choose **Open** the first time. On
 Windows the app doesn't compile anything -- it uses the prebuilt
-`brainstorm_seed_pool.exe` from the release zip and will say so if it's
-missing. The app also needs a current `native_search.cfg`, which Brainstorm
+`brainstorm_seed_pool.exe` beside it in `Seed Pool Builder/` and will say so if
+it is missing. The app also needs a current `native_search.cfg`, which Brainstorm
 writes when you toggle an auto-reroll in-game (Ctrl+A on, then off); the page
 will tell you if it is missing or stale. Prefer a terminal UI? The same tool exists as
 `python3 tools/brainstorm_pool_builder.py` (arrow-key menus, curses;
 macOS/Linux only -- Windows Python has no curses, use the browser UI).
+
+The Windows release groups the standalone UI and exhaustive scanner under one
+`Seed Pool Builder/` folder. A complete physical split from the mod would be
+counterproductive: Lovely needs `lovely.toml` and the loaded Lua files at the
+mod root, the running game expects its native search helper under `native/`,
+and both the game and builder intentionally share root-level
+`native_search.cfg` and `seed_pools/`. Those are the only filesystem
+constraints; the builder's own executables no longer mix with the game helper.
+
+To split a BSP3 pool by its recorded exact tag, Legendary, or voucher
+occurrences without rerunning RNG, launch **`Seed Pool Organizer.command`** on
+macOS or **`Seed Pool Organizer.bat`** on Windows. Ambiguous seeds are shown for
+an explicit category choice, incomplete sources use only their committed
+checkpoint, and every derivative records the source snapshot and lineage.
 
 ### Using a seed pool in-game (phase 2)
 

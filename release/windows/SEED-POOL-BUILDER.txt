@@ -1,0 +1,18 @@
+Brainstorm Seed Pool tools (Windows x64)
+========================================
+
+Launch it with the "Seed Pool Builder.bat" shortcut one folder up. Keep its
+console window open while a scan runs; closing it requests a checkpointed
+pause, and Build can resume the recorded work later.
+
+This folder intentionally owns the standalone pool executables:
+  Seed Pool Builder.exe       local browser interface
+  Seed Pool Organizer.exe     metadata organizer/splitter interface
+  brainstorm_seed_pool.exe    exhaustive scanner/refilter/merge helper
+
+The app reads native_search.cfg and writes seed_pools in the parent Brainstorm
+folder so Balatro sees exactly the same pools. Those are profile/runtime data,
+not app binaries, and the updater preserves them.
+
+For a snapshot error, start Balatro and briefly toggle Ctrl+A on and off. For a
+Windows security warning, see README-WINDOWS.txt in the extracted release.
