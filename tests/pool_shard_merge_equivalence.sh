@@ -131,7 +131,7 @@ for space, limit in (("natural", SEEDSPACE), ("total", SEEDSPACE_TOTAL)):
 c = Criteria(); c.legendary = "j_perkeo"; c.shard_total = 4; c.shard_index = 2
 text = c.text("binary", 2_000_003)
 assert "start 500000\n" in text and "count 500001\n" in text
-assert "label perkeo-a1-8-part-2-of-4\n" in text
+assert "label perkeo-a1-8-small-big-part-2-of-4\n" in text
 PY
 
 echo "PASS: four disjoint shards exactly merge to the monolithic $COUNT-rank result (pool_id $MONO_ID)"

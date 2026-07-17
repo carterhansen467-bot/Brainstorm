@@ -309,6 +309,42 @@ local function makeSeedList(n, salt)
 	return list
 end
 
+-- The production Lua oracle still exposes its historical P<n> shop-pack
+-- label, where the number is a flattened cursor into the shops that remain
+-- after selected skips.  Native Model 6 now reports the physical collection
+-- point instead.  Normalize only the fixture output so equivalence continues
+-- to compare the same route using the public, human-readable label:
+--
+--   RNG ante 1: Small, Big
+--   RNG ante 2+: previous Boss, current Small, current Big
+--
+-- Skipped Small/Big shops do not consume a P<n> pair, so this must consult the
+-- oracle's route rather than mechanically mapping P3/P4 to Small.
+local function canonicalLegendaryLocation(label, seed)
+	if type(label) ~= "string" then return label end
+	return (label:gsub("LegA(%d+)P(%d+)", function(streamAnteText, slotText)
+		local streamAnte, slot = tonumber(streamAnteText), tonumber(slotText)
+		local sim = assert(Brainstorm._packSim,
+			"legacy Legendary label was produced without a pack route")
+		assert(sim.seed == seed, "Legendary label route belongs to a different seed")
+
+		local shopPairs = {}
+		if streamAnte >= 2 then
+			shopPairs[#shopPairs + 1] = { ante = streamAnte - 1, phase = "Boss" }
+		end
+		if not (sim.skipSm and sim.skipSm[streamAnte]) then
+			shopPairs[#shopPairs + 1] = { ante = streamAnte, phase = "Sm" }
+		end
+		if not (sim.skipBig and sim.skipBig[streamAnte]) then
+			shopPairs[#shopPairs + 1] = { ante = streamAnte, phase = "Big" }
+		end
+
+		local pair = shopPairs[math.floor((slot - 1) / 2) + 1]
+		assert(pair, string.format("unmapped Legendary shop slot A%dP%d", streamAnte, slot))
+		return "LegA" .. pair.ante .. "Shop" .. pair.phase
+	end))
+end
+
 for ci, case in ipairs(CASES) do
 	bootstrapCase(case, ci)
 	local cfg = assert(Brainstorm.buildNativeConfigText(ci), "config serialize failed: " .. case.name)
@@ -318,8 +354,10 @@ for ci, case in ipairs(CASES) do
 	for i = 1, #seeds do
 		local ok = Brainstorm.passesAllFilters(seeds[i])
 		if ok then acc = acc + 1 end
+		local foundAt = ok and canonicalLegendaryLocation(
+			Brainstorm.AUTOREROLL.jokerFoundAt, seeds[i]) or nil
 		exp[i] = seeds[i] .. " " .. (ok and "1" or "0") .. " "
-			.. ((ok and Brainstorm.AUTOREROLL.jokerFoundAt) or "-")
+			.. (foundAt or "-")
 	end
 	writeFile(outdir .. "/case" .. ci .. ".seeds", table.concat(seeds, "\n") .. "\n")
 	writeFile(outdir .. "/case" .. ci .. ".expected", table.concat(exp, "\n") .. "\n")

@@ -214,10 +214,13 @@ typedef struct {
 	 * spaces: the directive consumes the rest of its config line) */
 	char poolFile[1024];
 	int npoolRouteRules;
-	struct { int poolIndex, minAnte, maxAnte, minCount, collect; }
+	struct { int poolIndex, minAnte, minPhase, maxAnte, maxPhase, minCount, collect; }
 		poolRouteRules[MAX_POOL_ROUTE_RULES];
 	int npoolLegendRules;
-	struct { int poolIndex, minAnte, maxAnte, neg, soulDepth; }
+	struct {
+		int poolIndex, minAnte, minPhase, maxAnte, maxPhase;
+		int neg, source, humanLocation, soulDepth;
+	}
 		poolLegendRules[MAX_POOL_LEGEND_RULES];
 } Config;
 
@@ -509,9 +512,30 @@ typedef struct {
 	int soulKind, cards;
 	int shopSlot; /* 1-based flattened physical shop-pack slot; 0 for tag reward */
 	int blind;    /* -1 shop, 0 Small reward, 1 Big reward */
+	int humanAnte; /* displayed route position, distinct from the RNG Ante key */
+	int phase;     /* 0 Boss, 1 Small, 2 Big */
+	int source;    /* 1 shop, 2 Charm reward, 3 Ethereal reward */
 } SoulPackEvent;
 
-static void append_shop_pair(const Ctx *c, int ante, int *cursor,
+enum { SOUL_PHASE_BOSS = 0, SOUL_PHASE_SMALL = 1, SOUL_PHASE_BIG = 2 };
+enum { SOUL_SOURCE_SHOP = 1, SOUL_SOURCE_CHARM = 2, SOUL_SOURCE_ETHEREAL = 3 };
+
+static int bspool_route_position(int ante, int phase) {
+	/* Displayed route chronology is Small -> Big -> Boss. Boss is generated
+	 * from the following RNG Ante, despite its enum value sorting first. */
+	int order = phase == SOUL_PHASE_SMALL ? 0
+			: phase == SOUL_PHASE_BIG ? 1 : 2;
+	return ante * 3 + order;
+}
+
+static bool bspool_location_in_range(int ante, int phase,
+		int minAnte, int minPhase, int maxAnte, int maxPhase) {
+	int position = bspool_route_position(ante, phase);
+	return position >= bspool_route_position(minAnte, minPhase)
+		&& position <= bspool_route_position(maxAnte, maxPhase);
+}
+
+static void append_shop_pair(const Ctx *c, int ante, int humanAnte, int phase, int *cursor,
 		SoulPackEvent events[8], int *n) {
 	const Config *g = c->g;
 	for (int i = 0; i < 2 && *cursor < c->packs_n[ante]; i++) {
@@ -522,10 +546,13 @@ static void append_shop_pair(const Ctx *c, int ante, int *cursor,
 		e->cards = pi >= 0 ? g->boostCards[pi] : 0;
 		e->shopSlot = slot + 1;
 		e->blind = -1;
+		e->humanAnte = humanAnte;
+		e->phase = phase;
+		e->source = SOUL_SOURCE_SHOP;
 	}
 }
 
-static void append_tag_reward(const Ctx *c, int kind, int blind,
+static void append_tag_reward(const Ctx *c, int ante, int kind, int blind,
 		SoulPackEvent events[8], int *n) {
 	if (!kind) return;
 	SoulPackEvent *e = &events[(*n)++];
@@ -533,6 +560,9 @@ static void append_tag_reward(const Ctx *c, int kind, int blind,
 	e->cards = c->g->tagRewardCards[kind];
 	e->shopSlot = 0;
 	e->blind = blind;
+	e->humanAnte = ante;
+	e->phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
+	e->source = kind == 1 ? SOUL_SOURCE_CHARM : SOUL_SOURCE_ETHEREAL;
 }
 
 /* Build one Ante's opened-pack timeline. Antes 2+ begin with the previous
@@ -542,23 +572,20 @@ static void append_tag_reward(const Ctx *c, int kind, int blind,
 static int soul_pack_events(Ctx *c, int ante, SoulPackEvent events[8]) {
 	sim_packs(c, ante, 6);
 	int cursor = 0, n = 0;
-	if (ante >= 2) append_shop_pair(c, ante, &cursor, events, &n);
-	if (c->skipSm[ante]) append_tag_reward(c, c->rewardSm[ante], 0, events, &n);
-	else append_shop_pair(c, ante, &cursor, events, &n);
-	if (c->skipBig[ante]) append_tag_reward(c, c->rewardBig[ante], 1, events, &n);
-	else append_shop_pair(c, ante, &cursor, events, &n);
+	if (ante >= 2) append_shop_pair(c, ante, ante - 1, SOUL_PHASE_BOSS, &cursor, events, &n);
+	if (c->skipSm[ante]) append_tag_reward(c, ante, c->rewardSm[ante], 0, events, &n);
+	else append_shop_pair(c, ante, ante, SOUL_PHASE_SMALL, &cursor, events, &n);
+	if (c->skipBig[ante]) append_tag_reward(c, ante, c->rewardBig[ante], 1, events, &n);
+	else append_shop_pair(c, ante, ante, SOUL_PHASE_BIG, &cursor, events, &n);
 	return n;
 }
 
-static void soul_event_location(char *out, size_t outsz, int ante,
-		const SoulPackEvent *event) {
-	if (event->blind < 0) {
-		snprintf(out, outsz, "LegA%dP%d", ante, event->shopSlot);
-	} else {
-		snprintf(out, outsz, "LegA%d%s%s", ante,
-				event->soulKind == 1 ? "Charm" : "Ethereal",
-				event->blind == 0 ? "Sm" : "Big");
-	}
+static void soul_event_location(char *out, size_t outsz, const SoulPackEvent *event) {
+	const char *phase = event->phase == SOUL_PHASE_BOSS ? "Boss"
+			: event->phase == SOUL_PHASE_SMALL ? "Sm" : "Big";
+	const char *source = event->source == SOUL_SOURCE_SHOP ? "Shop"
+			: event->source == SOUL_SOURCE_CHARM ? "Charm" : "Ethereal";
+	snprintf(out, outsz, "LegA%d%s%s", event->humanAnte, source, phase);
 }
 
 /* One ante's joker sequence: shop slots then (separately) buffoon-pack cards.
@@ -684,11 +711,15 @@ static bool apply_pool_route(Ctx *c) {
 		if (g->poolRouteRules[r].maxAnte > maxAnte) maxAnte = g->poolRouteRules[r].maxAnte;
 	for (int a = 1; a <= maxAnte; a++) {
 		for (int blind = 0; blind < 2; blind++) {
+			int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
 			int needRoll = 0;
 			for (int r = 0; r < g->npoolRouteRules; r++) {
 				if (g->poolRouteRules[r].collect && counts[r] < g->poolRouteRules[r].minCount
-						&& a >= g->poolRouteRules[r].minAnte
-						&& a <= g->poolRouteRules[r].maxAnte) { needRoll = 1; break; }
+						&& bspool_location_in_range(a, phase,
+								g->poolRouteRules[r].minAnte, g->poolRouteRules[r].minPhase,
+								g->poolRouteRules[r].maxAnte, g->poolRouteRules[r].maxPhase)) {
+					needRoll = 1; break;
+				}
 			}
 			if (!needRoll) continue;
 			int idx = roll_tag_at(c, a, blind);
@@ -696,8 +727,9 @@ static bool apply_pool_route(Ctx *c) {
 			for (int r = 0; r < g->npoolRouteRules; r++) {
 				if (!g->poolRouteRules[r].collect
 						|| counts[r] >= g->poolRouteRules[r].minCount
-						|| a < g->poolRouteRules[r].minAnte
-						|| a > g->poolRouteRules[r].maxAnte
+						|| !bspool_location_in_range(a, phase,
+								g->poolRouteRules[r].minAnte, g->poolRouteRules[r].minPhase,
+								g->poolRouteRules[r].maxAnte, g->poolRouteRules[r].maxPhase)
 						|| idx != g->poolRouteRules[r].poolIndex) continue;
 				counts[r]++;
 				int reward = tag_reward_kind(g, idx);
@@ -750,8 +782,10 @@ static bool check_pool_legend_rules(Ctx *c) {
 			d = g->poolLegendRules[i].poolIndex == first ? 1 : 2;
 		resolved[i] = d;
 		if (d > needDepth) needDepth = d;
-		if (g->poolLegendRules[i].maxAnte > maxAnte)
-			maxAnte = g->poolLegendRules[i].maxAnte;
+		int rngMax = g->poolLegendRules[i].maxAnte
+				+ (g->poolLegendRules[i].humanLocation
+					&& g->poolLegendRules[i].maxPhase == SOUL_PHASE_BOSS ? 1 : 0);
+		if (rngMax > maxAnte) maxAnte = rngMax;
 	}
 	int second = -1;
 	if (needDepth == 2) {
@@ -765,6 +799,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 	}
 
 	int found = 0, eventAnte[3] = { 0 };
+	SoulPackEvent eventPack[3] = { 0 };
 	double eventEdition[3] = { 0.0 };
 	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
 		SoulPackEvent packs[8];
@@ -792,6 +827,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 				soulInPack = true;
 				found++;
 				eventAnte[found] = ante;
+				eventPack[found] = packs[slot];
 				char editionKey[24];
 				snprintf(editionKey, sizeof editionKey, "edisou%d", ante);
 				eventEdition[found] = psr(c,
@@ -802,9 +838,16 @@ static bool check_pool_legend_rules(Ctx *c) {
 	if (found < needDepth) return false;
 	for (int i = 0; i < g->npoolLegendRules; i++) {
 		int depth = resolved[i];
-		if (eventAnte[depth] < g->poolLegendRules[i].minAnte
-				|| eventAnte[depth] > g->poolLegendRules[i].maxAnte
-				|| (g->poolLegendRules[i].neg && eventEdition[depth] <= 0.997)) return false;
+		if (g->poolLegendRules[i].humanLocation) {
+			if (!bspool_location_in_range(eventPack[depth].humanAnte,
+					eventPack[depth].phase,
+					g->poolLegendRules[i].minAnte, g->poolLegendRules[i].minPhase,
+					g->poolLegendRules[i].maxAnte, g->poolLegendRules[i].maxPhase)
+					|| (g->poolLegendRules[i].source
+						&& eventPack[depth].source != g->poolLegendRules[i].source)) return false;
+		} else if (eventAnte[depth] < g->poolLegendRules[i].minAnte
+				|| eventAnte[depth] > g->poolLegendRules[i].maxAnte) return false;
+		if (g->poolLegendRules[i].neg && eventEdition[depth] <= 0.997) return false;
 	}
 	return true;
 }
@@ -847,7 +890,7 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 							&& psr(c, stream_next(c, &c->edisouA[a], K_EDISOUA[a])) <= 0.997) {
 						return false;
 					}
-					soul_event_location(c->legloc, sizeof c->legloc, a, &packs[slot]);
+					soul_event_location(c->legloc, sizeof c->legloc, &packs[slot]);
 					*locOut = c->legloc;
 					return true;
 				}
@@ -1675,21 +1718,38 @@ typedef struct {
 	int schema, modelver, complete, coverageComplete, headerBytes, encoding, mergedParts;
 	uint64_t seedspace, rangeStart, rangeEnd, records, dataBytes;
 	uint64_t catalogHash, criteriaHash;
+	uint64_t familyId, segmentId, stageHash, lineageId, derivationId;
+	uint64_t snapshotId, membershipDigest, metadataDigest;
+	uint64_t scanCursor, inputCursor, parentSnapshotId, parentSegmentId;
+	uint64_t parentRecords, parentDataBytes, inputRecordStart, inputRecordEnd;
+	int parentCoverageComplete;
 	char charset[64];
 	int space;           /* SPACE_NATURAL / SPACE_TOTAL, derived from charset */
 	char label[136];     /* optional user-given pool name (may contain spaces) */
 	char poolId[24];     /* short shareable fingerprint, hex */
 	int refilterDepth;
+	uint64_t sourceCriteriaHash, sourceRecords;
+	char sourcePoolId[24];
+	int sourceComplete, sourceCoverageComplete;
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
 	int ntagRules;
-	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount; } tagRules[BSPOOL_MAX_TAG_RULES];
+	struct { char key[MAX_KEY]; int minAnte, minPhase, maxAnte, maxPhase, minCount; }
+		tagRules[BSPOOL_MAX_TAG_RULES];
 	int nrouteTagRules;
-	struct { char key[MAX_KEY]; int minAnte, maxAnte, minCount, collect; }
+	struct { char key[MAX_KEY]; int minAnte, minPhase, maxAnte, maxPhase, minCount, collect; }
 		routeTagRules[BSPOOL_MAX_TAG_RULES];
 	int nlegendaries; /* current-stage rule (0 or 1) */
-	struct { char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; } legendaries[1];
+	struct {
+		char key[MAX_KEY];
+		int minAnte, minPhase, maxAnte, maxPhase;
+		int neg, source, humanLocation, soulDepth;
+	} legendaries[1];
 	int nrouteLegendRules;
-	struct { char key[MAX_KEY]; int minAnte, maxAnte, neg, soulDepth; }
+	struct {
+		char key[MAX_KEY];
+		int minAnte, minPhase, maxAnte, maxPhase;
+		int neg, source, humanLocation, soulDepth;
+	}
 		routeLegendRules[MAX_POOL_LEGEND_RULES];
 } BspoolHeader;
 
@@ -1726,6 +1786,43 @@ static bool pool_header_int(const char *s, int *out) {
 
 static bool pool_header_no_more(char **sp) { return pool_tok(sp) == NULL; }
 
+static bool bspool_parse_phase(const char *s, int allowBoss, int *out) {
+	if (!s) return false;
+	if (allowBoss && (!strcmp(s, "boss") || !strcmp(s, "0")))
+		*out = SOUL_PHASE_BOSS;
+	else if (!strcmp(s, "small") || !strcmp(s, "sm") || !strcmp(s, "1"))
+		*out = SOUL_PHASE_SMALL;
+	else if (!strcmp(s, "big") || !strcmp(s, "2"))
+		*out = SOUL_PHASE_BIG;
+	else
+		return false;
+	return true;
+}
+
+static bool bspool_parse_source(const char *s, int *out) {
+	if (!s || !strcmp(s, "any") || !strcmp(s, "0"))
+		*out = 0;
+	else if (!strcmp(s, "shop") || !strcmp(s, "1"))
+		*out = SOUL_SOURCE_SHOP;
+	else if (!strcmp(s, "charm") || !strcmp(s, "2"))
+		*out = SOUL_SOURCE_CHARM;
+	else if (!strcmp(s, "ethereal") || !strcmp(s, "3"))
+		*out = SOUL_SOURCE_ETHEREAL;
+	else
+		return false;
+	return true;
+}
+
+static int bspool_tag_position_count(int minAnte, int minPhase,
+		int maxAnte, int maxPhase) {
+	int count = 0;
+	for (int ante = minAnte; ante <= maxAnte; ante++)
+		for (int phase = SOUL_PHASE_SMALL; phase <= SOUL_PHASE_BIG; phase++)
+			if (bspool_location_in_range(ante, phase,
+					minAnte, minPhase, maxAnte, maxPhase)) count++;
+	return count;
+}
+
 /* Legendary constraints from successive refilter stages describe the same
  * physical Soul #1/#2 sequence. Canonicalize them to at most one intersected
  * rule per (depth, key); conflicting exact-depth targets or disjoint Ante
@@ -1733,26 +1830,58 @@ static bool pool_header_no_more(char **sp) { return pool_tok(sp) == NULL; }
  * cumulative route. Either-depth (soulDepth 0) rules with different keys can
  * both be satisfied -- one per Soul -- so they stay separate entries. */
 static bool bspool_add_legend_rule(BspoolHeader *h, const char *key,
-		int minAnte, int maxAnte, int neg, int soulDepth) {
+		int minAnte, int minPhase, int maxAnte, int maxPhase,
+		int neg, int source, int humanLocation, int soulDepth) {
 	for (int i = 0; i < h->nrouteLegendRules; i++) {
 		if (h->routeLegendRules[i].soulDepth != soulDepth) continue;
 		if (strcmp(h->routeLegendRules[i].key, key)) {
 			if (soulDepth == SOUL_DEPTH_ANY) continue;
 			return false;
 		}
-		if (minAnte > h->routeLegendRules[i].minAnte)
-			h->routeLegendRules[i].minAnte = minAnte;
-		if (maxAnte < h->routeLegendRules[i].maxAnte)
-			h->routeLegendRules[i].maxAnte = maxAnte;
+		/* A legacy range names the RNG Ante stream, while a human range
+		 * names the displayed blind/source. Keep unlike coordinate systems as
+		 * separate cumulative constraints on the same Soul event. */
+		if (h->routeLegendRules[i].humanLocation != humanLocation) continue;
+		if (humanLocation) {
+			if (bspool_route_position(minAnte, minPhase)
+					> bspool_route_position(h->routeLegendRules[i].minAnte,
+						h->routeLegendRules[i].minPhase)) {
+				h->routeLegendRules[i].minAnte = minAnte;
+				h->routeLegendRules[i].minPhase = minPhase;
+			}
+			if (bspool_route_position(maxAnte, maxPhase)
+					< bspool_route_position(h->routeLegendRules[i].maxAnte,
+						h->routeLegendRules[i].maxPhase)) {
+				h->routeLegendRules[i].maxAnte = maxAnte;
+				h->routeLegendRules[i].maxPhase = maxPhase;
+			}
+			if (h->routeLegendRules[i].source && source
+					&& h->routeLegendRules[i].source != source) return false;
+			if (!h->routeLegendRules[i].source) h->routeLegendRules[i].source = source;
+		} else {
+			if (minAnte > h->routeLegendRules[i].minAnte)
+				h->routeLegendRules[i].minAnte = minAnte;
+			if (maxAnte < h->routeLegendRules[i].maxAnte)
+				h->routeLegendRules[i].maxAnte = maxAnte;
+		}
 		h->routeLegendRules[i].neg = h->routeLegendRules[i].neg || neg;
-		return h->routeLegendRules[i].minAnte <= h->routeLegendRules[i].maxAnte;
+		return humanLocation
+			? bspool_route_position(h->routeLegendRules[i].minAnte,
+					h->routeLegendRules[i].minPhase)
+				<= bspool_route_position(h->routeLegendRules[i].maxAnte,
+					h->routeLegendRules[i].maxPhase)
+			: h->routeLegendRules[i].minAnte <= h->routeLegendRules[i].maxAnte;
 	}
 	if (h->nrouteLegendRules >= MAX_POOL_LEGEND_RULES) return false;
 	int i = h->nrouteLegendRules++;
 	snprintf(h->routeLegendRules[i].key, MAX_KEY, "%s", key);
 	h->routeLegendRules[i].minAnte = minAnte;
+	h->routeLegendRules[i].minPhase = minPhase;
 	h->routeLegendRules[i].maxAnte = maxAnte;
+	h->routeLegendRules[i].maxPhase = maxPhase;
 	h->routeLegendRules[i].neg = neg;
+	h->routeLegendRules[i].source = source;
+	h->routeLegendRules[i].humanLocation = humanLocation;
 	h->routeLegendRules[i].soulDepth = soulDepth;
 	return true;
 }
@@ -1964,9 +2093,101 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 			v = pool_tok(&sp); if (!v || strlen(v) >= sizeof h->poolId || !pool_header_no_more(&sp)) malformed = 1;
 			else snprintf(h->poolId, sizeof h->poolId, "%s", v);
 		}
+		else if (!strcmp(d, "family_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->familyId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "segment_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->segmentId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "stage_hash")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->stageHash)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "lineage_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->lineageId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "derivation_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->derivationId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "snapshot_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->snapshotId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "membership_digest")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->membershipDigest)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "metadata_digest")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->metadataDigest)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "scan_cursor")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->scanCursor)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "input_cursor")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->inputCursor)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "parent_snapshot_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->parentSnapshotId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "parent_segment_id")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->parentSegmentId)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "parent_records")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->parentRecords)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "parent_data_bytes")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->parentDataBytes)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "parent_coverage_complete")) {
+			v = pool_tok(&sp); if (!pool_header_int(v, &h->parentCoverageComplete)
+					|| (h->parentCoverageComplete != 0 && h->parentCoverageComplete != 1)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "input_record_start")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->inputRecordStart)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "input_record_end")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->inputRecordEnd)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
 		else if (!strcmp(d, "refilter_depth")) {
 			v = pool_tok(&sp); if (!pool_header_int(v, &h->refilterDepth)
 					|| h->refilterDepth < 0 || !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "source_criteria_hash")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 16, &h->sourceCriteriaHash)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "source_records")) {
+			v = pool_tok(&sp); if (!pool_header_u64(v, 10, &h->sourceRecords)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "source_pool_id")) {
+			v = pool_tok(&sp); if (!v || strlen(v) >= sizeof h->sourcePoolId
+					|| !pool_header_no_more(&sp)) malformed = 1;
+			else snprintf(h->sourcePoolId, sizeof h->sourcePoolId, "%s", v);
+		}
+		else if (!strcmp(d, "source_complete")) {
+			v = pool_tok(&sp); if (!pool_header_int(v, &h->sourceComplete)
+					|| (h->sourceComplete != 0 && h->sourceComplete != 1)
+					|| !pool_header_no_more(&sp)) malformed = 1;
+		}
+		else if (!strcmp(d, "source_coverage_complete")) {
+			v = pool_tok(&sp); if (!pool_header_int(v, &h->sourceCoverageComplete)
+					|| (h->sourceCoverageComplete != 0 && h->sourceCoverageComplete != 1)
+					|| !pool_header_no_more(&sp)) malformed = 1;
 		}
 		else if (!strcmp(d, "merged_parts")) {
 			v = pool_tok(&sp); if (!pool_header_int(v, &h->mergedParts)
@@ -1980,61 +2201,122 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		else if (!strcmp(d, "tag")) {
 			if (h->ntagRules < BSPOOL_MAX_TAG_RULES) {
 				char *k = pool_tok(&sp);
-				char *a = pool_tok(&sp), *b = pool_tok(&sp), *c = pool_tok(&sp);
-				int ia, ib, ic;
-				if (k && strlen(k) < MAX_KEY && pool_header_int(a, &ia)
-						&& pool_header_int(b, &ib) && pool_header_int(c, &ic)
-						&& pool_header_no_more(&sp)) {
-					snprintf(h->tagRules[h->ntagRules].key, MAX_KEY, "%s", k);
-					h->tagRules[h->ntagRules].minAnte = ia;
-					h->tagRules[h->ntagRules].maxAnte = ib;
-					h->tagRules[h->ntagRules].minCount = ic;
-					h->ntagRules++;
+				char *values[6], *value; int nv = 0;
+				while ((value = pool_tok(&sp)) != NULL && nv < 6) values[nv++] = value;
+				int ia = 0, ip = SOUL_PHASE_SMALL, ib = 0, jp = SOUL_PHASE_BIG, ic = 0;
+				bool valid = k && strlen(k) < MAX_KEY;
+				if (valid && nv == 3) {
+					valid = pool_header_int(values[0], &ia)
+						&& pool_header_int(values[1], &ib)
+						&& pool_header_int(values[2], &ic);
+				} else if (valid && nv == 5) {
+					valid = pool_header_int(values[0], &ia)
+						&& bspool_parse_phase(values[1], 0, &ip)
+						&& pool_header_int(values[2], &ib)
+						&& bspool_parse_phase(values[3], 0, &jp)
+						&& pool_header_int(values[4], &ic);
+				} else valid = false;
+				if (valid) {
+					int i = h->ntagRules++;
+					snprintf(h->tagRules[i].key, MAX_KEY, "%s", k);
+					h->tagRules[i].minAnte = ia;
+					h->tagRules[i].minPhase = ip;
+					h->tagRules[i].maxAnte = ib;
+					h->tagRules[i].maxPhase = jp;
+					h->tagRules[i].minCount = ic;
 				} else malformed = 1;
 			} else malformed = 1;
 		}
 		else if (!strcmp(d, "route_tag")) {
 			if (h->nrouteTagRules < BSPOOL_MAX_TAG_RULES) {
 				char *mode = pool_tok(&sp), *k = pool_tok(&sp);
-				char *a = pool_tok(&sp), *b = pool_tok(&sp), *c = pool_tok(&sp);
-				int ia, ib, ic;
-				if (mode && k && strlen(k) < MAX_KEY && pool_header_int(a, &ia)
-						&& pool_header_int(b, &ib) && pool_header_int(c, &ic)
-						&& (!strcmp(mode, "collect") || !strcmp(mode, "observe"))
-						&& pool_header_no_more(&sp)) {
+				char *values[6], *value; int nv = 0;
+				while ((value = pool_tok(&sp)) != NULL && nv < 6) values[nv++] = value;
+				int ia = 0, ip = SOUL_PHASE_SMALL, ib = 0, jp = SOUL_PHASE_BIG, ic = 0;
+				bool valid = mode && k && strlen(k) < MAX_KEY
+						&& (!strcmp(mode, "collect") || !strcmp(mode, "observe"));
+				if (valid && nv == 3) {
+					valid = pool_header_int(values[0], &ia)
+						&& pool_header_int(values[1], &ib)
+						&& pool_header_int(values[2], &ic);
+				} else if (valid && nv == 5) {
+					valid = pool_header_int(values[0], &ia)
+						&& bspool_parse_phase(values[1], 0, &ip)
+						&& pool_header_int(values[2], &ib)
+						&& bspool_parse_phase(values[3], 0, &jp)
+						&& pool_header_int(values[4], &ic);
+				} else valid = false;
+				if (valid) {
 					int i = h->nrouteTagRules++;
 					snprintf(h->routeTagRules[i].key, MAX_KEY, "%s", k);
 					h->routeTagRules[i].minAnte = ia;
+					h->routeTagRules[i].minPhase = ip;
 					h->routeTagRules[i].maxAnte = ib;
+					h->routeTagRules[i].maxPhase = jp;
 					h->routeTagRules[i].minCount = ic;
 					h->routeTagRules[i].collect = !strcmp(mode, "collect");
 				} else malformed = 1;
 			} else malformed = 1;
 		}
 		else if (!strcmp(d, "route_legendary")) {
-			char *k = pool_tok(&sp), *a = pool_tok(&sp), *b = pool_tok(&sp);
-			char *n = pool_tok(&sp), *depth = pool_tok(&sp);
-			int ia, ib, in, id;
-			if (!k || strlen(k) >= MAX_KEY || !pool_header_int(a, &ia)
-					|| !pool_header_int(b, &ib) || !pool_header_int(n, &in)
-					|| !pool_header_int(depth, &id) || !pool_header_no_more(&sp)
-					|| ia < 1 || ib < ia || ib > BSPOOL_MAX_ANTE
+			char *k = pool_tok(&sp), *values[8], *value; int nv = 0;
+			while ((value = pool_tok(&sp)) != NULL && nv < 8) values[nv++] = value;
+			int ia = 0, ip = SOUL_PHASE_BOSS, ib = 0, jp = SOUL_PHASE_BIG;
+			int in = 0, source = 0, human = 0, id = 0;
+			bool valid = k && strlen(k) < MAX_KEY;
+			if (valid && nv == 4) {
+				valid = pool_header_int(values[0], &ia)
+					&& pool_header_int(values[1], &ib)
+					&& pool_header_int(values[2], &in)
+					&& pool_header_int(values[3], &id);
+			} else if (valid && nv == 7) {
+				human = 1;
+				valid = pool_header_int(values[0], &ia)
+					&& bspool_parse_phase(values[1], 1, &ip)
+					&& pool_header_int(values[2], &ib)
+					&& bspool_parse_phase(values[3], 1, &jp)
+					&& pool_header_int(values[4], &in)
+					&& bspool_parse_source(values[5], &source)
+					&& pool_header_int(values[6], &id);
+			} else valid = false;
+			if (!valid || ia < 1 || ib < ia || ib > BSPOOL_MAX_ANTE
+					|| (human && (bspool_route_position(ib, jp)
+						< bspool_route_position(ia, ip)
+						|| ib + (jp == SOUL_PHASE_BOSS ? 1 : 0) > BSPOOL_MAX_ANTE))
 					|| (in != 0 && in != 1) || id < SOUL_DEPTH_ANY || id > 2
-					|| !bspool_add_legend_rule(h, k, ia, ib, in, id)) malformed = 1;
+					|| !bspool_add_legend_rule(h, k, ia, ip, ib, jp,
+						in, source, human, id)) malformed = 1;
 		}
 		else if (!strcmp(d, "legendary")) {
 			char *k = pool_tok(&sp);
-			char *a = pool_tok(&sp), *b = pool_tok(&sp), *n = pool_tok(&sp);
-			int ia, ib, in = 0;
-			if (!h->nlegendaries && k && strlen(k) < MAX_KEY
-					&& pool_header_int(a, &ia) && pool_header_int(b, &ib)
-					&& (!n || pool_header_int(n, &in)) && (in == 0 || in == 1)
-					&& pool_header_no_more(&sp)) {
+			char *values[7], *value; int nv = 0;
+			while ((value = pool_tok(&sp)) != NULL && nv < 7) values[nv++] = value;
+			int ia = 0, ip = SOUL_PHASE_BOSS, ib = 0, jp = SOUL_PHASE_BIG;
+			int in = 0, source = 0, human = 0;
+			bool valid = !h->nlegendaries && k && strlen(k) < MAX_KEY;
+			if (valid && (nv == 2 || nv == 3)) {
+				valid = pool_header_int(values[0], &ia)
+					&& pool_header_int(values[1], &ib)
+					&& (nv == 2 || pool_header_int(values[2], &in));
+			} else if (valid && nv == 6) {
+				human = 1;
+				valid = pool_header_int(values[0], &ia)
+					&& bspool_parse_phase(values[1], 1, &ip)
+					&& pool_header_int(values[2], &ib)
+					&& bspool_parse_phase(values[3], 1, &jp)
+					&& pool_header_int(values[4], &in)
+					&& bspool_parse_source(values[5], &source);
+			} else valid = false;
+			if (valid && (in == 0 || in == 1)) {
 				int i = h->nlegendaries++;
 				snprintf(h->legendaries[i].key, MAX_KEY, "%s", k);
 				h->legendaries[i].minAnte = ia;
+				h->legendaries[i].minPhase = ip;
 				h->legendaries[i].maxAnte = ib;
+				h->legendaries[i].maxPhase = jp;
 				h->legendaries[i].neg = in;
+				h->legendaries[i].source = source;
+				h->legendaries[i].humanLocation = human;
 				h->legendaries[i].soulDepth = 1;
 			} else malformed = 1;
 		}
@@ -2119,7 +2401,9 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		int j = h->nrouteTagRules++;
 		snprintf(h->routeTagRules[j].key, MAX_KEY, "%s", h->tagRules[i].key);
 		h->routeTagRules[j].minAnte = h->tagRules[i].minAnte;
+		h->routeTagRules[j].minPhase = h->tagRules[i].minPhase;
 		h->routeTagRules[j].maxAnte = h->tagRules[i].maxAnte;
+		h->routeTagRules[j].maxPhase = h->tagRules[i].maxPhase;
 		h->routeTagRules[j].minCount = h->tagRules[i].minCount;
 		h->routeTagRules[j].collect = h->route;
 	}
@@ -2127,9 +2411,18 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		if (!h->routeTagRules[i].key[0] || h->routeTagRules[i].minAnte < 1
 				|| h->routeTagRules[i].maxAnte < h->routeTagRules[i].minAnte
 				|| h->routeTagRules[i].maxAnte > BSPOOL_MAX_ANTE
+				|| h->routeTagRules[i].minPhase < SOUL_PHASE_SMALL
+				|| h->routeTagRules[i].minPhase > SOUL_PHASE_BIG
+				|| h->routeTagRules[i].maxPhase < SOUL_PHASE_SMALL
+				|| h->routeTagRules[i].maxPhase > SOUL_PHASE_BIG
+				|| bspool_route_position(h->routeTagRules[i].maxAnte,
+						h->routeTagRules[i].maxPhase)
+					< bspool_route_position(h->routeTagRules[i].minAnte,
+						h->routeTagRules[i].minPhase)
 				|| h->routeTagRules[i].minCount < 1
-				|| h->routeTagRules[i].minCount > 2 * (h->routeTagRules[i].maxAnte
-						- h->routeTagRules[i].minAnte + 1)) {
+				|| h->routeTagRules[i].minCount > bspool_tag_position_count(
+						h->routeTagRules[i].minAnte, h->routeTagRules[i].minPhase,
+						h->routeTagRules[i].maxAnte, h->routeTagRules[i].maxPhase)) {
 			snprintf(err, errsz, "pool has an invalid embedded tag route"); return false;
 		}
 	}
@@ -2137,13 +2430,29 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		if (h->legendaries[i].minAnte < 1
 				|| h->legendaries[i].maxAnte < h->legendaries[i].minAnte
 				|| h->legendaries[i].maxAnte > BSPOOL_MAX_ANTE
+				|| (h->legendaries[i].humanLocation
+					&& (h->legendaries[i].minPhase < SOUL_PHASE_BOSS
+						|| h->legendaries[i].minPhase > SOUL_PHASE_BIG
+						|| h->legendaries[i].maxPhase < SOUL_PHASE_BOSS
+						|| h->legendaries[i].maxPhase > SOUL_PHASE_BIG
+						|| h->legendaries[i].source < 0
+						|| h->legendaries[i].source > SOUL_SOURCE_ETHEREAL
+						|| bspool_route_position(h->legendaries[i].maxAnte,
+								h->legendaries[i].maxPhase)
+							< bspool_route_position(h->legendaries[i].minAnte,
+								h->legendaries[i].minPhase)
+						|| h->legendaries[i].maxAnte
+							+ (h->legendaries[i].maxPhase == SOUL_PHASE_BOSS ? 1 : 0)
+							> BSPOOL_MAX_ANTE))
 				|| h->legendaries[i].soulDepth < SOUL_DEPTH_ANY
 				|| h->legendaries[i].soulDepth > 2) {
 			snprintf(err, errsz, "pool has an invalid embedded legendary rule"); return false;
 		}
 		if (!bspool_add_legend_rule(h, h->legendaries[i].key,
-				h->legendaries[i].minAnte, h->legendaries[i].maxAnte,
-				h->legendaries[i].neg, h->legendaries[i].soulDepth)) {
+				h->legendaries[i].minAnte, h->legendaries[i].minPhase,
+				h->legendaries[i].maxAnte, h->legendaries[i].maxPhase,
+				h->legendaries[i].neg, h->legendaries[i].source,
+				h->legendaries[i].humanLocation, h->legendaries[i].soulDepth)) {
 			snprintf(err, errsz, "pool has conflicting cumulative legendary rules"); return false;
 		}
 	}
@@ -2215,11 +2524,17 @@ static bool bspool_varint_read(const unsigned char *p, size_t n, size_t *at,
 		uint64_t *out) {
 	uint64_t v = 0;
 	int shift = 0;
+	size_t start = *at;
 	while (*at < n && shift <= 63) {
 		unsigned char b = p[(*at)++];
 		if (shift == 63 && (b & 0x7e)) return false;
 		v |= (uint64_t)(b & 0x7f) << shift;
-		if (!(b & 0x80)) { *out = v; return true; }
+		if (!(b & 0x80)) {
+			size_t minimal = 1;
+			for (uint64_t x = v; x >= 128; x >>= 7) minimal++;
+			if (*at - start != minimal) return false;
+			*out = v; return true;
+		}
 		shift += 7;
 	}
 	return false;
@@ -2374,8 +2689,14 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 		r->nblocks = bspool_get_u64le(footer + 16);
 		uint64_t indexRecords = bspool_get_u64le(footer + 24);
 		uint64_t footerDataBytes = bspool_get_u64le(footer + 32);
+		uint64_t footerMembership = h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				? bspool_get_u64le(footer + 40) : 0;
+		uint64_t footerMetadata = h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				? bspool_get_u64le(footer + 48) : 0;
 		if (indexOff != r->dataOff + r->dataBytes || indexRecords != r->records
 				|| footerDataBytes != r->dataBytes || r->nblocks > r->records
+				|| (h->membershipDigest && footerMembership != h->membershipDigest)
+				|| (h->metadataDigest && footerMetadata != h->metadataDigest)
 				|| r->nblocks > SIZE_MAX / sizeof *r->blocks
 				|| r->nblocks > (UINT64_MAX - indexOff - footerBytes) / indexEntryBytes
 				|| indexOff + r->nblocks * indexEntryBytes + footerBytes != fileBytes) {
@@ -2498,15 +2819,9 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 	s->ranks[0] = bi.first;
 	size_t at = 0;
 	for (uint32_t i = 1; i < bi.count; i++) {
-		uint64_t delta = 0; int shift = 0, sawEnd = 0;
-		while (at < bi.rankBytes && shift <= 63) {
-			unsigned char b = s->bytes[at++];
-			if (shift == 63 && (b & 0x7e)) return false;
-			delta |= (uint64_t)(b & 0x7f) << shift;
-			if (!(b & 0x80)) { sawEnd = 1; break; }
-			shift += 7;
-		}
-		if (!sawEnd || delta == 0 || UINT64_MAX - s->ranks[i - 1] < delta) return false;
+		uint64_t delta = 0;
+		if (!bspool_varint_read(s->bytes, bi.rankBytes, &at, &delta)
+				|| delta == 0 || UINT64_MAX - s->ranks[i - 1] < delta) return false;
 		s->ranks[i] = s->ranks[i - 1] + delta;
 		if (s->ranks[i] >= r->rangeEnd) return false;
 	}
@@ -2794,7 +3109,9 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		int j = g->npoolRouteRules++;
 		g->poolRouteRules[j].poolIndex = idx;
 		g->poolRouteRules[j].minAnte = h.routeTagRules[r].minAnte;
+		g->poolRouteRules[j].minPhase = h.routeTagRules[r].minPhase;
 		g->poolRouteRules[j].maxAnte = h.routeTagRules[r].maxAnte;
+		g->poolRouteRules[j].maxPhase = h.routeTagRules[r].maxPhase;
 		g->poolRouteRules[j].minCount = h.routeTagRules[r].minCount;
 		g->poolRouteRules[j].collect = 1;
 	}
@@ -2813,8 +3130,12 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		int j = g->npoolLegendRules++;
 		g->poolLegendRules[j].poolIndex = idx;
 		g->poolLegendRules[j].minAnte = h.routeLegendRules[r].minAnte;
+		g->poolLegendRules[j].minPhase = h.routeLegendRules[r].minPhase;
 		g->poolLegendRules[j].maxAnte = h.routeLegendRules[r].maxAnte;
+		g->poolLegendRules[j].maxPhase = h.routeLegendRules[r].maxPhase;
 		g->poolLegendRules[j].neg = h.routeLegendRules[r].neg;
+		g->poolLegendRules[j].source = h.routeLegendRules[r].source;
+		g->poolLegendRules[j].humanLocation = h.routeLegendRules[r].humanLocation;
 		g->poolLegendRules[j].soulDepth = h.routeLegendRules[r].soulDepth;
 	}
 	if (!h.coverageComplete) {

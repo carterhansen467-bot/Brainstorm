@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
 		bool oldok = passes(&oldctx);
 		bool newok = pool_evaluate_pre(&newctx, seed,
 				pseudohash_ks("", seed), pseudohash_ks(plan.firstKey, seed),
-				label, sizeof label);
+				label, sizeof label, NULL);
 		if (oldok != newok) {
 			fprintf(stderr, "mismatch rank=%" PRIu64 " seed=%s legacy=%d pool=%d label=%s\n",
 					rank, seed, oldok, newok, label);

@@ -77,6 +77,19 @@ replacements = {
     r"^complete [01]$": "complete 0",
     r"^coverage_complete [01]$": "coverage_complete 0",
 }
+if re.search(r"^membership_digest [0-9a-f]+$", text, re.M):
+    def fnv(data, value=1469598103934665603):
+        for byte in data:
+            value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+        return value
+    membership = fnv(raw[header_bytes:pos])
+    segment = int(re.search(r"^segment_id ([0-9a-f]+)$", text, re.M).group(1), 16)
+    identity = ("snapshot:%016x:%016x:%016x:%016x" %
+                (segment, records, data_bytes, membership)).encode("ascii")
+    snapshot = fnv(identity)
+    replacements[r"^membership_digest [0-9a-f]+$"] = (
+        "membership_digest %016x" % membership)
+    replacements[r"^snapshot_id [0-9a-f]+$"] = "snapshot_id %016x" % snapshot
 for pattern, value in replacements.items():
     text, n = re.subn(pattern, value, text, count=1, flags=re.M)
     assert n == 1, pattern

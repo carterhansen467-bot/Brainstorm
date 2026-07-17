@@ -40,6 +40,8 @@
 #define POOL_LABEL 512
 #define POOL_HEADER_SIZE BSPOOL_HEADER_SIZE
 #define POOL_OUTPUT_BUFFER (64 * 1024)
+#define POOL_HASH_INIT UINT64_C(1469598103934665603)
+#define POOL_STATE_SCHEMA 3
 _Static_assert(POOL_OUTPUT_BUFFER / 8 == BSPOOL_BLOCK_MAX_RECORDS,
 		"pool writer and schema-2 block limit must agree");
 
@@ -48,15 +50,17 @@ typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
 typedef struct {
 	char key[MAX_KEY];
 	int poolIndex;
-	int minAnte, maxAnte, minCount, collect;
+	int minAnte, minPhase, maxAnte, maxPhase, minCount, collect;
 } PoolTagRule;
 
 typedef struct {
 	int used;
 	char key[MAX_KEY];
 	int poolIndex;
-	int minAnte, maxAnte;
+	int minAnte, minPhase, maxAnte, maxPhase;
 	int requireNegative;
+	int source; /* 0 any, otherwise SOUL_SOURCE_* */
+	int humanLocation; /* 0 preserves legacy RNG-Ante interpretation */
 	int soulDepth; /* 1 (default), 2, or SOUL_DEPTH_ANY (either Soul) */
 } PoolLegendaryRule;
 
@@ -90,9 +94,12 @@ typedef struct {
 	char kSoulT[POOL_MAX_ANTE + 1][24];
 	char kSoulS[POOL_MAX_ANTE + 1][24];
 	char kEdiSoul[POOL_MAX_ANTE + 1][24];
-	uint64_t catalogHash, criteriaHash;
+	uint64_t catalogHash, criteriaHash, stageHash;
+	uint64_t familyId, segmentId, lineageId, derivationId;
 	int refilter, refilterDepth;
 	uint64_t sourceCriteriaHash, sourceRecords, sourceRangeStart, sourceRangeEnd;
+	uint64_t sourceDataBytes, sourceMembershipDigest, sourceSnapshotId;
+	uint64_t sourceFamilyId, sourceSegmentId, sourceLineageId;
 	int sourceComplete, sourceCoverageComplete;
 	char sourcePoolId[24];
 	uint64_t outputRangeStart, outputRangeEnd;
@@ -147,8 +154,37 @@ typedef struct {
 	int legendResolved[MAX_POOL_LEGEND_RULES + 2];
 } PoolCtx;
 
+#define POOL_EVENT_BLOCK_RECORDS 1024
+#define POOL_MAX_OCCURRENCES (2 * POOL_MAX_ANTE + 18)
+enum { POOL_META_TAG = 1, POOL_META_LEGENDARY = 2 };
+enum { POOL_META_NEGATIVE = 1u << 0, POOL_META_CHARM_REQUIRED = 1u << 1 };
+
 typedef struct {
-	uint64_t cursor, outputBytes, matched, scanned;
+	uint16_t keyIndex;
+	uint8_t kind, ante, phase, source, ordinal, flags;
+} PoolOccurrence;
+
+typedef struct {
+	uint8_t count;
+	PoolOccurrence occurrence[POOL_MAX_OCCURRENCES];
+} PoolMetadata;
+
+static bool pool_metadata_add(PoolMetadata *m, PoolOccurrence value) {
+	if (!m) return true;
+	for (uint8_t i = 0; i < m->count; i++) {
+		const PoolOccurrence *x = &m->occurrence[i];
+		if (x->keyIndex == value.keyIndex && x->kind == value.kind
+				&& x->ante == value.ante && x->phase == value.phase
+				&& x->source == value.source && x->ordinal == value.ordinal
+				&& x->flags == value.flags) return true;
+	}
+	if (m->count >= POOL_MAX_OCCURRENCES) return false;
+	m->occurrence[m->count++] = value;
+	return true;
+}
+
+typedef struct {
+	uint64_t cursor, outputBytes, matched, scanned, membershipDigest, metadataDigest;
 	double elapsed;
 	int done;
 } PoolState;
@@ -179,6 +215,59 @@ static bool pool_parse_int(const char *s, int *out) {
 	return true;
 }
 
+static bool pool_parse_phase(const char *s, int allowBoss, int *out) {
+	if (!s) return false;
+	if (allowBoss && (!strcmp(s, "boss") || !strcmp(s, "0")))
+		*out = SOUL_PHASE_BOSS;
+	else if (!strcmp(s, "small") || !strcmp(s, "sm") || !strcmp(s, "1"))
+		*out = SOUL_PHASE_SMALL;
+	else if (!strcmp(s, "big") || !strcmp(s, "2"))
+		*out = SOUL_PHASE_BIG;
+	else
+		return false;
+	return true;
+}
+
+static bool pool_parse_source(const char *s, int *out) {
+	if (!s || !strcmp(s, "any") || !strcmp(s, "0"))
+		*out = 0;
+	else if (!strcmp(s, "shop") || !strcmp(s, "1"))
+		*out = SOUL_SOURCE_SHOP;
+	else if (!strcmp(s, "charm") || !strcmp(s, "2"))
+		*out = SOUL_SOURCE_CHARM;
+	else if (!strcmp(s, "ethereal") || !strcmp(s, "3"))
+		*out = SOUL_SOURCE_ETHEREAL;
+	else
+		return false;
+	return true;
+}
+
+static const char *pool_phase_str(int phase) {
+	return phase == SOUL_PHASE_BOSS ? "boss"
+		: phase == SOUL_PHASE_SMALL ? "small" : "big";
+}
+
+static const char *pool_source_str(int source) {
+	return source == SOUL_SOURCE_SHOP ? "shop"
+		: source == SOUL_SOURCE_CHARM ? "charm"
+		: source == SOUL_SOURCE_ETHEREAL ? "ethereal" : "any";
+}
+
+static int pool_route_position(int ante, int phase) {
+	/* Human route order is Small -> Big -> Boss. The enum values are grouped
+	 * for pack-source handling (Boss=0), so do not use them as chronology. */
+	int order = phase == SOUL_PHASE_SMALL ? 0
+		: phase == SOUL_PHASE_BIG ? 1 : 2;
+	return ante * 3 + order;
+}
+
+static bool pool_location_in_range(int ante, int phase,
+		int minAnte, int minPhase, int maxAnte, int maxPhase) {
+	int position = pool_route_position(ante, phase);
+	return position >= pool_route_position(minAnte, minPhase)
+		&& position <= pool_route_position(maxAnte, maxPhase);
+}
+
 static bool pool_parse_hex64(const char *s, uint64_t *out) {
 	if (!s || !*s || *s == '-') return false;
 	errno = 0;
@@ -199,8 +288,8 @@ static bool pool_parse_double(const char *s, double *out) {
 	return true;
 }
 
-static uint64_t pool_hash_plan(const PoolPlan *p) {
-	uint64_t h = UINT64_C(1469598103934665603);
+static uint64_t pool_hash_stage(const PoolPlan *p) {
+	uint64_t h = POOL_HASH_INIT;
 	char line[160];
 	int n = snprintf(line, sizeof line, "poolver %d\nformat %d\ntag_route %d\n",
 			p->schema, (int)p->format, p->collectTags);
@@ -214,14 +303,25 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
-		n = snprintf(line, sizeof line, "tag %s %d %d %d\n",
-				r->key, r->minAnte, r->maxAnte, r->minCount);
+		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
+			n = snprintf(line, sizeof line, "tag %s %d %d %d\n",
+					r->key, r->minAnte, r->maxAnte, r->minCount);
+		else
+			n = snprintf(line, sizeof line, "tag %s %d %s %d %s %d\n",
+					r->key, r->minAnte, pool_phase_str(r->minPhase),
+					r->maxAnte, pool_phase_str(r->maxPhase), r->minCount);
 		h = pool_hash_update(h, line, (size_t)n);
 	}
 	for (int i = 0; i < p->nlegendary; i++) {
 		const PoolLegendaryRule *r = &p->legendary[i];
-		n = snprintf(line, sizeof line, "legendary %s %d %d %d\n",
-				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		if (r->humanLocation)
+			n = snprintf(line, sizeof line, "legendary %s %d %s %d %s %d %s\n",
+					r->key, r->minAnte, pool_phase_str(r->minPhase),
+					r->maxAnte, pool_phase_str(r->maxPhase), r->requireNegative,
+					pool_source_str(r->source));
+		else
+			n = snprintf(line, sizeof line, "legendary %s %d %d %d\n",
+					r->key, r->minAnte, r->maxAnte, r->requireNegative);
 		h = pool_hash_update(h, line, (size_t)n);
 		/* Preserve every existing depth-1 pool/state fingerprint. */
 		if (r->soulDepth != 1) {
@@ -230,6 +330,13 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 			h = pool_hash_update(h, line, (size_t)n);
 		}
 	}
+	return h;
+}
+
+static uint64_t pool_hash_plan(const PoolPlan *p) {
+	uint64_t h = pool_hash_stage(p);
+	char line[160];
+	int n;
 	if (p->refilter) {
 		n = snprintf(line, sizeof line, "source %016" PRIx64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %d\n",
 				p->sourceCriteriaHash, p->sourceRecords, p->sourceRangeStart,
@@ -245,6 +352,57 @@ static uint64_t pool_hash_plan(const PoolPlan *p) {
 		}
 	}
 	return h;
+}
+
+static uint64_t pool_hash_fields(const char *kind, uint64_t a, uint64_t b,
+		uint64_t c, uint64_t d) {
+	char text[128];
+	int n = snprintf(text, sizeof text, "%s:%016" PRIx64 ":%016" PRIx64
+			":%016" PRIx64 ":%016" PRIx64, kind, a, b, c, d);
+	return pool_hash_update(POOL_HASH_INIT, text, (size_t)n);
+}
+
+static void pool_set_identity(PoolPlan *p) {
+	p->stageHash = pool_hash_stage(p);
+	if (p->refilter) {
+		p->familyId = p->sourceFamilyId ? p->sourceFamilyId
+				: pool_hash_fields("family-fallback", p->catalogHash,
+						p->sourceCriteriaHash, (uint64_t)p->space, 0);
+		uint64_t parentLineage = p->sourceLineageId ? p->sourceLineageId
+				: pool_hash_fields("lineage-fallback", p->familyId,
+						p->sourceCriteriaHash, 0, 0);
+		p->lineageId = pool_hash_fields("refilter", parentLineage,
+				p->stageHash, p->sourceSnapshotId, 0);
+	} else {
+		p->familyId = pool_hash_fields("family", p->catalogHash, p->stageHash,
+				(uint64_t)p->space, space_size(p->space));
+		p->lineageId = pool_hash_fields("root", p->familyId, p->stageHash, 0, 0);
+	}
+	p->segmentId = pool_hash_fields("segment", p->lineageId,
+			p->outputRangeStart, p->outputRangeEnd, (uint64_t)p->space);
+	p->derivationId = pool_hash_fields(p->refilter ? "derive-refilter" : "derive-scan",
+			p->lineageId, p->segmentId, p->sourceSnapshotId, p->stageHash);
+}
+
+static uint64_t pool_snapshot_id(const PoolPlan *p, uint64_t records,
+		uint64_t dataBytes, uint64_t membershipDigest) {
+	return pool_hash_fields("snapshot", p->segmentId, records, dataBytes,
+			membershipDigest);
+}
+
+static bool pool_hash_fd_region(int fd, uint64_t offset, uint64_t bytes,
+		uint64_t *digest) {
+	unsigned char buf[64 * 1024];
+	uint64_t h = POOL_HASH_INIT;
+	while (bytes) {
+		size_t n = bytes < sizeof buf ? (size_t)bytes : sizeof buf;
+		if (offset > (uint64_t)INT64_MAX
+				|| bs_pread(fd, buf, n, (int64_t)offset) != (int64_t)n) return false;
+		h = pool_hash_update(h, buf, n);
+		offset += n; bytes -= n;
+	}
+	*digest = h;
+	return true;
 }
 
 static int pool_find_tag(const Config *g, const char *key) {
@@ -337,12 +495,24 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 				goto fail;
 			}
 			PoolTagRule *r = &p->tagRules[p->ntagRules++];
+			r->minPhase = SOUL_PHASE_SMALL;
+			r->maxPhase = SOUL_PHASE_BIG;
 			char *key = pool_tok(&sp);
 			if (!key || strlen(key) >= sizeof r->key) goto bad_value;
 			snprintf(r->key, sizeof r->key, "%s", key);
-			if (!pool_parse_int(pool_tok(&sp), &r->minAnte)
-					|| !pool_parse_int(pool_tok(&sp), &r->maxAnte)
-					|| !pool_parse_int(pool_tok(&sp), &r->minCount)) goto bad_value;
+			char *values[6]; int nv = 0;
+			for (char *v = pool_tok(&sp); v && nv < 6; v = pool_tok(&sp)) values[nv++] = v;
+			if (nv == 3) {
+				if (!pool_parse_int(values[0], &r->minAnte)
+						|| !pool_parse_int(values[1], &r->maxAnte)
+						|| !pool_parse_int(values[2], &r->minCount)) goto bad_value;
+			} else if (nv == 5) {
+				if (!pool_parse_int(values[0], &r->minAnte)
+						|| !pool_parse_phase(values[1], 0, &r->minPhase)
+						|| !pool_parse_int(values[2], &r->maxAnte)
+						|| !pool_parse_phase(values[3], 0, &r->maxPhase)
+						|| !pool_parse_int(values[4], &r->minCount)) goto bad_value;
+			} else goto bad_value;
 		} else if (!strcmp(d, "legendary")) {
 			if (p->nlegendary) {
 				snprintf(err, errsz, "criteria line %d: only one legendary rule is supported", lineno);
@@ -350,13 +520,26 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 			}
 			PoolLegendaryRule *r = &p->legendary[p->nlegendary++];
 			r->used = 1;
+			r->minPhase = SOUL_PHASE_BOSS;
+			r->maxPhase = SOUL_PHASE_BIG;
 			char *key = pool_tok(&sp);
 			if (!key || strlen(key) >= sizeof r->key) goto bad_value;
 			snprintf(r->key, sizeof r->key, "%s", key);
-			if (!pool_parse_int(pool_tok(&sp), &r->minAnte)
-					|| !pool_parse_int(pool_tok(&sp), &r->maxAnte)) goto bad_value;
-			char *neg = pool_tok(&sp);
-			if (neg && !pool_parse_int(neg, &r->requireNegative)) goto bad_value;
+			char *values[7]; int nv = 0;
+			for (char *v = pool_tok(&sp); v && nv < 7; v = pool_tok(&sp)) values[nv++] = v;
+			if (nv == 2 || nv == 3) {
+				if (!pool_parse_int(values[0], &r->minAnte)
+						|| !pool_parse_int(values[1], &r->maxAnte)
+						|| (nv == 3 && !pool_parse_int(values[2], &r->requireNegative))) goto bad_value;
+			} else if (nv == 6) {
+				r->humanLocation = 1;
+				if (!pool_parse_int(values[0], &r->minAnte)
+						|| !pool_parse_phase(values[1], 1, &r->minPhase)
+						|| !pool_parse_int(values[2], &r->maxAnte)
+						|| !pool_parse_phase(values[3], 1, &r->maxPhase)
+						|| !pool_parse_int(values[4], &r->requireNegative)
+						|| !pool_parse_source(values[5], &r->source)) goto bad_value;
+			} else goto bad_value;
 		} else if (!strcmp(d, "soul_depth")) {
 			/* Applies to the most recent legendary rule (or, for
 			 * compatibility with older single-rule files, the first rule
@@ -412,7 +595,17 @@ bad_value:
 		PoolTagRule *r = &p->tagRules[i];
 		r->collect = p->collectTags;
 		if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE
-				|| r->minCount < 1 || r->minCount > 2 * (r->maxAnte - r->minAnte + 1)) {
+				|| pool_route_position(r->maxAnte, r->maxPhase)
+						< pool_route_position(r->minAnte, r->minPhase)) {
+			snprintf(err, errsz, "bad range for tag rule %s", r->key);
+			return false;
+		}
+		int possible = 0;
+		for (int ante = r->minAnte; ante <= r->maxAnte; ante++)
+			for (int phase = SOUL_PHASE_SMALL; phase <= SOUL_PHASE_BIG; phase++)
+				if (pool_location_in_range(ante, phase, r->minAnte, r->minPhase,
+						r->maxAnte, r->maxPhase)) possible++;
+		if (r->minCount < 1 || r->minCount > possible) {
 			snprintf(err, errsz, "bad range/count for tag rule %s", r->key);
 			return false;
 		}
@@ -430,7 +623,12 @@ bad_value:
 		}
 		for (int i = 0; i < p->nlegendary; i++) {
 			PoolLegendaryRule *r = &p->legendary[i];
-			if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE) {
+			int rngMax = r->maxAnte + (r->humanLocation
+					&& r->maxPhase == SOUL_PHASE_BOSS ? 1 : 0);
+			if (r->minAnte < 1 || r->maxAnte < r->minAnte || r->maxAnte > POOL_MAX_ANTE
+					|| (r->humanLocation && pool_route_position(r->maxAnte, r->maxPhase)
+							< pool_route_position(r->minAnte, r->minPhase))
+					|| rngMax > POOL_MAX_ANTE) {
 				snprintf(err, errsz, "bad range for legendary rule %s", r->key);
 				return false;
 			}
@@ -445,7 +643,7 @@ bad_value:
 				snprintf(err, errsz, "legendary %s is unavailable in this snapshot", r->key);
 				return false;
 			}
-			if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
+			if (rngMax > p->maxAnte) p->maxAnte = rngMax;
 		}
 		p->firstKind = 1;
 		snprintf(p->firstKey, sizeof p->firstKey, "Joker4");
@@ -548,16 +746,18 @@ static void pool_label_add(char *label, size_t cap, const char *fmt, ...) {
 /* Refiltering is an intersection on one physical route, not merely a second
  * independent predicate pass. Replay the source pool's cumulative collected
  * tag rules so the new Soul/pack criteria see the same missing shops. */
-static bool pool_apply_base_route(PoolCtx *c) {
+static bool pool_apply_base_route(PoolCtx *c, PoolMetadata *metadata) {
 	const PoolPlan *p = c->p;
 	int counts[POOL_MAX_TAG_RULES] = { 0 };
 	for (int ante = 1; ante <= p->maxAnte; ante++) {
 		for (int blind = 0; blind < 2; blind++) {
+			int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
 			int needRoll = 0;
 			for (int r = 0; r < p->nbaseTagRules; r++) {
 				const PoolTagRule *rule = &p->baseTagRules[r];
-				if (rule->collect && counts[r] < rule->minCount
-						&& ante >= rule->minAnte && ante <= rule->maxAnte) {
+				if (pool_location_in_range(ante, phase, rule->minAnte, rule->minPhase,
+						rule->maxAnte, rule->maxPhase)
+						&& (metadata || (rule->collect && counts[r] < rule->minCount))) {
 					needRoll = 1; break;
 				}
 			}
@@ -566,9 +766,15 @@ static bool pool_apply_base_route(PoolCtx *c) {
 			if (idx < 0) return false;
 			for (int r = 0; r < p->nbaseTagRules; r++) {
 				const PoolTagRule *rule = &p->baseTagRules[r];
-				if (!rule->collect || counts[r] >= rule->minCount
-						|| ante < rule->minAnte || ante > rule->maxAnte
+				if (!pool_location_in_range(ante, phase, rule->minAnte, rule->minPhase,
+						rule->maxAnte, rule->maxPhase)
 						|| idx != rule->poolIndex) continue;
+				if (!pool_metadata_add(metadata, (PoolOccurrence) {
+						.kind = POOL_META_TAG, .keyIndex = (uint16_t)rule->poolIndex,
+						.ante = (uint8_t)ante,
+						.phase = (uint8_t)phase,
+				})) return false;
+				if (!rule->collect || counts[r] >= rule->minCount) continue;
 				counts[r]++;
 				int reward = tag_reward_kind(c->g, idx);
 				if (blind == 0) {
@@ -584,19 +790,29 @@ static bool pool_apply_base_route(PoolCtx *c) {
 	return true;
 }
 
-static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap) {
+static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata) {
 	const PoolPlan *p = c->p;
 	int counts[POOL_MAX_TAG_RULES] = { 0 };
 	bool wroteRule[POOL_MAX_TAG_RULES] = { false };
 	int remaining = p->ntagRules;
 	for (int ante = p->minTagAnte; ante <= p->maxTagAnte; ante++) {
 		for (int blind = 0; blind < 2; blind++) {
+			int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
 			int idx = pool_roll_tag_at(c, ante, blind);
 			if (idx < 0) return false;
 			for (int r = 0; r < p->ntagRules; r++) {
 				const PoolTagRule *rule = &p->tagRules[r];
-				if (counts[r] >= rule->minCount || ante < rule->minAnte || ante > rule->maxAnte
+				if (!pool_location_in_range(ante, phase, rule->minAnte, rule->minPhase,
+						rule->maxAnte, rule->maxPhase)
 						|| idx != rule->poolIndex) continue;
+				if (!pool_metadata_add(metadata, (PoolOccurrence) {
+						.kind = POOL_META_TAG,
+						.keyIndex = (uint16_t)rule->poolIndex,
+						.ante = (uint8_t)ante,
+						.phase = (uint8_t)phase,
+				})) return false;
+				if (counts[r] >= rule->minCount) continue;
 				counts[r]++;
 				if (rule->collect) {
 					int reward = tag_reward_kind(c->g, idx);
@@ -621,7 +837,6 @@ static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap) {
 		for (int r = 0; r < p->ntagRules; r++) {
 			if (p->tagRules[r].maxAnte == ante && counts[r] < p->tagRules[r].minCount) return false;
 		}
-		if (remaining == 0) return true;
 	}
 	return remaining == 0;
 }
@@ -654,7 +869,8 @@ static void pool_sim_packs(PoolCtx *c, int ante) {
 	}
 }
 
-static void pool_append_shop_pair(const PoolCtx *c, int ante, int *cursor,
+static void pool_append_shop_pair(const PoolCtx *c, int ante, int humanAnte,
+		int phase, int *cursor,
 		SoulPackEvent events[8], int *n) {
 	const Config *g = c->g;
 	for (int i = 0; i < 2 && *cursor < c->packsN[ante]; i++) {
@@ -665,10 +881,13 @@ static void pool_append_shop_pair(const PoolCtx *c, int ante, int *cursor,
 		e->cards = pi >= 0 ? g->boostCards[pi] : 0;
 		e->shopSlot = slot + 1;
 		e->blind = -1;
+		e->humanAnte = humanAnte;
+		e->phase = phase;
+		e->source = SOUL_SOURCE_SHOP;
 	}
 }
 
-static void pool_append_tag_reward(const PoolCtx *c, int kind, int blind,
+static void pool_append_tag_reward(const PoolCtx *c, int ante, int kind, int blind,
 		SoulPackEvent events[8], int *n) {
 	if (!kind) return;
 	SoulPackEvent *e = &events[(*n)++];
@@ -676,28 +895,30 @@ static void pool_append_tag_reward(const PoolCtx *c, int kind, int blind,
 	e->cards = c->g->tagRewardCards[kind];
 	e->shopSlot = 0;
 	e->blind = blind;
+	e->humanAnte = ante;
+	e->phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
+	e->source = kind == 1 ? SOUL_SOURCE_CHARM : SOUL_SOURCE_ETHEREAL;
 }
 
 static int pool_soul_pack_events(PoolCtx *c, int ante, SoulPackEvent events[8]) {
 	pool_sim_packs(c, ante);
 	int cursor = 0, n = 0;
-	if (ante >= 2) pool_append_shop_pair(c, ante, &cursor, events, &n);
-	if (c->skipSm[ante]) pool_append_tag_reward(c, c->rewardSm[ante], 0, events, &n);
-	else pool_append_shop_pair(c, ante, &cursor, events, &n);
-	if (c->skipBig[ante]) pool_append_tag_reward(c, c->rewardBig[ante], 1, events, &n);
-	else pool_append_shop_pair(c, ante, &cursor, events, &n);
+	if (ante >= 2) pool_append_shop_pair(c, ante, ante - 1,
+			SOUL_PHASE_BOSS, &cursor, events, &n);
+	if (c->skipSm[ante]) pool_append_tag_reward(c, ante, c->rewardSm[ante], 0, events, &n);
+	else pool_append_shop_pair(c, ante, ante, SOUL_PHASE_SMALL, &cursor, events, &n);
+	if (c->skipBig[ante]) pool_append_tag_reward(c, ante, c->rewardBig[ante], 1, events, &n);
+	else pool_append_shop_pair(c, ante, ante, SOUL_PHASE_BIG, &cursor, events, &n);
 	return n;
 }
 
-static void pool_soul_event_label(char *out, size_t outsz, int ante,
+static void pool_soul_event_label(char *out, size_t outsz,
 		const SoulPackEvent *event) {
-	if (event->blind < 0) {
-		snprintf(out, outsz, "A%dP%d", ante, event->shopSlot);
-	} else {
-		snprintf(out, outsz, "A%d%s%s", ante,
-				event->soulKind == 1 ? "Charm" : "Ethereal",
-				event->blind == 0 ? "Sm" : "Big");
-	}
+	const char *phase = event->phase == SOUL_PHASE_BOSS ? "Boss"
+			: event->phase == SOUL_PHASE_SMALL ? "Sm" : "Big";
+	const char *source = event->source == SOUL_SOURCE_SHOP ? "Shop"
+			: event->source == SOUL_SOURCE_CHARM ? "Charm" : "Ethereal";
+	snprintf(out, outsz, "A%d%s%s", event->humanAnte, source, phase);
 }
 
 static int pool_legend_rule_count(const PoolPlan *p) {
@@ -753,7 +974,8 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
  * route, including the per-pack Soul/Black-Hole gates and the edition roll
  * consumed whenever a Soul is used. Every inherited and current rule is then
  * checked against the corresponding exact Soul event. */
-static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
+static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata) {
 	const Config *g = c->g;
 	const PoolPlan *p = c->p;
 	int nrules = pool_legend_rule_count(p), needDepth = 0, maxAnte = 0;
@@ -761,7 +983,9 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 	for (int i = 0; i < nrules; i++) {
 		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
 		if (c->legendResolved[i] > needDepth) needDepth = c->legendResolved[i];
-		if (r->maxAnte > maxAnte) maxAnte = r->maxAnte;
+		int rngMax = r->maxAnte + (r->humanLocation
+				&& r->maxPhase == SOUL_PHASE_BOSS ? 1 : 0);
+		if (rngMax > maxAnte) maxAnte = rngMax;
 	}
 	int found = 0, eventAnte[3] = { 0 };
 	SoulPackEvent eventPack[3] = { 0 };
@@ -792,6 +1016,16 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 				eventPack[found] = packs[slot];
 				eventEdition[found] = pool_psr(c, pool_stream_next(c,
 						&c->ediSoul[ante], p->kEdiSoul[ante]));
+				int legendaryIndex = found == 1 ? c->firstLegendaryIdx : c->secondLegendaryIdx;
+				if (legendaryIndex < 0 || !pool_metadata_add(metadata, (PoolOccurrence) {
+						.keyIndex = (uint16_t)legendaryIndex,
+						.kind = POOL_META_LEGENDARY,
+						.ante = (uint8_t)packs[slot].humanAnte,
+						.phase = (uint8_t)packs[slot].phase,
+						.source = (uint8_t)packs[slot].source,
+						.ordinal = (uint8_t)found,
+						.flags = eventEdition[found] > 0.997 ? POOL_META_NEGATIVE : 0,
+				})) return false;
 			}
 		}
 	}
@@ -799,12 +1033,19 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 	for (int i = 0; i < nrules; i++) {
 		const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
 		int depth = c->legendResolved[i];
-		if (eventAnte[depth] < r->minAnte || eventAnte[depth] > r->maxAnte
-				|| (r->requireNegative && eventEdition[depth] <= 0.997)) return false;
+		if (r->humanLocation) {
+			const SoulPackEvent *event = &eventPack[depth];
+			if (!pool_location_in_range(event->humanAnte, event->phase,
+					r->minAnte, r->minPhase, r->maxAnte, r->maxPhase)
+					|| (r->source && event->source != r->source)) return false;
+		} else if (eventAnte[depth] < r->minAnte || eventAnte[depth] > r->maxAnte) {
+			return false;
+		}
+		if (r->requireNegative && eventEdition[depth] <= 0.997) return false;
 	}
 	if (p->nlegendary) {
 		char loc1[32], loc2[32];
-		pool_soul_event_label(loc1, sizeof loc1, eventAnte[1], &eventPack[1]);
+		pool_soul_event_label(loc1, sizeof loc1, &eventPack[1]);
 		int currentSecond = 0;
 		for (int i = p->nbaseLegendaryRules; i < nrules; i++)
 			if (c->legendResolved[i] == 2) currentSecond = 1;
@@ -815,7 +1056,7 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 			const char *secondKey = c->secondLegendaryIdx >= 0
 					&& c->secondLegendaryIdx < g->njoker[4]
 					? g->jokerKey[4][c->secondLegendaryIdx] : "?";
-			pool_soul_event_label(loc2, sizeof loc2, eventAnte[2], &eventPack[2]);
+			pool_soul_event_label(loc2, sizeof loc2, &eventPack[2]);
 			pool_label_add(label, labelCap,
 					"%sSoul1(%s)=%s Soul2(%s)=%s",
 					label && label[0] ? " " : "", firstKey, loc1, secondKey, loc2);
@@ -828,7 +1069,7 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap) {
 }
 
 static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
-		double hfirst, char *label, size_t labelCap) {
+		double hfirst, char *label, size_t labelCap, PoolMetadata *metadata) {
 	const PoolPlan *p = c->p;
 	memcpy(c->seed, seed, 9);
 	c->gen++;
@@ -839,6 +1080,7 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	memset(c->rewardBig, 0, sizeof c->rewardBig);
 	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
 	if (label && labelCap) label[0] = 0;
+	if (metadata) metadata->count = 0;
 	if (p->firstKind == 1) {
 		c->joker4.state = hfirst;
 		c->joker4.gen = c->gen;
@@ -849,13 +1091,13 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	/* Specific legendary selection is independent of tag/pack streams and
 	 * rejects ~80% of vanilla candidates before the expensive route walk. */
 	if (!pool_precheck_all_legendaries(c)) return false;
-	if (p->nbaseTagRules && !pool_apply_base_route(c)) return false;
-	if (p->ntagRules && !pool_check_tags(c, label, labelCap)) return false;
+	if (p->nbaseTagRules && !pool_apply_base_route(c, metadata)) return false;
+	if (p->ntagRules && !pool_check_tags(c, label, labelCap, metadata)) return false;
 	c->forcedAnte = 1;
 	for (int ante = 1; ante <= p->maxAnte; ante++) {
 		if (pool_pack_max_slots(c, ante) > 0) { c->forcedAnte = ante; break; }
 	}
-	if (!pool_check_all_souls(c, label, labelCap)) return false;
+	if (!pool_check_all_souls(c, label, labelCap, metadata)) return false;
 	return true;
 }
 
@@ -902,11 +1144,56 @@ typedef struct {
 	_Atomic bool ioError;
 	FILE *out;
 	bs_mutex_t outMutex;
+	uint64_t *membershipDigest;
+	uint64_t *metadataDigest;
 } PoolScanShared;
 
 static bool pool_read_input_batch(const PoolScanShared *s, uint64_t first,
 		uint64_t count, uint64_t ranks[ILV], BspoolScratch *scratch) {
 	return bspool_reader_read(&s->p->inputReader, first, count, ranks, scratch);
+}
+
+static bool pool_reader_prefix_bytes(const BspoolReader *r, int encoding,
+		uint64_t records, uint64_t *bytes) {
+	if (records > r->records) return false;
+	if (encoding == BSPOOL_ENCODING_U64) {
+		if (records > UINT64_MAX / 8u) return false;
+		*bytes = records * 8u;
+		return true;
+	}
+	if (!records) { *bytes = 0; return true; }
+	uint32_t headerBytes = encoding == BSPOOL_ENCODING_DELTA_EVENTS
+			? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
+	for (uint64_t i = 0; i < r->nblocks; i++) {
+		const BspoolBlockIndex *e = &r->blocks[i];
+		uint64_t endRecord = e->firstRecord + e->count;
+		if (endRecord == records) {
+			*bytes = e->offset + headerBytes + e->payloadBytes - r->dataOff;
+			return true;
+		}
+		if (endRecord > records) return false;
+	}
+	return false;
+}
+
+static bool pool_reader_metadata_digest(const BspoolReader *r, uint64_t *digest) {
+	if (r->encoding != BSPOOL_ENCODING_DELTA_EVENTS) { *digest = 0; return true; }
+	unsigned char buf[64 * 1024];
+	uint64_t h = POOL_HASH_INIT;
+	for (uint64_t i = 0; i < r->nblocks; i++) {
+		const BspoolBlockIndex *e = &r->blocks[i];
+		uint64_t offset = e->offset + BSPOOL3_BLOCK_HEADER_SIZE + e->rankBytes;
+		uint64_t left = e->metadataBytes;
+		while (left) {
+			size_t n = left < sizeof buf ? (size_t)left : sizeof buf;
+			if (offset > (uint64_t)INT64_MAX
+					|| bs_pread(r->fd, buf, n, (int64_t)offset) != (int64_t)n) return false;
+			h = pool_hash_update(h, buf, n);
+			offset += n; left -= n;
+		}
+	}
+	*digest = h;
+	return true;
 }
 
 static int pool_rank_compare(const void *a, const void *b) {
@@ -944,43 +1231,215 @@ static size_t pool_encode_rank_block(unsigned char *buf, uint32_t count,
 	return out;
 }
 
-/* Schema 3 starts with the same sorted positive-delta rank payload, followed
- * by an inverted occurrence table. The metadata writer is enabled in the next
- * layer; descriptor_count=0 is already a complete, canonical empty table and
- * lets the reader/writer migration be verified independently. */
-static size_t pool_encode_event_block(unsigned char *buf, uint32_t count,
-		unsigned char *encoded, unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE]) {
-	qsort(buf, count, 8u, pool_rank_compare);
-	uint64_t first, last;
-	memcpy(&first, buf, 8); memcpy(&last, buf + (size_t)(count - 1) * 8u, 8);
-	size_t rankBytes = 0;
-	uint64_t prior = first;
-	for (uint32_t i = 1; i < count; i++) {
-		uint64_t rank;
-		memcpy(&rank, buf + (size_t)i * 8u, 8);
-		uint64_t delta = rank - prior;
-		do {
-			unsigned char b = (unsigned char)(delta & 0x7f);
-			delta >>= 7;
-			if (delta) b |= 0x80;
-			encoded[rankBytes++] = b;
-		} while (delta);
-		prior = rank;
+typedef struct {
+	uint64_t rank;
+	PoolMetadata metadata;
+} PoolEventHit;
+
+typedef struct {
+	uint8_t len;
+	unsigned char bytes[MAX_KEY + 8];
+	uint16_t *records;
+	uint32_t count, cap;
+} PoolMetaDescriptor;
+
+typedef struct {
+	unsigned char *data;
+	size_t size, cap;
+} PoolByteBuffer;
+
+static int pool_event_hit_compare(const void *a, const void *b) {
+	const PoolEventHit *x = a, *y = b;
+	return x->rank < y->rank ? -1 : x->rank > y->rank;
+}
+
+static int pool_meta_descriptor_compare(const void *a, const void *b) {
+	const PoolMetaDescriptor *x = a, *y = b;
+	size_t common = x->len < y->len ? x->len : y->len;
+	int cmp = memcmp(x->bytes, y->bytes, common);
+	return cmp ? cmp : x->len < y->len ? -1 : x->len > y->len;
+}
+
+static bool pool_byte_reserve(PoolByteBuffer *b, size_t add) {
+	if (add > BSPOOL3_BLOCK_MAX_METADATA - b->size) return false;
+	size_t need = b->size + add;
+	if (need <= b->cap) return true;
+	size_t cap = b->cap ? b->cap : 256;
+	while (cap < need) {
+		size_t next = cap * 2;
+		if (next < cap || next > BSPOOL3_BLOCK_MAX_METADATA) {
+			cap = BSPOOL3_BLOCK_MAX_METADATA; break;
+		}
+		cap = next;
 	}
-	encoded[rankBytes] = 0; /* descriptor_count = 0 */
-	memset(header, 0, BSPOOL3_BLOCK_HEADER_SIZE);
-	memcpy(header, "BSP3", 4);
-	header[4] = BSPOOL3_BLOCK_HEADER_SIZE;
-	bspool_put_u32le(header + 8, count);
+	unsigned char *p = realloc(b->data, cap);
+	if (!p) return false;
+	b->data = p; b->cap = cap;
+	return true;
+}
+
+static bool pool_byte_append(PoolByteBuffer *b, const void *p, size_t n) {
+	if (!pool_byte_reserve(b, n)) return false;
+	memcpy(b->data + b->size, p, n); b->size += n;
+	return true;
+}
+
+static bool pool_byte_varint(PoolByteBuffer *b, uint64_t value) {
+	unsigned char raw[10];
+	size_t n = 0;
+	do {
+		raw[n] = (unsigned char)(value & 0x7f);
+		value >>= 7;
+		if (value) raw[n] |= 0x80;
+		n++;
+	} while (value);
+	return pool_byte_append(b, raw, n);
+}
+
+static bool pool_occurrence_descriptor(const Config *g, const PoolOccurrence *o,
+		unsigned char out[MAX_KEY + 8], uint8_t *len) {
+	const char *key = NULL;
+	if (o->kind == POOL_META_TAG && o->keyIndex < (uint16_t)g->ntags)
+		key = g->tagKey[o->keyIndex];
+	else if (o->kind == POOL_META_LEGENDARY && o->keyIndex < (uint16_t)g->njoker[4])
+		key = g->jokerKey[4][o->keyIndex];
+	if (!key) return false;
+	size_t keyLen = strlen(key);
+	if (!keyLen || keyLen >= MAX_KEY) return false;
+	out[0] = o->kind;
+	out[1] = (unsigned char)keyLen;
+	memcpy(out + 2, key, keyLen);
+	out[2 + keyLen] = o->ante;
+	out[3 + keyLen] = o->phase;
+	out[4 + keyLen] = o->source;
+	out[5 + keyLen] = o->ordinal;
+	out[6 + keyLen] = o->flags;
+	*len = (uint8_t)(7 + keyLen);
+	return true;
+}
+
+static bool pool_meta_record(PoolMetaDescriptor *d, uint16_t record) {
+	if (d->count == d->cap) {
+		uint32_t cap = d->cap ? d->cap * 2u : 16u;
+		if (cap < d->cap || cap > POOL_EVENT_BLOCK_RECORDS) cap = POOL_EVENT_BLOCK_RECORDS;
+		if (cap <= d->cap) return false;
+		uint16_t *p = realloc(d->records, (size_t)cap * sizeof *p);
+		if (!p) return false;
+		d->records = p; d->cap = cap;
+	}
+	d->records[d->count++] = record;
+	return true;
+}
+
+static void pool_meta_descriptors_free(PoolMetaDescriptor *d, size_t n) {
+	for (size_t i = 0; i < n; i++) free(d[i].records);
+	free(d);
+}
+
+static bool pool_flush_event_hits(PoolScanShared *s, PoolEventHit *hits,
+		size_t *used) {
+	if (!*used) return true;
+	qsort(hits, *used, sizeof *hits, pool_event_hit_compare);
+	unsigned char rankPayload[(POOL_EVENT_BLOCK_RECORDS - 1) * 6];
+	size_t rankBytes = 0;
+	uint64_t prior = hits[0].rank;
+	for (size_t i = 1; i < *used; i++) {
+		uint64_t delta = hits[i].rank - prior;
+		if (!delta) goto fail;
+		do {
+			unsigned char byte = (unsigned char)(delta & 0x7f);
+			delta >>= 7;
+			if (delta) byte |= 0x80;
+			rankPayload[rankBytes++] = byte;
+		} while (delta);
+		prior = hits[i].rank;
+	}
+	PoolMetaDescriptor *descriptors = NULL;
+	size_t ndescriptors = 0, descriptorCap = 0;
+	uint32_t associations = 0;
+	for (uint16_t record = 0; record < (uint16_t)*used; record++) {
+		const PoolMetadata *m = &hits[record].metadata;
+		for (uint8_t j = 0; j < m->count; j++) {
+			unsigned char bytes[MAX_KEY + 8]; uint8_t len = 0;
+			if (!pool_occurrence_descriptor(s->g, &m->occurrence[j], bytes, &len)) goto fail_desc;
+			size_t d = 0;
+			for (; d < ndescriptors; d++)
+				if (descriptors[d].len == len && !memcmp(descriptors[d].bytes, bytes, len)) break;
+			if (d == ndescriptors) {
+				if (ndescriptors == descriptorCap) {
+					size_t cap = descriptorCap ? descriptorCap * 2 : 16;
+					PoolMetaDescriptor *p = realloc(descriptors, cap * sizeof *p);
+					if (!p) goto fail_desc;
+					descriptors = p; descriptorCap = cap;
+				}
+				memset(&descriptors[d], 0, sizeof descriptors[d]);
+				descriptors[d].len = len;
+				memcpy(descriptors[d].bytes, bytes, len);
+				ndescriptors++;
+			}
+			if (!pool_meta_record(&descriptors[d], record) || associations == UINT32_MAX) goto fail_desc;
+			associations++;
+		}
+	}
+	qsort(descriptors, ndescriptors, sizeof *descriptors, pool_meta_descriptor_compare);
+	PoolByteBuffer metadata = { 0 };
+	if (!pool_byte_varint(&metadata, ndescriptors)) goto fail_meta;
+	for (size_t d = 0; d < ndescriptors; d++) {
+		PoolMetaDescriptor *entry = &descriptors[d];
+		if (!pool_byte_varint(&metadata, entry->len)
+				|| !pool_byte_append(&metadata, entry->bytes, entry->len)
+				|| !pool_byte_varint(&metadata, entry->count)
+				|| !entry->count
+				|| !pool_byte_varint(&metadata, entry->records[0])) goto fail_meta;
+		for (uint32_t i = 1; i < entry->count; i++) {
+			uint16_t delta = (uint16_t)(entry->records[i] - entry->records[i - 1]);
+			if (!delta || !pool_byte_varint(&metadata, delta)) goto fail_meta;
+		}
+	}
+	unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE] = { 0 };
+	memcpy(header, "BSP3", 4); header[4] = BSPOOL3_BLOCK_HEADER_SIZE;
+	bspool_put_u32le(header + 8, (uint32_t)*used);
 	bspool_put_u32le(header + 12, (uint32_t)rankBytes);
-	bspool_put_u32le(header + 16, 1);
-	bspool_put_u32le(header + 20, 0);
-	bspool_put_u64le(header + 24, first);
-	bspool_put_u64le(header + 32, last);
+	bspool_put_u32le(header + 16, (uint32_t)metadata.size);
+	bspool_put_u32le(header + 20, associations);
+	bspool_put_u64le(header + 24, hits[0].rank);
+	bspool_put_u64le(header + 32, hits[*used - 1].rank);
 	uint64_t crc = bspool_crc64_update(0, header + 4, 36);
-	crc = bspool_crc64_update(crc, encoded, rankBytes + 1);
+	crc = bspool_crc64_update(crc, rankPayload, rankBytes);
+	crc = bspool_crc64_update(crc, metadata.data, metadata.size);
 	bspool_put_u64le(header + 40, crc);
-	return rankBytes + 1;
+	bs_mutex_lock(&s->outMutex);
+	size_t wh = fwrite(header, 1, sizeof header, s->out);
+	size_t wr = rankBytes ? fwrite(rankPayload, 1, rankBytes, s->out) : 0;
+	size_t wm = fwrite(metadata.data, 1, metadata.size, s->out);
+	if (wh == sizeof header && wr == rankBytes && wm == metadata.size) {
+		*s->membershipDigest = pool_hash_update(*s->membershipDigest, header, sizeof header);
+		*s->membershipDigest = pool_hash_update(*s->membershipDigest, rankPayload, rankBytes);
+		*s->membershipDigest = pool_hash_update(*s->membershipDigest, metadata.data, metadata.size);
+		*s->metadataDigest = pool_hash_update(*s->metadataDigest, metadata.data, metadata.size);
+	}
+	bs_mutex_unlock(&s->outMutex);
+	free(metadata.data);
+	pool_meta_descriptors_free(descriptors, ndescriptors);
+	if (wh != sizeof header || wr != rankBytes || wm != metadata.size) goto fail;
+	*used = 0;
+	return true;
+fail_meta:
+	free(metadata.data);
+fail_desc:
+	pool_meta_descriptors_free(descriptors, ndescriptors);
+fail:
+	atomic_store(&s->ioError, true);
+	return false;
+}
+
+static bool pool_buffer_event_hit(PoolScanShared *s, PoolEventHit *hits,
+		size_t *used, uint64_t rank, const PoolMetadata *metadata) {
+	if (*used == POOL_EVENT_BLOCK_RECORDS && !pool_flush_event_hits(s, hits, used)) return false;
+	hits[*used].rank = rank;
+	hits[*used].metadata = *metadata;
+	(*used)++;
+	return true;
 }
 
 static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
@@ -992,19 +1451,20 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
 	size_t headerBytes = BSPOOL_BLOCK_HEADER_SIZE;
 	if (s->p->format == POOL_BINARY) {
 		uint32_t count = (uint32_t)(*used / 8u);
-		size_t out;
-		if (s->p->outputSchema == BSPOOL_SCHEMA_EVENTS) {
-			out = pool_encode_event_block(buf, count, encoded, header);
-			headerBytes = BSPOOL3_BLOCK_HEADER_SIZE;
-		} else {
-			out = pool_encode_rank_block(buf, count, encoded, header);
-		}
+		if (s->p->outputSchema == BSPOOL_SCHEMA_EVENTS) return false;
+		size_t out = pool_encode_rank_block(buf, count, encoded, header);
 		writeBuf = encoded; writeBytes = out;
 	}
 	bs_mutex_lock(&s->outMutex);
 	size_t wroteHeader = s->p->format == POOL_BINARY
 			? fwrite(header, 1, headerBytes, s->out) : headerBytes;
 	size_t wrote = fwrite(writeBuf, 1, writeBytes, s->out);
+	if (wroteHeader == headerBytes && wrote == writeBytes && s->membershipDigest) {
+		uint64_t h = *s->membershipDigest;
+		if (s->p->format == POOL_BINARY) h = pool_hash_update(h, header, headerBytes);
+		h = pool_hash_update(h, writeBuf, writeBytes);
+		*s->membershipDigest = h;
+	}
 	bs_mutex_unlock(&s->outMutex);
 	if (wroteHeader != headerBytes || wrote != writeBytes) {
 		atomic_store(&s->ioError, true);
@@ -1034,18 +1494,24 @@ static void *pool_scan_worker(void *arg) {
 	PoolCtx *c = calloc(1, sizeof *c);
 	unsigned char *outbuf = malloc(POOL_OUTPUT_BUFFER);
 	unsigned char *encoded = malloc(POOL_OUTPUT_BUFFER);
+	bool eventMode = s->p->format == POOL_BINARY
+			&& s->p->outputSchema == BSPOOL_SCHEMA_EVENTS;
+	PoolEventHit *eventHits = eventMode
+			? malloc(POOL_EVENT_BLOCK_RECORDS * sizeof *eventHits) : NULL;
 	BspoolScratch inputScratch = { .cachedBlock = UINT64_MAX };
-	if (!c || !outbuf || !encoded) {
-		free(c); free(outbuf); free(encoded);
+	if (!c || !outbuf || !encoded || (eventMode && !eventHits)) {
+		free(c); free(outbuf); free(encoded); free(eventHits);
 		atomic_store(&s->ioError, true);
 		return NULL;
 	}
 	c->g = s->g;
 	c->p = s->p;
 	size_t outUsed = 0;
+	size_t eventUsed = 0;
 	char seeds[ILV][9];
 	double hseed[ILV], hfirst[ILV];
 	uint64_t ranks[ILV];
+	PoolMetadata metadata;
 	while (!atomic_load(&s->ioError)) {
 		uint64_t begin = atomic_fetch_add(&s->next, s->p->chunk);
 		if (begin >= s->end) break;
@@ -1076,9 +1542,13 @@ static void *pool_scan_worker(void *arg) {
 				}
 			}
 			for (int i = 0; i < ILV; i++) {
-				if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i], NULL, 0)) {
+				if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i], NULL, 0, &metadata)) {
 					chunkMatched++;
-					if (!pool_buffer_hit(s, outbuf, encoded, &outUsed, ranks[i], seeds[i])) goto done;
+					if (eventMode) {
+						if (!pool_buffer_event_hit(s, eventHits, &eventUsed,
+								ranks[i], &metadata)) goto done;
+					} else if (!pool_buffer_hit(s, outbuf, encoded, &outUsed,
+							ranks[i], seeds[i])) goto done;
 				}
 			}
 		}
@@ -1090,17 +1560,23 @@ static void *pool_scan_worker(void *arg) {
 			make_seed_in(space, candidate, seeds[0]);
 			double hs = pseudohash_ks("", seeds[0]);
 			double hf = pseudohash_ks(s->p->firstKey, seeds[0]);
-			if (pool_evaluate_pre(c, seeds[0], hs, hf, NULL, 0)) {
+			if (pool_evaluate_pre(c, seeds[0], hs, hf, NULL, 0, &metadata)) {
 				chunkMatched++;
-				if (!pool_buffer_hit(s, outbuf, encoded, &outUsed, candidate, seeds[0])) goto done;
+				if (eventMode) {
+					if (!pool_buffer_event_hit(s, eventHits, &eventUsed,
+							candidate, &metadata)) goto done;
+				} else if (!pool_buffer_hit(s, outbuf, encoded, &outUsed,
+						candidate, seeds[0])) goto done;
 			}
 		}
 		atomic_fetch_add(&s->matched, chunkMatched);
 		atomic_fetch_add(&s->scanned, end - begin);
 	}
 done:
-	(void)pool_flush_hits(s, outbuf, encoded, &outUsed);
+	if (eventMode) (void)pool_flush_event_hits(s, eventHits, &eventUsed);
+	else (void)pool_flush_hits(s, outbuf, encoded, &outUsed);
 	bspool_scratch_destroy(&inputScratch);
+	free(eventHits);
 	free(encoded);
 	free(outbuf);
 	free(c);
@@ -1108,7 +1584,9 @@ done:
 }
 
 static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
-		uint64_t dataBytes, int complete, char *err, size_t errsz) {
+		uint64_t dataBytes, uint64_t membershipDigest, uint64_t metadataDigest,
+		uint64_t cursor,
+		int complete, char *err, size_t errsz) {
 	if (p->format != POOL_BINARY) return true;
 	unsigned char buf[BSPOOL_HEADER_EVENTS_SIZE];
 	if (p->headerBytes != BSPOOL_HEADER_SIZE
@@ -1122,6 +1600,7 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	 * consumer can later compose the pool's tag route with overlay filters. */
 	char poolId[24];
 	pool_compute_id(p, records, complete, poolId);
+	uint64_t snapshotId = pool_snapshot_id(p, records, dataBytes, membershipDigest);
 	int coverageComplete = complete && (!p->refilter || p->sourceCoverageComplete);
 	const char *encoding = p->outputSchema == BSPOOL_SCHEMA_EVENTS
 			? "delta-varint-events-v1" : "delta-varint-blocks-v1";
@@ -1132,12 +1611,18 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			"range_start %" PRIu64 "\nrange_end %" PRIu64 "\n"
 			"catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n"
 			"pool_id %s\n"
+			"family_id %016" PRIx64 "\nsegment_id %016" PRIx64 "\n"
+			"stage_hash %016" PRIx64 "\nlineage_id %016" PRIx64 "\n"
+			"derivation_id %016" PRIx64 "\nsnapshot_id %016" PRIx64 "\n"
+			"membership_digest %016" PRIx64 "\nmetadata_digest %016" PRIx64
+			"\nscan_cursor %" PRIu64 "\n"
 			"tag_route %s\n",
 			p->outputSchema, MODELVER, encoding, p->headerBytes,
 			space_charset(p->space), space_size(p->space),
 			space_name(p->space),
 			p->outputRangeStart, p->outputRangeEnd, p->catalogHash, p->criteriaHash,
-			poolId,
+			poolId, p->familyId, p->segmentId, p->stageHash, p->lineageId,
+			p->derivationId, snapshotId, membershipDigest, metadataDigest, cursor,
 			p->collectTags ? "collect" : "observe");
 	if (n < 0 || (size_t)n >= headerCap) { snprintf(err, errsz, "binary header overflow"); return false; }
 	if (p->label[0]) {
@@ -1147,9 +1632,17 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	for (int i = 0; i < p->nbaseTagRules; i++) {
 		const PoolTagRule *r = &p->baseTagRules[i];
-		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
-				"route_tag %s %s %d %d %d\n", r->collect ? "collect" : "observe",
-				r->key, r->minAnte, r->maxAnte, r->minCount);
+		int rw;
+		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
+			rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"route_tag %s %s %d %d %d\n", r->collect ? "collect" : "observe",
+					r->key, r->minAnte, r->maxAnte, r->minCount);
+		else
+			rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"route_tag %s %s %d %s %d %s %d\n",
+					r->collect ? "collect" : "observe", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->minCount);
 		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
 			snprintf(err, errsz, "binary header overflow from cumulative refilter route");
 			return false;
@@ -1158,9 +1651,17 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	for (int i = 0; i < p->nbaseLegendaryRules; i++) {
 		const PoolLegendaryRule *r = &p->baseLegendaryRules[i];
-		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
-				"route_legendary %s %d %d %d %d\n", r->key,
-				r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
+		int rw;
+		if (r->humanLocation)
+			rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"route_legendary %s %d %s %d %s %d %s %d\n", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->requireNegative,
+					pool_source_str(r->source), r->soulDepth);
+		else
+			rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"route_legendary %s %d %d %d %d\n", r->key,
+					r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
 		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
 			snprintf(err, errsz, "binary header overflow from cumulative legendary route");
 			return false;
@@ -1169,15 +1670,31 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
-		int w = snprintf((char *)buf + n, headerCap - (size_t)n, "tag %s %d %d %d\n",
-				r->key, r->minAnte, r->maxAnte, r->minCount);
+		int w;
+		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
+			w = snprintf((char *)buf + n, headerCap - (size_t)n, "tag %s %d %d %d\n",
+					r->key, r->minAnte, r->maxAnte, r->minCount);
+		else
+			w = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"tag %s %d %s %d %s %d\n", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->minCount);
 		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
 	for (int i = 0; i < p->nlegendary; i++) {
 		const PoolLegendaryRule *r = &p->legendary[i];
-		int w = snprintf((char *)buf + n, headerCap - (size_t)n, "legendary %s %d %d %d\n",
-				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		int w;
+		if (r->humanLocation)
+			w = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"legendary %s %d %s %d %s %d %s\n", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->requireNegative,
+					pool_source_str(r->source));
+		else
+			w = snprintf((char *)buf + n, headerCap - (size_t)n,
+					"legendary %s %d %d %d\n", r->key,
+					r->minAnte, r->maxAnte, r->requireNegative);
 		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 		if (r->soulDepth != 1) {
@@ -1190,10 +1707,16 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	if (p->refilter) {
 		int w = snprintf((char *)buf + n, headerCap - (size_t)n,
 				"refilter_depth %d\nsource_criteria_hash %016" PRIx64 "\nsource_records %" PRIu64 "\nsource_pool_id %s\n"
-				"source_complete %d\nsource_coverage_complete %d\n",
+				"source_complete %d\nsource_coverage_complete %d\n"
+				"input_cursor %" PRIu64 "\ninput_record_start 0\ninput_record_end %" PRIu64 "\n"
+				"parent_snapshot_id %016" PRIx64 "\nparent_segment_id %016" PRIx64 "\n"
+				"parent_records %" PRIu64 "\nparent_data_bytes %" PRIu64 "\n"
+				"parent_coverage_complete %d\n",
 				p->refilterDepth, p->sourceCriteriaHash, p->sourceRecords,
 				p->sourcePoolId[0] ? p->sourcePoolId : "-",
-				p->sourceComplete, p->sourceCoverageComplete);
+				p->sourceComplete, p->sourceCoverageComplete, cursor,
+				p->sourceRecords, p->sourceSnapshotId, p->sourceSegmentId,
+				p->sourceRecords, p->sourceDataBytes, p->sourceCoverageComplete);
 		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
@@ -1212,7 +1735,8 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 }
 
 static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, uint64_t records,
-		uint64_t dataBytes, uint64_t *finalBytes, char *err, size_t errsz) {
+		uint64_t dataBytes, uint64_t membershipDigest, uint64_t metadataDigest,
+		uint64_t *finalBytes, char *err, size_t errsz) {
 	if (fflush(f) != 0) { snprintf(err, errsz, "cannot flush pool data before indexing"); return false; }
 	BspoolHeader h;
 	memset(&h, 0, sizeof h);
@@ -1260,8 +1784,11 @@ static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, u
 	bspool_put_u64le(footer + 16, r.nblocks);
 	bspool_put_u64le(footer + 24, records);
 	bspool_put_u64le(footer + 32, dataBytes);
-	if (schema == BSPOOL_SCHEMA_EVENTS)
+	if (schema == BSPOOL_SCHEMA_EVENTS) {
+		bspool_put_u64le(footer + 40, membershipDigest);
+		bspool_put_u64le(footer + 48, metadataDigest);
 		bspool_put_u64le(footer + 72, bspool_crc64_update(0, footer, 72));
+	}
 	uint64_t blocks = r.nblocks;
 	bspool_reader_destroy(&r);
 	if (fwrite(footer, 1, footerBytes, f) != footerBytes || fflush(f) != 0 || bs_fsync_file(f) != 0) {
@@ -1283,10 +1810,12 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	}
 	FILE *f = fopen(tmp, "w");
 	if (!f) { snprintf(err, errsz, "cannot write state: %s", strerror(errno)); return false; }
-	fprintf(f, "BRAINSTORM_SEED_POOL_STATE %d\n", POOL_SCHEMA);
+	fprintf(f, "BRAINSTORM_SEED_POOL_STATE %d\n", POOL_STATE_SCHEMA);
 	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n", p->catalogHash, p->criteriaHash);
 	fprintf(f, "range_start %" PRIu64 "\nrange_end %" PRIu64 "\n", p->start, p->start + p->count);
 	fprintf(f, "cursor %" PRIu64 "\noutput_bytes %" PRIu64 "\n", s->cursor, s->outputBytes);
+	fprintf(f, "membership_digest %016" PRIx64 "\n", s->membershipDigest);
+	fprintf(f, "metadata_digest %016" PRIx64 "\n", s->metadataDigest);
 	fprintf(f, "matched %" PRIu64 "\nscanned %" PRIu64 "\nelapsed_seconds %.9f\ndone %d\nend\n",
 			s->matched, s->scanned, s->elapsed, s->done);
 	/* Always close the temporary stream, including after a flush/fsync error.
@@ -1320,9 +1849,12 @@ static bool pool_load_state(const char *path, const PoolPlan *p, PoolState *s,
 		SS_VERSION = 1u << 0, SS_CATALOG = 1u << 1, SS_CRITERIA = 1u << 2,
 		SS_RANGE_START = 1u << 3, SS_RANGE_END = 1u << 4, SS_CURSOR = 1u << 5,
 		SS_OUTPUT = 1u << 6, SS_MATCHED = 1u << 7, SS_SCANNED = 1u << 8,
-		SS_ELAPSED = 1u << 9, SS_DONE = 1u << 10
+		SS_ELAPSED = 1u << 9, SS_DONE = 1u << 10, SS_MEMBERSHIP = 1u << 11,
+		SS_METADATA = 1u << 12
 	};
-	const unsigned required = (1u << 11) - 1;
+	const unsigned requiredV1 = (1u << 11) - 1;
+	const unsigned requiredV2 = (1u << 12) - 1;
+	const unsigned requiredV3 = (1u << 13) - 1;
 	unsigned seen = 0;
 	uint64_t ch = 0, qh = 0, rs = 0, re = 0;
 	char line[256];
@@ -1345,6 +1877,10 @@ static bool pool_load_state(const char *path, const PoolPlan *p, PoolState *s,
 			bit = SS_CURSOR; if (!pool_parse_u64(v, &s->cursor)) goto bad;
 		} else if (!strcmp(d, "output_bytes")) {
 			bit = SS_OUTPUT; if (!pool_parse_u64(v, &s->outputBytes)) goto bad;
+		} else if (!strcmp(d, "membership_digest")) {
+			bit = SS_MEMBERSHIP; if (!pool_parse_hex64(v, &s->membershipDigest)) goto bad;
+		} else if (!strcmp(d, "metadata_digest")) {
+			bit = SS_METADATA; if (!pool_parse_hex64(v, &s->metadataDigest)) goto bad;
 		} else if (!strcmp(d, "matched")) {
 			bit = SS_MATCHED; if (!pool_parse_u64(v, &s->matched)) goto bad;
 		} else if (!strcmp(d, "scanned")) {
@@ -1364,7 +1900,9 @@ static bool pool_load_state(const char *path, const PoolPlan *p, PoolState *s,
 		seen |= bit;
 	}
 	fclose(f);
-	if (seen != required || version != POOL_SCHEMA || !sawEnd
+	if ((version == 1 ? seen != requiredV1
+				: version == 2 ? seen != requiredV2 : seen != requiredV3)
+			|| (version != 1 && version != 2 && version != POOL_STATE_SCHEMA) || !sawEnd
 			|| ch != p->catalogHash || qh != p->criteriaHash
 			|| rs != p->start || re != p->start + p->count || s->cursor < rs || s->cursor > re
 			|| s->scanned != s->cursor - rs || s->matched > s->scanned
@@ -1395,6 +1933,12 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 	fprintf(f, "modelver %d\nfp_mode %s\n", MODELVER, g_seed_fma ? "fma" : "plain");
 	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n", p->catalogHash, p->criteriaHash);
 	fprintf(f, "pool_id %s\n", poolId);
+	fprintf(f, "family_id %016" PRIx64 "\nsegment_id %016" PRIx64
+			"\nstage_hash %016" PRIx64 "\nlineage_id %016" PRIx64
+			"\nderivation_id %016" PRIx64 "\nmembership_digest %016" PRIx64
+			"\nmetadata_digest %016" PRIx64 "\n",
+			p->familyId, p->segmentId, p->stageHash, p->lineageId, p->derivationId,
+			s->membershipDigest, s->metadataDigest);
 	if (p->label[0]) fprintf(f, "label %s\n", p->label);
 	fprintf(f, "charset %s\nseedspace %" PRIu64 "\nspace %s\n",
 			space_charset(p->space), space_size(p->space), space_name(p->space));
@@ -1410,31 +1954,57 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			p->collectTags ? "collect-first-required" : "observe");
 	if (p->refilter) fprintf(f,
 			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n"
-			"source_complete %d\nsource_coverage_complete %d\n",
+			"source_complete %d\nsource_coverage_complete %d\n"
+			"parent_snapshot_id %016" PRIx64 "\nparent_segment_id %016" PRIx64
+			"\nparent_records %" PRIu64 "\nparent_data_bytes %" PRIu64 "\n",
 			p->refilterDepth, p->sourceRecords, p->sourceCriteriaHash,
 			p->sourcePoolId[0] ? p->sourcePoolId : "-",
-			p->sourceComplete, p->sourceCoverageComplete);
+			p->sourceComplete, p->sourceCoverageComplete, p->sourceSnapshotId,
+			p->sourceSegmentId, p->sourceRecords, p->sourceDataBytes);
 	for (int i = 0; i < p->nbaseTagRules; i++) {
 		const PoolTagRule *r = &p->baseTagRules[i];
-		fprintf(f, "source_route_tag %s %s %d %d %d\n",
-				r->collect ? "collect" : "observe", r->key,
-				r->minAnte, r->maxAnte, r->minCount);
+		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
+			fprintf(f, "source_route_tag %s %s %d %d %d\n",
+					r->collect ? "collect" : "observe", r->key,
+					r->minAnte, r->maxAnte, r->minCount);
+		else
+			fprintf(f, "source_route_tag %s %s %d %s %d %s %d\n",
+					r->collect ? "collect" : "observe", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->minCount);
 	}
 	for (int i = 0; i < p->nbaseLegendaryRules; i++) {
 		const PoolLegendaryRule *r = &p->baseLegendaryRules[i];
-		fprintf(f, "source_route_legendary %s %d %d %d %d\n", r->key,
-				r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
+		if (r->humanLocation)
+			fprintf(f, "source_route_legendary %s %d %s %d %s %d %s %d\n", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->requireNegative,
+					pool_source_str(r->source), r->soulDepth);
+		else
+			fprintf(f, "source_route_legendary %s %d %d %d %d\n", r->key,
+					r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
 	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
-		fprintf(f, "tag %s %d %d %d\n", r->key, r->minAnte, r->maxAnte, r->minCount);
+		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
+			fprintf(f, "tag %s %d %d %d\n", r->key, r->minAnte, r->maxAnte, r->minCount);
+		else
+			fprintf(f, "tag %s %d %s %d %s %d\n", r->key,
+					r->minAnte, pool_phase_str(r->minPhase), r->maxAnte,
+					pool_phase_str(r->maxPhase), r->minCount);
 	}
 	for (int i = 0; i < p->nlegendary; i++) {
 		const PoolLegendaryRule *r = &p->legendary[i];
-		fprintf(f, "%s_soul_legendary %s %d %d %d\n",
-				r->soulDepth == 2 ? "second"
-					: r->soulDepth == SOUL_DEPTH_ANY ? "either" : "first",
-				r->key, r->minAnte, r->maxAnte, r->requireNegative);
+		const char *depthName = r->soulDepth == 2 ? "second"
+				: r->soulDepth == SOUL_DEPTH_ANY ? "either" : "first";
+		if (r->humanLocation)
+			fprintf(f, "%s_soul_legendary %s %d %s %d %s %d %s\n",
+					depthName, r->key, r->minAnte, pool_phase_str(r->minPhase),
+					r->maxAnte, pool_phase_str(r->maxPhase), r->requireNegative,
+					pool_source_str(r->source));
+		else
+			fprintf(f, "%s_soul_legendary %s %d %d %d\n",
+					depthName, r->key, r->minAnte, r->maxAnte, r->requireNegative);
 		if (r->soulDepth != 1)
 			fprintf(f, "soul_depth %s\n", pool_soul_depth_str(r->soulDepth));
 	}
@@ -1478,7 +2048,8 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			|| snprintf(manifestPath, sizeof manifestPath, "%s.manifest", output) >= (int)sizeof manifestPath) {
 		fprintf(stderr, "output path is too long\n"); return 1;
 	}
-	PoolState state = { .cursor = p->start };
+	PoolState state = { .cursor = p->start, .membershipDigest = POOL_HASH_INIT,
+			.metadataDigest = POOL_HASH_INIT };
 	FILE *out = NULL;
 	bool stateExists = bs_file_exists(statePath);
 	if (p->resume && !stateExists && p->format != POOL_COUNT && bs_file_exists(output)) {
@@ -1513,6 +2084,9 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			if (p->format == POOL_BINARY
 					&& (resumeHeader.catalogHash != p->catalogHash
 						|| resumeHeader.criteriaHash != p->criteriaHash
+						|| (resumeHeader.familyId && resumeHeader.familyId != p->familyId)
+						|| (resumeHeader.segmentId && resumeHeader.segmentId != p->segmentId)
+						|| (resumeHeader.lineageId && resumeHeader.lineageId != p->lineageId)
 						|| resumeHeader.rangeStart != p->outputRangeStart
 						|| resumeHeader.rangeEnd != p->outputRangeEnd
 						|| resumeHeader.records != state.matched
@@ -1522,6 +2096,41 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 										!= state.outputBytes - (uint64_t)p->headerBytes)))) {
 				fprintf(stderr, "output header does not match its resumable state\n");
 				return 1;
+			}
+			FILE *digestFile = fopen(output, "rb");
+			uint64_t committedDigest = 0;
+			uint64_t digestOffset = p->format == POOL_BINARY
+					? (uint64_t)p->headerBytes : 0;
+			uint64_t digestBytes = p->format == POOL_BINARY
+					? resumeHeader.dataBytes : state.outputBytes;
+			bool digestOk = digestFile && pool_hash_fd_region(fileno(digestFile),
+					digestOffset, digestBytes, &committedDigest);
+			if (digestFile) fclose(digestFile);
+			if (!digestOk || (state.membershipDigest
+					&& state.membershipDigest != committedDigest)) {
+				fprintf(stderr, "committed output digest does not match its resumable state\n");
+				return 1;
+			}
+			state.membershipDigest = committedDigest;
+			if (p->format == POOL_BINARY) {
+				FILE *metadataFile = fopen(output, "rb");
+				int64_t metadataFileBytes = metadataFile ? bs_file_size(metadataFile) : -1;
+				BspoolReader metadataReader;
+				uint64_t committedMetadata = 0;
+				bool metadataOk = metadataFile && metadataFileBytes >= 0
+						&& bspool_reader_init(&metadataReader, fileno(metadataFile),
+								&resumeHeader, (uint64_t)metadataFileBytes, err, sizeof err)
+						&& pool_reader_metadata_digest(&metadataReader, &committedMetadata);
+				if (metadataOk) bspool_reader_destroy(&metadataReader);
+				if (metadataFile) fclose(metadataFile);
+				if (!metadataOk || (state.metadataDigest
+						&& state.metadataDigest != committedMetadata)) {
+					fprintf(stderr, "committed metadata digest does not match its resumable state\n");
+					return 1;
+				}
+				state.metadataDigest = committedMetadata;
+			} else {
+				state.metadataDigest = 0;
 			}
 			if (p->format == POOL_BINARY && resumeHeader.complete) {
 				FILE *finished = fopen(output, "rb");
@@ -1579,7 +2188,8 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			if (p->format == POOL_BINARY) {
 				state.outputBytes = (uint64_t)p->headerBytes;
 				if (bs_fseeko(out, p->headerBytes, SEEK_SET) != 0
-						|| !pool_write_header(out, p, 0, 0, 0, err, sizeof err)) {
+						|| !pool_write_header(out, p, 0, 0, state.membershipDigest,
+								state.metadataDigest, state.cursor, 0, err, sizeof err)) {
 					fprintf(stderr, "%s\n", err); fclose(out); return 1;
 				}
 			}
@@ -1603,6 +2213,8 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		PoolScanShared shared;
 		memset(&shared, 0, sizeof shared);
 		shared.g = g; shared.p = p; shared.end = epochEnd; shared.out = out;
+		shared.membershipDigest = &state.membershipDigest;
+		shared.metadataDigest = &state.metadataDigest;
 		atomic_init(&shared.next, state.cursor);
 		atomic_init(&shared.scanned, 0);
 		atomic_init(&shared.matched, 0);
@@ -1641,7 +2253,9 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			if (pos < 0) { fprintf(stderr, "cannot read output position\n"); fclose(out); return 1; }
 			state.outputBytes = (uint64_t)pos;
 			if (!pool_write_header(out, p, state.matched,
-					state.outputBytes - (uint64_t)p->headerBytes, 0, err, sizeof err)) {
+					state.outputBytes - (uint64_t)p->headerBytes,
+					state.membershipDigest, state.metadataDigest,
+					state.cursor, 0, err, sizeof err)) {
 				fprintf(stderr, "%s\n", err); fclose(out); return 1;
 			}
 		}
@@ -1659,10 +2273,13 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		if (p->format == POOL_BINARY && state.done
 				&& !pool_append_index(out, p->outputSchema, p->headerBytes,
 						p->space, state.matched, dataBytes,
+						state.membershipDigest, state.metadataDigest,
 						&state.outputBytes, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); fclose(out); return 1;
 		}
-		if (!pool_write_header(out, p, state.matched, dataBytes, state.done, err, sizeof err)) {
+		if (!pool_write_header(out, p, state.matched, dataBytes,
+				state.membershipDigest, state.metadataDigest,
+				state.cursor, state.done, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); fclose(out); return 1;
 		}
 		if (fclose(out) != 0) { fprintf(stderr, "cannot close output: %s\n", strerror(errno)); return 1; }
@@ -1710,7 +2327,9 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 		PoolTagRule *r = &p->baseTagRules[p->nbaseTagRules++];
 		snprintf(r->key, sizeof r->key, "%s", h.routeTagRules[i].key);
 		r->minAnte = h.routeTagRules[i].minAnte;
+		r->minPhase = h.routeTagRules[i].minPhase;
 		r->maxAnte = h.routeTagRules[i].maxAnte;
+		r->maxPhase = h.routeTagRules[i].maxPhase;
 		r->minCount = h.routeTagRules[i].minCount;
 		r->collect = h.routeTagRules[i].collect;
 		r->poolIndex = pool_find_tag(g, r->key);
@@ -1728,8 +2347,12 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 		PoolLegendaryRule *r = &p->baseLegendaryRules[p->nbaseLegendaryRules++];
 		snprintf(r->key, sizeof r->key, "%s", h.routeLegendRules[i].key);
 		r->minAnte = h.routeLegendRules[i].minAnte;
+		r->minPhase = h.routeLegendRules[i].minPhase;
 		r->maxAnte = h.routeLegendRules[i].maxAnte;
+		r->maxPhase = h.routeLegendRules[i].maxPhase;
 		r->requireNegative = h.routeLegendRules[i].neg;
+		r->source = h.routeLegendRules[i].source;
+		r->humanLocation = h.routeLegendRules[i].humanLocation;
 		r->soulDepth = h.routeLegendRules[i].soulDepth;
 		r->used = 1;
 		r->poolIndex = pool_find_legendary(g, r->key);
@@ -1737,7 +2360,9 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 			snprintf(err, errsz, "source legendary %s is unavailable in this snapshot", r->key);
 			fclose(f); return false;
 		}
-		if (r->maxAnte > p->maxAnte) p->maxAnte = r->maxAnte;
+		int rngMax = r->maxAnte + (r->humanLocation
+				&& r->maxPhase == SOUL_PHASE_BOSS ? 1 : 0);
+		if (rngMax > p->maxAnte) p->maxAnte = rngMax;
 		/* Static conflicts are only provable between exact-depth rules: an
 		 * either-depth rule can settle on whichever Soul the other rule does
 		 * not claim, so those combinations are left to evaluation. */
@@ -1745,8 +2370,19 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 			const PoolLegendaryRule *cur = &p->legendary[j];
 			if (cur->soulDepth == SOUL_DEPTH_ANY || r->soulDepth == SOUL_DEPTH_ANY) continue;
 			if (cur->soulDepth != r->soulDepth) continue;
-			if (strcmp(cur->key, r->key)
-					|| cur->maxAnte < r->minAnte || r->maxAnte < cur->minAnte) {
+			int conflict = strcmp(cur->key, r->key) != 0;
+			if (!conflict && cur->humanLocation == r->humanLocation) {
+				if (r->humanLocation) {
+					conflict = pool_route_position(cur->maxAnte, cur->maxPhase)
+							< pool_route_position(r->minAnte, r->minPhase)
+						|| pool_route_position(r->maxAnte, r->maxPhase)
+							< pool_route_position(cur->minAnte, cur->minPhase)
+						|| (cur->source && r->source && cur->source != r->source);
+				} else {
+					conflict = cur->maxAnte < r->minAnte || r->maxAnte < cur->minAnte;
+				}
+			}
+			if (conflict) {
 				snprintf(err, errsz,
 						"new and source rules conflict for Soul #%d", r->soulDepth);
 				fclose(f); return false;
@@ -1768,28 +2404,116 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 	int64_t size = bs_file_size(f);
 	if (size < 0 || (h.encoding == BSPOOL_ENCODING_U64
 			&& (uint64_t)size < (uint64_t)h.headerBytes + h.records * 8u)
-			|| !bspool_reader_init(&p->inputReader, fileno(f), &h,
+			) {
+		if (!err[0]) snprintf(err, errsz, "input pool size does not match its committed record count");
+		fclose(f); return false;
+	}
+	BspoolReader liveReader;
+	if (!bspool_reader_init(&liveReader, fileno(f), &h,
 					(uint64_t)(size < 0 ? 0 : size), err, errsz)) {
 		if (!err[0]) snprintf(err, errsz, "input pool size does not match its committed record count");
 		fclose(f); return false;
 	}
 	if (!h.records) {
 		snprintf(err, errsz, "input pool has no seed records");
-		bspool_reader_destroy(&p->inputReader);
+		bspool_reader_destroy(&liveReader);
+		fclose(f); return false;
+	}
+	uint64_t sourceFamilyId = h.familyId ? h.familyId
+			: pool_hash_fields("family-fallback", h.catalogHash, h.criteriaHash,
+					(uint64_t)h.space, h.seedspace);
+	uint64_t sourceLineageId = h.lineageId ? h.lineageId
+			: pool_hash_fields("lineage-fallback", sourceFamilyId, h.criteriaHash, 0, 0);
+	uint64_t sourceSegmentId = h.segmentId ? h.segmentId
+			: pool_hash_fields("segment", sourceLineageId, h.rangeStart, h.rangeEnd,
+					(uint64_t)h.space);
+	uint64_t pinnedRecords = h.records;
+	uint64_t pinnedDataBytes = h.encoding == BSPOOL_ENCODING_U64
+			? h.records * 8u : h.dataBytes;
+	uint64_t pinnedSnapshotId = h.snapshotId;
+	int pinnedComplete = h.complete, pinnedCoverageComplete = h.coverageComplete;
+	char pinnedPoolId[24];
+	snprintf(pinnedPoolId, sizeof pinnedPoolId, "%s", h.poolId);
+	char outputState[1024];
+	bool hasResumeOutput = snprintf(outputState, sizeof outputState, "%s.state", output)
+			< (int)sizeof outputState && p->resume && bs_file_exists(output)
+			&& bs_file_exists(outputState);
+	if (hasResumeOutput) {
+		FILE *priorFile = fopen(output, "rb");
+		BspoolHeader prior;
+		bool priorOk = priorFile && bspool_read_header(priorFile, &prior, err, errsz);
+		if (priorFile) fclose(priorFile);
+		if (!priorOk) {
+			bspool_reader_destroy(&liveReader); fclose(f); return false;
+		}
+		pinnedRecords = prior.parentRecords ? prior.parentRecords : prior.sourceRecords;
+		if (!pinnedRecords || pinnedRecords > h.records) {
+			snprintf(err, errsz, "resumable refilter source prefix is no longer available");
+			bspool_reader_destroy(&liveReader); fclose(f); return false;
+		}
+		if (prior.parentSegmentId && prior.parentSegmentId != sourceSegmentId) {
+			snprintf(err, errsz, "resumable refilter belongs to a different source segment");
+			bspool_reader_destroy(&liveReader); fclose(f); return false;
+		}
+		pinnedDataBytes = prior.parentDataBytes;
+		if (!pinnedDataBytes && !pool_reader_prefix_bytes(&liveReader, h.encoding,
+				pinnedRecords, &pinnedDataBytes)) {
+			snprintf(err, errsz, "cannot recover the resumable source block boundary");
+			bspool_reader_destroy(&liveReader); fclose(f); return false;
+		}
+		pinnedSnapshotId = prior.parentSnapshotId;
+		pinnedComplete = prior.sourceComplete;
+		pinnedCoverageComplete = prior.sourceCoverageComplete;
+		if (prior.sourcePoolId[0])
+			snprintf(pinnedPoolId, sizeof pinnedPoolId, "%s", prior.sourcePoolId);
+	}
+	uint64_t liveDataBytes = h.encoding == BSPOOL_ENCODING_U64 ? h.records * 8u : h.dataBytes;
+	if (pinnedDataBytes > liveDataBytes) {
+		snprintf(err, errsz, "resumable refilter source data prefix was truncated");
+		bspool_reader_destroy(&liveReader); fclose(f); return false;
+	}
+	uint64_t pinnedDigest = 0;
+	if (!pool_hash_fd_region(fileno(f), (uint64_t)h.headerBytes,
+			pinnedDataBytes, &pinnedDigest)) {
+		snprintf(err, errsz, "cannot fingerprint the committed source prefix");
+		bspool_reader_destroy(&liveReader); fclose(f); return false;
+	}
+	uint64_t expectedSnapshotId = pool_hash_fields("snapshot", sourceSegmentId,
+			pinnedRecords, pinnedDataBytes, pinnedDigest);
+	if ((pinnedSnapshotId && pinnedSnapshotId != expectedSnapshotId)
+			|| (pinnedRecords == h.records && h.membershipDigest
+					&& h.membershipDigest != pinnedDigest)) {
+		snprintf(err, errsz, "committed source prefix digest differs from the pinned snapshot");
+		bspool_reader_destroy(&liveReader); fclose(f); return false;
+	}
+	pinnedSnapshotId = expectedSnapshotId;
+	BspoolHeader pinned = h;
+	pinned.records = pinnedRecords;
+	pinned.dataBytes = pinnedDataBytes;
+	if (pinned.encoding != BSPOOL_ENCODING_U64) pinned.complete = 0;
+	bspool_reader_destroy(&liveReader);
+	if (!bspool_reader_init(&p->inputReader, fileno(f), &pinned,
+			(uint64_t)size, err, errsz)) {
 		fclose(f); return false;
 	}
 	p->refilter = 1;
 	p->refilterDepth = h.refilterDepth + 1;
 	p->sourceCriteriaHash = h.criteriaHash;
-	p->sourceRecords = h.records;
+	p->sourceRecords = pinnedRecords;
 	p->sourceRangeStart = h.rangeStart;
 	p->sourceRangeEnd = h.rangeEnd;
-	p->sourceComplete = h.complete;
-	p->sourceCoverageComplete = h.coverageComplete;
-	snprintf(p->sourcePoolId, sizeof p->sourcePoolId, "%s", h.poolId);
+	p->sourceDataBytes = pinnedDataBytes;
+	p->sourceMembershipDigest = pinnedDigest;
+	p->sourceSnapshotId = pinnedSnapshotId;
+	p->sourceFamilyId = sourceFamilyId;
+	p->sourceSegmentId = sourceSegmentId;
+	p->sourceLineageId = sourceLineageId;
+	p->sourceComplete = pinnedComplete;
+	p->sourceCoverageComplete = pinnedCoverageComplete;
+	snprintf(p->sourcePoolId, sizeof p->sourcePoolId, "%s", pinnedPoolId);
 	p->space = h.space;
 	p->start = 0;
-	p->count = h.records;
+	p->count = pinnedRecords;
 	p->countAll = 0;
 	p->outputRangeStart = h.rangeStart;
 	p->outputRangeEnd = h.rangeEnd;
@@ -1817,7 +2541,7 @@ static int pool_mode_fixture(const Config *g, const PoolPlan *p, const char *see
 		memcpy(seed, line, slen); seed[slen] = 0;
 		double hs = pseudohash_ks("", seed);
 		double hf = pseudohash_ks(p->firstKey, seed);
-		bool ok = pool_evaluate_pre(c, seed, hs, hf, label, sizeof label);
+		bool ok = pool_evaluate_pre(c, seed, hs, hf, label, sizeof label, NULL);
 		printf("%s %d %s\n", seed, ok ? 1 : 0, ok && label[0] ? label : "-");
 	}
 	free(c);
@@ -1880,6 +2604,8 @@ typedef struct {
 	uint64_t rangeStart, rangeEnd;
 	const char *poolId, *label;
 	int mergedParts;
+	uint64_t familyId, segmentId, stageHash, lineageId, derivationId;
+	uint64_t snapshotId, membershipDigest, metadataDigest, scanCursor;
 } PoolHeaderRewrite;
 
 static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
@@ -1921,7 +2647,17 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 		else if (rewrite && rewrite->overrideRange
 				&& (!strcmp(d, "range_start") || !strcmp(d, "range_end")
 					|| !strcmp(d, "pool_id") || !strcmp(d, "label")
-					|| !strcmp(d, "merged_parts"))) replacement = NULL;
+					|| !strcmp(d, "merged_parts") || !strcmp(d, "family_id")
+					|| !strcmp(d, "segment_id") || !strcmp(d, "stage_hash")
+					|| !strcmp(d, "lineage_id") || !strcmp(d, "derivation_id")
+					|| !strcmp(d, "snapshot_id") || !strcmp(d, "membership_digest")
+					|| !strcmp(d, "metadata_digest") || !strcmp(d, "scan_cursor")
+					|| !strcmp(d, "input_cursor") || !strcmp(d, "parent_snapshot_id")
+					|| !strcmp(d, "parent_segment_id") || !strcmp(d, "parent_records")
+					|| !strcmp(d, "parent_data_bytes")
+					|| !strcmp(d, "parent_coverage_complete")
+					|| !strcmp(d, "input_record_start") || !strcmp(d, "input_record_end")
+					|| !strcmp(d, "shard_index") || !strcmp(d, "shard_total"))) replacement = NULL;
 		else replacement = line;
 		if (replacement) {
 			size_t n = strlen(replacement);
@@ -1931,12 +2667,18 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 		line = nl ? nl + 1 : NULL;
 	}
 	if (rewrite && rewrite->overrideRange) {
-		char merged[384];
+		char merged[768];
 		int m = snprintf(merged, sizeof merged,
-				"range_start %" PRIu64 "\nrange_end %" PRIu64 "\npool_id %s\nlabel %s\nmerged_parts %d\n",
+				"range_start %" PRIu64 "\nrange_end %" PRIu64 "\npool_id %s\nlabel %s\nmerged_parts %d\n"
+				"family_id %016" PRIx64 "\nsegment_id %016" PRIx64 "\nstage_hash %016" PRIx64 "\n"
+				"lineage_id %016" PRIx64 "\nderivation_id %016" PRIx64 "\nsnapshot_id %016" PRIx64 "\n"
+				"membership_digest %016" PRIx64 "\nmetadata_digest %016" PRIx64 "\nscan_cursor %" PRIu64 "\n",
 				rewrite->rangeStart, rewrite->rangeEnd,
 				rewrite->poolId ? rewrite->poolId : "-",
-				rewrite->label ? rewrite->label : "merged-pool", rewrite->mergedParts);
+				rewrite->label ? rewrite->label : "merged-pool", rewrite->mergedParts,
+				rewrite->familyId, rewrite->segmentId, rewrite->stageHash,
+				rewrite->lineageId, rewrite->derivationId, rewrite->snapshotId,
+				rewrite->membershipDigest, rewrite->metadataDigest, rewrite->scanCursor);
 		if (m < 0 || (size_t)m > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "merged pool header overflow"); return false; }
 		memcpy(out + used, merged, (size_t)m); used += (size_t)m;
 	}
@@ -2018,7 +2760,8 @@ static int pool_mode_convert(const char *input, const char *output) {
 		uint64_t finalBytes = 0;
 		if (dataEnd < POOL_HEADER_SIZE || !pool_append_index(out, BSPOOL_SCHEMA_BLOCKS,
 				POOL_HEADER_SIZE, h.space, h.records,
-				(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err)
+				(uint64_t)dataEnd - POOL_HEADER_SIZE, 0, 0,
+				&finalBytes, err, sizeof err)
 				|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
 						BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE, h.records,
 						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, h.coverageComplete,
@@ -2079,7 +2822,8 @@ static void pool_output_label(const char *path, char out[136]) {
 }
 
 static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
-		uint64_t *written, char *err, size_t errsz) {
+		uint64_t *written, uint64_t *membershipDigest, uint64_t *metadataDigest,
+		char *err, size_t errsz) {
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
 	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS
 			|| part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
@@ -2100,6 +2844,11 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					|| (e->payloadBytes && fwrite(scratch.bytes, 1, e->payloadBytes, out) != e->payloadBytes)) {
 				snprintf(err, errsz, "cannot copy verified block from %s", part->path); goto fail;
 			}
+			*membershipDigest = pool_hash_update(*membershipDigest, header, headerBytes);
+			*membershipDigest = pool_hash_update(*membershipDigest, scratch.bytes, e->payloadBytes);
+			if (part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS)
+				*metadataDigest = pool_hash_update(*metadataDigest,
+						scratch.bytes + e->rankBytes, e->metadataBytes);
 			*written += e->count;
 		}
 	} else {
@@ -2120,6 +2869,8 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					|| fwrite(encoded, 1, payload, out) != payload) {
 				snprintf(err, errsz, "cannot write merged output"); goto fail;
 			}
+			*membershipDigest = pool_hash_update(*membershipDigest, header, sizeof header);
+			*membershipDigest = pool_hash_update(*membershipDigest, encoded, payload);
 			record += n; *written += n;
 		}
 	}
@@ -2197,7 +2948,10 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 		const BspoolHeader *a = &parts[0].header, *b = &parts[i].header;
 		if (b->modelver != a->modelver || b->catalogHash != a->catalogHash
 				|| b->criteriaHash != a->criteriaHash || b->space != a->space
-				|| b->seedspace != a->seedspace || b->route != a->route) {
+				|| b->seedspace != a->seedspace || b->route != a->route
+				|| (a->familyId && b->familyId && a->familyId != b->familyId)
+				|| (a->stageHash && b->stageHash && a->stageHash != b->stageHash)
+				|| (a->lineageId && b->lineageId && a->lineageId != b->lineageId)) {
 			snprintf(err, sizeof err, "%s is not compatible with %s (model, profile, space, or criteria differ)",
 					parts[i].path, parts[0].path); goto done;
 		}
@@ -2236,14 +2990,40 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 	}
 	FILE *out = fopen(output, "w+b");
 	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
-	PoolHeaderRewrite rewrite = { 1, rangeStart, rangeEnd, poolId, label, mergedParts };
+	uint64_t familyId = parts[0].header.familyId ? parts[0].header.familyId
+			: pool_hash_fields("family-fallback", parts[0].header.catalogHash,
+					parts[0].header.criteriaHash, (uint64_t)parts[0].header.space,
+					parts[0].header.seedspace);
+	uint64_t stageHash = parts[0].header.stageHash ? parts[0].header.stageHash
+			: parts[0].header.criteriaHash;
+	uint64_t lineageId = parts[0].header.lineageId ? parts[0].header.lineageId
+			: pool_hash_fields("lineage-fallback", familyId,
+					parts[0].header.criteriaHash, 0, 0);
+	uint64_t segmentId = pool_hash_fields("segment", lineageId, rangeStart,
+			rangeEnd, (uint64_t)parts[0].header.space);
+	PoolHeaderRewrite rewrite = {
+		.overrideRange = 1, .rangeStart = rangeStart, .rangeEnd = rangeEnd,
+		.poolId = poolId, .label = label, .mergedParts = mergedParts,
+		.familyId = familyId, .segmentId = segmentId, .stageHash = stageHash,
+		.lineageId = lineageId,
+		.derivationId = pool_hash_fields("derive-merge", lineageId, segmentId,
+				(uint64_t)mergedParts, totalRecords),
+		.membershipDigest = POOL_HASH_INIT,
+		.metadataDigest = outputSchema == BSPOOL_SCHEMA_EVENTS ? POOL_HASH_INIT : 0,
+		.scanCursor = rangeEnd,
+	};
+	rewrite.snapshotId = pool_hash_fields("snapshot", segmentId, totalRecords, 0,
+			rewrite.membershipDigest);
 	if (bs_fseeko(out, outputHeaderBytes, SEEK_SET) != 0
 			|| !pool_write_repacked_header(out, original, outputHeaderBytes,
 					outputSchema, outputHeaderBytes, totalRecords, 0, 0, 0,
 					&rewrite, err, sizeof err)) { fclose(out); remove(output); goto done; }
 	uint64_t written = 0;
+	uint64_t membershipDigest = POOL_HASH_INIT;
+	uint64_t metadataDigest = outputSchema == BSPOOL_SCHEMA_EVENTS ? POOL_HASH_INIT : 0;
 	for (int i = 0; i < ninputs; i++) {
-		if (!pool_merge_write_part(out, &parts[i], &written, err, sizeof err)) {
+		if (!pool_merge_write_part(out, &parts[i], &written,
+				&membershipDigest, &metadataDigest, err, sizeof err)) {
 			fclose(out); remove(output); goto done;
 		}
 		fprintf(stderr, "merged=%d/%d records=%" PRIu64 "/%" PRIu64 "\n",
@@ -2251,12 +3031,19 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 	}
 	int64_t dataEnd = bs_ftello(out);
 	uint64_t finalBytes = 0;
+	uint64_t mergedDataBytes = dataEnd >= outputHeaderBytes
+			? (uint64_t)dataEnd - (uint64_t)outputHeaderBytes : 0;
+	rewrite.membershipDigest = membershipDigest;
+	rewrite.metadataDigest = metadataDigest;
+	rewrite.snapshotId = pool_hash_fields("snapshot", segmentId, totalRecords,
+			mergedDataBytes, membershipDigest);
 	/* Do not allow short-circuiting to skip fclose: Windows cannot remove a
 	 * failed output while it is open. */
 	bool finalOk = written == totalRecords && dataEnd >= outputHeaderBytes;
 	if (finalOk) finalOk = pool_append_index(out, outputSchema,
 			outputHeaderBytes, parts[0].header.space, totalRecords,
-			(uint64_t)dataEnd - (uint64_t)outputHeaderBytes, &finalBytes, err, sizeof err);
+			mergedDataBytes, membershipDigest, metadataDigest,
+			&finalBytes, err, sizeof err);
 	if (finalOk) finalOk = pool_write_repacked_header(out, original, outputHeaderBytes,
 			outputSchema, outputHeaderBytes, totalRecords,
 			(uint64_t)dataEnd - (uint64_t)outputHeaderBytes, 1, 1,
@@ -2334,6 +3121,7 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	plan.criteriaHash = pool_hash_plan(&plan);
+	pool_set_identity(&plan);
 	if (!strcmp(argv[1], "scan")) return pool_mode_scan(&catalog, &plan, argv[4]);
 	if (refilter) {
 		int rc = pool_mode_scan(&catalog, &plan, argv[5]);
