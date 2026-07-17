@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
 	newctx.g = &catalog;
 	newctx.p = &plan;
 	uint64_t count = strtoull(argv[3], NULL, 10);
+	uint64_t intentionalExtensions = 0;
 	for (uint64_t rank = 0; rank < count; rank++) {
 		char seed[9], label[POOL_LABEL];
 		make_seed(rank, seed);
@@ -58,11 +59,22 @@ int main(int argc, char **argv) {
 				pseudohash_ks("", seed), pseudohash_ks(plan.firstKey, seed),
 				label, sizeof label, NULL);
 		if (oldok != newok) {
+			/* The standalone builder now deliberately extends Model-3 with
+			 * targeted Charm and minimum-purchase Omen branches. A positive
+			 * result explicitly labels either route; every other verdict must
+			 * remain byte-for-byte compatible with the established evaluator. */
+			if (!oldok && newok && (strstr(label, "CharmRequired=")
+					|| strstr(label, "BuyRoute="))) {
+				intentionalExtensions++;
+				continue;
+			}
 			fprintf(stderr, "mismatch rank=%" PRIu64 " seed=%s legacy=%d pool=%d label=%s\n",
 					rank, seed, oldok, newok, label);
 			return 1;
 		}
 	}
-	printf("PASS: pool/Model-3 compatibility across %" PRIu64 " seeds\n", count);
+	printf("PASS: pool/Model-3 compatibility across %" PRIu64
+			" seeds (+%" PRIu64 " labeled Charm/Omen extensions)\n",
+			count, intentionalExtensions);
 	return 0;
 }

@@ -165,6 +165,7 @@ function Brainstorm.passesAllFilters(seed_found)
 		Brainstorm.skipsFromFilters(tagLoc)
 	local finalSkipSm, finalSkipBig = filterSkipSm, filterSkipBig
 	local finalRewardSm, finalRewardBig = filterRewardSm, filterRewardBig
+	local finalVoucherRoute = nil
 	if ar.seedPoolFile and ar.seedPoolFile ~= "" and Brainstorm.readPoolHeader then
 		local poolPath = Brainstorm.seedPoolPath and Brainstorm.seedPoolPath()
 		local poolHeader = poolPath and Brainstorm.readPoolHeader(poolPath)
@@ -174,7 +175,8 @@ function Brainstorm.passesAllFilters(seed_found)
 		-- Rewind so the pool's embedded rules replay the same per-blind rolls
 		-- from the beginning, then rewind once more for downstream overlays.
 		Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
-		poolOK, finalSkipSm, finalSkipBig, finalRewardSm, finalRewardBig =
+		poolOK, finalSkipSm, finalSkipBig, finalRewardSm, finalRewardBig,
+			finalVoucherRoute =
 			Brainstorm.evaluatePoolCriteria(seed_found, poolHeader,
 				filterSkipSm, filterSkipBig, filterRewardSm, filterRewardBig)
 		if not poolOK then return false end
@@ -188,7 +190,14 @@ function Brainstorm.passesAllFilters(seed_found)
 	-- Spectral packs for the run's FIRST Soul (see checkLegendaryAnywhere).
 	local legLoc = nil
 	if legAnywhere then
-		local ok, loc = Brainstorm.checkLegendaryAnywhere(seed_found, ar.searchLegendary, ar.searchNegativeLegendary)
+		local ok, loc = Brainstorm.checkLegendaryAnywhere(seed_found,
+			ar.searchLegendary, ar.searchNegativeLegendary, finalVoucherRoute)
+		if not ok then
+			ok, loc, finalSkipSm, finalSkipBig, finalRewardSm, finalRewardBig =
+				Brainstorm.tryTargetedCharmLegendary(seed_found, ar.searchLegendary,
+					ar.searchNegativeLegendary, finalSkipSm, finalSkipBig,
+					finalRewardSm, finalRewardBig, finalVoucherRoute)
+		end
 		if not ok then return false end
 		legLoc = loc
 	end
@@ -340,37 +349,29 @@ end
 --   * Pool = base vouchers only; upgraded vouchers (v.requires) stay UNAVAILABLE
 --     (prereq not in used_vouchers). ~half the 32-entry pool is UNAVAILABLE, so
 --     resamples are common (ante 1 above resampled 4x before landing).
---   * get_current_pool also excludes any voucher still in the shop
---     (G.shop_vouchers) or already redeemed (used_vouchers). Under "redeem
---     nothing" that means each ante N>=2 excludes ante N-1's voucher (still on
---     offer). We mirror that by blanking prev's slot; ante 1 excludes nothing.
---     Confirmed live at ante 1 and a couple of ante 2+ spot-checks (Ctrl+B).
+--   * An unredeemed voucher remains eligible on the next normal roll. The old
+--     shop and its voucher CardArea are destroyed before the Boss transition
+--     calls get_next_voucher_key(), so G.shop_vouchers no longer excludes the
+--     previous offer. Only redeemed/starting-owned vouchers are removed.
 function Brainstorm.rollVoucherSequence(seed_found, max_ante)
 	local base = Brainstorm.getVoucherCulledPool()
 	local out = {}
-	local prev = nil
 	for ante = 1, max_ante do
-		local pool = base
-		if prev then
-			pool = {}
-			for i = 1, #base do pool[i] = (base[i] == prev) and 'UNAVAILABLE' or base[i] end
-		end
 		local key = 'Voucher' .. ante
-		local chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(key .. seed_found))
+		local chosen = pseudorandom_element(base, Brainstorm.pseudoseed(key .. seed_found))
 		local it = 1
 		while chosen == 'UNAVAILABLE' do
 			it = it + 1
-			chosen = pseudorandom_element(pool, Brainstorm.pseudoseed(key .. '_resample' .. it .. seed_found))
+			chosen = pseudorandom_element(base, Brainstorm.pseudoseed(key .. '_resample' .. it .. seed_found))
 		end
 		out[ante] = chosen
-		prev = chosen
 	end
 	return out
 end
 
 -- ante_mode: 1-8 requires the target voucher at exactly that ante; 0 = any of
 -- 1-4; -1 = any of 1-8. Deeper antes use the same per-ante 'Voucher'..ante
--- keys + redeem-nothing blanking the 1-4 model was verified with.
+-- keys. Skipping an offer does not remove it from later pools.
 function Brainstorm.checkVoucherSearch(seed_found, target_key, ante_mode)
 	ante_mode = ante_mode or 1
 	local any_to = (ante_mode == 0 and 4) or (ante_mode == -1 and 8) or nil
@@ -1103,7 +1104,8 @@ end
 -- offer; CharmSm/Big or EtherealSm/Big is the immediate reward at that blind.
 -- Use the first Soul encountered on that route.
 -- ===========================================================================
-function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negative)
+function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negative,
+		voucherRoute)
 	if G.GAME.banned_keys and G.GAME.banned_keys.c_soul then return false end
 	for ante = 1, 8 do
 		local packs = Brainstorm.getSoulPackEvents(seed_found, ante)
@@ -1113,15 +1115,22 @@ function Brainstorm.checkLegendaryAnywhere(seed_found, target_key, require_negat
 			local center = packEvent.center
 			local kind = center and not center.forced and center.kind or nil
 			if kind == 'Arcana' or kind == 'Spectral' then
-				local stype = (kind == 'Arcana') and 'Tarot' or 'Spectral'
 				local ncards = Brainstorm.packCardCount(center)
 				local soul_in_pack, bh_in_pack = false, false
 				for card = 1, ncards do
+					local contentKind = kind
+					if kind == 'Arcana'
+							and Brainstorm.omenOwnedForSoulEvent(voucherRoute, packEvent)
+							and pseudorandom(Brainstorm.pseudoseed(
+								'omen_globe' .. seed_found)) > 0.8 then
+						contentKind = 'Spectral'
+					end
+					local stype = (contentKind == 'Arcana') and 'Tarot' or 'Spectral'
 					local soul = false
 					if not soul_in_pack then
 						soul = pseudorandom(Brainstorm.pseudoseed('soul_' .. stype .. ante .. seed_found)) > 0.997
 					end
-					if kind == 'Spectral' and not bh_in_pack then
+					if contentKind == 'Spectral' and not bh_in_pack then
 						local bh = pseudorandom(Brainstorm.pseudoseed('soul_' .. stype .. ante .. seed_found)) > 0.997
 						if bh then
 							if not (G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) then
@@ -1359,6 +1368,283 @@ function Brainstorm.mergeRewardRoutes(a, b)
 	return out
 end
 
+local POOL_PHASE_ORDER = { small = 0, big = 1, boss = 2 }
+
+function Brainstorm.poolRoutePosition(ante, phase)
+	local order = POOL_PHASE_ORDER[phase]
+	if not ante or not order then return nil end
+	return (ante - 1) * 3 + order
+end
+
+function Brainstorm.poolLocationInRange(ante, phase, rule)
+	local at = Brainstorm.poolRoutePosition(ante, phase)
+	local first = Brainstorm.poolRoutePosition(rule.minAnte, rule.minPhase or "small")
+	local last = Brainstorm.poolRoutePosition(rule.maxAnte, rule.maxPhase or "big")
+	return at and first and last and at >= first and at <= last
+end
+
+-- Omen is active for every Arcana card at or after the shop where it was
+-- purchased. A pool voucher route carries the minimum fresh-run purchase
+-- schedule; ordinary active filters fall back to the run's starting state.
+function Brainstorm.omenOwnedForSoulEvent(route, event)
+	if route and route.initialOwned and route.initialOwned.v_omen_globe then return true end
+	if not route and G.GAME.used_vouchers and G.GAME.used_vouchers.v_omen_globe then
+		return true
+	end
+	local purchase = route and route.purchase and route.purchase.v_omen_globe
+	if not purchase or purchase.visit ~= 1 then return false end
+	local ante, phase
+	if purchase.ante == 1 then
+		ante = 1
+		phase = route.skipSm and route.skipSm[1] and "big" or "small"
+	elseif purchase.ante and purchase.ante >= 2 then
+		ante, phase = purchase.ante - 1, "boss"
+	else
+		return false
+	end
+	local boughtAt = Brainstorm.poolRoutePosition(ante, phase)
+	local eventAt = Brainstorm.poolRoutePosition(event.humanAnte, event.phase)
+	return boughtAt and eventAt and eventAt >= boughtAt
+end
+
+-- If the canonical pack route misses an active Legendary-Anywhere target,
+-- try each actually rolled Charm tag as one additional skip. Each branch gets
+-- a fresh RNG state, so a failed hypothetical never advances the canonical
+-- run or the next candidate branch.
+function Brainstorm.tryTargetedCharmLegendary(seed_found, target_key,
+		require_negative, baseSm, baseBig, baseRewardSm, baseRewardBig, voucherRoute)
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+	local rolls = {}
+	for ante = 1, 8 do
+		rolls[ante] = {
+			Brainstorm.rollTag(seed_found, ante),
+			Brainstorm.rollTag(seed_found, ante),
+		}
+	end
+	for ante = 1, 8 do
+		for blind = 1, 2 do
+			local alreadySkipped = (blind == 1 and baseSm and baseSm[ante])
+				or (blind == 2 and baseBig and baseBig[ante])
+			if rolls[ante][blind] == "tag_charm" and not alreadySkipped then
+				local branchSm = Brainstorm.mergeSkipRoutes(baseSm,
+					blind == 1 and { [ante] = true } or nil)
+				local branchBig = Brainstorm.mergeSkipRoutes(baseBig,
+					blind == 2 and { [ante] = true } or nil)
+				local branchRewardSm = Brainstorm.mergeRewardRoutes(baseRewardSm,
+					blind == 1 and { [ante] = "tag_charm" } or nil)
+				local branchRewardBig = Brainstorm.mergeRewardRoutes(baseRewardBig,
+					blind == 2 and { [ante] = "tag_charm" } or nil)
+				Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+				Brainstorm.setPackSkipAssumption(seed_found, branchSm, branchBig,
+					branchRewardSm, branchRewardBig)
+				local oldRouteSm, oldRouteBig
+				if voucherRoute then
+					oldRouteSm, oldRouteBig = voucherRoute.skipSm, voucherRoute.skipBig
+					voucherRoute.skipSm, voucherRoute.skipBig = branchSm, branchBig
+				end
+				local ok, loc = Brainstorm.checkLegendaryAnywhere(seed_found,
+					target_key, require_negative, voucherRoute)
+				if ok then
+					return true, loc, branchSm, branchBig,
+						branchRewardSm, branchRewardBig
+				end
+				if voucherRoute then
+					voucherRoute.skipSm, voucherRoute.skipBig = oldRouteSm, oldRouteBig
+				end
+			end
+		end
+	end
+	return false
+end
+
+function Brainstorm.startingVoucherSet()
+	local owned = {}
+	local backConfig = G.GAME.selected_back and G.GAME.selected_back.effect
+		and G.GAME.selected_back.effect.config
+	if backConfig then
+		if type(backConfig.voucher) == "string" then owned[backConfig.voucher] = true end
+		if type(backConfig.vouchers) == "table" then
+			for _, key in pairs(backConfig.vouchers) do
+				if type(key) == "string" then owned[key] = true end
+			end
+		end
+	end
+	local challenge = G.GAME.challenge_tab
+	if challenge and type(challenge.vouchers) == "table" then
+		for _, voucher in ipairs(challenge.vouchers) do
+			local key = type(voucher) == "table" and (voucher.id or voucher.key) or voucher
+			if type(key) == "string" then owned[key] = true end
+		end
+	end
+	return owned
+end
+
+local function poolCopyTable(value)
+	local out = {}
+	for key, item in pairs(value or {}) do out[key] = item end
+	return out
+end
+
+local function poolCopyPurchase(value)
+	local out = {}
+	for key, item in pairs(value or {}) do
+		out[key] = { ante = item.ante, visit = item.visit }
+	end
+	return out
+end
+
+local function poolVoucherCatalog()
+	local centers = (G.P_CENTER_POOLS and G.P_CENTER_POOLS.Voucher) or {}
+	local keys = {}
+	for _, center in ipairs(centers) do keys[center.key] = true end
+	local flags = G.GAME.pool_flags or {}
+	local banned = G.GAME.banned_keys or {}
+	local catalog, byKey = {}, {}
+	for index, center in ipairs(centers) do
+		local eligible = center.unlocked ~= false and not banned[center.key]
+		if center.no_pool_flag and flags[center.no_pool_flag] then eligible = false end
+		if center.yes_pool_flag and not flags[center.yes_pool_flag] then eligible = false end
+		local prerequisite
+		if center.requires then
+			if type(center.requires) == "table" and #center.requires == 1
+					and keys[center.requires[1]] then
+				prerequisite = center.requires[1]
+			else
+				eligible = false
+			end
+		end
+		catalog[index] = { key = center.key, eligible = eligible,
+			prerequisite = prerequisite }
+		byKey[center.key] = catalog[index]
+	end
+	return catalog, byKey
+end
+
+-- Find the deterministic minimum-purchase route that satisfies all voucher
+-- occurrence windows embedded in a pool. Skip edges run first, so equal-cost
+-- routes resolve exactly like both native engines. Exclusions forbid buying an
+-- offer, not seeing it. `legendPass`, when supplied, is evaluated at a leaf and
+-- lets Omen timing participate in the same route search.
+function Brainstorm.findPoolVoucherRoute(seed_found, header, skipSm, skipBig, options)
+	options = options or {}
+	local rules = header.pool_vouchers or {}
+	local exclusions = {}
+	for _, key in ipairs(header.pool_voucher_exclusions or {}) do exclusions[key] = true end
+	local catalog, byKey = poolVoucherCatalog()
+	local initial = Brainstorm.startingVoucherSet()
+	for _, rule in ipairs(rules) do if not byKey[rule.key] then return nil end end
+	if options.requireOmen and not byKey.v_omen_globe and not initial.v_omen_globe then
+		return nil
+	end
+	-- No voucher predicate and no requested Omen purchase means the minimum
+	-- route buys nothing. Validate a requested Soul branch immediately so a
+	-- challenge with every voucher banned/already owned does not reject an
+	-- otherwise valid canonical or targeted-Charm route.
+	if #rules == 0 and not options.requireOmen then
+		local route = { initialOwned = initial, owned = poolCopyTable(initial),
+			purchase = {}, purchases = 0, skipSm = skipSm, skipBig = skipBig }
+		if options.requireSouls then
+			if not options.legendPass then return nil end
+			local saved = poolCopyTable(Brainstorm.random_state)
+			local passed = options.legendPass(route)
+			Brainstorm.random_state = saved
+			if not passed then return nil end
+		end
+		return route
+	end
+
+	local maxAnte = options.maxAnte or 1
+	for _, rule in ipairs(rules) do if rule.maxAnte > maxAnte then maxAnte = rule.maxAnte end end
+	if maxAnte < 1 or maxAnte > 8 then return nil end
+	local purchased = poolCopyTable(initial)
+	local best
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+
+	local function rollVoucher(ante, owned)
+		local available, any = {}, false
+		for index, item in ipairs(catalog) do
+			local ok = item.eligible and not owned[item.key]
+				and (not item.prerequisite or owned[item.prerequisite])
+			available[index] = ok and item.key or "UNAVAILABLE"
+			if ok then any = true end
+		end
+		if not any then return nil end
+		local stream = "Voucher" .. ante
+		local chosen = pseudorandom_element(available,
+			Brainstorm.pseudoseed(stream .. seed_found))
+		local iteration = 1
+		while chosen == "UNAVAILABLE" do
+			iteration = iteration + 1
+			chosen = pseudorandom_element(available,
+				Brainstorm.pseudoseed(stream .. "_resample" .. iteration .. seed_found))
+		end
+		return chosen
+	end
+
+	local function search(ante, owned, matched, matchedCount, purchases,
+			purchase, visits)
+		if best and purchases > best.purchases then return end
+		for index, rule in ipairs(rules) do
+			if not matched[index] and ante > rule.maxAnte then return end
+		end
+		if ante > maxAnte then
+			if matchedCount ~= #rules then return end
+			if options.requireOmen and not owned.v_omen_globe then return end
+			local route = { initialOwned = initial, owned = owned, purchase = purchase,
+				purchases = purchases, skipSm = skipSm, skipBig = skipBig }
+			if options.legendPass then
+				local saved = poolCopyTable(Brainstorm.random_state)
+				if not options.legendPass(route) then
+					Brainstorm.random_state = saved
+					return
+				end
+				Brainstorm.random_state = saved
+			end
+			if not best or purchases < best.purchases then
+				best = { purchases = purchases, route = route }
+			end
+			return
+		end
+
+		local key = rollVoucher(ante, owned)
+		if not key then return end
+		local visit = (visits[ante] or 0) + 1
+		local nextVisits = poolCopyTable(visits); nextVisits[ante] = visit
+		local visible = ante ~= 1 or visit ~= 1
+			or not (skipSm and skipSm[1]) or not (skipBig and skipBig[1])
+		local nextMatched, nextCount = poolCopyTable(matched), matchedCount
+		if visible then
+			for index, rule in ipairs(rules) do
+				if not nextMatched[index] and key == rule.key
+						and ante >= rule.minAnte and ante <= rule.maxAnte then
+					nextMatched[index], nextCount = true, nextCount + 1
+				end
+			end
+		end
+		local afterOffer = poolCopyTable(Brainstorm.random_state)
+		search(ante + 1, owned, nextMatched, nextCount, purchases,
+			purchase, nextVisits)
+		Brainstorm.random_state = poolCopyTable(afterOffer)
+
+		local needMore = nextCount ~= #rules
+			or (options.requireOmen and not owned.v_omen_globe)
+		local reducer = key == "v_hieroglyph" or key == "v_petroglyph"
+		local hasTagRoute = #(header.route_tags or {}) > 0
+		if visible and needMore and (not best or purchases + 1 <= best.purchases)
+				and not exclusions[key]
+				and not (reducer and (options.requireSouls or hasTagRoute)) then
+			local bought = poolCopyTable(owned); bought[key] = true
+			local boughtAt = poolCopyPurchase(purchase)
+			boughtAt[key] = { ante = ante, visit = visit }
+			search(reducer and ante or ante + 1, bought, nextMatched, nextCount,
+				purchases + 1, boughtAt, nextVisits)
+		end
+	end
+
+	search(1, purchased, {}, 0, 0, {}, {})
+	return best and best.route or nil
+end
+
 -- Replay the cumulative route embedded in a .bspool header. Each rule selects
 -- its first required matching occurrences, exactly like the external scanner;
 -- observe-only stages count toward membership but do not remove shops.
@@ -1370,10 +1656,11 @@ function Brainstorm.poolRouteSkips(seed_found, header)
 	for ante = 1, 39 do
 		local rolled = nil
 		for blind = 1, 2 do
+			local phase = blind == 1 and "small" or "big"
 			local need = false
 			for i, rule in ipairs(rules) do
 				if rule.collect and counts[i] < rule.count
-						and ante >= rule.minAnte and ante <= rule.maxAnte then
+						and Brainstorm.poolLocationInRange(ante, phase, rule) then
 					need = true; break
 				end
 			end
@@ -1381,7 +1668,7 @@ function Brainstorm.poolRouteSkips(seed_found, header)
 				rolled = Brainstorm.rollTag(seed_found, ante)
 				for i, rule in ipairs(rules) do
 					if rule.collect and counts[i] < rule.count
-							and ante >= rule.minAnte and ante <= rule.maxAnte
+							and Brainstorm.poolLocationInRange(ante, phase, rule)
 							and rolled == rule.key then
 						counts[i] = counts[i] + 1
 						local reward = Brainstorm.tagSoulRewardKey(rule.key) and rule.key or nil
@@ -1424,7 +1711,11 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 		local count = 0
 		for ante = rule.minAnte, rule.maxAnte do
 			for blind = 1, 2 do
-				if rolls[ante] and rolls[ante][blind] == rule.key then count = count + 1 end
+				local phase = blind == 1 and "small" or "big"
+				if Brainstorm.poolLocationInRange(ante, phase, rule)
+						and rolls[ante] and rolls[ante][blind] == rule.key then
+					count = count + 1
+				end
 			end
 		end
 		if count < rule.count then return false end
@@ -1433,9 +1724,10 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 	for i = 1, #routeRules do routeCounts[i] = 0 end
 	for ante = 1, maxTagAnte do
 		for blind = 1, 2 do
+			local phase = blind == 1 and "small" or "big"
 			for i, rule in ipairs(routeRules) do
 				if rule.collect and routeCounts[i] < rule.count
-						and ante >= rule.minAnte and ante <= rule.maxAnte
+						and Brainstorm.poolLocationInRange(ante, phase, rule)
 						and rolls[ante][blind] == rule.key then
 					routeCounts[i] = routeCounts[i] + 1
 					local reward = Brainstorm.tagSoulRewardKey(rule.key) and rule.key or nil
@@ -1454,15 +1746,16 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 	local finalBig = Brainstorm.mergeSkipRoutes(big, overlayBig)
 	local finalRewardSm = Brainstorm.mergeRewardRoutes(rewardSm, overlayRewardSm)
 	local finalRewardBig = Brainstorm.mergeRewardRoutes(rewardBig, overlayRewardBig)
+	local voucherRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
+		finalSm, finalBig, { maxAnte = 1 })
+	if not voucherRoute then return false end
 
 	local legendaryRules = header.pool_legendaries or {}
 	if #legendaryRules == 0 and header.legendary then legendaryRules = { header.legendary } end
 	if #legendaryRules == 0 then
-		return true, finalSm, finalBig, finalRewardSm, finalRewardBig
+		return true, finalSm, finalBig, finalRewardSm, finalRewardBig, voucherRoute
 	end
 	if G.GAME.banned_keys and G.GAME.banned_keys.c_soul then return false end
-	Brainstorm.setPackSkipAssumption(seed_found, finalSm, finalBig,
-		finalRewardSm, finalRewardBig)
 
 	local function pickLegendary(forbidden)
 		local pool = Brainstorm.getJokerCulledPool(4)
@@ -1481,9 +1774,12 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 		return chosen
 	end
 
-	local maxAnte = 0
+	local maxAnte, tagMaxAnte = 0, 0
 	for _, rule in ipairs(legendaryRules) do
-		maxAnte = math.max(maxAnte, rule.maxAnte)
+		tagMaxAnte = math.max(tagMaxAnte, rule.maxAnte)
+		maxAnte = math.max(maxAnte,
+			rule.maxAnte + (rule.humanLocation
+				and (rule.maxPhase or "big") == "boss" and 1 or 0))
 	end
 	-- Either-depth rules (soulDepth 0) resolve deterministically: the
 	-- exclusive Soul #2 pick can never repeat Soul #1's legendary, so the
@@ -1502,52 +1798,147 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 	end
 	local maxDepth = needSecond and 2 or 1
 
-	local soulNumber, events = 0, {}
-	for ante = 1, maxAnte do
-		local packs = Brainstorm.getSoulPackEvents(seed_found, ante)
-		if not packs then return false end
-		for _, packEvent in ipairs(packs) do
-			local center = packEvent.center
-			local kind = center and not center.forced and center.kind or nil
-			if kind == 'Arcana' or kind == 'Spectral' then
-				local stype = kind == 'Arcana' and 'Tarot' or 'Spectral'
-				local soulInPack, blackHoleInPack = false, false
-				for _ = 1, Brainstorm.packCardCount(center) do
-					local soul = false
-					if not soulInPack then
-						soul = pseudorandom(Brainstorm.pseudoseed(
-							'soul_' .. stype .. ante .. seed_found)) > 0.997
-					end
-					if kind == 'Spectral' and not blackHoleInPack then
-						local blackHole = pseudorandom(Brainstorm.pseudoseed(
-							'soul_' .. stype .. ante .. seed_found)) > 0.997
-						if blackHole then
-							if not (G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) then
-								blackHoleInPack = true
+	local function soulRoutePass(routeSm, routeBig, routeRewardSm, routeRewardBig,
+			ownedRoute)
+		-- Each targeted branch clones the canonical RNG state. Independent
+		-- per-key streams then advance exactly as they would in the game, while
+		-- the canonical route remains untouched for the next branch.
+		Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+		Brainstorm.setPackSkipAssumption(seed_found, routeSm, routeBig,
+			routeRewardSm, routeRewardBig)
+		if ownedRoute then ownedRoute.skipSm, ownedRoute.skipBig = routeSm, routeBig end
+		local soulNumber, events = 0, {}
+		for ante = 1, maxAnte do
+			local packs = Brainstorm.getSoulPackEvents(seed_found, ante)
+			if not packs then return false end
+			for _, packEvent in ipairs(packs) do
+				local center = packEvent.center
+				local kind = center and not center.forced and center.kind or nil
+				if kind == 'Arcana' or kind == 'Spectral' then
+					local soulInPack, blackHoleInPack = false, false
+					for _ = 1, Brainstorm.packCardCount(center) do
+						local contentKind = kind
+						if kind == 'Arcana'
+								and Brainstorm.omenOwnedForSoulEvent(ownedRoute, packEvent)
+								and pseudorandom(Brainstorm.pseudoseed(
+									'omen_globe' .. seed_found)) > 0.8 then
+							contentKind = 'Spectral'
+						end
+						local stype = contentKind == 'Arcana' and 'Tarot' or 'Spectral'
+						local soul = false
+						if not soulInPack then
+							soul = pseudorandom(Brainstorm.pseudoseed(
+								'soul_' .. stype .. ante .. seed_found)) > 0.997
+						end
+						if contentKind == 'Spectral' and not blackHoleInPack then
+							local blackHole = pseudorandom(Brainstorm.pseudoseed(
+								'soul_' .. stype .. ante .. seed_found)) > 0.997
+							if blackHole then
+								if not (G.GAME.banned_keys and G.GAME.banned_keys.c_black_hole) then
+									blackHoleInPack = true
+								end
+								soul = false
 							end
-							soul = false
+						end
+						if soul then
+							soulInPack = true
+							soulNumber = soulNumber + 1
+							events[soulNumber] = { ante = ante,
+								humanAnte = packEvent.humanAnte, phase = packEvent.phase,
+								source = packEvent.source,
+								edition = pseudorandom(Brainstorm.pseudoseed(
+									"edisou" .. ante .. seed_found)) }
 						end
 					end
-					if soul then
-						soulInPack = true
-						soulNumber = soulNumber + 1
-						events[soulNumber] = { ante = ante,
-							edition = pseudorandom(Brainstorm.pseudoseed(
-								"edisou" .. ante .. seed_found)) }
-					end
 				end
+				if soulNumber >= maxDepth then break end
 			end
 			if soulNumber >= maxDepth then break end
 		end
-		if soulNumber >= maxDepth then break end
+		if soulNumber < maxDepth then return false end
+		for i, rule in ipairs(legendaryRules) do
+			local event = events[resolved[i]]
+			local locationOK = event and (rule.humanLocation
+				and Brainstorm.poolLocationInRange(event.humanAnte, event.phase, rule)
+				or (not rule.humanLocation and event.ante >= rule.minAnte
+					and event.ante <= rule.maxAnte))
+			if not locationOK
+					or ((rule.source or "any") ~= "any" and event.source ~= rule.source)
+					or (rule.negative and event.edition <= 0.997) then
+				return false
+			end
+		end
+		return true
 	end
-	if soulNumber < maxDepth then return false end
-	for i, rule in ipairs(legendaryRules) do
-		local event = events[resolved[i]]
-		if not event or event.ante < rule.minAnte or event.ante > rule.maxAnte
-				or (rule.negative and event.edition <= 0.997) then return false end
+
+	if soulRoutePass(finalSm, finalBig, finalRewardSm, finalRewardBig,
+			voucherRoute) then
+		return true, finalSm, finalBig, finalRewardSm, finalRewardBig, voucherRoute
 	end
-	return true, finalSm, finalBig, finalRewardSm, finalRewardBig
+	local voucherMaxAnte = math.min(maxAnte, 8)
+	local omenRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
+		finalSm, finalBig, {
+			requireOmen = true, requireSouls = true, maxAnte = voucherMaxAnte,
+			legendPass = function(route)
+				return soulRoutePass(finalSm, finalBig, finalRewardSm,
+					finalRewardBig, route)
+			end,
+		})
+	if omenRoute then
+		return true, finalSm, finalBig, finalRewardSm, finalRewardBig, omenRoute
+	end
+
+	-- Targeted Charm branch: if the canonical route misses, test every actual
+	-- Charm Tag once. The branch skips only that blind, opens its five-card
+	-- reward immediately, and is retained only when it satisfies all embedded
+	-- Legendary rules.
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+	for ante = 1, tagMaxAnte do
+		if not rolls[ante] then
+			rolls[ante] = {
+				Brainstorm.rollTag(seed_found, ante),
+				Brainstorm.rollTag(seed_found, ante),
+			}
+		end
+		for blind = 1, 2 do
+			local alreadySkipped = (blind == 1 and finalSm and finalSm[ante])
+				or (blind == 2 and finalBig and finalBig[ante])
+			if rolls[ante][blind] == 'tag_charm' and not alreadySkipped then
+				local branchSm = Brainstorm.mergeSkipRoutes(finalSm,
+					blind == 1 and { [ante] = true } or nil)
+				local branchBig = Brainstorm.mergeSkipRoutes(finalBig,
+					blind == 2 and { [ante] = true } or nil)
+				local branchRewardSm = Brainstorm.mergeRewardRoutes(finalRewardSm,
+					blind == 1 and { [ante] = 'tag_charm' } or nil)
+				local branchRewardBig = Brainstorm.mergeRewardRoutes(finalRewardBig,
+					blind == 2 and { [ante] = 'tag_charm' } or nil)
+				local branchRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
+					branchSm, branchBig, {
+						requireSouls = true, maxAnte = voucherMaxAnte,
+						legendPass = function(route)
+							return soulRoutePass(branchSm, branchBig,
+								branchRewardSm, branchRewardBig, route)
+						end,
+					})
+				if not branchRoute then
+					branchRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
+						branchSm, branchBig, {
+							requireOmen = true, requireSouls = true,
+							maxAnte = voucherMaxAnte,
+							legendPass = function(route)
+								return soulRoutePass(branchSm, branchBig,
+									branchRewardSm, branchRewardBig, route)
+							end,
+						})
+				end
+				if branchRoute then
+					return true, branchSm, branchBig, branchRewardSm, branchRewardBig,
+						branchRoute
+				end
+			end
+		end
+	end
+	return false
 end
 
 function Brainstorm.skipsFromFilters(tagLoc)
@@ -1724,11 +2115,12 @@ function Brainstorm.getSoulPackEvents(seed_found, ante)
 	end
 	local shopPacks = Brainstorm.getSimulatedPacks(seed_found, ante, 6)
 	local events, cursor = {}, 1
-	local function addShopPair()
+	local function addShopPair(humanAnte, phase)
 		for _ = 1, 2 do
 			local center = shopPacks[cursor]
 			if center == nil then return end
-			events[#events + 1] = { center = center, location = "P" .. cursor }
+			events[#events + 1] = { center = center, location = "P" .. cursor,
+				humanAnte = humanAnte, phase = phase, source = "shop" }
 			cursor = cursor + 1
 		end
 	end
@@ -1739,19 +2131,21 @@ function Brainstorm.getSoulPackEvents(seed_found, ante)
 		if not center then return false end
 		events[#events + 1] = { center = center,
 			location = (tagKey == "tag_charm" and "Charm" or "Ethereal") .. blind,
-			tagReward = true }
+			tagReward = true, humanAnte = ante,
+			phase = blind == "Sm" and "small" or "big",
+			source = tagKey == "tag_charm" and "charm" or "ethereal" }
 		return true
 	end
-	if ante >= 2 then addShopPair() end
+	if ante >= 2 then addShopPair(ante - 1, "boss") end
 	if sim.skipSm and sim.skipSm[ante] then
 		if not addReward(sim.rewardSm, "Sm") then return nil end
 	else
-		addShopPair()
+		addShopPair(ante, "small")
 	end
 	if sim.skipBig and sim.skipBig[ante] then
 		if not addReward(sim.rewardBig, "Big") then return nil end
 	else
-		addShopPair()
+		addShopPair(ante, "big")
 	end
 	return events
 end
@@ -2503,7 +2897,22 @@ function Brainstorm.readPoolHeader(path)
 			raw = raw:sub(1, headerBytes)
 		end
 	end
-	local h = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
+	local h = {
+		tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {},
+		vouchers = {}, route_vouchers = {}, voucher_exclusions = {},
+		route_voucher_exclusions = {},
+	}
+	local function words(value)
+		local out = {}
+		for word in value:gmatch("%S+") do out[#out + 1] = word end
+		return out
+	end
+	local function phase(value, allowBoss)
+		value = value and value:lower()
+		if value == "small" or value == "big" or (allowBoss and value == "boss") then
+			return value
+		end
+	end
 	h.schema = schema
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
@@ -2521,33 +2930,90 @@ function Brainstorm.readPoolHeader(path)
 				or k == "membership_digest" or k == "metadata_digest"
 				or k == "parent_snapshot_id" or k == "parent_segment_id" then h[k] = v
 		elseif k == "tag" then
-			local key, lo, hi, count = v:match("^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)$")
-			if key then h.tags[#h.tags + 1] = {
-				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count),
-			} end
+			local p = words(v)
+			local minPhase, maxPhase, count
+			if #p == 4 then
+				minPhase, maxPhase, count = "small", "big", tonumber(p[4])
+			elseif #p == 6 then
+				minPhase, maxPhase, count = phase(p[3]), phase(p[5]), tonumber(p[6])
+			end
+			if p[1] and tonumber(p[2]) and tonumber(p[#p == 4 and 3 or 4])
+					and minPhase and maxPhase and count then
+				h.tags[#h.tags + 1] = { key = p[1], minAnte = tonumber(p[2]),
+					minPhase = minPhase, maxAnte = tonumber(p[#p == 4 and 3 or 4]),
+					maxPhase = maxPhase, count = count }
+			end
 		elseif k == "legendary" then
-			local key, lo, hi, neg = v:match("^(%S+)%s+(%d+)%s+(%d+)%s*(%d*)$")
-			if key then h.legendaries[#h.legendaries + 1] = {
-				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi),
-				negative = tonumber(neg) == 1,
-			} end
+			local p = words(v)
+			local minPhase, maxPhase, neg, source, maxAnte
+			if #p == 4 then
+				minPhase, maxPhase, maxAnte = "boss", "big", tonumber(p[3])
+				neg, source = tonumber(p[4]), "any"
+			elseif #p == 7 then
+				minPhase, maxPhase, maxAnte = phase(p[3], true), phase(p[5], true), tonumber(p[4])
+				neg, source = tonumber(p[6]), p[7]:lower()
+			end
+			if p[1] and tonumber(p[2]) and maxAnte and minPhase and maxPhase
+					and (neg == 0 or neg == 1)
+					and (source == "any" or source == "shop" or source == "charm"
+						or source == "ethereal") then
+				h.legendaries[#h.legendaries + 1] = { key = p[1],
+					minAnte = tonumber(p[2]), minPhase = minPhase,
+					maxAnte = maxAnte, maxPhase = maxPhase,
+					negative = neg == 1, source = source, humanLocation = #p == 7 }
+			end
 		elseif k == "soul_depth" then
 			-- applies to the preceding legendary line; 0 = either Soul
 			local rule = h.legendaries[#h.legendaries]
 			if rule then rule.soulDepth = (v == "any") and 0 or tonumber(v) end
 		elseif k == "route_legendary" then
-			local key, lo, hi, neg, depth = v:match(
-				"^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)$")
-			if key then h.pool_legendaries[#h.pool_legendaries + 1] = {
-				key = key, minAnte = tonumber(lo), maxAnte = tonumber(hi),
-				negative = tonumber(neg) == 1, soulDepth = tonumber(depth),
-			} end
+			local p = words(v)
+			local minPhase, maxPhase, neg, source, depth, maxAnte
+			if #p == 5 then
+				minPhase, maxPhase, maxAnte = "boss", "big", tonumber(p[3])
+				neg, source, depth = tonumber(p[4]), "any", tonumber(p[5])
+			elseif #p == 8 then
+				minPhase, maxPhase, maxAnte = phase(p[3], true), phase(p[5], true), tonumber(p[4])
+				neg, source, depth = tonumber(p[6]), p[7]:lower(), tonumber(p[8])
+			end
+			if p[1] and tonumber(p[2]) and maxAnte and minPhase and maxPhase
+					and (neg == 0 or neg == 1) and (depth == 0 or depth == 1 or depth == 2)
+					and (source == "any" or source == "shop" or source == "charm"
+						or source == "ethereal") then
+				h.pool_legendaries[#h.pool_legendaries + 1] = { key = p[1],
+					minAnte = tonumber(p[2]), minPhase = minPhase,
+					maxAnte = maxAnte, maxPhase = maxPhase,
+					negative = neg == 1, source = source, soulDepth = depth,
+					humanLocation = #p == 8 }
+			end
 		elseif k == "route_tag" then
-			local mode, key, lo, hi, count = v:match("^(%S+)%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)$")
-			if key then h.route_tags[#h.route_tags + 1] = {
-				collect = mode == "collect", key = key, minAnte = tonumber(lo),
-				maxAnte = tonumber(hi), count = tonumber(count),
-			} end
+			local p = words(v)
+			local minPhase, maxPhase, count, maxAnte
+			if #p == 5 then
+				minPhase, maxPhase, maxAnte, count = "small", "big", tonumber(p[4]), tonumber(p[5])
+			elseif #p == 7 then
+				minPhase, maxPhase, maxAnte, count = phase(p[4]), phase(p[6]), tonumber(p[5]), tonumber(p[7])
+			end
+			if (p[1] == "collect" or p[1] == "observe") and p[2]
+					and tonumber(p[3]) and maxAnte and minPhase and maxPhase and count then
+				h.route_tags[#h.route_tags + 1] = { collect = p[1] == "collect",
+					key = p[2], minAnte = tonumber(p[3]), minPhase = minPhase,
+					maxAnte = maxAnte, maxPhase = maxPhase, count = count }
+			end
+		elseif k == "voucher" or k == "route_voucher" then
+			local p = words(v)
+			if #p == 3 and tonumber(p[2]) and tonumber(p[3]) then
+				local list = k == "voucher" and h.vouchers or h.route_vouchers
+				list[#list + 1] = { key = p[1], minAnte = tonumber(p[2]),
+					maxAnte = tonumber(p[3]) }
+			end
+		elseif k == "voucher_exclude" or k == "route_voucher_exclude" then
+			local p = words(v)
+			if #p == 1 then
+				local list = k == "voucher_exclude" and h.voucher_exclusions
+					or h.route_voucher_exclusions
+				list[#list + 1] = p[1]
+			end
 		end
 	end
 	local collect = h.tag_route ~= "observe"
@@ -2558,6 +3024,16 @@ function Brainstorm.readPoolHeader(path)
 	for _, rule in ipairs(h.legendaries) do
 		rule.soulDepth = rule.soulDepth or 1
 		h.pool_legendaries[#h.pool_legendaries + 1] = rule
+	end
+	h.pool_vouchers = {}
+	for _, rule in ipairs(h.route_vouchers) do h.pool_vouchers[#h.pool_vouchers + 1] = rule end
+	for _, rule in ipairs(h.vouchers) do h.pool_vouchers[#h.pool_vouchers + 1] = rule end
+	h.pool_voucher_exclusions = {}
+	for _, key in ipairs(h.route_voucher_exclusions) do
+		h.pool_voucher_exclusions[#h.pool_voucher_exclusions + 1] = key
+	end
+	for _, key in ipairs(h.voucher_exclusions) do
+		h.pool_voucher_exclusions[#h.pool_voucher_exclusions + 1] = key
 	end
 	return h
 end
@@ -2713,10 +3189,39 @@ function Brainstorm.buildNativeConfigText(session)
 		if G.GAME.banned_keys and G.GAME.banned_keys[v.key] then reqOk = 0 end
 		add("tagdef", ck(v.key), tostring(reqOk), tostring(v.min_ante or 0))
 	end
+	local startingVouchers = Brainstorm.startingVoucherSet()
+	local voucherKeys = {}
+	for _, v in ipairs(G.P_CENTER_POOLS["Voucher"]) do voucherKeys[v.key] = true end
 	for _, v in ipairs(G.P_CENTER_POOLS["Voucher"]) do
-		local eligible = v.unlocked ~= false and not v.requires
+		local prerequisitesMet = not v.requires
+		if type(v.requires) == "table" and #v.requires > 0 then
+			prerequisitesMet = true
+			for _, key in ipairs(v.requires) do
+				if not startingVouchers[key] then prerequisitesMet = false; break end
+			end
+		end
+		local eligible = v.unlocked ~= false and prerequisitesMet
+			and not startingVouchers[v.key]
 		local avail = (eligible and not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])) and "1" or "0"
 		add("vouchdef", ck(v.key), avail)
+		-- The standalone pool builder can deliberately buy earlier offers, so
+		-- it needs dynamic prerequisite data instead of the legacy
+		-- "redeem-nothing" availability above. Base-game vouchers have at most
+		-- one prerequisite; refuse unusual multi-prerequisite modded entries
+		-- until their route state can be represented without ambiguity.
+		local prerequisite = "-"
+		local routeEligible = v.unlocked ~= false
+			and not (G.GAME.banned_keys and G.GAME.banned_keys[v.key])
+		if v.no_pool_flag and G.GAME.pool_flags[v.no_pool_flag] then routeEligible = false end
+		if v.yes_pool_flag and not G.GAME.pool_flags[v.yes_pool_flag] then routeEligible = false end
+		if v.requires then
+			if type(v.requires) == "table" and #v.requires == 1
+					and voucherKeys[v.requires[1]] then
+				prerequisite = v.requires[1]
+			else routeEligible = false end
+		end
+		add("vouchroute", ck(v.key), routeEligible and "1" or "0", ck(prerequisite))
+		if startingVouchers[v.key] then add("vouchowned", ck(v.key)) end
 	end
 	for r = 1, 4 do
 		local pool = G.P_JOKER_RARITY_POOLS[r]

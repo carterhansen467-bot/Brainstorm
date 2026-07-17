@@ -233,7 +233,7 @@ write_search_cfg() {
 		echo "mapacks 0 0 0 0 0 0 0 0"
 		echo "packslots 2"
 		echo "poolfile $(native_path "$poolf")"
-		grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
+		grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
 		echo "end"
 	} > "$out"
 }

@@ -50,6 +50,7 @@ local snap = {
 	},
 	multiAnteSearch = {}, useCulledCache = true,
 }
+local voucherByKey, startingVouchers = {}, {}
 for line in read(snapshotPath):gmatch("[^\r\n]+") do
 	local p = {}; for word in line:gmatch("%S+") do p[#p + 1] = word end
 	if p[1] == "tagdef" then
@@ -57,7 +58,17 @@ for line in read(snapshotPath):gmatch("[^\r\n]+") do
 			key = p[2], requiresOk = p[3] == "1", min_ante = tonumber(p[4]) or 0,
 		}
 	elseif p[1] == "vouchdef" then
-		snap.voucherPool[#snap.voucherPool + 1] = { key = p[2], unlocked = p[3] == "1" }
+		local center = { key = p[2], unlocked = p[3] == "1" }
+		snap.voucherPool[#snap.voucherPool + 1] = center
+		voucherByKey[p[2]] = center
+	elseif p[1] == "vouchroute" then
+		local center = voucherByKey[p[2]]
+		if center then
+			center.unlocked = p[3] == "1"
+			center.requires = p[4] ~= "-" and { p[4] } or nil
+		end
+	elseif p[1] == "vouchowned" then
+		startingVouchers[#startingVouchers + 1] = p[2]
 	elseif p[1] == "jokerdef" then
 		local rarity = tonumber(p[2]); snap.jokerPools[rarity][#snap.jokerPools[rarity] + 1] = {
 			key = p[3], rarity = rarity, unlocked = p[4] == "1",
@@ -89,67 +100,20 @@ end
 love = { thread = { getChannel = getChannel } }
 package.loaded["love.thread"] = true
 assert(load(workerSrc, "worker"))(serialize(snap), fileText, 0, 1)
+G.GAME.selected_back = { effect = { config = { vouchers = startingVouchers } } }
 
-local function readPoolHeader(path)
-	local prefixBytes, maxHeaderBytes = 1024, 256 * 1024
-	local f = assert(io.open(path, "rb"))
-	local raw = f:read(prefixBytes) or ""
-	local schema = tonumber(raw:match("^BRAINSTORM_SEED_POOL%s+(%d+)[\r\n]"))
-	if schema == 3 then
-		local headerBytes
-		for line in raw:gmatch("[^\r\n%z]+") do
-			headerBytes = tonumber(line:match("^header_bytes%s+(%d+)%s*$")) or headerBytes
-		end
-		assert(headerBytes and headerBytes >= prefixBytes and headerBytes <= maxHeaderBytes,
-			"invalid schema-3 pool header_bytes")
-		if headerBytes > #raw then
-			raw = raw .. (f:read(headerBytes - #raw) or "")
-			assert(#raw == headerBytes, "truncated schema-3 pool header")
-		else
-			raw = raw:sub(1, headerBytes)
-		end
-	end
-	f:close()
-	return raw
+package.loaded.nativefs.read = function(path, bytes)
+	local f = io.open(path, "rb")
+	if not f then return nil end
+	local value = f:read(bytes or "*a"); f:close(); return value
 end
-
-local raw = readPoolHeader(poolPath)
-local header = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
-for line in raw:gmatch("[^\n%z]+") do
-	local key, rest = line:match("^(%S+)%s*(.-)%s*$")
-	if key == "tag_route" then header.tag_route = rest
-	elseif key == "soul_depth" then
-		-- applies to the preceding legendary line; 0 = either Soul
-		local rule = header.legendaries[#header.legendaries]
-		if rule then rule.soulDepth = (rest == "any") and 0 or tonumber(rest) end
-	elseif key == "tag" then
-		local k, lo, hi, count = rest:match("^(%S+) (%d+) (%d+) (%d+)$")
-		header.tags[#header.tags + 1] = { key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count) }
-	elseif key == "route_tag" then
-		local mode, k, lo, hi, count = rest:match("^(%S+) (%S+) (%d+) (%d+) (%d+)$")
-		header.route_tags[#header.route_tags + 1] = { collect = mode == "collect", key = k,
-			minAnte = tonumber(lo), maxAnte = tonumber(hi), count = tonumber(count) }
-	elseif key == "legendary" then
-		local k, lo, hi, neg = rest:match("^(%S+) (%d+) (%d+) (%d+)$")
-		header.legendaries[#header.legendaries + 1] = {
-			key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi), negative = neg == "1",
-		}
-	elseif key == "route_legendary" then
-		local k, lo, hi, neg, depth = rest:match("^(%S+) (%d+) (%d+) (%d+) (%d+)$")
-		header.pool_legendaries[#header.pool_legendaries + 1] = {
-			key = k, minAnte = tonumber(lo), maxAnte = tonumber(hi),
-			negative = neg == "1", soulDepth = tonumber(depth),
-		}
-	elseif key == "end" then break end
+package.loaded.nativefs.getInfo = function(path)
+	local f = io.open(path, "rb")
+	if not f then return nil end
+	f:close(); return { type = "file" }
 end
-for _, rule in ipairs(header.tags) do
-	rule.collect = header.tag_route ~= "observe"
-	header.route_tags[#header.route_tags + 1] = rule
-end
-for _, rule in ipairs(header.legendaries) do
-	rule.soulDepth = rule.soulDepth or 1
-	header.pool_legendaries[#header.pool_legendaries + 1] = rule
-end
+local header = assert(Brainstorm.readPoolHeader(poolPath),
+	"production Lua rejected the pool header")
 
 for seed in read(seedsPath):gmatch("[^\r\n]+") do
 	Brainstorm.random_state = { hashed_seed = pseudohash(seed) }

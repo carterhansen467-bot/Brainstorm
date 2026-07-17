@@ -69,8 +69,8 @@ def criteria_from_json(data, snap):
         key = rule.get("key", "")
         if key not in tag_keys:
             raise ValueError("Unknown or locked tag %r" % key)
-        lo = clamp_int(rule.get("min", 1), 1, core.MAX_ANTE)
-        hi = clamp_int(rule.get("max", 8), lo, core.MAX_ANTE)
+        lo = clamp_int(rule.get("min", 1), 1, core.MAX_VOUCHER_ANTE)
+        hi = clamp_int(rule.get("max", 8), lo, core.MAX_VOUCHER_ANTE)
         min_phase = str(rule.get("minPhase", "small"))
         max_phase = str(rule.get("maxPhase", "big"))
         if min_phase not in core.TAG_PHASES or max_phase not in core.TAG_PHASES:
@@ -84,8 +84,40 @@ def criteria_from_json(data, snap):
         cnt = clamp_int(rule.get("count", 1), 1,
                         core.tag_location_count(lo, min_phase, hi, max_phase))
         c.tag_rules.append([key, lo, hi, cnt, min_phase, max_phase])
+    usable_vouchers = snap.usable_vouchers() \
+        if hasattr(snap, "usable_vouchers") else []
+    voucher_keys = {key for key, _prerequisite in usable_vouchers}
+    raw_voucher_rules = data.get("voucherRules", [])
+    if len(raw_voucher_rules) > core.MAX_VOUCHER_RULES:
+        raise ValueError("At most %d voucher targets are supported."
+                         % core.MAX_VOUCHER_RULES)
+    for rule in raw_voucher_rules:
+        key = str(rule.get("key", ""))
+        if key not in voucher_keys:
+            raise ValueError("Unknown or unavailable voucher %r" % key)
+        lo = clamp_int(rule.get("min", 1), 1, core.MAX_ANTE)
+        hi = clamp_int(rule.get("max", 8), lo, core.MAX_ANTE)
+        c.voucher_rules.append([key, lo, hi])
+    raw_exclusions = data.get("voucherExclusions", [])
+    if len(raw_exclusions) > core.MAX_VOUCHER_EXCLUSIONS:
+        raise ValueError("At most %d voucher purchase exclusions are supported."
+                         % core.MAX_VOUCHER_EXCLUSIONS)
+    for value in raw_exclusions:
+        key = str(value.get("key", "") if isinstance(value, dict) else value)
+        if key not in voucher_keys:
+            raise ValueError("Unknown or unavailable voucher exclusion %r" % key)
+        if key in c.voucher_exclusions:
+            raise ValueError("Each voucher purchase exclusion can only be added once.")
+        c.voucher_exclusions.append(key)
+    if c.voucher_exclusions and not c.voucher_rules:
+        raise ValueError("A voucher purchase exclusion requires at least one voucher target.")
+    if c.voucher_rules and data.get("route", "collect") != "observe" \
+            and any(rule[0] in ("tag_voucher", "tag_double")
+                    for rule in c.tag_rules):
+        raise ValueError("Collected Voucher and Double Tags are not yet supported "
+                         "with voucher targets; observe that tag or remove it.")
     if not c.predicates():
-        raise ValueError("Pick a legendary or add at least one tag requirement.")
+        raise ValueError("Pick a Legendary, add a tag requirement, or add a voucher target.")
     c.route_collect = data.get("route", "collect") != "observe"
     c.threads = clamp_int(data.get("threads", 0), 0, 64)
     space = data.get("space", "natural")
@@ -298,6 +330,13 @@ select:disabled, input:disabled { opacity:.48; cursor:not-allowed; }
 .rule { display:grid; grid-template-columns:minmax(150px, 1.5fr) .55fr .55fr .65fr .55fr .65fr auto;
   gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
   border-radius:12px; background:#11141e; }
+.voucher-list { display:grid; gap:9px; }
+.voucher-rule { display:grid; grid-template-columns:minmax(190px, 1.5fr) .65fr .65fr auto;
+  gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
+  border-radius:12px; background:#11141e; }
+.voucher-exclusion { display:grid; grid-template-columns:minmax(220px, 1fr) auto;
+  gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
+  border-radius:12px; background:#11141e; }
 .rule-field { display:grid; gap:5px; min-width:0; }
 .empty-rules { padding:16px; border:1px dashed #34394e; border-radius:12px; text-align:center;
   color:var(--faint); font-size:13px; }
@@ -404,6 +443,9 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .rule { grid-template-columns:1fr 1fr; }
   .rule .rule-field:first-child { grid-column:1 / -1; }
   .rule button { grid-column:1 / -1; }
+  .voucher-rule, .voucher-exclusion { grid-template-columns:1fr 1fr; }
+  .voucher-rule .rule-field:first-child, .voucher-exclusion .rule-field:first-child,
+  .voucher-rule button, .voucher-exclusion button { grid-column:1 / -1; }
   .pool-grid, .pool-lineage-grid { grid-template-columns:1fr; }
   .merge-panel { grid-template-columns:1fr; }
   .library-head { display:block; }
@@ -429,7 +471,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <section class="card" aria-labelledby="filterTitle">
         <div class="card-head"><span class="step">1</span><div>
           <h2 id="filterTitle">Choose what seeds must contain</h2>
-          <p class="card-copy">Use a Legendary, one or more tags, or combine both.</p>
+          <p class="card-copy">Use a Legendary, tags, vouchers, or combine them.</p>
         </div></div>
 
         <div class="section-label">Legendary joker</div>
@@ -462,6 +504,20 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
         <div class="section-label">Tag requirements</div>
         <div id="rules"><div class="empty-rules">No tags required yet.</div></div>
         <div class="button-row"><button type="button" class="mini" onclick="addRule()">＋ Add tag requirement</button></div>
+
+        <div class="section-label">Voucher targets</div>
+        <div id="voucherRules" class="voucher-list"><div class="empty-rules">No vouchers required yet.</div></div>
+        <div class="button-row"><button type="button" class="mini" id="btnAddVoucher" onclick="addVoucherRule()">＋ Add voucher target</button></div>
+        <div class="hint">The scanner finds the minimum-purchase route that reaches every target within its Ante window.</div>
+
+        <details class="advanced">
+          <summary>Voucher purchase exclusions</summary>
+          <div class="advanced-body">
+            <div id="voucherExclusions" class="voucher-list"><div class="empty-rules">No purchases excluded.</div></div>
+            <div class="button-row"><button type="button" class="mini" id="btnAddVoucherExclusion" onclick="addVoucherExclusion()">＋ Add purchase exclusion</button></div>
+            <div class="hint">An excluded voucher may still appear, but a matching route cannot depend on buying it. You can exclude the target itself to require finding it as an offer.</div>
+          </div>
+        </details>
 
         <div class="section-label">Route behavior</div>
         <div class="field"><label for="route">When a required tag appears</label>
@@ -524,7 +580,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <section class="card summary-card" aria-labelledby="summaryTitle">
         <div class="summary-title"><h2 id="summaryTitle">Build summary</h2><span class="ready-pill" id="readyPill">Needs filter</span></div>
         <dl class="summary-list">
-          <div class="summary-item"><dt>Looking for</dt><dd id="sumFilter">Choose a Legendary or tag</dd></div>
+          <div class="summary-item"><dt>Looking for</dt><dd id="sumFilter">Choose a Legendary, tag, or voucher</dd></div>
           <div class="summary-item"><dt>Source</dt><dd id="sumSource">Balatro's natural seeds</dd></div>
           <div class="summary-item"><dt>Scope</dt><dd id="sumScope">First 100 million</dd></div>
           <div class="summary-item"><dt>Compute</dt><dd id="sumThreads">Automatic threads</dd></div>
@@ -626,6 +682,76 @@ function removeRule(button){
   updateSummary();
 }
 
+function voucherOptions(){
+  return (CAT.vouchers || []).map(v=>{
+    const prerequisite = v.prerequisiteName ? ` · requires ${v.prerequisiteName}` : "";
+    return `<option value="${esc(v.key)}">${esc(v.name + prerequisite)}</option>`;
+  }).join("");
+}
+
+function refreshVoucherButtons(){
+  if (!CAT) return;
+  const targets = document.querySelectorAll("#voucherRules .voucher-rule").length;
+  const exclusions = document.querySelectorAll("#voucherExclusions .voucher-exclusion").length;
+  $("btnAddVoucher").disabled = !(CAT.vouchers || []).length || targets >= 8;
+  $("btnAddVoucherExclusion").disabled = !targets || !(CAT.vouchers || []).length
+    || exclusions >= Math.min(16, CAT.vouchers.length);
+}
+
+function addVoucherRule(key){
+  if (!CAT || !(CAT.vouchers || []).length) return;
+  if (document.querySelectorAll("#voucherRules .voucher-rule").length >= 8) return;
+  const div = document.createElement("div");
+  div.className = "voucher-rule";
+  div.innerHTML = `<div class="rule-field"><span class="label">Voucher</span><select class="vkey">${voucherOptions()}</select></div>
+    <div class="rule-field"><span class="label">From ante</span><input type="number" class="vmin" min="1" max="8" value="1"></div>
+    <div class="rule-field"><span class="label">Through ante</span><input type="number" class="vmax" min="1" max="8" value="8"></div>
+    <button type="button" class="mini" onclick="removeVoucherRule(this)">Remove</button>`;
+  if (key) div.querySelector(".vkey").value = key;
+  const empty = $("voucherRules").querySelector(".empty-rules");
+  if (empty) empty.remove();
+  $("voucherRules").appendChild(div);
+  refreshVoucherButtons();
+  updateSummary();
+}
+
+function removeVoucherRule(button){
+  button.closest(".voucher-rule").remove();
+  if (!$("voucherRules").querySelector(".voucher-rule"))
+    $("voucherRules").innerHTML = '<div class="empty-rules">No vouchers required yet.</div>';
+  refreshVoucherButtons();
+  updateSummary();
+}
+
+function addVoucherExclusion(key){
+  if (!CAT || !(CAT.vouchers || []).length
+      || !$("voucherRules").querySelector(".voucher-rule")) return;
+  if (document.querySelectorAll("#voucherExclusions .voucher-exclusion").length >= 16) return;
+  const used = new Set([...document.querySelectorAll("#voucherExclusions .vxkey")]
+    .map(select=>select.value));
+  const available = CAT.vouchers.find(v=>!used.has(v.key));
+  const chosen = key || (available && available.key);
+  if (!chosen) return;
+  const div = document.createElement("div");
+  div.className = "voucher-exclusion";
+  div.innerHTML = `<div class="rule-field"><span class="label">Route cannot purchase</span><select class="vxkey">${voucherOptions()}</select></div>
+    <button type="button" class="mini" onclick="removeVoucherExclusion(this)">Remove</button>`;
+  div.querySelector(".vxkey").value = chosen;
+  const empty = $("voucherExclusions").querySelector(".empty-rules");
+  if (empty) empty.remove();
+  $("voucherExclusions").appendChild(div);
+  refreshVoucherButtons();
+  updateSummary();
+}
+
+function removeVoucherExclusion(button){
+  button.closest(".voucher-exclusion").remove();
+  if (!$("voucherExclusions").querySelector(".voucher-exclusion"))
+    $("voucherExclusions").innerHTML = '<div class="empty-rules">No purchases excluded.</div>';
+  refreshVoucherButtons();
+  updateSummary();
+}
+
 function criteria(){
   const rules = [...document.querySelectorAll("#rules .rule")].map(r=>({
     key: r.querySelector(".rkey").value,
@@ -634,12 +760,18 @@ function criteria(){
     minPhase: r.querySelector(".rminphase").value,
     max: +r.querySelector(".rmax").value,
     maxPhase: r.querySelector(".rmaxphase").value }));
+  const voucherRules = [...document.querySelectorAll("#voucherRules .voucher-rule")].map(r=>({
+    key: r.querySelector(".vkey").value,
+    min: +r.querySelector(".vmin").value,
+    max: +r.querySelector(".vmax").value }));
+  const voucherExclusions = [...document.querySelectorAll("#voucherExclusions .voucher-exclusion")]
+    .map(r=>r.querySelector(".vxkey").value);
   return { legendary: $("legendary").value,
     legMin:+$("legMin").value, legMax:+$("legMax").value,
     legMinPhase:$("legMinPhase").value, legMaxPhase:$("legMaxPhase").value,
     legSource:$("legSource").value,
     legNeg:$("legNeg").checked, legSoulDepth:$("legDepth").value,
-    rules, route:$("route").value,
+    rules, voucherRules, voucherExclusions, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
 	space:$("space").value, inputPool:$("inputPool").value,
 	shardTotal:+$("shardTotal").value, shardIndex:+$("shardIndex").value,
@@ -676,7 +808,19 @@ function updateSummary(){
     const tag = CAT.tags.find(t=>t.key === r.key);
     pieces.push(`${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`);
   }
-  $("sumFilter").textContent = pieces.length ? pieces.join(" + ") : "Choose a Legendary or tag";
+  for (const r of c.voucherRules) {
+    const voucher = (CAT.vouchers || []).find(v=>v.key === r.key);
+    const window = r.min === r.max ? `A${r.min}` : `A${r.min}–A${r.max}`;
+    pieces.push(`${(voucher && voucher.name) || r.key} voucher · ${window}`);
+  }
+  if (c.voucherExclusions.length) {
+    const names = c.voucherExclusions.map(key=>{
+      const voucher = (CAT.vouchers || []).find(v=>v.key === key);
+      return (voucher && voucher.name) || key;
+    });
+    pieces.push(`without purchasing ${names.join(", ")}`);
+  }
+  $("sumFilter").textContent = pieces.length ? pieces.join(" + ") : "Choose a Legendary, tag, or voucher";
   $("readyPill").textContent = pieces.length ? "Ready" : "Needs filter";
   $("readyPill").style.background = pieces.length ? "#173824" : "#382f16";
   $("readyPill").style.color = pieces.length ? "#86e7aa" : "#f4d46b";
@@ -842,6 +986,7 @@ async function tick(){
     if (CAT.legendaries.some(l=>l.key==="j_perkeo")) $("legendary").value="j_perkeo";
     const th = $("threads");
     for (let i=1;i<=CAT.cpus;i++) th.add(new Option(i,i));
+    refreshVoucherButtons();
   }
 	setOptions($("inputPool"), inputPoolOptions(j.pool_groups || []), true);
 	const fromPool = !!$("inputPool").value;
@@ -935,10 +1080,15 @@ class Handler(BaseHTTPRequestHandler):
                     for k, ma in self.snap.usable_tags()]
             legendaries = [{"key": k, "name": core.joker_name(k)}
                            for k in self.snap.usable_legendaries()]
+            vouchers = [{"key": key, "name": core.voucher_name(key),
+                         "prerequisite": prerequisite,
+                         "prerequisiteName": core.voucher_name(prerequisite)
+                         if prerequisite else ""}
+                        for key, prerequisite in self.snap.usable_vouchers()]
             pools, pool_groups = pool_library()
             self._json({
                 "catalog": {"tags": tags, "legendaries": legendaries,
-                            "cpus": os.cpu_count() or 8},
+                            "vouchers": vouchers, "cpus": os.cpu_count() or 8},
                 "pools": pools,
                 "pool_groups": pool_groups,
                 "job": job_state(),

@@ -35,16 +35,65 @@ import threading
 import time
 from collections import deque
 
-if getattr(sys, "frozen", False):
-    # PyInstaller bundle ("Seed Pool Builder.exe" in the mod root): __file__
-    # would point into the onefile extraction dir, not the mod folder.
-    MOD_DIR = os.path.dirname(os.path.abspath(sys.executable))
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+if IS_FROZEN:
+    # __file__ points into PyInstaller's temporary onefile extraction folder.
+    # Keep the app location separate from the mod location: Windows releases
+    # put both builder executables in <mod>/Seed Pool Builder/ so the active
+    # SMODS folder is less cluttered.
+    BUILDER_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
-    MOD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    BUILDER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _looks_like_mod_dir(path):
+    return (os.path.isfile(os.path.join(path, "Brainstorm_main.lua"))
+            and os.path.isfile(os.path.join(path, "manifest.json")))
+
+
+def _find_mod_dir():
+    """Find the active mod root without depending on its folder name.
+
+    Source runs start in tools/, old frozen releases start in the mod root,
+    and current Windows releases start in the Seed Pool Builder/ child.  An
+    explicit environment override also lets a separately copied builder point
+    at an unusual installation without changing any game files.
+    """
+    candidates = []
+    override = os.environ.get("BRAINSTORM_MOD_DIR", "").strip()
+    if override:
+        candidates.append(os.path.abspath(os.path.expanduser(override)))
+    current = BUILDER_DIR
+    for _ in range(4):
+        candidates.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    for candidate in candidates:
+        if _looks_like_mod_dir(candidate):
+            return candidate
+    # Preserve the old source/frozen fallback so preflight can give its normal
+    # missing-file diagnostics rather than failing during module import.
+    if IS_FROZEN:
+        return BUILDER_DIR
+    return os.path.dirname(BUILDER_DIR)
+
+
+MOD_DIR = _find_mod_dir()
 NATIVE_DIR = os.path.join(MOD_DIR, "native")
 IS_WINDOWS = os.name == "nt"
-POOL_BIN = os.path.join(NATIVE_DIR,
-                        "brainstorm_seed_pool" + (".exe" if IS_WINDOWS else ""))
+_POOL_BINARY_NAME = "brainstorm_seed_pool" + (".exe" if IS_WINDOWS else "")
+_POOL_BINARY_CANDIDATES = [
+    # Current packaged Windows layout.
+    os.path.join(BUILDER_DIR, _POOL_BINARY_NAME),
+    # Allow a self-contained builder folder with a native/ child too.
+    os.path.join(BUILDER_DIR, "native", _POOL_BINARY_NAME),
+    # Source checkouts and Windows releases through win-v9.
+    os.path.join(NATIVE_DIR, _POOL_BINARY_NAME),
+]
+POOL_BIN = next((path for path in _POOL_BINARY_CANDIDATES
+                 if os.path.isfile(path)), _POOL_BINARY_CANDIDATES[-1])
 SNAPSHOT = os.path.join(MOD_DIR, "native_search.cfg")
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 POOL_HEADER_PREFIX_BYTES = 1024
@@ -58,6 +107,9 @@ SPACES = [
     ("total", "All typeable (adds 0/O + short seeds)", SEEDSPACE_TOTAL),
 ]
 MAX_TAG_RULES = 16
+MAX_VOUCHER_RULES = 8
+MAX_VOUCHER_EXCLUSIONS = 16
+MAX_VOUCHER_ANTE = 8
 MAX_ANTE = 39
 MODEL_VERSION = 6
 
@@ -77,6 +129,25 @@ TAG_NAMES = {
     "tag_orbital": "Orbital Tag", "tag_economy": "Economy Tag",
 }
 
+VOUCHER_NAMES = {
+    "v_overstock_norm": "Overstock", "v_overstock_plus": "Overstock Plus",
+    "v_clearance_sale": "Clearance Sale", "v_liquidation": "Liquidation",
+    "v_hone": "Hone", "v_glow_up": "Glow Up",
+    "v_reroll_surplus": "Reroll Surplus", "v_reroll_glut": "Reroll Glut",
+    "v_crystal_ball": "Crystal Ball", "v_omen_globe": "Omen Globe",
+    "v_telescope": "Telescope", "v_observatory": "Observatory",
+    "v_grabber": "Grabber", "v_nacho_tong": "Nacho Tong",
+    "v_wasteful": "Wasteful", "v_recyclomancy": "Recyclomancy",
+    "v_tarot_merchant": "Tarot Merchant", "v_tarot_tycoon": "Tarot Tycoon",
+    "v_planet_merchant": "Planet Merchant", "v_planet_tycoon": "Planet Tycoon",
+    "v_seed_money": "Seed Money", "v_money_tree": "Money Tree",
+    "v_blank": "Blank", "v_antimatter": "Antimatter",
+    "v_magic_trick": "Magic Trick", "v_illusion": "Illusion",
+    "v_hieroglyph": "Hieroglyph", "v_petroglyph": "Petroglyph",
+    "v_directors_cut": "Director's Cut", "v_retcon": "Retcon",
+    "v_paint_brush": "Paint Brush", "v_palette": "Palette",
+}
+
 SCOPES = [
     ("Entire seed space", 0),
     ("First 10M seeds", 10_000_000),
@@ -92,6 +163,12 @@ def joker_name(key):
     return key[2:].replace("_", " ").title() if key.startswith("j_") else key
 
 
+def voucher_name(key):
+    if key in VOUCHER_NAMES:
+        return VOUCHER_NAMES[key]
+    return key[2:].replace("_", " ").title() if key.startswith("v_") else key
+
+
 class Snapshot:
     """The catalog part of native_search.cfg: what can actually appear."""
 
@@ -104,6 +181,8 @@ class Snapshot:
         self.tag_reward_defs = {}
         self.tags = []        # (key, reqOk, minAnte)
         self.legendaries = [] # (key, avail)
+        self.vouchers = []    # (key, fresh-run avail, prerequisite key or "")
+        self.voucher_owned = set()
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 parts = line.split()
@@ -115,6 +194,11 @@ class Snapshot:
                     self.tags.append((parts[1], parts[2] == "1", int(parts[3])))
                 elif parts[0] == "jokerdef" and len(parts) >= 4 and parts[1] == "4":
                     self.legendaries.append((parts[2], parts[3] == "1"))
+                elif parts[0] == "vouchroute" and len(parts) == 4:
+                    self.vouchers.append((parts[1], parts[2] == "1",
+                                          "" if parts[3] == "-" else parts[3]))
+                elif parts[0] == "vouchowned" and len(parts) == 2:
+                    self.voucher_owned.add(parts[1])
                 elif parts[0] == "boostdef":
                     self.has_boostdef = True
                     self.bad_boostdef = self.bad_boostdef or len(parts) != 7
@@ -132,6 +216,22 @@ class Snapshot:
 
     def usable_legendaries(self):
         return [k for k, ok in self.legendaries if ok]
+
+    def usable_vouchers(self):
+        # A target is useful only when its complete prerequisite chain can be
+        # reached from fresh eligible bases or a deck/challenge starting
+        # voucher. Keep catalog order for exact RNG index presentation.
+        reachable = set(self.voucher_owned)
+        changed = True
+        while changed:
+            changed = False
+            for key, ok, prerequisite in self.vouchers:
+                if (ok and key not in reachable
+                        and (not prerequisite or prerequisite in reachable)):
+                    reachable.add(key)
+                    changed = True
+        return [(key, prerequisite) for key, ok, prerequisite in self.vouchers
+                if ok and key in reachable and key not in self.voucher_owned]
 
     def current_model_copy(self):
         """Return a current snapshot or refuse stale catalog semantics.
@@ -200,6 +300,11 @@ class Criteria:
         self.leg_neg = False
         self.leg_soul_depth = 1  # 1 = first Soul only, 0 = up to 2 Souls deep
         self.tag_rules = []      # [key, min, max, count, min_phase, max_phase]
+        self.voucher_rules = []  # [key, min_ante, max_ante]
+        # Vouchers here may still be offered, but a qualifying route may not
+        # purchase them.  This is deliberately separate from voucher_rules so
+        # a target can itself be marked "must be found without buying it".
+        self.voucher_exclusions = []  # [key]
         self.route_collect = True
         self.threads = 0         # 0 = auto
         self.scope = 0           # index into SCOPES
@@ -213,7 +318,8 @@ class Criteria:
         return SEEDSPACE_TOTAL if self.space == "total" else SEEDSPACE
 
     def predicates(self):
-        return bool(self.legendary) or bool(self.tag_rules)
+        return (bool(self.legendary) or bool(self.tag_rules)
+                or bool(self.voucher_rules))
 
     def auto_name(self):
         bits = []
@@ -226,6 +332,12 @@ class Criteria:
             if cnt > 1:
                 b += "x%d" % cnt
             bits.append(b)
+        for key, lo, hi in self.voucher_rules:
+            b = key.replace("v_", "", 1)
+            b += "-a%d" % lo if lo == hi else "-a%d-%d" % (lo, hi)
+            bits.append(b)
+        for key in self.voucher_exclusions:
+            bits.append("no-buy-" + key.replace("v_", "", 1))
         if self.legendary:
             b = self.legendary.replace("j_", "")
             if self.leg_neg:
@@ -285,6 +397,10 @@ class Criteria:
             else:
                 lines.append("tag %s %d %s %d %s %d"
                              % (key, lo, min_phase, hi, max_phase, cnt))
+        for key, lo, hi in self.voucher_rules:
+            lines.append("voucher %s %d %d" % (key, lo, hi))
+        for key in self.voucher_exclusions:
+            lines.append("voucher_exclude %s" % key)
         if self.legendary:
             if self.leg_human_location:
                 lines.append("legendary %s %d %s %d %s %d %s"
@@ -311,6 +427,13 @@ class Criteria:
             s += " (A%d %s through A%d %s)" % (
                 lo, PHASE_LABELS[min_phase], hi, PHASE_LABELS[max_phase])
             parts.append(s)
+        for key, lo, hi in self.voucher_rules:
+            s = voucher_name(key)
+            s += " (A%d)" % lo if lo == hi else " (A%d through A%d)" % (lo, hi)
+            parts.append(s)
+        if self.voucher_exclusions:
+            names = ", ".join(voucher_name(key) for key in self.voucher_exclusions)
+            parts.append("route cannot purchase %s" % names)
         depth_text = {1: " within 1 Soul (the first)",
                       0: " within 2 Souls (first or second)",
                       2: " second reachable Soul only"}
@@ -492,7 +615,8 @@ def read_pool_header(path):
 
 POOL_CRITERIA_FIELDS = (
     "tag", "route_tag", "legendary", "route_legendary", "soul_depth",
-    "tag_route",
+    "tag_route", "voucher", "route_voucher", "voucher_exclude",
+    "route_voucher_exclude",
 )
 POOL_IDENTITY_FIELDS = (
     "family_id", "segment_id", "stage_hash", "lineage_id",
@@ -770,6 +894,8 @@ class App:
         self.tag_keys = [k for k, _ in snap.usable_tags()]
         self.tag_min_ante = {k: ma for k, ma in snap.usable_tags()}
         self.legendaries = snap.usable_legendaries()
+        self.vouchers = [key for key, _prerequisite in snap.usable_vouchers()]
+        self.voucher_prerequisite = dict(snap.usable_vouchers())
         self.input_pools = [""]
         if os.path.isdir(POOL_DIR):
             for fn in sorted(os.listdir(POOL_DIR)):
@@ -828,6 +954,20 @@ class App:
             f.append(Field("rule", "Tag rule %d" % (i + 1), rule=rule, ridx=i))
         if len(c.tag_rules) < MAX_TAG_RULES and self.tag_keys:
             f.append(Field("action", "[ Add a tag requirement ]", run=self._add_rule))
+        for i, rule in enumerate(c.voucher_rules):
+            f.append(Field("voucher_rule", "Voucher target %d" % (i + 1),
+                           rule=rule, ridx=i))
+        if len(c.voucher_rules) < MAX_VOUCHER_RULES and self.vouchers:
+            f.append(Field("action", "[ Add a voucher target ]",
+                           run=self._add_voucher_rule))
+        for i, key in enumerate(c.voucher_exclusions):
+            f.append(Field("voucher_exclusion", "Cannot require purchase %d" % (i + 1),
+                           key=key, ridx=i))
+        if (c.voucher_rules
+                and len(c.voucher_exclusions) < MAX_VOUCHER_EXCLUSIONS
+                and len(c.voucher_exclusions) < len(self.vouchers)):
+            f.append(Field("action", "[ Add a voucher purchase exclusion ]",
+                           run=self._add_voucher_exclusion))
         f.append(Field("toggle", "Tag route",
                        get=lambda: c.route_collect, set=self._set_route,
                        on="collect (skip matched blinds)",
@@ -934,6 +1074,16 @@ class App:
         self.crit.tag_rules.append(
             [key, max(1, self.tag_min_ante.get(key, 1)), 8, 1, "small", "big"])
 
+    def _add_voucher_rule(self):
+        if self.vouchers:
+            self.crit.voucher_rules.append([self.vouchers[0], 1, 8])
+
+    def _add_voucher_exclusion(self):
+        used = set(self.crit.voucher_exclusions)
+        key = next((item for item in self.vouchers if item not in used), None)
+        if key:
+            self.crit.voucher_exclusions.append(key)
+
     def _quit(self):
         raise KeyboardInterrupt
 
@@ -957,7 +1107,7 @@ class App:
             val = self.field_value(fld)
             line = "%-34s %s" % (fld.label, val) if val is not None else fld.label
             scr.addnstr(top + i, 2, line.ljust(w - 5), w - 4, attr)
-        keys = "up/down move   left/right change   enter select   a add tag   d delete tag   q quit"
+        keys = "up/down move   left/right change   enter edit   a add tag   d delete selected rule   q quit"
         scr.addnstr(h - 2, 2, keys[: w - 4], w - 4, curses.A_DIM)
         if self.status:
             scr.addnstr(h - 3, 2, self.status[: w - 4], w - 4, curses.color_pair(4))
@@ -979,6 +1129,14 @@ class App:
             return "< %s >  A%d %s - A%d %s  count %d" % (
                 TAG_NAMES.get(key, key), lo, PHASE_LABELS[min_phase],
                 hi, PHASE_LABELS[max_phase], cnt)
+        if fld.kind == "voucher_rule":
+            key, lo, hi = fld.rule
+            prerequisite = self.voucher_prerequisite.get(key, "")
+            needs = "  (requires %s)" % voucher_name(prerequisite) \
+                if prerequisite else ""
+            return "< %s >  A%d - A%d%s" % (voucher_name(key), lo, hi, needs)
+        if fld.kind == "voucher_exclusion":
+            return "< %s >  (may appear; route cannot buy it)" % voucher_name(fld.key)
         return None
 
     # ------------------------------------------------------- interaction
@@ -999,6 +1157,13 @@ class App:
             fld.rule[1] = max(lo, self.tag_min_ante.get(fld.rule[0], 1), 1)
             if fld.rule[2] < fld.rule[1]:
                 fld.rule[2] = fld.rule[1]
+        elif fld.kind == "voucher_rule":
+            key = fld.rule[0]
+            i = (self.vouchers.index(key) + delta) % len(self.vouchers)
+            fld.rule[0] = self.vouchers[i]
+        elif fld.kind == "voucher_exclusion":
+            i = (self.vouchers.index(fld.key) + delta) % len(self.vouchers)
+            self.crit.voucher_exclusions[fld.ridx] = self.vouchers[i]
 
     def edit_rule(self, fld):
         """Enter on a tag rule: small sub-loop editing antes/count."""
@@ -1044,6 +1209,30 @@ class App:
                     rule[1], rule[4], rule[2], rule[5]))
         self.status = ""
 
+    def edit_voucher_rule(self, fld):
+        """Enter on a voucher target: edit its inclusive Ante window."""
+        rule = fld.rule
+        part = 0
+        labels = ["earliest ante", "latest ante"]
+        while True:
+            self.status = "Editing %s -- %s: left/right change, tab next, enter done" \
+                % (voucher_name(rule[0]), labels[part])
+            self.draw_form()
+            ch = self.scr.getch()
+            if ch in (curses.KEY_ENTER, 10, 13, 27):
+                break
+            if ch == 9:
+                part = (part + 1) % 2
+            elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                delta = 1 if ch == curses.KEY_RIGHT else -1
+                if part == 0:
+                    rule[1] = max(1, min(MAX_VOUCHER_ANTE, rule[1] + delta))
+                    rule[2] = max(rule[2], rule[1])
+                else:
+                    rule[2] = max(1, min(MAX_VOUCHER_ANTE, rule[2] + delta))
+                    rule[1] = min(rule[1], rule[2])
+        self.status = ""
+
     def edit_text(self, fld):
         curses.curs_set(1)
         buf = list(self.crit.name if self.crit.name_edited else "")
@@ -1068,7 +1257,9 @@ class App:
     # ------------------------------------------------------------- runs
     def validate(self):
         if not self.crit.predicates():
-            return "Add a legendary or at least one tag requirement first."
+            return "Add a Legendary, tag requirement, or voucher target first."
+        if self.crit.voucher_exclusions and not self.crit.voucher_rules:
+            return "A voucher purchase exclusion requires at least one voucher target."
         if self.input_idx and self.crit.shard_total > 1:
             return "Distributed parts currently apply to Balatro's seed space, not an input pool."
         if self.crit.legendary and route_position(
@@ -1087,6 +1278,20 @@ class App:
                 return "%s route start must come before its route end." % TAG_NAMES.get(key, key)
             if cnt > tag_location_count(lo, min_phase, hi, max_phase):
                 return "%s count exceeds the selected blind window." % TAG_NAMES.get(key, key)
+            if (self.crit.voucher_rules and self.crit.route_collect
+                    and key in ("tag_voucher", "tag_double")):
+                return ("Collected Voucher and Double Tags are not yet supported "
+                        "with voucher targets; observe that tag or remove it.")
+        for key, lo, hi in self.crit.voucher_rules:
+            if key not in self.vouchers:
+                return "%s is unavailable in this snapshot." % voucher_name(key)
+            if lo < 1 or hi < lo or hi > MAX_VOUCHER_ANTE:
+                return "%s has an invalid Ante window." % voucher_name(key)
+        if len(set(self.crit.voucher_exclusions)) != len(self.crit.voucher_exclusions):
+            return "Each voucher purchase exclusion can only be added once."
+        for key in self.crit.voucher_exclusions:
+            if key not in self.vouchers:
+                return "%s is unavailable in this snapshot." % voucher_name(key)
         return None
 
     def _do_estimate(self):
@@ -1231,12 +1436,18 @@ class App:
                     self._add_rule()
             elif ch in (ord("d"), ord("D")) and fld.kind == "rule":
                 del self.crit.tag_rules[fld.ridx]
+            elif ch in (ord("d"), ord("D")) and fld.kind == "voucher_rule":
+                del self.crit.voucher_rules[fld.ridx]
+            elif ch in (ord("d"), ord("D")) and fld.kind == "voucher_exclusion":
+                del self.crit.voucher_exclusions[fld.ridx]
             elif ch in (curses.KEY_ENTER, 10, 13):
                 self.status = ""
                 if fld.kind == "action":
                     fld.run()
                 elif fld.kind == "rule":
                     self.edit_rule(fld)
+                elif fld.kind == "voucher_rule":
+                    self.edit_voucher_rule(fld)
                 elif fld.kind == "text":
                     self.edit_text(fld)
                 elif fld.kind == "toggle":
@@ -1250,11 +1461,11 @@ def preflight():
             # No compiler assumed on Windows: the prebuilt exes ship in the
             # release zip (see README's Windows section).
             problems.append(
-                "native\\brainstorm_seed_pool.exe not found. Download the "
-                "Brainstorm Windows release zip and copy both .exe files "
-                "into the Mods\\Brainstorm\\native\\ folder, then run this "
-                "again. (Building from source instead: see "
-                "native/build_windows.sh.)")
+                "brainstorm_seed_pool.exe not found. Re-run the Windows "
+                "Brainstorm installer so 'Seed Pool Builder\\' contains both "
+                "the app and scanner. Older/source layouts may instead put "
+                "the scanner in Mods\\Brainstorm\\native\\. (Building from "
+                "source instead: see native/build_windows.sh.)")
         else:
             build = os.path.join(NATIVE_DIR, "build.sh")
             print("Building native helpers (first run)...")
@@ -1297,7 +1508,8 @@ def main():
         print("\n".join(problems), file=sys.stderr)
         return 1
     snap = Snapshot(SNAPSHOT)
-    if not snap.usable_legendaries() and not snap.usable_tags():
+    if (not snap.usable_legendaries() and not snap.usable_tags()
+            and not snap.usable_vouchers()):
         print("The snapshot has no usable pools; regenerate native_search.cfg in-game.",
               file=sys.stderr)
         return 1

@@ -154,7 +154,7 @@ PY
 	echo "matchany 0"; echo "jslot 1 - 0"; echo "jslot 2 - 0"; echo "jslot 3 - 0"
 	echo "maslots 0 0 0 0 0 0 0 0"; echo "mapacks 0 0 0 0 0 0 0 0"; echo "packslots 2"
 	echo "poolfile $(native_path "$OUT/refined.bspool")"
-	grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
+	grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' "$OUT/snapshot.cfg"
 	echo "end"
 } > "$OUT/search.cfg"
 : > "$OUT/hb"

@@ -79,6 +79,26 @@ for name in tag-small tag-big charm boss; do
 	}
 done
 
+# The targeted Charm/Omen branches intentionally let one seed expose its first
+# Soul at different locations on different valid routes.  Legacy coordinate
+# compatibility is a single-route property, so give that portion of the test a
+# snapshot with only those two alternate-route sources disabled.  The primary
+# fixtures above still exercise both features with the real snapshot.
+awk '
+	$1 == "tagdef" && $2 == "tag_charm" { $3 = 0 }
+	$1 == "vouchdef" && $2 == "v_omen_globe" { $3 = 0 }
+	$1 == "vouchroute" && $2 == "v_omen_globe" { $3 = 0 }
+	$1 == "vouchowned" && $2 == "v_omen_globe" { next }
+	{ print }
+' "$OUT/snapshot.cfg" > "$OUT/legacy-snapshot.cfg"
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/legacy-snapshot.cfg" \
+	"$OUT/boss.cfg" "$OUT/legacy-boss.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/legacy-boss.bspool" \
+	"$OUT/legacy-boss.txt"
+[ -s "$OUT/legacy-boss.txt" ] || {
+	echo "FAIL: alternate-free legacy Boss sample is empty; raise COUNT (currently $COUNT)"; exit 1;
+}
+
 grep -a -q "^tag $TAG 1 small 1 small 1$" "$OUT/tag-small.bspool"
 grep -a -q "^tag $TAG 1 big 1 big 1$" "$OUT/tag-big.bspool"
 grep -a -q "^legendary $LEGENDARY 1 small 1 small 0 charm$" \
@@ -196,24 +216,24 @@ fi
 
 # Legacy A2 means the RNG stream Ante, not displayed Ante. Human A1 Boss is
 # therefore accepted by legacy A2 and rejected by legacy A1.
-"./native/brainstorm_seed_pool$EXE" fixture "$OUT/snapshot.cfg" \
-	"$OUT/legacy-a2.cfg" "$OUT/boss.txt" > "$OUT/legacy-a2.fixture"
+"./native/brainstorm_seed_pool$EXE" fixture "$OUT/legacy-snapshot.cfg" \
+	"$OUT/legacy-a2.cfg" "$OUT/legacy-boss.txt" > "$OUT/legacy-a2.fixture"
 if awk '$2 != 1 { bad=1 } END { exit !bad }' "$OUT/legacy-a2.fixture"; then
 	echo "FAIL: human A1 Boss was not accepted by legacy RNG-Ante 2"; exit 1
 fi
-"./native/brainstorm_seed_pool$EXE" fixture "$OUT/snapshot.cfg" \
-	"$OUT/legacy-a1.cfg" "$OUT/boss.txt" > "$OUT/legacy-a1.fixture"
+"./native/brainstorm_seed_pool$EXE" fixture "$OUT/legacy-snapshot.cfg" \
+	"$OUT/legacy-a1.cfg" "$OUT/legacy-boss.txt" > "$OUT/legacy-a1.fixture"
 if awk '$2 == 1 { found=1 } END { exit !found }' "$OUT/legacy-a1.fixture"; then
 	echo "FAIL: old Legendary 1..1 was reinterpreted as human A1"; exit 1
 fi
 
 # Refiltering the exact human pool through the equivalent legacy RNG-Ante rule
 # proves both coordinate systems survive the .bspool header parser together.
-"./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
-	"$OUT/legacy-a2.cfg" "$OUT/boss.bspool" "$OUT/boss-roundtrip.bspool"
+"./native/brainstorm_seed_pool$EXE" refilter "$OUT/legacy-snapshot.cfg" \
+	"$OUT/legacy-a2.cfg" "$OUT/legacy-boss.bspool" "$OUT/boss-roundtrip.bspool"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/boss-roundtrip.bspool" \
 	"$OUT/boss-roundtrip.txt"
-sort "$OUT/boss.txt" > "$OUT/boss.sorted"
+sort "$OUT/legacy-boss.txt" > "$OUT/boss.sorted"
 sort "$OUT/boss-roundtrip.txt" > "$OUT/boss-roundtrip.sorted"
 cmp "$OUT/boss.sorted" "$OUT/boss-roundtrip.sorted"
 grep -a -q "^route_legendary $LEGENDARY 1 boss 1 boss 0 shop 1$" \
@@ -231,8 +251,8 @@ check_metadata "$OUT/boss-roundtrip.bspool" 2 "$LEGENDARY" 1 0 1
 	echo "matchany 0"; echo "jslot 1 - 0"; echo "jslot 2 - 0"; echo "jslot 3 - 0"
 	echo "maslots 0 0 0 0 0 0 0 0"; echo "mapacks 0 0 0 0 0 0 0 0"; echo "packslots 2"
 	echo "poolfile $(native_path "$OUT/boss-roundtrip.bspool")"
-	grep -E '^(tagdef|vouchdef|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' \
-		"$OUT/snapshot.cfg"
+	grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' \
+		"$OUT/legacy-snapshot.cfg"
 	echo "end"
 } > "$OUT/overlay.cfg"
 sed -n '1,500p' "$OUT/boss-roundtrip.txt" > "$OUT/overlay.seeds"

@@ -37,6 +37,9 @@
 #define POOL_SCHEMA 1
 #define POOL_MAX_ANTE 39
 #define POOL_MAX_TAG_RULES BSPOOL_MAX_TAG_RULES
+#define POOL_MAX_VOUCHER_RULES 8
+#define POOL_MAX_VOUCHER_EXCLUSIONS 16
+#define POOL_MAX_VOUCHER_ANTE 8
 #define POOL_LABEL 512
 #define POOL_HEADER_SIZE BSPOOL_HEADER_SIZE
 #define POOL_OUTPUT_BUFFER (64 * 1024)
@@ -64,6 +67,11 @@ typedef struct {
 	int soulDepth; /* 1 (default), 2, or SOUL_DEPTH_ANY (either Soul) */
 } PoolLegendaryRule;
 
+typedef struct {
+	char key[MAX_KEY];
+	int poolIndex, minAnte, maxAnte;
+} PoolVoucherRule;
+
 static const char *pool_soul_depth_str(int depth) {
 	return depth == SOUL_DEPTH_ANY ? "any" : depth == 2 ? "2" : "1";
 }
@@ -83,10 +91,21 @@ typedef struct {
 	PoolTagRule baseTagRules[POOL_MAX_TAG_RULES];
 	int nbaseLegendaryRules;
 	PoolLegendaryRule baseLegendaryRules[MAX_POOL_LEGEND_RULES];
+	int nbaseVoucherRules;
+	PoolVoucherRule baseVoucherRules[POOL_MAX_VOUCHER_RULES];
+	int nbaseVoucherExclusions;
+	int baseVoucherExclusions[POOL_MAX_VOUCHER_EXCLUSIONS];
+	char baseVoucherExclusionKeys[POOL_MAX_VOUCHER_EXCLUSIONS][MAX_KEY];
 	int nlegendary; /* current-stage rule (0 or 1) */
 	PoolLegendaryRule legendary[1];
+	int nvoucherRules;
+	PoolVoucherRule voucherRules[POOL_MAX_VOUCHER_RULES];
+	int nvoucherExclusions;
+	int voucherExclusions[POOL_MAX_VOUCHER_EXCLUSIONS];
+	char voucherExclusionKeys[POOL_MAX_VOUCHER_EXCLUSIONS][MAX_KEY];
+	int maxVoucherAnte;
 	int minTagAnte, maxTagAnte, maxAnte;
-	int firstKind; /* 1 = Joker4, 2 = Tag<firstAnte> */
+	int firstKind; /* 1 = Joker4, 2 = Tag<firstAnte>, 3 = Voucher1 */
 	int firstAnte;
 	char firstKey[32];
 	char kTag[POOL_MAX_ANTE + 1][16];
@@ -138,15 +157,22 @@ typedef struct {
 	PoolStream jokerResample[MAX_RESAMPLE];
 	PoolStream tag[POOL_MAX_ANTE + 1];
 	PoolStream tagResample[POOL_MAX_ANTE + 1][MAX_RESAMPLE];
+	PoolStream voucher[POOL_MAX_ANTE + 1];
+	PoolStream voucherResample[POOL_MAX_ANTE + 1][MAX_RESAMPLE];
+	uint8_t voucherVisits[POOL_MAX_ANTE + 1];
 	int tagRoll[POOL_MAX_ANTE + 1][2];
 	uint8_t tagRollDone[POOL_MAX_ANTE + 1][2];
 	PoolStream shopPack[POOL_MAX_ANTE + 1];
 	PoolStream soulT[POOL_MAX_ANTE + 1], soulS[POOL_MAX_ANTE + 1];
 	PoolStream ediSoul[POOL_MAX_ANTE + 1];
+	PoolStream omen;
 	uint64_t packsGen[POOL_MAX_ANTE + 1];
 	int packsN[POOL_MAX_ANTE + 1], packIdx[POOL_MAX_ANTE + 1][6];
 	uint8_t skipSm[POOL_MAX_ANTE + 1], skipBig[POOL_MAX_ANTE + 1];
 	uint8_t rewardSm[POOL_MAX_ANTE + 1], rewardBig[POOL_MAX_ANTE + 1];
+	uint64_t voucherPurchased;
+	uint8_t voucherPurchaseAnte[MAX_VOUCH], voucherPurchaseVisit[MAX_VOUCH];
+	uint8_t charmRequired;
 	int forcedAnte;
 	int firstLegendaryIdx, secondLegendaryIdx;
 	/* Per-rule Soul depth after either-depth resolution (base rules first,
@@ -155,9 +181,13 @@ typedef struct {
 } PoolCtx;
 
 #define POOL_EVENT_BLOCK_RECORDS 1024
-#define POOL_MAX_OCCURRENCES (2 * POOL_MAX_ANTE + 18)
-enum { POOL_META_TAG = 1, POOL_META_LEGENDARY = 2 };
-enum { POOL_META_NEGATIVE = 1u << 0, POOL_META_CHARM_REQUIRED = 1u << 1 };
+#define POOL_MAX_OCCURRENCES 160
+enum { POOL_META_TAG = 1, POOL_META_LEGENDARY = 2, POOL_META_VOUCHER = 3 };
+enum {
+	POOL_META_NEGATIVE = 1u << 0,
+	POOL_META_CHARM_REQUIRED = 1u << 1,
+	POOL_META_PURCHASED = 1u << 2
+};
 
 typedef struct {
 	uint16_t keyIndex;
@@ -330,6 +360,17 @@ static uint64_t pool_hash_stage(const PoolPlan *p) {
 			h = pool_hash_update(h, line, (size_t)n);
 		}
 	}
+	for (int i = 0; i < p->nvoucherRules; i++) {
+		const PoolVoucherRule *r = &p->voucherRules[i];
+		n = snprintf(line, sizeof line, "voucher %s %d %d\n",
+				r->key, r->minAnte, r->maxAnte);
+		h = pool_hash_update(h, line, (size_t)n);
+	}
+	for (int i = 0; i < p->nvoucherExclusions; i++) {
+		n = snprintf(line, sizeof line, "voucher_exclude %s\n",
+				p->voucherExclusionKeys[i]);
+		h = pool_hash_update(h, line, (size_t)n);
+	}
 	return h;
 }
 
@@ -412,6 +453,11 @@ static int pool_find_tag(const Config *g, const char *key) {
 
 static int pool_find_legendary(const Config *g, const char *key) {
 	for (int i = 0; i < g->njoker[4]; i++) if (!strcmp(g->jokerKey[4][i], key)) return i;
+	return -1;
+}
+
+static int pool_find_voucher(const Config *g, const char *key) {
+	for (int i = 0; i < g->nvouch; i++) if (!strcmp(g->vouchKey[i], key)) return i;
 	return -1;
 }
 
@@ -540,6 +586,33 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 						|| !pool_parse_int(values[4], &r->requireNegative)
 						|| !pool_parse_source(values[5], &r->source)) goto bad_value;
 			} else goto bad_value;
+		} else if (!strcmp(d, "voucher")) {
+			if (p->nvoucherRules >= POOL_MAX_VOUCHER_RULES) {
+				snprintf(err, errsz, "criteria line %d: too many voucher rules (max %d)",
+						lineno, POOL_MAX_VOUCHER_RULES);
+				goto fail;
+			}
+			PoolVoucherRule *r = &p->voucherRules[p->nvoucherRules++];
+			char *key = pool_tok(&sp);
+			if (!key || strlen(key) >= sizeof r->key
+					|| !pool_parse_int(pool_tok(&sp), &r->minAnte)
+					|| !pool_parse_int(pool_tok(&sp), &r->maxAnte)) goto bad_value;
+			snprintf(r->key, sizeof r->key, "%s", key);
+		} else if (!strcmp(d, "voucher_exclude")) {
+			if (p->nvoucherExclusions >= POOL_MAX_VOUCHER_EXCLUSIONS) {
+				snprintf(err, errsz, "criteria line %d: too many voucher exclusions (max %d)",
+						lineno, POOL_MAX_VOUCHER_EXCLUSIONS);
+				goto fail;
+			}
+			char *key = pool_tok(&sp);
+			if (!key) goto bad_value;
+			int index = pool_find_voucher(g, key);
+			if (index < 0) goto bad_value;
+			for (int i = 0; i < p->nvoucherExclusions; i++)
+				if (p->voucherExclusions[i] == index) goto bad_value;
+			int slot = p->nvoucherExclusions++;
+			p->voucherExclusions[slot] = index;
+			snprintf(p->voucherExclusionKeys[slot], MAX_KEY, "%s", key);
 		} else if (!strcmp(d, "soul_depth")) {
 			/* Applies to the most recent legendary rule (or, for
 			 * compatibility with older single-rule files, the first rule
@@ -585,7 +658,13 @@ bad_value:
 	if (p->checkpoint < p->chunk) p->checkpoint = p->chunk;
 	p->resume = !!p->resume;
 	p->collectTags = !!p->collectTags;
-	if (p->ntagRules == 0 && !p->nlegendary) { snprintf(err, errsz, "criteria has no predicates"); return false; }
+	if (p->ntagRules == 0 && !p->nlegendary && !p->nvoucherRules) {
+		snprintf(err, errsz, "criteria has no predicates"); return false;
+	}
+	if (p->nvoucherExclusions && !p->nvoucherRules) {
+		snprintf(err, errsz, "voucher_exclude requires at least one voucher rule");
+		return false;
+	}
 	if (!p->nlegendary && p->legendary[0].soulDepth != 1) {
 		snprintf(err, errsz, "soul_depth requires a legendary rule");
 		return false;
@@ -647,10 +726,57 @@ bad_value:
 		}
 		p->firstKind = 1;
 		snprintf(p->firstKey, sizeof p->firstKey, "Joker4");
-	} else {
+	} else if (p->ntagRules) {
 		p->firstKind = 2;
 		p->firstAnte = p->minTagAnte;
 		snprintf(p->firstKey, sizeof p->firstKey, "Tag%d", p->firstAnte);
+	} else {
+		p->firstKind = 3;
+		snprintf(p->firstKey, sizeof p->firstKey, "Voucher1");
+	}
+	if (p->nvoucherRules) {
+		if (g->nvouch > 64) {
+			snprintf(err, errsz,
+					"voucher routes support at most 64 catalog entries (snapshot has %d)",
+					g->nvouch);
+			return false;
+		}
+		for (int i = 0; i < g->nvouch; i++) {
+			if (!g->vouchRouteDefined[i]) {
+				snprintf(err, errsz,
+						"voucher route catalog is missing; refresh native_search.cfg in Balatro");
+				return false;
+			}
+		}
+		for (int i = 0; i < p->nvoucherRules; i++) {
+			PoolVoucherRule *r = &p->voucherRules[i];
+			if (r->minAnte < 1 || r->maxAnte < r->minAnte
+					|| r->maxAnte > POOL_MAX_VOUCHER_ANTE) {
+				snprintf(err, errsz, "bad range for voucher rule %s", r->key);
+				return false;
+			}
+			r->poolIndex = pool_find_voucher(g, r->key);
+			if (r->poolIndex < 0 || !g->vouchRouteAvail[r->poolIndex]) {
+				snprintf(err, errsz, "voucher %s is unavailable in this snapshot", r->key);
+				return false;
+			}
+			if (g->vouchInitiallyOwned[r->poolIndex]) {
+				snprintf(err, errsz,
+						"voucher %s is already owned at the start of this snapshot", r->key);
+				return false;
+			}
+			if (r->maxAnte > p->maxVoucherAnte) p->maxVoucherAnte = r->maxAnte;
+		}
+		if (p->maxVoucherAnte > p->maxAnte) p->maxAnte = p->maxVoucherAnte;
+		for (int i = 0; i < p->ntagRules; i++) {
+			const PoolTagRule *r = &p->tagRules[i];
+			if (r->collect && (!strcmp(r->key, "tag_voucher")
+					|| !strcmp(r->key, "tag_double"))) {
+				snprintf(err, errsz,
+						"collected Voucher/Double Tags are not yet supported with voucher routes");
+				return false;
+			}
+		}
 	}
 	if (p->maxTagAnte > p->maxAnte) p->maxAnte = p->maxTagAnte;
 	for (int a = 1; a <= p->maxAnte; a++) {
@@ -841,9 +967,378 @@ static bool pool_check_tags(PoolCtx *c, char *label, size_t labelCap,
 	return remaining == 0;
 }
 
+/* ------------------------------------------------------- voucher routes --
+ * Voucher offers are rolled after the old shop has been destroyed, so an
+ * unbought offer remains eligible on later Antes. Buying changes the dynamic
+ * pool (owned vouchers disappear; upgrades whose prerequisite is now owned
+ * become eligible). Hieroglyph/Petroglyph reduce the displayed Ante by one;
+ * the following Boss restores it, causing another call to the SAME VoucherN
+ * stream at its next advance. Explore skip first and retain the minimum-buy
+ * route. Exclusions forbid only the buy edge, never the offer itself. */
+
+typedef struct {
+	PoolStream main;
+	PoolStream resample[MAX_RESAMPLE];
+	int nresample;
+	uint8_t visits;
+} PoolVoucherUndo;
+
+typedef struct {
+	int found, purchases;
+	int maxAnte, requireOmen, requireSouls;
+	int omenIndex;
+	uint16_t omenActivationMask;
+	uint64_t purchased;
+	PoolMetadata metadata;
+} PoolVoucherBest;
+
+static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata);
+
+static void pool_reset_soul_walk(PoolCtx *c) {
+	memset(c->shopPack, 0, sizeof c->shopPack);
+	memset(c->soulT, 0, sizeof c->soulT);
+	memset(c->soulS, 0, sizeof c->soulS);
+	memset(c->ediSoul, 0, sizeof c->ediSoul);
+	memset(&c->omen, 0, sizeof c->omen);
+	memset(c->packsGen, 0, sizeof c->packsGen);
+	memset(c->packsN, 0, sizeof c->packsN);
+}
+
+static int pool_voucher_rule_count(const PoolPlan *p) {
+	return p->nbaseVoucherRules + p->nvoucherRules;
+}
+
+static const PoolVoucherRule *pool_voucher_rule_at(const PoolPlan *p, int i) {
+	return i < p->nbaseVoucherRules ? &p->baseVoucherRules[i]
+			: &p->voucherRules[i - p->nbaseVoucherRules];
+}
+
+static bool pool_voucher_purchase_excluded(const PoolPlan *p, int index) {
+	for (int i = 0; i < p->nbaseVoucherExclusions; i++)
+		if (p->baseVoucherExclusions[i] == index) return true;
+	for (int i = 0; i < p->nvoucherExclusions; i++)
+		if (p->voucherExclusions[i] == index) return true;
+	return false;
+}
+
+static int pool_roll_route_voucher(PoolCtx *c, int ante, uint64_t purchased,
+		PoolVoucherUndo *undo) {
+	const Config *g = c->g;
+	if (ante < 1 || ante > POOL_MAX_ANTE || g->nvouch < 1 || g->nvouch > 64)
+		return -1;
+	char key[24];
+	snprintf(key, sizeof key, "Voucher%d", ante);
+	undo->main = c->voucher[ante];
+	undo->nresample = 0;
+	undo->visits = c->voucherVisits[ante];
+	c->voucherVisits[ante]++;
+
+	uint8_t available[MAX_VOUCH] = { 0 };
+	int navailable = 0;
+	for (int i = 0; i < g->nvouch; i++) {
+		int prerequisite = g->vouchPrereq[i];
+		available[i] = g->vouchRouteAvail[i]
+			&& !(purchased & (UINT64_C(1) << i))
+			&& (prerequisite < 0 || (purchased & (UINT64_C(1) << prerequisite)));
+		if (available[i]) navailable++;
+	}
+	if (!navailable) return -1;
+
+	int idx = pool_psr_n(c, pool_stream_next(c, &c->voucher[ante], key), g->nvouch);
+	int it = 1;
+	while (idx > 0 && !available[idx - 1]) {
+		it++;
+		if (it - 2 >= MAX_RESAMPLE) return -1;
+		undo->resample[undo->nresample++] = c->voucherResample[ante][it - 2];
+		double value = pool_resample_next(c, c->voucherResample[ante], key, it);
+		if (isnan(value)) return -1;
+		idx = pool_psr_n(c, value, g->nvouch);
+	}
+	return idx > 0 ? idx - 1 : -1;
+}
+
+static void pool_undo_route_voucher(PoolCtx *c, int ante,
+		const PoolVoucherUndo *undo) {
+	c->voucher[ante] = undo->main;
+	c->voucherVisits[ante] = undo->visits;
+	for (int i = 0; i < undo->nresample; i++)
+		c->voucherResample[ante][i] = undo->resample[i];
+}
+
+static void pool_search_voucher_route(PoolCtx *c, int ante, uint64_t purchased,
+		uint32_t matched, int purchases, PoolMetadata *route,
+		PoolVoucherBest *best) {
+	const PoolPlan *p = c->p;
+	const Config *g = c->g;
+	int nrules = pool_voucher_rule_count(p);
+	uint32_t all = nrules == 32 ? UINT32_MAX : ((UINT32_C(1) << nrules) - 1u);
+	if (best->found && purchases > best->purchases) return;
+	for (int i = 0; i < nrules; i++) {
+		const PoolVoucherRule *r = pool_voucher_rule_at(p, i);
+		if (!(matched & (UINT32_C(1) << i)) && ante > r->maxAnte) return;
+	}
+	if (ante > best->maxAnte) {
+		if (matched == all && (!best->found || purchases < best->purchases)) {
+			if (best->requireOmen
+					&& (best->omenIndex < 0
+						|| !(purchased & (UINT64_C(1) << best->omenIndex)))) return;
+			if (best->requireSouls && best->requireOmen) {
+				int purchaseAnte = best->omenIndex >= 0
+						? c->voucherPurchaseAnte[best->omenIndex] : 0;
+				if (purchaseAnte < 1 || purchaseAnte > POOL_MAX_VOUCHER_ANTE
+						|| !(best->omenActivationMask & (UINT16_C(1) << (purchaseAnte - 1))))
+					return;
+			} else if (best->requireSouls) {
+				PoolMetadata trial = *route;
+				c->voucherPurchased = purchased;
+				pool_reset_soul_walk(c);
+				if (!pool_check_all_souls(c, NULL, 0, &trial)) {
+					pool_reset_soul_walk(c);
+					return;
+				}
+				pool_reset_soul_walk(c);
+			}
+			best->found = 1;
+			best->purchases = purchases;
+			best->purchased = purchased;
+			best->metadata = *route;
+		}
+		return;
+	}
+
+	PoolVoucherUndo undo;
+	int index = pool_roll_route_voucher(c, ante, purchased, &undo);
+	if (index < 0) {
+		pool_undo_route_voucher(c, ante, &undo);
+		return;
+	}
+	uint8_t visit = c->voucherVisits[ante];
+	/* The initial A1 voucher has no Boss-entry shop. If both A1 blinds are
+	 * skipped, it was rolled but is never physically offered. Every later (or
+	 * repeated) generation is visible immediately in a Boss-entry shop. */
+	int visible = ante != 1 || visit != 1 || !c->skipSm[1] || !c->skipBig[1];
+	uint32_t offeredMask = 0;
+	for (int i = 0; visible && i < nrules; i++) {
+		const PoolVoucherRule *r = pool_voucher_rule_at(p, i);
+		if (index == r->poolIndex && ante >= r->minAnte && ante <= r->maxAnte)
+			offeredMask |= UINT32_C(1) << i;
+	}
+	uint32_t nextMatched = matched | offeredMask;
+	int before = route->count;
+	if (offeredMask && !pool_metadata_add(route, (PoolOccurrence) {
+			.kind = POOL_META_VOUCHER, .keyIndex = (uint16_t)index,
+			.ante = (uint8_t)ante, .source = SOUL_SOURCE_SHOP,
+			.ordinal = visit,
+	})) {
+		pool_undo_route_voucher(c, ante, &undo);
+		return;
+	}
+	int afterOffer = route->count;
+
+	/* Once all targets have appeared, buying anything else cannot improve the
+	 * minimum route. Continue skip-only so metadata still records every later
+	 * target occurrence inside the requested windows. */
+	pool_search_voucher_route(c, ante + 1, purchased, nextMatched,
+			purchases, route, best);
+	route->count = (uint8_t)afterOffer;
+
+	int needMore = nextMatched != all
+			|| (best->requireOmen && (best->omenIndex < 0
+				|| !(purchased & (UINT64_C(1) << best->omenIndex))));
+	if (visible && needMore && (!best->found || purchases + 1 <= best->purchases)
+			&& !pool_voucher_purchase_excluded(p, index)) {
+		/* The scoped mixed model composes only Omen into the Soul timeline.
+		 * A minimum voucher-target route may use an Ante reducer while the
+		 * canonical Legendary replay stays unchanged; Omen fallback and tag
+		 * routes conservatively reject that unresolved timeline interaction. */
+		if (best->requireSouls || p->nbaseTagRules || p->ntagRules) {
+			if (!strcmp(g->vouchKey[index], "v_hieroglyph")
+					|| !strcmp(g->vouchKey[index], "v_petroglyph"))
+				goto skip_buy;
+		}
+		int purchasePhase = ante == 1 && visit == 1
+				? (c->skipSm[1] ? SOUL_PHASE_BIG : SOUL_PHASE_SMALL)
+				: SOUL_PHASE_BOSS;
+		if (pool_metadata_add(route, (PoolOccurrence) {
+				.kind = POOL_META_VOUCHER, .keyIndex = (uint16_t)index,
+				.ante = (uint8_t)ante, .phase = (uint8_t)purchasePhase,
+				.source = SOUL_SOURCE_SHOP,
+				.ordinal = visit, .flags = POOL_META_PURCHASED,
+		})) {
+			uint8_t oldPurchaseAnte = c->voucherPurchaseAnte[index];
+			uint8_t oldPurchaseVisit = c->voucherPurchaseVisit[index];
+			c->voucherPurchaseAnte[index] = (uint8_t)ante;
+			c->voucherPurchaseVisit[index] = visit;
+			int repeatsAnte = !strcmp(g->vouchKey[index], "v_hieroglyph")
+					|| !strcmp(g->vouchKey[index], "v_petroglyph");
+			pool_search_voucher_route(c, repeatsAnte ? ante : ante + 1,
+					purchased | (UINT64_C(1) << index), nextMatched,
+					purchases + 1, route, best);
+			c->voucherPurchaseAnte[index] = oldPurchaseAnte;
+			c->voucherPurchaseVisit[index] = oldPurchaseVisit;
+		}
+		route->count = (uint8_t)afterOffer;
+	}
+skip_buy:
+	route->count = (uint8_t)before;
+	pool_undo_route_voucher(c, ante, &undo);
+}
+
+static uint16_t pool_omen_activation_mask(PoolCtx *c, int omenIndex,
+		int routeMaxAnte, uint16_t candidates) {
+	if (omenIndex < 0 || omenIndex >= c->g->nvouch) return 0;
+	uint64_t oldPurchased = c->voucherPurchased;
+	uint8_t oldAnte = c->voucherPurchaseAnte[omenIndex];
+	uint8_t oldVisit = c->voucherPurchaseVisit[omenIndex];
+	uint16_t mask = 0;
+	for (int ante = 1; ante <= routeMaxAnte; ante++) {
+		if (!(candidates & (UINT16_C(1) << (ante - 1)))) continue;
+		c->voucherPurchased = oldPurchased | (UINT64_C(1) << omenIndex);
+		c->voucherPurchaseAnte[omenIndex] = (uint8_t)ante;
+		c->voucherPurchaseVisit[omenIndex] = 1;
+		pool_reset_soul_walk(c);
+		if (pool_check_all_souls(c, NULL, 0, NULL))
+			mask |= UINT16_C(1) << (ante - 1);
+	}
+	c->voucherPurchased = oldPurchased;
+	c->voucherPurchaseAnte[omenIndex] = oldAnte;
+	c->voucherPurchaseVisit[omenIndex] = oldVisit;
+	pool_reset_soul_walk(c);
+	return mask;
+}
+
+static bool pool_check_vouchers_mode(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata, int requireOmen, int requireSouls,
+		int routeMaxAnte) {
+	const PoolPlan *p = c->p;
+	int nrules = pool_voucher_rule_count(p);
+	if (!nrules && !requireOmen && !requireSouls) return true;
+	if (nrules > 31 || c->g->nvouch > 64) return false;
+	PoolMetadata route = { 0 };
+	if (metadata) route = *metadata;
+	PoolVoucherBest best = {
+		.purchases = INT_MAX,
+		.maxAnte = routeMaxAnte,
+		.requireOmen = requireOmen,
+		.requireSouls = requireSouls,
+		.omenIndex = pool_find_voucher(c->g, "v_omen_globe"),
+	};
+	if (best.maxAnte < p->maxVoucherAnte) best.maxAnte = p->maxVoucherAnte;
+	if (best.maxAnte < 1 || best.maxAnte > POOL_MAX_VOUCHER_ANTE) return false;
+	if (requireOmen && best.omenIndex < 0) return false;
+	uint64_t initialPurchased = 0;
+	for (int i = 0; i < c->g->nvouch; i++)
+		if (c->g->vouchInitiallyOwned[i]) initialPurchased |= UINT64_C(1) << i;
+	/* With no voucher predicates and no requested Omen purchase, the minimum
+	 * route buys nothing.  Validate the Soul branch directly instead of
+	 * requiring an unrelated voucher offer to exist in every Ante.  This also
+	 * covers challenge snapshots where every voucher is banned/already owned. */
+	if (!nrules && !requireOmen) {
+		c->voucherPurchased = initialPurchased;
+		PoolMetadata trial = route;
+		pool_reset_soul_walk(c);
+		bool passed = pool_check_all_souls(c, NULL, 0, &trial);
+		pool_reset_soul_walk(c);
+		return passed;
+	}
+	int haveBest = 0;
+	if (requireOmen && requireSouls) {
+		/* Most candidates cannot reach Omen at all. Find the deterministic
+		 * minimum Omen route before running up to eight Soul timelines. If its
+		 * activation point works, it is already the globally minimum solution;
+		 * only a failing reachable route pays for the exhaustive timing mask. */
+		PoolVoucherBest probe = best;
+		probe.requireSouls = 0;
+		PoolMetadata probeRoute = route;
+		pool_search_voucher_route(c, 1, initialPurchased, 0, 0,
+				&probeRoute, &probe);
+		if (!probe.found) return false;
+		int probeAnte = 0;
+		for (int i = 0; i < probe.metadata.count; i++) {
+			const PoolOccurrence *o = &probe.metadata.occurrence[i];
+			if (o->kind == POOL_META_VOUCHER && o->keyIndex == best.omenIndex
+					&& (o->flags & POOL_META_PURCHASED)) {
+					probeAnte = o->ante;
+					break;
+				}
+		}
+		if (!probeAnte) return false; /* starting Omen already failed canonically */
+		uint16_t probeBit = UINT16_C(1) << (probeAnte - 1);
+		uint16_t probePass = pool_omen_activation_mask(c, best.omenIndex,
+				best.maxAnte, probeBit);
+		if (probePass) {
+			best = probe;
+			haveBest = 1;
+		} else {
+			uint16_t allCandidates = (UINT16_C(1) << best.maxAnte) - 1u;
+			best.omenActivationMask = pool_omen_activation_mask(c,
+					best.omenIndex, best.maxAnte, allCandidates);
+			if (!best.omenActivationMask) return false;
+		}
+	}
+	if (!haveBest)
+		pool_search_voucher_route(c, 1, initialPurchased, 0, 0, &route, &best);
+	if (!best.found) return false;
+	if (metadata) *metadata = best.metadata;
+	c->voucherPurchased = best.purchased;
+	for (int i = 0; i < best.metadata.count; i++) {
+		const PoolOccurrence *o = &best.metadata.occurrence[i];
+		if (o->kind == POOL_META_VOUCHER && (o->flags & POOL_META_PURCHASED)
+				&& o->keyIndex < MAX_VOUCH) {
+			c->voucherPurchaseAnte[o->keyIndex] = o->ante;
+			c->voucherPurchaseVisit[o->keyIndex] = o->ordinal;
+		}
+	}
+
+	for (int i = p->nbaseVoucherRules; i < nrules; i++) {
+		const PoolVoucherRule *r = pool_voucher_rule_at(p, i);
+		int wrote = 0;
+		for (int j = 0; j < best.metadata.count; j++) {
+			const PoolOccurrence *o = &best.metadata.occurrence[j];
+			if (o->kind != POOL_META_VOUCHER || o->keyIndex != r->poolIndex
+					|| (o->flags & POOL_META_PURCHASED)
+					|| o->ante < r->minAnte || o->ante > r->maxAnte) continue;
+			pool_label_add(label, labelCap, "%s%sA%dV%d",
+					wrote ? "," : (label && label[0] ? " " : ""),
+					wrote ? "" : r->key, o->ante, o->ordinal);
+			wrote = 1;
+		}
+	}
+	if (best.purchases) {
+		pool_label_add(label, labelCap, "%sBuyRoute=", label && label[0] ? " " : "");
+		int wrote = 0;
+		for (int i = 0; i < best.metadata.count; i++) {
+			const PoolOccurrence *o = &best.metadata.occurrence[i];
+			if (o->kind != POOL_META_VOUCHER || !(o->flags & POOL_META_PURCHASED)) continue;
+			const char *key = o->keyIndex < c->g->nvouch ? c->g->vouchKey[o->keyIndex] : "?";
+			pool_label_add(label, labelCap, "%s%s@A%dV%d",
+					wrote ? "," : "", key, o->ante, o->ordinal);
+			wrote = 1;
+		}
+	}
+	return true;
+}
+
+static bool pool_check_vouchers(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata) {
+	return pool_check_vouchers_mode(c, label, labelCap, metadata,
+			0, 0, c->p->maxVoucherAnte);
+}
+
 static int pool_pack_max_slots(const PoolCtx *c, int ante) {
 	int shops = (ante >= 2 ? 3 : 2) - (c->skipSm[ante] ? 1 : 0) - (c->skipBig[ante] ? 1 : 0);
 	return shops * 2;
+}
+
+static void pool_resolve_forced_ante(PoolCtx *c) {
+	c->forcedAnte = 1;
+	for (int ante = 1; ante <= c->p->maxAnte; ante++) {
+		if (pool_pack_max_slots(c, ante) > 0) {
+			c->forcedAnte = ante;
+			break;
+		}
+	}
 }
 
 static void pool_sim_packs(PoolCtx *c, int ante) {
@@ -925,6 +1420,32 @@ static int pool_legend_rule_count(const PoolPlan *p) {
 	return p->nbaseLegendaryRules + p->nlegendary;
 }
 
+static bool pool_voucher_owned_for_soul_event(const PoolCtx *c, int voucherIndex,
+		const SoulPackEvent *event) {
+	if (voucherIndex < 0 || voucherIndex >= c->g->nvouch) return false;
+	if (c->g->vouchInitiallyOwned[voucherIndex]) return true;
+	if (!(c->voucherPurchased & (UINT64_C(1) << voucherIndex))) return false;
+	int ante = c->voucherPurchaseAnte[voucherIndex];
+	int visit = c->voucherPurchaseVisit[voucherIndex];
+	if (!ante || !visit) return false;
+	/* Combined Soul routes deliberately do not buy Ante reducers, so every
+	 * purchase is either the initial A1 offer (first reachable blind shop) or
+	 * a later voucher's Boss-entry shop. Voucher identities were generated
+	 * before the purchase, while pack contents are opened afterward. */
+	int purchaseAnte, purchasePhase;
+	if (ante == 1 && visit == 1) {
+		purchaseAnte = 1;
+		purchasePhase = c->skipSm[1] ? SOUL_PHASE_BIG : SOUL_PHASE_SMALL;
+	} else if (visit == 1 && ante >= 2) {
+		purchaseAnte = ante - 1;
+		purchasePhase = SOUL_PHASE_BOSS;
+	} else {
+		return false;
+	}
+	return pool_route_position(event->humanAnte, event->phase)
+			>= pool_route_position(purchaseAnte, purchasePhase);
+}
+
 static const PoolLegendaryRule *pool_legend_rule_at(const PoolPlan *p, int i) {
 	return i < p->nbaseLegendaryRules ? &p->baseLegendaryRules[i]
 			: &p->legendary[i - p->nbaseLegendaryRules];
@@ -996,13 +1517,19 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap,
 		for (int slot = 0; slot < npacks && found < needDepth; slot++) {
 			int soulKind = packs[slot].soulKind, cards = packs[slot].cards;
 			if (!soulKind) continue;
-			PoolStream *stream = soulKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
-			const char *key = soulKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
+			int omenIndex = pool_find_voucher(g, "v_omen_globe");
+			bool omenOwned = pool_voucher_owned_for_soul_event(c, omenIndex, &packs[slot]);
 			bool soulInPack = false, blackHoleInPack = false;
 			for (int card = 0; card < cards && found < needDepth; card++) {
+				int contentKind = soulKind;
+				if (soulKind == 1 && omenOwned
+						&& pool_psr(c, pool_stream_next(c, &c->omen, "omen_globe")) > 0.8)
+					contentKind = 2;
+				PoolStream *stream = contentKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
+				const char *key = contentKind == 1 ? p->kSoulT[ante] : p->kSoulS[ante];
 				bool soul = !soulInPack
 						&& pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
-				if (soulKind == 2 && !blackHoleInPack) {
+				if (contentKind == 2 && !blackHoleInPack) {
 					bool blackHole = pool_psr(c, pool_stream_next(c, stream, key)) > 0.997;
 					if (blackHole) {
 						if (g->blackHoleAllowed) blackHoleInPack = true;
@@ -1024,7 +1551,8 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap,
 						.phase = (uint8_t)packs[slot].phase,
 						.source = (uint8_t)packs[slot].source,
 						.ordinal = (uint8_t)found,
-						.flags = eventEdition[found] > 0.997 ? POOL_META_NEGATIVE : 0,
+						.flags = (eventEdition[found] > 0.997 ? POOL_META_NEGATIVE : 0)
+								| (c->charmRequired ? POOL_META_CHARM_REQUIRED : 0),
 				})) return false;
 			}
 		}
@@ -1068,6 +1596,64 @@ static bool pool_check_all_souls(PoolCtx *c, char *label, size_t labelCap,
 	return true;
 }
 
+static bool pool_try_targeted_charm(PoolCtx *c, char *label, size_t labelCap,
+		PoolMetadata *metadata, int baseMetadataCount, size_t baseLabelLength,
+		int soulMaxAnte, int tagMaxAnte) {
+	const Config *g = c->g;
+	const PoolPlan *p = c->p;
+	int charmIndex = pool_find_tag(g, "tag_charm");
+	if (charmIndex < 0 || tagMaxAnte < 1) return false;
+	if (tagMaxAnte > POOL_MAX_ANTE) tagMaxAnte = POOL_MAX_ANTE;
+	int routeMaxAnte = soulMaxAnte;
+	if (routeMaxAnte > POOL_MAX_VOUCHER_ANTE)
+		routeMaxAnte = POOL_MAX_VOUCHER_ANTE;
+	if (routeMaxAnte < p->maxVoucherAnte) routeMaxAnte = p->maxVoucherAnte;
+	if (routeMaxAnte < 1) routeMaxAnte = 1;
+
+	for (int ante = 1; ante <= tagMaxAnte; ante++) {
+		for (int blind = 0; blind < 2; blind++) {
+			int idx = pool_roll_tag_at(c, ante, blind);
+			if (idx < 0) return false;
+			uint8_t *skip = blind == 0 ? &c->skipSm[ante] : &c->skipBig[ante];
+			uint8_t *reward = blind == 0 ? &c->rewardSm[ante] : &c->rewardBig[ante];
+			if (idx != charmIndex || *skip) continue;
+			uint8_t oldSkip = *skip, oldReward = *reward, oldCharm = c->charmRequired;
+			int oldForced = c->forcedAnte;
+			*skip = 1;
+			*reward = 1;
+			c->charmRequired = 1;
+			pool_resolve_forced_ante(c);
+
+			for (int omenAttempt = 0; omenAttempt < 2; omenAttempt++) {
+				if (metadata) metadata->count = (uint8_t)baseMetadataCount;
+				if (label) label[baseLabelLength] = 0;
+				int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
+				if (!pool_metadata_add(metadata, (PoolOccurrence) {
+						.kind = POOL_META_TAG, .keyIndex = (uint16_t)charmIndex,
+						.ante = (uint8_t)ante, .phase = (uint8_t)phase,
+						.flags = POOL_META_CHARM_REQUIRED,
+				})) break;
+				if (!pool_check_vouchers_mode(c, label, labelCap, metadata,
+						omenAttempt, 1, routeMaxAnte)) continue;
+				pool_reset_soul_walk(c);
+				if (!pool_check_all_souls(c, label, labelCap, metadata)) continue;
+				pool_label_add(label, labelCap, "%sCharmRequired=A%d%s",
+						label && label[0] ? " " : "", ante,
+						blind == 0 ? "Sm" : "Big");
+				return true;
+			}
+
+			*skip = oldSkip;
+			*reward = oldReward;
+			c->charmRequired = oldCharm;
+			c->forcedAnte = oldForced;
+		}
+	}
+	if (metadata) metadata->count = (uint8_t)baseMetadataCount;
+	if (label) label[baseLabelLength] = 0;
+	return false;
+}
+
 static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 		double hfirst, char *label, size_t labelCap, PoolMetadata *metadata) {
 	const PoolPlan *p = c->p;
@@ -1079,14 +1665,22 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	memset(c->rewardSm, 0, sizeof c->rewardSm);
 	memset(c->rewardBig, 0, sizeof c->rewardBig);
 	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
+	memset(c->voucherVisits, 0, sizeof c->voucherVisits);
+	memset(c->voucherPurchaseAnte, 0, sizeof c->voucherPurchaseAnte);
+	memset(c->voucherPurchaseVisit, 0, sizeof c->voucherPurchaseVisit);
+	c->voucherPurchased = 0;
+	c->charmRequired = 0;
 	if (label && labelCap) label[0] = 0;
 	if (metadata) metadata->count = 0;
 	if (p->firstKind == 1) {
 		c->joker4.state = hfirst;
 		c->joker4.gen = c->gen;
-	} else {
+	} else if (p->firstKind == 2) {
 		c->tag[p->firstAnte].state = hfirst;
 		c->tag[p->firstAnte].gen = c->gen;
+	} else {
+		c->voucher[1].state = hfirst;
+		c->voucher[1].gen = c->gen;
 	}
 	/* Specific legendary selection is independent of tag/pack streams and
 	 * rejects ~80% of vanilla candidates before the expensive route walk. */
@@ -1097,7 +1691,48 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	for (int ante = 1; ante <= p->maxAnte; ante++) {
 		if (pool_pack_max_slots(c, ante) > 0) { c->forcedAnte = ante; break; }
 	}
-	if (!pool_check_all_souls(c, label, labelCap, metadata)) return false;
+	int beforeVoucherMetadata = metadata ? metadata->count : 0;
+	size_t beforeVoucherLabel = label ? strlen(label) : 0;
+	if (pool_voucher_rule_count(p)
+			&& !pool_check_vouchers(c, label, labelCap, metadata)) return false;
+	pool_reset_soul_walk(c);
+	if (!pool_check_all_souls(c, label, labelCap, metadata)) {
+		/* Targeted alternate route: only when the canonical route misses its
+		 * Legendary, search voucher purchases that obtain Omen Globe early
+		 * enough to convert Arcana cards. The DFS validates the Soul result at
+		 * each route leaf, so a later equal-cost Omen route cannot mask an
+		 * earlier successful one. */
+		if (!pool_legend_rule_count(p)) return false;
+		if (metadata) metadata->count = (uint8_t)beforeVoucherMetadata;
+		if (label) label[beforeVoucherLabel] = 0;
+		int soulMaxAnte = 1;
+		for (int i = 0; i < pool_legend_rule_count(p); i++) {
+			const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+			int rngMax = r->maxAnte + (r->humanLocation
+					&& r->maxPhase == SOUL_PHASE_BOSS ? 1 : 0);
+			if (rngMax > soulMaxAnte) soulMaxAnte = rngMax;
+		}
+		if (soulMaxAnte > POOL_MAX_VOUCHER_ANTE)
+			soulMaxAnte = POOL_MAX_VOUCHER_ANTE;
+		bool recovered = pool_check_vouchers_mode(c, label, labelCap, metadata,
+				1, 1, soulMaxAnte);
+		if (recovered) {
+			pool_reset_soul_walk(c);
+			recovered = pool_check_all_souls(c, label, labelCap, metadata);
+		}
+		if (!recovered) {
+			if (metadata) metadata->count = (uint8_t)beforeVoucherMetadata;
+			if (label) label[beforeVoucherLabel] = 0;
+			int tagMaxAnte = 1;
+			for (int i = 0; i < pool_legend_rule_count(p); i++) {
+				const PoolLegendaryRule *r = pool_legend_rule_at(p, i);
+				if (r->maxAnte > tagMaxAnte) tagMaxAnte = r->maxAnte;
+			}
+			if (!pool_try_targeted_charm(c, label, labelCap, metadata,
+					beforeVoucherMetadata, beforeVoucherLabel,
+					soulMaxAnte, tagMaxAnte)) return false;
+		}
+	}
 	return true;
 }
 
@@ -1303,6 +1938,8 @@ static bool pool_occurrence_descriptor(const Config *g, const PoolOccurrence *o,
 		key = g->tagKey[o->keyIndex];
 	else if (o->kind == POOL_META_LEGENDARY && o->keyIndex < (uint16_t)g->njoker[4])
 		key = g->jokerKey[4][o->keyIndex];
+	else if (o->kind == POOL_META_VOUCHER && o->keyIndex < (uint16_t)g->nvouch)
+		key = g->vouchKey[o->keyIndex];
 	if (!key) return false;
 	size_t keyLen = strlen(key);
 	if (!keyLen || keyLen >= MAX_KEY) return false;
@@ -1668,6 +2305,25 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		}
 		n += rw;
 	}
+	for (int i = 0; i < p->nbaseVoucherRules; i++) {
+		const PoolVoucherRule *r = &p->baseVoucherRules[i];
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"route_voucher %s %d %d\n", r->key, r->minAnte, r->maxAnte);
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from cumulative voucher route");
+			return false;
+		}
+		n += rw;
+	}
+	for (int i = 0; i < p->nbaseVoucherExclusions; i++) {
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"route_voucher_exclude %s\n", p->baseVoucherExclusionKeys[i]);
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from voucher exclusions");
+			return false;
+		}
+		n += rw;
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		int w;
@@ -1703,6 +2359,25 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 			n += w;
 		}
+	}
+	for (int i = 0; i < p->nvoucherRules; i++) {
+		const PoolVoucherRule *r = &p->voucherRules[i];
+		int w = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"voucher %s %d %d\n", r->key, r->minAnte, r->maxAnte);
+		if (w < 0 || (size_t)w >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from voucher criteria");
+			return false;
+		}
+		n += w;
+	}
+	for (int i = 0; i < p->nvoucherExclusions; i++) {
+		int w = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"voucher_exclude %s\n", p->voucherExclusionKeys[i]);
+		if (w < 0 || (size_t)w >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from voucher exclusions");
+			return false;
+		}
+		n += w;
 	}
 	if (p->refilter) {
 		int w = snprintf((char *)buf + n, headerCap - (size_t)n,
@@ -1921,7 +2596,7 @@ bad:
 	return false;
 }
 
-static bool pool_write_manifest(const char *path, const Config *g, const PoolPlan *p,
+static bool pool_write_manifest(const char *path, const PoolPlan *p,
 		const PoolState *s, char *err, size_t errsz) {
 	FILE *f = fopen(path, "w");
 	if (!f) { snprintf(err, errsz, "cannot write manifest: %s", strerror(errno)); return false; }
@@ -1984,6 +2659,14 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			fprintf(f, "source_route_legendary %s %d %d %d %d\n", r->key,
 					r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
 	}
+	for (int i = 0; i < p->nbaseVoucherRules; i++) {
+		const PoolVoucherRule *r = &p->baseVoucherRules[i];
+		fprintf(f, "source_route_voucher %s %d %d\n",
+				r->key, r->minAnte, r->maxAnte);
+	}
+	for (int i = 0; i < p->nbaseVoucherExclusions; i++)
+		fprintf(f, "source_route_voucher_exclude %s\n",
+				p->baseVoucherExclusionKeys[i]);
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
@@ -2008,6 +2691,12 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 		if (r->soulDepth != 1)
 			fprintf(f, "soul_depth %s\n", pool_soul_depth_str(r->soulDepth));
 	}
+	for (int i = 0; i < p->nvoucherRules; i++) {
+		const PoolVoucherRule *r = &p->voucherRules[i];
+		fprintf(f, "voucher %s %d %d\n", r->key, r->minAnte, r->maxAnte);
+	}
+	for (int i = 0; i < p->nvoucherExclusions; i++)
+		fprintf(f, "voucher_exclude %s\n", p->voucherExclusionKeys[i]);
 	fprintf(f, "elapsed_seconds %.6f\nseeds_per_second %.3f\nmatch_rate %.12g\n", s->elapsed,
 			s->elapsed > 0.0 ? (double)s->scanned / s->elapsed : 0.0, rate);
 	if (!p->refilter) {
@@ -2149,7 +2838,7 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 					state.done = 1;
 					state.outputBytes = (uint64_t)actualBytes;
 					if (!pool_write_state(statePath, p, &state, err, sizeof err)
-							|| !pool_write_manifest(manifestPath, g, p, &state, err, sizeof err)) {
+							|| !pool_write_manifest(manifestPath, p, &state, err, sizeof err)) {
 						fprintf(stderr, "%s\n", err); return 1;
 					}
 					fprintf(stderr, "recovered finalized pool (%" PRIu64 " matches)\n", state.matched);
@@ -2285,7 +2974,7 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		if (fclose(out) != 0) { fprintf(stderr, "cannot close output: %s\n", strerror(errno)); return 1; }
 	}
 	if (!pool_write_state(statePath, p, &state, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
-	if (!pool_write_manifest(manifestPath, g, p, &state, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
+	if (!pool_write_manifest(manifestPath, p, &state, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
 	if (state.done) {
 		fprintf(stderr, "complete: scanned=%" PRIu64 " matched=%" PRIu64 " elapsed=%.3fs\n", state.scanned, state.matched, state.elapsed);
 		return 0;
@@ -2385,6 +3074,94 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 			if (conflict) {
 				snprintf(err, errsz,
 						"new and source rules conflict for Soul #%d", r->soulDepth);
+				fclose(f); return false;
+			}
+		}
+	}
+	if (h.nrouteVoucherRules + p->nvoucherRules > POOL_MAX_VOUCHER_RULES) {
+		snprintf(err, errsz, "source + new voucher routes exceed the %d-rule cumulative limit",
+				POOL_MAX_VOUCHER_RULES);
+		fclose(f); return false;
+	}
+	if (h.nrouteVoucherRules) {
+		if (g->nvouch > 64) {
+			snprintf(err, errsz,
+					"voucher routes support at most 64 catalog entries (snapshot has %d)",
+					g->nvouch);
+			fclose(f); return false;
+		}
+		for (int i = 0; i < g->nvouch; i++) if (!g->vouchRouteDefined[i]) {
+			snprintf(err, errsz,
+					"voucher route catalog is missing; refresh native_search.cfg in Balatro");
+			fclose(f); return false;
+		}
+	}
+	for (int i = 0; i < h.nrouteVoucherRules; i++) {
+		PoolVoucherRule *r = &p->baseVoucherRules[p->nbaseVoucherRules++];
+		snprintf(r->key, sizeof r->key, "%s", h.routeVoucherRules[i].key);
+		r->minAnte = h.routeVoucherRules[i].minAnte;
+		r->maxAnte = h.routeVoucherRules[i].maxAnte;
+		if (r->minAnte < 1 || r->maxAnte < r->minAnte
+				|| r->maxAnte > POOL_MAX_VOUCHER_ANTE) {
+			snprintf(err, errsz,
+					"source voucher %s exceeds the supported Ante %d route window",
+					r->key, POOL_MAX_VOUCHER_ANTE);
+			fclose(f); return false;
+		}
+		r->poolIndex = pool_find_voucher(g, r->key);
+		if (r->poolIndex < 0 || !g->vouchRouteAvail[r->poolIndex]) {
+			snprintf(err, errsz, "source voucher %s is unavailable in this snapshot", r->key);
+			fclose(f); return false;
+		}
+		if (g->vouchInitiallyOwned[r->poolIndex]) {
+			snprintf(err, errsz, "source voucher %s is already owned at run start", r->key);
+			fclose(f); return false;
+		}
+		if (r->maxAnte > p->maxVoucherAnte) p->maxVoucherAnte = r->maxAnte;
+	}
+	for (int i = 0; i < h.nrouteVoucherExclusions; i++) {
+		int index = pool_find_voucher(g, h.routeVoucherExclusions[i]);
+		if (index < 0) {
+			snprintf(err, errsz, "source voucher exclusion %s is unknown",
+					h.routeVoucherExclusions[i]);
+			fclose(f); return false;
+		}
+		int duplicate = 0;
+		for (int j = 0; j < p->nbaseVoucherExclusions; j++)
+			if (p->baseVoucherExclusions[j] == index) { duplicate = 1; break; }
+		if (duplicate) continue;
+		if (p->nbaseVoucherExclusions >= POOL_MAX_VOUCHER_EXCLUSIONS) {
+			snprintf(err, errsz, "source pool has too many voucher exclusions");
+			fclose(f); return false;
+		}
+		int slot = p->nbaseVoucherExclusions++;
+		p->baseVoucherExclusions[slot] = index;
+		snprintf(p->baseVoucherExclusionKeys[slot], MAX_KEY, "%s",
+				h.routeVoucherExclusions[i]);
+	}
+	int combinedVoucherExclusions = p->nbaseVoucherExclusions;
+	for (int i = 0; i < p->nvoucherExclusions; i++) {
+		int duplicate = 0;
+		for (int j = 0; j < p->nbaseVoucherExclusions; j++)
+			if (p->voucherExclusions[i] == p->baseVoucherExclusions[j]) {
+				duplicate = 1; break;
+			}
+		if (!duplicate) combinedVoucherExclusions++;
+	}
+	if (combinedVoucherExclusions > POOL_MAX_VOUCHER_EXCLUSIONS) {
+		snprintf(err, errsz,
+				"source + new voucher routes exceed the %d-exclusion cumulative limit",
+				POOL_MAX_VOUCHER_EXCLUSIONS);
+		fclose(f); return false;
+	}
+	if (p->maxVoucherAnte > p->maxAnte) p->maxAnte = p->maxVoucherAnte;
+	if (pool_voucher_rule_count(p)) {
+		for (int i = 0; i < p->nbaseTagRules; i++) {
+			const PoolTagRule *r = &p->baseTagRules[i];
+			if (r->collect && (!strcmp(r->key, "tag_voucher")
+					|| !strcmp(r->key, "tag_double"))) {
+				snprintf(err, errsz,
+						"source route collects Voucher/Double Tags, unsupported with voucher routes");
 				fclose(f); return false;
 			}
 		}
