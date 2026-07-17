@@ -90,7 +90,30 @@ love = { thread = { getChannel = getChannel } }
 package.loaded["love.thread"] = true
 assert(load(workerSrc, "worker"))(serialize(snap), fileText, 0, 1)
 
-local raw = read(poolPath):sub(1, 1024)
+local function readPoolHeader(path)
+	local prefixBytes, maxHeaderBytes = 1024, 256 * 1024
+	local f = assert(io.open(path, "rb"))
+	local raw = f:read(prefixBytes) or ""
+	local schema = tonumber(raw:match("^BRAINSTORM_SEED_POOL%s+(%d+)[\r\n]"))
+	if schema == 3 then
+		local headerBytes
+		for line in raw:gmatch("[^\r\n%z]+") do
+			headerBytes = tonumber(line:match("^header_bytes%s+(%d+)%s*$")) or headerBytes
+		end
+		assert(headerBytes and headerBytes >= prefixBytes and headerBytes <= maxHeaderBytes,
+			"invalid schema-3 pool header_bytes")
+		if headerBytes > #raw then
+			raw = raw .. (f:read(headerBytes - #raw) or "")
+			assert(#raw == headerBytes, "truncated schema-3 pool header")
+		else
+			raw = raw:sub(1, headerBytes)
+		end
+	end
+	f:close()
+	return raw
+end
+
+local raw = readPoolHeader(poolPath)
 local header = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
 for line in raw:gmatch("[^\n%z]+") do
 	local key, rest = line:match("^(%S+)%s*(.-)%s*$")

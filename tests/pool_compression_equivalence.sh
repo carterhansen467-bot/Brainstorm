@@ -1,6 +1,7 @@
 #!/bin/sh
-# Schema-2 compression proof: create a pool, synthesize the equivalent legacy
-# u64le representation, read and convert it, then verify byte-corruption is
+# Compression compatibility proof: create a current schema-3 pool, synthesize
+# the equivalent legacy schema-1 u64le representation, convert that to schema
+# 2, then verify every generation represents the same seeds and corruption is
 # rejected instead of silently producing a different seed set.
 set -eu
 
@@ -32,14 +33,23 @@ end
 EOF
 
 "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
-  "$OUT/criteria.cfg" "$OUT/native-v2.bspool"
-"./native/brainstorm_seed_pool$EXE" export "$OUT/native-v2.bspool" "$OUT/native-v2.txt"
+  "$OUT/criteria.cfg" "$OUT/native-v3.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/native-v3.bspool" "$OUT/native-v3.txt"
+
+python3 - "$OUT/native-v3.bspool" <<'PY'
+import re, sys
+with open(sys.argv[1], "rb") as f:
+    text = f.read(1024).split(b"\0", 1)[0].decode("ascii")
+assert re.search(r"^BRAINSTORM_SEED_POOL 3$", text, re.M)
+assert re.search(r"^encoding delta-varint-events-v1$", text, re.M)
+assert re.search(r"^header_bytes 8192$", text, re.M)
+PY
 
 # A checkpoint is a trust boundary: inconsistent counters must be rejected,
 # never used to truncate/append the pool at a fabricated committed position.
 sed 's/^resume 0$/resume 1/' "$OUT/criteria.cfg" > "$OUT/resume.cfg"
-cp "$OUT/native-v2.bspool" "$OUT/bad-state.bspool"
-cp "$OUT/native-v2.bspool.state" "$OUT/bad-state.bspool.state"
+cp "$OUT/native-v3.bspool" "$OUT/bad-state.bspool"
+cp "$OUT/native-v3.bspool.state" "$OUT/bad-state.bspool.state"
 python3 - "$OUT/bad-state.bspool.state" <<'PY'
 import re, sys
 p = sys.argv[1]
@@ -55,12 +65,24 @@ if "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
 fi
 
 # Re-encode the exact exported set as the former schema-1 u64le format.
-python3 - "$OUT/native-v2.bspool" "$OUT/native-v2.txt" "$OUT/legacy-v1.bspool" <<'PY'
-import struct, sys
+python3 - "$OUT/native-v3.bspool" "$OUT/native-v3.txt" "$OUT/legacy-v1.bspool" <<'PY'
+import re, struct, sys
 source, seeds, output = sys.argv[1:]
-raw = open(source, "rb").read(1024)
+with open(source, "rb") as f:
+    prefix = f.read(1024)
+    prefix_text = prefix.split(b"\0", 1)[0].decode("ascii")
+    header_bytes = int(re.search(r"^header_bytes (\d+)$", prefix_text, re.M).group(1))
+    f.seek(0)
+    raw = f.read(header_bytes)
 lines = raw.split(b"\0", 1)[0].decode("ascii").splitlines()
 outlines = []
+legacy_keys = {
+    "modelver", "charset", "seedspace", "space", "range_start", "range_end",
+    "catalog_hash", "criteria_hash", "pool_id", "tag_route", "label",
+    "route_tag", "route_legendary", "tag", "legendary", "soul_depth",
+    "refilter_depth", "merged_parts", "records", "complete",
+    "coverage_complete", "end",
+}
 for line in lines:
     key = line.split(" ", 1)[0]
     if key == "BRAINSTORM_SEED_POOL":
@@ -69,7 +91,9 @@ for line in lines:
         outlines.append("encoding u64le")
     elif key == "data_bytes":
         continue
-    else:
+    elif key == "header_bytes":
+        outlines.append("header_bytes 1024")
+    elif key in legacy_keys:
         outlines.append(line)
 header = ("\n".join(outlines) + "\n").encode("ascii")
 assert len(header) <= 1024
@@ -87,11 +111,36 @@ PY
 "./native/brainstorm_seed_pool$EXE" export "$OUT/legacy-v1.bspool" "$OUT/legacy-v1.txt"
 "./native/brainstorm_seed_pool$EXE" convert "$OUT/legacy-v1.bspool" "$OUT/converted-v2.bspool"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/converted-v2.bspool" "$OUT/converted-v2.txt"
-sort "$OUT/native-v2.txt" > "$OUT/native.sorted"
+sort "$OUT/native-v3.txt" > "$OUT/native.sorted"
 sort "$OUT/legacy-v1.txt" > "$OUT/legacy.sorted"
 sort "$OUT/converted-v2.txt" > "$OUT/converted.sorted"
 cmp "$OUT/native.sorted" "$OUT/legacy.sorted"
 cmp "$OUT/native.sorted" "$OUT/converted.sorted"
+
+# Schema 3 protects the full rank+metadata payload with CRC64. Flip the first
+# rank byte without repairing the checksum and require a hard decode failure.
+cp "$OUT/native-v3.bspool" "$OUT/corrupt-v3.bspool"
+python3 - "$OUT/corrupt-v3.bspool" <<'PY'
+import re, struct, sys
+p = sys.argv[1]
+with open(p, "r+b") as f:
+    prefix = f.read(1024)
+    text = prefix.split(b"\0", 1)[0].decode("ascii")
+    header_bytes = int(re.search(r"^header_bytes (\d+)$", text, re.M).group(1))
+    f.seek(header_bytes)
+    raw = f.read(48)
+    fields = struct.unpack("<4sHHIIIIQQQ", raw)
+    assert fields[0] == b"BSP3" and fields[1] == 48 and fields[4] > 0
+    f.seek(header_bytes + 48)
+    b = f.read(1)
+    assert b
+    f.seek(-1, 1)
+    f.write(bytes([b[0] ^ 1]))
+PY
+if "./native/brainstorm_seed_pool$EXE" export "$OUT/corrupt-v3.bspool" \
+    "$OUT/corrupt-v3.txt" 2>/dev/null; then
+  echo "FAIL: schema-3 payload corruption was accepted"; exit 1
+fi
 
 grep -q '^BRAINSTORM_SEED_POOL 2$' "$OUT/converted-v2.bspool"
 grep -q '^encoding delta-varint-blocks-v1$' "$OUT/converted-v2.bspool"

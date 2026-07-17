@@ -93,9 +93,16 @@ fi
 # A checksummed block damaged in transit is rejected during merge.
 cp "$OUT/part-1.bspool" "$OUT/corrupt.bspool"
 python3 - "$OUT/corrupt.bspool" <<'PY'
-import sys
+import re, sys
 with open(sys.argv[1], "r+b") as f:
-    f.seek(1024 + 32)
+    prefix = f.read(1024)
+    match = re.search(br"^header_bytes (\d+)$", prefix, re.M)
+    header_bytes = int(match.group(1)) if match else 1024
+    f.seek(header_bytes)
+    magic = f.read(4)
+    block_header_bytes = 48 if magic == b"BSP3" else 32
+    assert magic in (b"BSP2", b"BSP3")
+    f.seek(header_bytes + block_header_bytes)
     b = f.read(1)
     assert b
     f.seek(-1, 1)

@@ -39,24 +39,38 @@ write_criteria "$OUT/combined.cfg" "tag tag_charm 1 8 1" "legendary j_perkeo 1 8
 "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
 	"$OUT/broad.cfg" "$OUT/complete-source.bspool"
 
-# Keep exactly the first two committed BSP2 blocks and discard the completed
-# index/footer. This has the same on-disk shape as a cleanly checkpointed pause,
-# but is deterministic and quick enough for CI.
+# Keep exactly the first two committed compressed blocks and discard the
+# completed index/footer. This has the same on-disk shape as a cleanly
+# checkpointed pause, but is deterministic and quick enough for CI. Accept the
+# old BSP2 layout as well as the current BSP3 event-block layout so this remains
+# a backwards-compatibility test, not just a writer-format test.
 python3 - "$OUT/complete-source.bspool" "$OUT/partial-source.bspool" <<'PY'
 import re, struct, sys
 src, dst = sys.argv[1:]
 raw = open(src, "rb").read()
-header = raw[:1024]
-text = header.split(b"\0", 1)[0].decode("ascii")
-pos = 1024
+prefix = raw[:1024]
+text = prefix.split(b"\0", 1)[0].decode("ascii")
+schema = int(re.search(r"^BRAINSTORM_SEED_POOL (\d+)$", text, re.M).group(1))
+header_bytes = int(re.search(r"^header_bytes (\d+)$", text, re.M).group(1))
+assert header_bytes >= 1024 and len(raw) >= header_bytes
+text = raw[:header_bytes].split(b"\0", 1)[0].decode("ascii")
+pos = header_bytes
 records = 0
 for _ in range(2):
-    magic, count, payload, checksum, first, last = struct.unpack(
-        "<4sIIIQQ", raw[pos:pos + 32])
-    assert magic == b"BSP2" and count > 0
-    pos += 32 + payload
+    if schema == 3:
+        (magic, block_header_bytes, flags, count, rank_bytes, metadata_bytes,
+         associations, first, last, checksum) = struct.unpack(
+            "<4sHHIIIIQQQ", raw[pos:pos + 48])
+        assert magic == b"BSP3" and block_header_bytes == 48 and count > 0
+        assert rank_bytes > 0 and metadata_bytes > 0
+        pos += block_header_bytes + rank_bytes + metadata_bytes
+    else:
+        magic, count, payload, checksum, first, last = struct.unpack(
+            "<4sIIIQQ", raw[pos:pos + 32])
+        assert schema == 2 and magic == b"BSP2" and count > 0
+        pos += 32 + payload
     records += count
-data_bytes = pos - 1024
+data_bytes = pos - header_bytes
 replacements = {
     r"^records \d+$": "records %d" % records,
     r"^data_bytes \d+$": "data_bytes %d" % data_bytes,
@@ -67,10 +81,10 @@ for pattern, value in replacements.items():
     text, n = re.subn(pattern, value, text, count=1, flags=re.M)
     assert n == 1, pattern
 encoded = text.encode("ascii")
-assert len(encoded) <= 1024
+assert len(encoded) <= header_bytes
 with open(dst, "wb") as f:
-    f.write(encoded.ljust(1024, b"\0"))
-    f.write(raw[1024:pos])
+    f.write(encoded.ljust(header_bytes, b"\0"))
+    f.write(raw[header_bytes:pos])
 PY
 
 "./native/brainstorm_seed_pool$EXE" export "$OUT/partial-source.bspool" "$OUT/partial.txt"
@@ -85,7 +99,18 @@ sort "$OUT/refined.txt" > "$OUT/actual.txt"
 cmp "$OUT/expected.txt" "$OUT/actual.txt"
 [ -s "$OUT/actual.txt" ] || { echo "FAIL: deterministic partial sample had no refined hits"; exit 1; }
 
-head -c 1024 "$OUT/refined.bspool" | tr -d '\0' > "$OUT/refined.header"
+python3 - "$OUT/refined.bspool" > "$OUT/refined.header" <<'PY'
+import re, sys
+p = sys.argv[1]
+with open(p, "rb") as f:
+    prefix = f.read(1024)
+    text = prefix.split(b"\0", 1)[0].decode("ascii")
+    m = re.search(r"^header_bytes (\d+)$", text, re.M)
+    assert m
+    size = int(m.group(1))
+    f.seek(0)
+    print(f.read(size).split(b"\0", 1)[0].decode("ascii"), end="")
+PY
 grep -q '^complete 1$' "$OUT/refined.header"
 grep -q '^coverage_complete 0$' "$OUT/refined.header"
 grep -q '^source_complete 0$' "$OUT/refined.header"

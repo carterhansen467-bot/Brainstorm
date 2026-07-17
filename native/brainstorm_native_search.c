@@ -1645,17 +1645,31 @@ static bool calibrate(const Config *g, char *err, size_t errsz) {
  * fixed-size zero-padded text block so a shared pool is self-describing:
  * versions, scanned range, fingerprints, AND the criteria that built it. */
 #define BSPOOL_SCHEMA_LEGACY 1
-#define BSPOOL_SCHEMA 2
+#define BSPOOL_SCHEMA_BLOCKS 2
+#define BSPOOL_SCHEMA_EVENTS 3
+/* BSPOOL_SCHEMA names the latest legacy-compatible compressed generation used
+ * by conversion. New scans select EVENTS explicitly in their PoolPlan. */
+#define BSPOOL_SCHEMA BSPOOL_SCHEMA_BLOCKS
 #define BSPOOL_HEADER_SIZE 1024
+#define BSPOOL_HEADER_EVENTS_SIZE 8192
+#define BSPOOL_HEADER_MAX_SIZE (256 * 1024)
 #define BSPOOL_MAX_TAG_RULES MAX_POOL_ROUTE_RULES
 #define BSPOOL_MAX_ANTE MAX_SEARCH_ANTE
 #define BSPOOL_BLOCK_HEADER_SIZE 32
+#define BSPOOL3_BLOCK_HEADER_SIZE 48
 #define BSPOOL_BLOCK_MAX_RECORDS 8192
 #define BSPOOL_BLOCK_MAX_PAYLOAD ((BSPOOL_BLOCK_MAX_RECORDS - 1) * 6)
+#define BSPOOL3_BLOCK_MAX_METADATA (16 * 1024 * 1024)
 #define BSPOOL_INDEX_ENTRY_SIZE 24
 #define BSPOOL_FOOTER_SIZE 40
+#define BSPOOL3_INDEX_ENTRY_SIZE 32
+#define BSPOOL3_FOOTER_SIZE 80
 
-enum { BSPOOL_ENCODING_U64 = 1, BSPOOL_ENCODING_DELTA_BLOCKS = 2 };
+enum {
+	BSPOOL_ENCODING_U64 = 1,
+	BSPOOL_ENCODING_DELTA_BLOCKS = 2,
+	BSPOOL_ENCODING_DELTA_EVENTS = 3
+};
 
 typedef struct {
 	int schema, modelver, complete, coverageComplete, headerBytes, encoding, mergedParts;
@@ -1793,10 +1807,56 @@ static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
 static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz) {
 	memset(h, 0, sizeof *h);
 	h->route = 1;
-	char buf[BSPOOL_HEADER_SIZE + 1];
+	char buf[BSPOOL_HEADER_MAX_SIZE + 1];
 	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
 	size_t got = fread(buf, 1, BSPOOL_HEADER_SIZE, f);
 	if (got != BSPOOL_HEADER_SIZE) { snprintf(err, errsz, "pool header is truncated"); return false; }
+	buf[got] = 0;
+	int peekSchema = 0;
+	const char *firstNl = memchr(buf, '\n', got);
+	size_t firstLen = firstNl ? (size_t)(firstNl - buf) : got;
+	char firstLine[64];
+	if (!firstLen || firstLen >= sizeof firstLine) {
+		snprintf(err, errsz, "not a Brainstorm seed pool"); return false;
+	}
+	memcpy(firstLine, buf, firstLen); firstLine[firstLen] = 0;
+	char *firstSp = firstLine;
+	char *firstMagic = pool_tok(&firstSp), *firstVersion = pool_tok(&firstSp);
+	if (!firstMagic || strcmp(firstMagic, "BRAINSTORM_SEED_POOL")
+			|| !pool_header_int(firstVersion, &peekSchema) || pool_tok(&firstSp)) {
+		snprintf(err, errsz, "not a Brainstorm seed pool"); return false;
+	}
+	size_t expectedHeader = BSPOOL_HEADER_SIZE;
+	if (peekSchema == BSPOOL_SCHEMA_EVENTS) {
+		uint64_t declared = 0;
+		const char *line = buf, *prefixEnd = buf + got;
+		while (line < prefixEnd) {
+			const char *nl = memchr(line, '\n', (size_t)(prefixEnd - line));
+			size_t len = nl ? (size_t)(nl - line) : (size_t)(prefixEnd - line);
+			if (len && len < 64) {
+				char copy[64];
+				memcpy(copy, line, len); copy[len] = 0;
+				char *sp = copy;
+				char *d = pool_tok(&sp), *v = pool_tok(&sp);
+				if (d && !strcmp(d, "header_bytes") && v && !pool_tok(&sp)
+						&& pool_header_u64(v, 10, &declared)) break;
+			}
+			if (!nl) break;
+			line = nl + 1;
+		}
+		if (declared < BSPOOL_HEADER_SIZE || declared > BSPOOL_HEADER_MAX_SIZE) {
+			snprintf(err, errsz, "schema-3 pool has a missing or invalid header_bytes");
+			return false;
+		}
+		expectedHeader = (size_t)declared;
+	}
+	if (expectedHeader > got) {
+		size_t more = expectedHeader - got;
+		if (fread(buf + got, 1, more, f) != more) {
+			snprintf(err, errsz, "pool header is truncated"); return false;
+		}
+		got = expectedHeader;
+	}
 	buf[got] = 0;
 	char *cur = buf;
 	enum {
@@ -2001,9 +2061,11 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	if (malformed || (seen & required) != required) {
 		snprintf(err, errsz, "pool header is malformed or missing required metadata"); return false;
 	}
-	if (h->schema != BSPOOL_SCHEMA_LEGACY && h->schema != BSPOOL_SCHEMA) {
-		snprintf(err, errsz, "pool schema %d unsupported (want %d or %d)",
-				h->schema, BSPOOL_SCHEMA_LEGACY, BSPOOL_SCHEMA);
+	if (h->schema != BSPOOL_SCHEMA_LEGACY && h->schema != BSPOOL_SCHEMA_BLOCKS
+			&& h->schema != BSPOOL_SCHEMA_EVENTS) {
+		snprintf(err, errsz, "pool schema %d unsupported (want %d, %d, or %d)",
+				h->schema, BSPOOL_SCHEMA_LEGACY, BSPOOL_SCHEMA_BLOCKS,
+				BSPOOL_SCHEMA_EVENTS);
 		return false;
 	}
 	if (!sawEnd) { snprintf(err, errsz, "pool header has no end marker"); return false; }
@@ -2017,14 +2079,18 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 	}
 	if (!strcmp(encoding, "u64le")) h->encoding = BSPOOL_ENCODING_U64;
 	else if (!strcmp(encoding, "delta-varint-blocks-v1")) h->encoding = BSPOOL_ENCODING_DELTA_BLOCKS;
+	else if (!strcmp(encoding, "delta-varint-events-v1")) h->encoding = BSPOOL_ENCODING_DELTA_EVENTS;
 	else { snprintf(err, errsz, "pool encoding '%s' is unsupported", encoding); return false; }
 	if (h->schema == BSPOOL_SCHEMA_LEGACY && h->encoding != BSPOOL_ENCODING_U64) {
 		snprintf(err, errsz, "legacy pool must use u64le encoding"); return false;
 	}
-	if (h->schema == BSPOOL_SCHEMA && h->encoding != BSPOOL_ENCODING_DELTA_BLOCKS) {
-		snprintf(err, errsz, "schema %d pool must use delta blocks", BSPOOL_SCHEMA); return false;
+	if (h->schema == BSPOOL_SCHEMA_BLOCKS && h->encoding != BSPOOL_ENCODING_DELTA_BLOCKS) {
+		snprintf(err, errsz, "schema %d pool must use delta blocks", BSPOOL_SCHEMA_BLOCKS); return false;
 	}
-	if (h->schema == BSPOOL_SCHEMA && !(seen & HS_DATA_BYTES)) {
+	if (h->schema == BSPOOL_SCHEMA_EVENTS && h->encoding != BSPOOL_ENCODING_DELTA_EVENTS) {
+		snprintf(err, errsz, "schema %d pool must use event blocks", BSPOOL_SCHEMA_EVENTS); return false;
+	}
+	if (h->schema >= BSPOOL_SCHEMA_BLOCKS && !(seen & HS_DATA_BYTES)) {
 		snprintf(err, errsz, "compressed pool is missing its committed byte count"); return false;
 	}
 	/* The charset decides which seed space the ranks index (the human-readable
@@ -2039,7 +2105,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 		snprintf(err, errsz, "pool range or record count is invalid");
 		return false;
 	}
-	if (h->headerBytes != BSPOOL_HEADER_SIZE) {
+	if (h->headerBytes != (int)expectedHeader) {
 		snprintf(err, errsz, "pool header_bytes %d is invalid", h->headerBytes);
 		return false;
 	}
@@ -2091,6 +2157,7 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 typedef struct {
 	uint64_t offset, firstRecord;
 	uint32_t count, payloadBytes;
+	uint32_t rankBytes, metadataBytes, associations;
 } BspoolBlockIndex;
 
 typedef struct {
@@ -2131,6 +2198,68 @@ static uint32_t bspool_checksum(const unsigned char *p, size_t n) {
 	return h;
 }
 
+/* CRC64-ECMA-182. Schema 3 covers the semantic block-header fields and both
+ * payloads together so rank membership and occurrence metadata share one
+ * atomic corruption boundary. */
+static uint64_t bspool_crc64_update(uint64_t crc, const unsigned char *p, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		crc ^= (uint64_t)p[i] << 56;
+		for (int bit = 0; bit < 8; bit++)
+			crc = (crc & UINT64_C(0x8000000000000000))
+					? (crc << 1) ^ UINT64_C(0x42f0e1eba9ea3693) : crc << 1;
+	}
+	return crc;
+}
+
+static bool bspool_varint_read(const unsigned char *p, size_t n, size_t *at,
+		uint64_t *out) {
+	uint64_t v = 0;
+	int shift = 0;
+	while (*at < n && shift <= 63) {
+		unsigned char b = p[(*at)++];
+		if (shift == 63 && (b & 0x7e)) return false;
+		v |= (uint64_t)(b & 0x7f) << shift;
+		if (!(b & 0x80)) { *out = v; return true; }
+		shift += 7;
+	}
+	return false;
+}
+
+/* Schema-3 metadata is block-local and inverted by canonical occurrence
+ * descriptor. Each descriptor owns an ascending delta list of record indexes.
+ * Unknown length-delimited descriptors remain safely skippable. */
+static bool bspool_validate_metadata(const unsigned char *p, size_t n,
+		uint32_t records, uint32_t expectedAssociations) {
+	size_t at = 0;
+	uint64_t descriptors = 0, associations = 0;
+	if (!bspool_varint_read(p, n, &at, &descriptors) || descriptors > expectedAssociations) return false;
+	const unsigned char *prior = NULL;
+	size_t priorLen = 0;
+	for (uint64_t d = 0; d < descriptors; d++) {
+		uint64_t len = 0, matches = 0, index = 0;
+		if (!bspool_varint_read(p, n, &at, &len) || !len || len > n - at) return false;
+		const unsigned char *desc = p + at;
+		if (prior) {
+			size_t common = len < priorLen ? (size_t)len : priorLen;
+			int cmp = memcmp(prior, desc, common);
+			if (cmp > 0 || (cmp == 0 && priorLen >= len)) return false;
+		}
+		prior = desc; priorLen = (size_t)len; at += (size_t)len;
+		if (!bspool_varint_read(p, n, &at, &matches) || !matches
+				|| matches > records || associations > UINT32_MAX - matches) return false;
+		if (!bspool_varint_read(p, n, &at, &index) || index >= records) return false;
+		for (uint64_t i = 1; i < matches; i++) {
+			uint64_t delta = 0;
+			if (!bspool_varint_read(p, n, &at, &delta) || !delta
+					|| index > UINT64_MAX - delta) return false;
+			index += delta;
+			if (index >= records) return false;
+		}
+		associations += matches;
+	}
+	return at == n && associations == expectedAssociations;
+}
+
 static bool bspool_scratch_bytes(BspoolScratch *s, size_t need) {
 	if (need <= s->bytesCap) return need == 0 || s->bytes != NULL;
 	unsigned char *p = realloc(s->bytes, need);
@@ -2152,19 +2281,44 @@ static void bspool_scratch_destroy(BspoolScratch *s) {
 	free(s->bytes); free(s->ranks); memset(s, 0, sizeof *s);
 }
 
-static bool bspool_block_header(int fd, uint64_t off, uint32_t *count,
-		uint32_t *payloadBytes, uint32_t *checksum, uint64_t *first,
-		uint64_t *last) {
+typedef struct {
+	uint32_t count, rankBytes, metadataBytes, associations, checksum, headerBytes;
+	uint64_t first, last, crc64;
+} BspoolBlockInfo;
+
+static bool bspool_block_header(int fd, uint64_t off, int encoding,
+		BspoolBlockInfo *info) {
+	memset(info, 0, sizeof *info);
+	if (encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
+		unsigned char raw[BSPOOL3_BLOCK_HEADER_SIZE];
+		if (bs_pread(fd, raw, sizeof raw, (int64_t)off) != (int64_t)sizeof raw
+				|| memcmp(raw, "BSP3", 4) || raw[4] != BSPOOL3_BLOCK_HEADER_SIZE
+				|| raw[5] != 0 || raw[6] != 0 || raw[7] != 0) return false;
+		info->headerBytes = BSPOOL3_BLOCK_HEADER_SIZE;
+		info->count = bspool_get_u32le(raw + 8);
+		info->rankBytes = bspool_get_u32le(raw + 12);
+		info->metadataBytes = bspool_get_u32le(raw + 16);
+		info->associations = bspool_get_u32le(raw + 20);
+		info->first = bspool_get_u64le(raw + 24);
+		info->last = bspool_get_u64le(raw + 32);
+		info->crc64 = bspool_get_u64le(raw + 40);
+		return info->count > 0 && info->count <= BSPOOL_BLOCK_MAX_RECORDS
+				&& info->rankBytes <= (uint32_t)((info->count - 1u) * 6u)
+				&& info->metadataBytes > 0
+				&& info->metadataBytes <= BSPOOL3_BLOCK_MAX_METADATA
+				&& info->rankBytes <= UINT32_MAX - info->metadataBytes;
+	}
 	unsigned char raw[BSPOOL_BLOCK_HEADER_SIZE];
 	if (bs_pread(fd, raw, sizeof raw, (int64_t)off) != (int64_t)sizeof raw
 			|| memcmp(raw, "BSP2", 4)) return false;
-	*count = bspool_get_u32le(raw + 4);
-	*payloadBytes = bspool_get_u32le(raw + 8);
-	*checksum = bspool_get_u32le(raw + 12);
-	*first = bspool_get_u64le(raw + 16);
-	*last = bspool_get_u64le(raw + 24);
-	return *count > 0 && *count <= BSPOOL_BLOCK_MAX_RECORDS
-			&& *payloadBytes <= (uint32_t)((*count - 1u) * 6u);
+	info->headerBytes = BSPOOL_BLOCK_HEADER_SIZE;
+	info->count = bspool_get_u32le(raw + 4);
+	info->rankBytes = bspool_get_u32le(raw + 8);
+	info->checksum = bspool_get_u32le(raw + 12);
+	info->first = bspool_get_u64le(raw + 16);
+	info->last = bspool_get_u64le(raw + 24);
+	return info->count > 0 && info->count <= BSPOOL_BLOCK_MAX_RECORDS
+			&& info->rankBytes <= (uint32_t)((info->count - 1u) * 6u);
 }
 
 static bool bspool_index_push(BspoolReader *r, uint64_t *cap,
@@ -2201,11 +2355,20 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 		return false;
 	}
 	if (h->complete) {
-		if (fileBytes < BSPOOL_FOOTER_SIZE) { snprintf(err, errsz, "compressed pool has no index footer"); return false; }
-		unsigned char footer[BSPOOL_FOOTER_SIZE];
-		if (bs_pread(fd, footer, sizeof footer, (int64_t)(fileBytes - sizeof footer)) != (int64_t)sizeof footer
-				|| memcmp(footer, "BSPIDX2\n", 8)) {
+		uint32_t footerBytes = h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				? BSPOOL3_FOOTER_SIZE : BSPOOL_FOOTER_SIZE;
+		uint32_t indexEntryBytes = h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				? BSPOOL3_INDEX_ENTRY_SIZE : BSPOOL_INDEX_ENTRY_SIZE;
+		if (fileBytes < footerBytes) { snprintf(err, errsz, "compressed pool has no index footer"); return false; }
+		unsigned char footer[BSPOOL3_FOOTER_SIZE] = { 0 };
+		if (bs_pread(fd, footer, footerBytes, (int64_t)(fileBytes - footerBytes)) != (int64_t)footerBytes
+				|| memcmp(footer, h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+						? "BSPIDX3\n" : "BSPIDX2\n", 8)) {
 			snprintf(err, errsz, "compressed pool index footer is missing"); return false;
+		}
+		if (h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				&& bspool_crc64_update(0, footer, 72) != bspool_get_u64le(footer + 72)) {
+			snprintf(err, errsz, "event pool index footer checksum differs"); return false;
 		}
 		uint64_t indexOff = bspool_get_u64le(footer + 8);
 		r->nblocks = bspool_get_u64le(footer + 16);
@@ -2214,46 +2377,62 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 		if (indexOff != r->dataOff + r->dataBytes || indexRecords != r->records
 				|| footerDataBytes != r->dataBytes || r->nblocks > r->records
 				|| r->nblocks > SIZE_MAX / sizeof *r->blocks
-				|| r->nblocks > (UINT64_MAX - indexOff - BSPOOL_FOOTER_SIZE) / BSPOOL_INDEX_ENTRY_SIZE
-				|| indexOff + r->nblocks * BSPOOL_INDEX_ENTRY_SIZE + BSPOOL_FOOTER_SIZE != fileBytes) {
+				|| r->nblocks > (UINT64_MAX - indexOff - footerBytes) / indexEntryBytes
+				|| indexOff + r->nblocks * indexEntryBytes + footerBytes != fileBytes) {
 			snprintf(err, errsz, "compressed pool index metadata is inconsistent"); return false;
 		}
 		if (r->nblocks) {
 			r->blocks = malloc((size_t)r->nblocks * sizeof *r->blocks);
 			if (!r->blocks) { snprintf(err, errsz, "cannot allocate compressed pool index"); return false; }
 		}
-		unsigned char raw[BSPOOL_INDEX_ENTRY_SIZE * 4096];
+		unsigned char raw[BSPOOL3_INDEX_ENTRY_SIZE * 4096];
 		uint64_t done = 0;
 		while (done < r->nblocks) {
 			uint64_t n = r->nblocks - done;
 			if (n > 4096) n = 4096;
-			size_t bytes = (size_t)n * BSPOOL_INDEX_ENTRY_SIZE;
-			if (bs_pread(fd, raw, bytes, (int64_t)(indexOff + done * BSPOOL_INDEX_ENTRY_SIZE)) != (int64_t)bytes) {
+			size_t bytes = (size_t)n * indexEntryBytes;
+			if (bs_pread(fd, raw, bytes, (int64_t)(indexOff + done * indexEntryBytes)) != (int64_t)bytes) {
 				snprintf(err, errsz, "cannot read compressed pool index"); goto fail;
 			}
 			for (uint64_t i = 0; i < n; i++) {
-				unsigned char *p = raw + i * BSPOOL_INDEX_ENTRY_SIZE;
+				unsigned char *p = raw + i * indexEntryBytes;
 				BspoolBlockIndex *e = &r->blocks[done + i];
+				memset(e, 0, sizeof *e);
 				e->offset = bspool_get_u64le(p);
 				e->firstRecord = bspool_get_u64le(p + 8);
 				e->count = bspool_get_u32le(p + 16);
-				e->payloadBytes = bspool_get_u32le(p + 20);
+				if (h->encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
+					e->rankBytes = bspool_get_u32le(p + 20);
+					e->metadataBytes = bspool_get_u32le(p + 24);
+					e->associations = bspool_get_u32le(p + 28);
+					if (e->metadataBytes > BSPOOL3_BLOCK_MAX_METADATA
+							|| e->rankBytes > UINT32_MAX - e->metadataBytes) {
+						snprintf(err, errsz, "event pool index payload size overflows"); goto fail;
+					}
+					e->payloadBytes = e->rankBytes + e->metadataBytes;
+				} else {
+					e->payloadBytes = e->rankBytes = bspool_get_u32le(p + 20);
+				}
 			}
 			done += n;
 		}
 	} else {
 		uint64_t off = r->dataOff, end = r->dataOff + r->dataBytes, firstRecord = 0, cap = 0;
 		while (off < end) {
-			uint32_t count, payload, checksum; uint64_t first, last;
-			if (end - off < BSPOOL_BLOCK_HEADER_SIZE
-					|| !bspool_block_header(fd, off, &count, &payload, &checksum, &first, &last)
-					|| payload > end - off - BSPOOL_BLOCK_HEADER_SIZE) {
+			BspoolBlockInfo bi;
+			if (!bspool_block_header(fd, off, h->encoding, &bi)
+					|| bi.headerBytes > end - off
+					|| bi.rankBytes > end - off - bi.headerBytes
+					|| bi.metadataBytes > end - off - bi.headerBytes - bi.rankBytes) {
 				snprintf(err, errsz, "compressed pool has a malformed committed block"); goto fail;
 			}
-			BspoolBlockIndex e = { off, firstRecord, count, payload };
+			BspoolBlockIndex e = { .offset = off, .firstRecord = firstRecord,
+					.count = bi.count, .payloadBytes = bi.rankBytes + bi.metadataBytes,
+					.rankBytes = bi.rankBytes, .metadataBytes = bi.metadataBytes,
+					.associations = bi.associations };
 			if (!bspool_index_push(r, &cap, e)) { snprintf(err, errsz, "cannot allocate compressed pool index"); goto fail; }
-			firstRecord += count;
-			off += BSPOOL_BLOCK_HEADER_SIZE + payload;
+			firstRecord += bi.count;
+			off += bi.headerBytes + bi.rankBytes + bi.metadataBytes;
 		}
 		if (off != end || firstRecord != r->records) {
 			snprintf(err, errsz, "compressed pool blocks do not match committed records"); goto fail;
@@ -2261,20 +2440,24 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 	}
 	if ((r->records == 0) != (r->nblocks == 0)) { snprintf(err, errsz, "compressed pool index is empty or incomplete"); goto fail; }
 	uint64_t expectedRecord = 0, expectedOffset = r->dataOff;
+	uint32_t blockHeaderBytes = h->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+			? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
 	for (uint64_t i = 0; i < r->nblocks; i++) {
 		BspoolBlockIndex *e = &r->blocks[i];
 		if (e->firstRecord != expectedRecord || !e->count
 				|| e->count > BSPOOL_BLOCK_MAX_RECORDS
-				|| e->payloadBytes > (e->count - 1u) * 6u
+				|| e->rankBytes > (e->count - 1u) * 6u
+				|| (h->encoding == BSPOOL_ENCODING_DELTA_EVENTS && !e->metadataBytes)
+				|| e->payloadBytes != e->rankBytes + e->metadataBytes
 				|| e->count > r->records - expectedRecord
 				|| e->offset != expectedOffset || e->offset < r->dataOff
 				|| e->offset > r->dataOff + r->dataBytes
-				|| BSPOOL_BLOCK_HEADER_SIZE > r->dataOff + r->dataBytes - e->offset
-				|| e->payloadBytes > r->dataOff + r->dataBytes - e->offset - BSPOOL_BLOCK_HEADER_SIZE) {
+				|| blockHeaderBytes > r->dataOff + r->dataBytes - e->offset
+				|| e->payloadBytes > r->dataOff + r->dataBytes - e->offset - blockHeaderBytes) {
 			snprintf(err, errsz, "compressed pool index entry is invalid"); goto fail;
 		}
 		expectedRecord += e->count;
-		expectedOffset += BSPOOL_BLOCK_HEADER_SIZE + e->payloadBytes;
+		expectedOffset += blockHeaderBytes + e->payloadBytes;
 	}
 	if (expectedRecord != r->records || expectedOffset != r->dataOff + r->dataBytes) {
 		snprintf(err, errsz, "compressed pool index record or byte count differs"); goto fail;
@@ -2293,19 +2476,30 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 	if (s->cachedBlock == block && s->ranks) return true;
 	if (block >= r->nblocks) return false;
 	const BspoolBlockIndex *e = &r->blocks[block];
-	uint32_t count, payload, checksum; uint64_t first, last;
-	if (!bspool_block_header(r->fd, e->offset, &count, &payload, &checksum, &first, &last)
-			|| count != e->count || payload != e->payloadBytes
-			|| first < r->rangeStart || last >= r->rangeEnd || first > last
-			|| !bspool_scratch_bytes(s, payload) || !bspool_scratch_ranks(s, count)) return false;
+	BspoolBlockInfo bi;
+	if (!bspool_block_header(r->fd, e->offset, r->encoding, &bi)
+			|| bi.count != e->count || bi.rankBytes != e->rankBytes
+			|| bi.metadataBytes != e->metadataBytes || bi.associations != e->associations
+			|| bi.first < r->rangeStart || bi.last >= r->rangeEnd || bi.first > bi.last
+			|| bi.rankBytes > SIZE_MAX - bi.metadataBytes
+			|| !bspool_scratch_bytes(s, (size_t)bi.rankBytes + bi.metadataBytes)
+			|| !bspool_scratch_ranks(s, bi.count)) return false;
+	size_t payload = (size_t)bi.rankBytes + bi.metadataBytes;
 	if (payload && bs_pread(r->fd, s->bytes, payload,
-			(int64_t)(e->offset + BSPOOL_BLOCK_HEADER_SIZE)) != (int64_t)payload) return false;
-	if (bspool_checksum(s->bytes, payload) != checksum) return false;
-	s->ranks[0] = first;
+			(int64_t)(e->offset + bi.headerBytes)) != (int64_t)payload) return false;
+	if (r->encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
+		unsigned char raw[BSPOOL3_BLOCK_HEADER_SIZE];
+		if (bs_pread(r->fd, raw, sizeof raw, (int64_t)e->offset) != (int64_t)sizeof raw) return false;
+		uint64_t crc = bspool_crc64_update(0, raw + 4, 36);
+		crc = bspool_crc64_update(crc, s->bytes, payload);
+		if (crc != bi.crc64 || !bspool_validate_metadata(s->bytes + bi.rankBytes,
+				bi.metadataBytes, bi.count, bi.associations)) return false;
+	} else if (bspool_checksum(s->bytes, bi.rankBytes) != bi.checksum) return false;
+	s->ranks[0] = bi.first;
 	size_t at = 0;
-	for (uint32_t i = 1; i < count; i++) {
+	for (uint32_t i = 1; i < bi.count; i++) {
 		uint64_t delta = 0; int shift = 0, sawEnd = 0;
-		while (at < payload && shift <= 63) {
+		while (at < bi.rankBytes && shift <= 63) {
 			unsigned char b = s->bytes[at++];
 			if (shift == 63 && (b & 0x7e)) return false;
 			delta |= (uint64_t)(b & 0x7f) << shift;
@@ -2316,7 +2510,7 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 		s->ranks[i] = s->ranks[i - 1] + delta;
 		if (s->ranks[i] >= r->rangeEnd) return false;
 	}
-	if (at != payload || s->ranks[count - 1] != last) return false;
+	if (at != bi.rankBytes || s->ranks[bi.count - 1] != bi.last) return false;
 	s->cachedBlock = block;
 	return true;
 }

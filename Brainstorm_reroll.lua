@@ -2479,21 +2479,47 @@ function Brainstorm.seedPoolDir()
 	return Brainstorm.modPath() .. "/seed_pools"
 end
 
--- Identity readout for a .bspool: the header is a fixed 1 KiB text block, so
--- one bounded read is enough even for multi-GB pools. Returns nil when the
--- file is missing or not a pool.
+-- Identity readout for a .bspool. Schemas 1/2 have a fixed 1 KiB header;
+-- schema 3 advertises a potentially larger header_bytes value in that first
+-- KiB. The cap keeps this metadata read bounded even for a malformed pool.
 function Brainstorm.readPoolHeader(path)
 	local nativefs = require("nativefs")
-	local raw = nativefs.read(path, 1024)
+	local prefixBytes, maxHeaderBytes = 1024, 256 * 1024
+	local raw = nativefs.read(path, prefixBytes)
 	if not raw or not raw:match("^BRAINSTORM_SEED_POOL ") then return nil end
+	local schema = tonumber(raw:match("^BRAINSTORM_SEED_POOL%s+(%d+)[\r\n]"))
+	if schema == 3 then
+		local headerBytes
+		for line in raw:gmatch("[^\r\n%z]+") do
+			headerBytes = tonumber(line:match("^header_bytes%s+(%d+)%s*$")) or headerBytes
+		end
+		if not headerBytes or headerBytes < prefixBytes or headerBytes > maxHeaderBytes then
+			return nil
+		end
+		if headerBytes > #raw then
+			raw = nativefs.read(path, headerBytes)
+			if not raw or #raw ~= headerBytes then return nil end
+		else
+			raw = raw:sub(1, headerBytes)
+		end
+	end
 	local h = { tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {} }
+	h.schema = schema
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
 		if k == "records" or k == "complete" or k == "coverage_complete"
-				or k == "modelver" or k == "refilter_depth" then h[k] = tonumber(v)
+				or k == "modelver" or k == "refilter_depth" or k == "header_bytes"
+				or k == "scan_cursor" or k == "input_cursor" or k == "parent_records"
+				or k == "parent_data_bytes" or k == "parent_coverage_complete"
+				or k == "input_record_start" or k == "input_record_end"
+				or k == "shard_index" or k == "shard_total" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
-				or k == "catalog_hash" or k == "tag_route" then h[k] = v
+				or k == "catalog_hash" or k == "tag_route" or k == "family_id"
+				or k == "segment_id" or k == "stage_hash" or k == "lineage_id"
+				or k == "derivation_id" or k == "snapshot_id"
+				or k == "membership_digest" or k == "metadata_digest"
+				or k == "parent_snapshot_id" or k == "parent_segment_id" then h[k] = v
 		elseif k == "tag" then
 			local key, lo, hi, count = v:match("^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)$")
 			if key then h.tags[#h.tags + 1] = {

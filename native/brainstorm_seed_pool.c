@@ -66,6 +66,7 @@ static const char *pool_soul_depth_str(int depth) {
 
 typedef struct {
 	int schema, sawEnd;
+	int outputSchema, headerBytes;
 	int threads, resume, collectTags;
 	int space; /* SPACE_NATURAL (default) or SPACE_TOTAL */
 	char label[136]; /* optional shareable pool name; not part of criteriaHash */
@@ -266,6 +267,8 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 	p->checkpoint = UINT64_C(16777216);
 	p->chunk = UINT64_C(16384);
 	p->format = POOL_BINARY;
+	p->outputSchema = BSPOOL_SCHEMA_EVENTS;
+	p->headerBytes = BSPOOL_HEADER_EVENTS_SIZE;
 	p->minTagAnte = POOL_MAX_ANTE + 1;
 	p->legendary[0].soulDepth = 1;
 	FILE *f = fopen(path, "r");
@@ -941,23 +944,69 @@ static size_t pool_encode_rank_block(unsigned char *buf, uint32_t count,
 	return out;
 }
 
+/* Schema 3 starts with the same sorted positive-delta rank payload, followed
+ * by an inverted occurrence table. The metadata writer is enabled in the next
+ * layer; descriptor_count=0 is already a complete, canonical empty table and
+ * lets the reader/writer migration be verified independently. */
+static size_t pool_encode_event_block(unsigned char *buf, uint32_t count,
+		unsigned char *encoded, unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE]) {
+	qsort(buf, count, 8u, pool_rank_compare);
+	uint64_t first, last;
+	memcpy(&first, buf, 8); memcpy(&last, buf + (size_t)(count - 1) * 8u, 8);
+	size_t rankBytes = 0;
+	uint64_t prior = first;
+	for (uint32_t i = 1; i < count; i++) {
+		uint64_t rank;
+		memcpy(&rank, buf + (size_t)i * 8u, 8);
+		uint64_t delta = rank - prior;
+		do {
+			unsigned char b = (unsigned char)(delta & 0x7f);
+			delta >>= 7;
+			if (delta) b |= 0x80;
+			encoded[rankBytes++] = b;
+		} while (delta);
+		prior = rank;
+	}
+	encoded[rankBytes] = 0; /* descriptor_count = 0 */
+	memset(header, 0, BSPOOL3_BLOCK_HEADER_SIZE);
+	memcpy(header, "BSP3", 4);
+	header[4] = BSPOOL3_BLOCK_HEADER_SIZE;
+	bspool_put_u32le(header + 8, count);
+	bspool_put_u32le(header + 12, (uint32_t)rankBytes);
+	bspool_put_u32le(header + 16, 1);
+	bspool_put_u32le(header + 20, 0);
+	bspool_put_u64le(header + 24, first);
+	bspool_put_u64le(header + 32, last);
+	uint64_t crc = bspool_crc64_update(0, header + 4, 36);
+	crc = bspool_crc64_update(crc, encoded, rankBytes + 1);
+	bspool_put_u64le(header + 40, crc);
+	return rankBytes + 1;
+}
+
 static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
 		unsigned char *encoded, size_t *used) {
 	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
 	const unsigned char *writeBuf = buf;
 	size_t writeBytes = *used;
-	unsigned char header[BSPOOL_BLOCK_HEADER_SIZE];
+	unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE];
+	size_t headerBytes = BSPOOL_BLOCK_HEADER_SIZE;
 	if (s->p->format == POOL_BINARY) {
 		uint32_t count = (uint32_t)(*used / 8u);
-		size_t out = pool_encode_rank_block(buf, count, encoded, header);
+		size_t out;
+		if (s->p->outputSchema == BSPOOL_SCHEMA_EVENTS) {
+			out = pool_encode_event_block(buf, count, encoded, header);
+			headerBytes = BSPOOL3_BLOCK_HEADER_SIZE;
+		} else {
+			out = pool_encode_rank_block(buf, count, encoded, header);
+		}
 		writeBuf = encoded; writeBytes = out;
 	}
 	bs_mutex_lock(&s->outMutex);
 	size_t wroteHeader = s->p->format == POOL_BINARY
-			? fwrite(header, 1, sizeof header, s->out) : sizeof header;
+			? fwrite(header, 1, headerBytes, s->out) : headerBytes;
 	size_t wrote = fwrite(writeBuf, 1, writeBytes, s->out);
 	bs_mutex_unlock(&s->outMutex);
-	if (wroteHeader != sizeof header || wrote != writeBytes) {
+	if (wroteHeader != headerBytes || wrote != writeBytes) {
 		atomic_store(&s->ioError, true);
 		return false;
 	}
@@ -1061,39 +1110,47 @@ done:
 static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 		uint64_t dataBytes, int complete, char *err, size_t errsz) {
 	if (p->format != POOL_BINARY) return true;
-	unsigned char buf[POOL_HEADER_SIZE];
-	memset(buf, 0, sizeof buf);
+	unsigned char buf[BSPOOL_HEADER_EVENTS_SIZE];
+	if (p->headerBytes != BSPOOL_HEADER_SIZE
+			&& p->headerBytes != BSPOOL_HEADER_EVENTS_SIZE) {
+		snprintf(err, errsz, "unsupported output header size"); return false;
+	}
+	size_t headerCap = (size_t)p->headerBytes;
+	memset(buf, 0, headerCap);
 	/* The header embeds the criteria that built the pool so a shared .bspool
 	 * is self-describing without its .manifest sidecar, and so the in-game
 	 * consumer can later compose the pool's tag route with overlay filters. */
 	char poolId[24];
 	pool_compute_id(p, records, complete, poolId);
 	int coverageComplete = complete && (!p->refilter || p->sourceCoverageComplete);
-	int n = snprintf((char *)buf, sizeof buf,
+	const char *encoding = p->outputSchema == BSPOOL_SCHEMA_EVENTS
+			? "delta-varint-events-v1" : "delta-varint-blocks-v1";
+	int n = snprintf((char *)buf, headerCap,
 			"BRAINSTORM_SEED_POOL %d\n"
-			"modelver %d\nencoding delta-varint-blocks-v1\ncharset %s\nseedspace %" PRIu64 "\n"
+			"modelver %d\nencoding %s\nheader_bytes %d\ncharset %s\nseedspace %" PRIu64 "\n"
 			"space %s\n"
 			"range_start %" PRIu64 "\nrange_end %" PRIu64 "\n"
 			"catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\n"
 			"pool_id %s\n"
 			"tag_route %s\n",
-			BSPOOL_SCHEMA, MODELVER, space_charset(p->space), space_size(p->space),
+			p->outputSchema, MODELVER, encoding, p->headerBytes,
+			space_charset(p->space), space_size(p->space),
 			space_name(p->space),
 			p->outputRangeStart, p->outputRangeEnd, p->catalogHash, p->criteriaHash,
 			poolId,
 			p->collectTags ? "collect" : "observe");
-	if (n < 0 || n >= (int)sizeof buf) { snprintf(err, errsz, "binary header overflow"); return false; }
+	if (n < 0 || (size_t)n >= headerCap) { snprintf(err, errsz, "binary header overflow"); return false; }
 	if (p->label[0]) {
-		int lw = snprintf((char *)buf + n, sizeof buf - (size_t)n, "label %s\n", p->label);
-		if (lw < 0 || lw >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		int lw = snprintf((char *)buf + n, headerCap - (size_t)n, "label %s\n", p->label);
+		if (lw < 0 || (size_t)lw >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += lw;
 	}
 	for (int i = 0; i < p->nbaseTagRules; i++) {
 		const PoolTagRule *r = &p->baseTagRules[i];
-		int rw = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
 				"route_tag %s %s %d %d %d\n", r->collect ? "collect" : "observe",
 				r->key, r->minAnte, r->maxAnte, r->minCount);
-		if (rw < 0 || rw >= (int)(sizeof buf - (size_t)n)) {
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
 			snprintf(err, errsz, "binary header overflow from cumulative refilter route");
 			return false;
 		}
@@ -1101,10 +1158,10 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	for (int i = 0; i < p->nbaseLegendaryRules; i++) {
 		const PoolLegendaryRule *r = &p->baseLegendaryRules[i];
-		int rw = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
 				"route_legendary %s %d %d %d %d\n", r->key,
 				r->minAnte, r->maxAnte, r->requireNegative, r->soulDepth);
-		if (rw < 0 || rw >= (int)(sizeof buf - (size_t)n)) {
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
 			snprintf(err, errsz, "binary header overflow from cumulative legendary route");
 			return false;
 		}
@@ -1112,41 +1169,41 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
-		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "tag %s %d %d %d\n",
+		int w = snprintf((char *)buf + n, headerCap - (size_t)n, "tag %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->minCount);
-		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
 	for (int i = 0; i < p->nlegendary; i++) {
 		const PoolLegendaryRule *r = &p->legendary[i];
-		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n, "legendary %s %d %d %d\n",
+		int w = snprintf((char *)buf + n, headerCap - (size_t)n, "legendary %s %d %d %d\n",
 				r->key, r->minAnte, r->maxAnte, r->requireNegative);
-		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 		if (r->soulDepth != 1) {
-			w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+			w = snprintf((char *)buf + n, headerCap - (size_t)n,
 					"soul_depth %s\n", pool_soul_depth_str(r->soulDepth));
-			if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+			if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 			n += w;
 		}
 	}
 	if (p->refilter) {
-		int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+		int w = snprintf((char *)buf + n, headerCap - (size_t)n,
 				"refilter_depth %d\nsource_criteria_hash %016" PRIx64 "\nsource_records %" PRIu64 "\nsource_pool_id %s\n"
 				"source_complete %d\nsource_coverage_complete %d\n",
 				p->refilterDepth, p->sourceCriteriaHash, p->sourceRecords,
 				p->sourcePoolId[0] ? p->sourcePoolId : "-",
 				p->sourceComplete, p->sourceCoverageComplete);
-		if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+		if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 		n += w;
 	}
-	int w = snprintf((char *)buf + n, sizeof buf - (size_t)n,
+	int w = snprintf((char *)buf + n, headerCap - (size_t)n,
 			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\ncoverage_complete %d\n"
-			"header_bytes %d\nend\n",
-			records, dataBytes, complete, coverageComplete, POOL_HEADER_SIZE);
-	if (w < 0 || w >= (int)(sizeof buf - (size_t)n)) { snprintf(err, errsz, "binary header overflow"); return false; }
+			"end\n",
+			records, dataBytes, complete, coverageComplete);
+	if (w < 0 || (size_t)w >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
 	int64_t at = bs_ftello(f);
-	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, sizeof buf, f) != sizeof buf
+	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(buf, 1, headerCap, f) != headerCap
 			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
 		snprintf(err, errsz, "cannot update binary header: %s", strerror(errno));
 		return false;
@@ -1154,51 +1211,64 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 	return true;
 }
 
-static bool pool_append_index(FILE *f, int space, uint64_t records,
+static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, uint64_t records,
 		uint64_t dataBytes, uint64_t *finalBytes, char *err, size_t errsz) {
 	if (fflush(f) != 0) { snprintf(err, errsz, "cannot flush pool data before indexing"); return false; }
 	BspoolHeader h;
 	memset(&h, 0, sizeof h);
-	h.headerBytes = POOL_HEADER_SIZE; h.encoding = BSPOOL_ENCODING_DELTA_BLOCKS;
+	h.headerBytes = headerBytes;
+	h.encoding = schema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL_ENCODING_DELTA_EVENTS : BSPOOL_ENCODING_DELTA_BLOCKS;
 	h.space = space; h.records = records; h.dataBytes = dataBytes;
 	BspoolReader r;
-	if (!bspool_reader_init(&r, fileno(f), &h, POOL_HEADER_SIZE + dataBytes, err, errsz)) return false;
-	uint64_t indexOff = POOL_HEADER_SIZE + dataBytes;
+	if (!bspool_reader_init(&r, fileno(f), &h, (uint64_t)headerBytes + dataBytes, err, errsz)) return false;
+	uint64_t indexOff = (uint64_t)headerBytes + dataBytes;
 	if (bs_fseeko(f, (int64_t)indexOff, SEEK_SET) != 0) {
 		snprintf(err, errsz, "cannot seek to compressed pool index"); bspool_reader_destroy(&r); return false;
 	}
-	unsigned char raw[BSPOOL_INDEX_ENTRY_SIZE * 4096];
+	uint32_t entryBytes = schema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL3_INDEX_ENTRY_SIZE : BSPOOL_INDEX_ENTRY_SIZE;
+	unsigned char raw[BSPOOL3_INDEX_ENTRY_SIZE * 4096];
 	uint64_t done = 0;
 	while (done < r.nblocks) {
 		uint64_t n = r.nblocks - done;
 		if (n > 4096) n = 4096;
 		for (uint64_t i = 0; i < n; i++) {
 			const BspoolBlockIndex *e = &r.blocks[done + i];
-			unsigned char *q = raw + i * BSPOOL_INDEX_ENTRY_SIZE;
+			unsigned char *q = raw + i * entryBytes;
 			bspool_put_u64le(q, e->offset);
 			bspool_put_u64le(q + 8, e->firstRecord);
 			bspool_put_u32le(q + 16, e->count);
-			bspool_put_u32le(q + 20, e->payloadBytes);
+			bspool_put_u32le(q + 20, e->rankBytes);
+			if (schema == BSPOOL_SCHEMA_EVENTS) {
+				bspool_put_u32le(q + 24, e->metadataBytes);
+				bspool_put_u32le(q + 28, e->associations);
+			}
 		}
-		size_t bytes = (size_t)n * BSPOOL_INDEX_ENTRY_SIZE;
+		size_t bytes = (size_t)n * entryBytes;
 		if (fwrite(raw, 1, bytes, f) != bytes) {
 			snprintf(err, errsz, "cannot write compressed pool index"); bspool_reader_destroy(&r); return false;
 		}
 		done += n;
 	}
-	unsigned char footer[BSPOOL_FOOTER_SIZE];
-	memset(footer, 0, sizeof footer); memcpy(footer, "BSPIDX2\n", 8);
+	unsigned char footer[BSPOOL3_FOOTER_SIZE];
+	uint32_t footerBytes = schema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL3_FOOTER_SIZE : BSPOOL_FOOTER_SIZE;
+	memset(footer, 0, footerBytes);
+	memcpy(footer, schema == BSPOOL_SCHEMA_EVENTS ? "BSPIDX3\n" : "BSPIDX2\n", 8);
 	bspool_put_u64le(footer + 8, indexOff);
 	bspool_put_u64le(footer + 16, r.nblocks);
 	bspool_put_u64le(footer + 24, records);
 	bspool_put_u64le(footer + 32, dataBytes);
+	if (schema == BSPOOL_SCHEMA_EVENTS)
+		bspool_put_u64le(footer + 72, bspool_crc64_update(0, footer, 72));
 	uint64_t blocks = r.nblocks;
 	bspool_reader_destroy(&r);
-	if (fwrite(footer, 1, sizeof footer, f) != sizeof footer || fflush(f) != 0 || bs_fsync_file(f) != 0) {
+	if (fwrite(footer, 1, footerBytes, f) != footerBytes || fflush(f) != 0 || bs_fsync_file(f) != 0) {
 		snprintf(err, errsz, "cannot commit compressed pool index"); return false;
 	}
 	int64_t pos = bs_ftello(f);
-	if (pos < 0 || (uint64_t)pos != indexOff + blocks * BSPOOL_INDEX_ENTRY_SIZE + BSPOOL_FOOTER_SIZE) {
+	if (pos < 0 || (uint64_t)pos != indexOff + blocks * entryBytes + footerBytes) {
 		snprintf(err, errsz, "compressed pool index size accounting failed"); return false;
 	}
 	*finalBytes = (uint64_t)pos;
@@ -1299,8 +1369,8 @@ static bool pool_load_state(const char *path, const PoolPlan *p, PoolState *s,
 			|| rs != p->start || re != p->start + p->count || s->cursor < rs || s->cursor > re
 			|| s->scanned != s->cursor - rs || s->matched > s->scanned
 			|| !isfinite(s->elapsed) || s->elapsed < 0.0 || (s->done != 0 && s->done != 1)
-			|| s->done != (s->cursor == re)
-			|| (p->format == POOL_BINARY && s->outputBytes < POOL_HEADER_SIZE)
+			|| (s->done && s->cursor != re)
+			|| (p->format == POOL_BINARY && s->outputBytes < (uint64_t)p->headerBytes)
 			|| (p->format == POOL_COUNT && s->outputBytes != 0)
 			|| s->outputBytes > (uint64_t)INT64_MAX) {
 		snprintf(err, errsz, "state does not match this model, criteria, or range");
@@ -1333,7 +1403,10 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\ncoverage_complete %d\n",
 			s->scanned, s->matched, s->done, coverageComplete);
 	fprintf(f, "format %s\nrecord_order block-sorted\ntag_route %s\n",
-			p->format == POOL_BINARY ? "delta-varint-blocks-v1" : p->format == POOL_TEXT ? "seed-text" : "count-only",
+			p->format == POOL_BINARY
+					? (p->outputSchema == BSPOOL_SCHEMA_EVENTS
+							? "delta-varint-events-v1" : "delta-varint-blocks-v1")
+					: p->format == POOL_TEXT ? "seed-text" : "count-only",
 			p->collectTags ? "collect-first-required" : "observe");
 	if (p->refilter) fprintf(f,
 			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n"
@@ -1377,14 +1450,15 @@ static bool pool_write_manifest(const char *path, const Config *g, const PoolPla
 			}
 		}
 		double projectedCompressed = projected * (expectedDeltaBytes + 0.01)
-				+ POOL_HEADER_SIZE + BSPOOL_FOOTER_SIZE;
+				+ p->headerBytes + (p->outputSchema == BSPOOL_SCHEMA_EVENTS
+						? BSPOOL3_FOOTER_SIZE : BSPOOL_FOOTER_SIZE);
 		fprintf(f, "projected_full_matches %.0f\nprojected_u64_bytes %.0f\n"
 				"projected_compressed_bytes %.0f\nexpected_compressed_bytes_per_record %.6f\n",
 				projected, projected * 8.0, projectedCompressed, expectedDeltaBytes + 0.01);
 	}
-	if (p->format == POOL_BINARY && s->matched && s->outputBytes >= POOL_HEADER_SIZE) {
+	if (p->format == POOL_BINARY && s->matched && s->outputBytes >= (uint64_t)p->headerBytes) {
 		fprintf(f, "compressed_file_bytes %" PRIu64 "\nbytes_per_record %.6f\n",
-				s->outputBytes, (double)(s->outputBytes - POOL_HEADER_SIZE) / (double)s->matched);
+				s->outputBytes, (double)(s->outputBytes - (uint64_t)p->headerBytes) / (double)s->matched);
 	}
 	fprintf(f, "end\n");
 	if (fclose(f) != 0) { snprintf(err, errsz, "cannot close manifest: %s", strerror(errno)); return false; }
@@ -1395,7 +1469,7 @@ static double pool_now(void) {
 	return bs_monotonic_seconds();
 }
 
-static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output) {
+static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 	char err[256];
 	if (!calibrate(g, err, sizeof err)) { fprintf(stderr, "calibration failed: %s\n", err); return 1; }
 	if (!pool_batch_selftest(p)) { fprintf(stderr, "batch hash self-test failed\n"); return 1; }
@@ -1411,9 +1485,81 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 		fprintf(stderr, "output exists without resumable state; set 'resume 0' to replace it\n");
 		return 1;
 	}
+	BspoolHeader resumeHeader;
+	memset(&resumeHeader, 0, sizeof resumeHeader);
+	if (p->resume && stateExists && p->format == POOL_BINARY) {
+		FILE *probe = fopen(output, "rb");
+		if (!probe) {
+			fprintf(stderr, "cannot open output header for resume: %s\n", strerror(errno));
+			return 1;
+		}
+		bool headerOk = bspool_read_header(probe, &resumeHeader, err, sizeof err);
+		fclose(probe);
+		if (!headerOk || (resumeHeader.schema != BSPOOL_SCHEMA_BLOCKS
+				&& resumeHeader.schema != BSPOOL_SCHEMA_EVENTS)) {
+			fprintf(stderr, "%s\n", headerOk ? "resumable output uses an unsupported pool schema" : err);
+			return 1;
+		}
+		p->outputSchema = resumeHeader.schema;
+		p->headerBytes = resumeHeader.headerBytes;
+	}
 	if (p->resume && stateExists) {
 		if (!pool_load_state(statePath, p, &state, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
 		if (p->format != POOL_COUNT) {
+			bool finalizedAhead = p->format == POOL_BINARY && !state.done
+					&& resumeHeader.complete && state.cursor == p->start + p->count
+					&& resumeHeader.dataBytes
+							== state.outputBytes - (uint64_t)p->headerBytes;
+			if (p->format == POOL_BINARY
+					&& (resumeHeader.catalogHash != p->catalogHash
+						|| resumeHeader.criteriaHash != p->criteriaHash
+						|| resumeHeader.rangeStart != p->outputRangeStart
+						|| resumeHeader.rangeEnd != p->outputRangeEnd
+						|| resumeHeader.records != state.matched
+						|| (state.done && !resumeHeader.complete)
+						|| (!state.done && !finalizedAhead && (resumeHeader.complete
+								|| resumeHeader.dataBytes
+										!= state.outputBytes - (uint64_t)p->headerBytes)))) {
+				fprintf(stderr, "output header does not match its resumable state\n");
+				return 1;
+			}
+			if (p->format == POOL_BINARY && resumeHeader.complete) {
+				FILE *finished = fopen(output, "rb");
+				int64_t actualBytes = finished ? bs_file_size(finished) : -1;
+				BspoolReader verified;
+				bool valid = finished && actualBytes >= 0
+						&& bspool_reader_init(&verified, fileno(finished), &resumeHeader,
+								(uint64_t)actualBytes, err, sizeof err);
+				if (valid) bspool_reader_destroy(&verified);
+				if (finished) fclose(finished);
+				if (!valid || (state.done && (uint64_t)actualBytes != state.outputBytes)) {
+					fprintf(stderr, "completed pool size does not match its state\n");
+					return 1;
+				}
+				if (finalizedAhead) {
+					state.done = 1;
+					state.outputBytes = (uint64_t)actualBytes;
+					if (!pool_write_state(statePath, p, &state, err, sizeof err)
+							|| !pool_write_manifest(manifestPath, g, p, &state, err, sizeof err)) {
+						fprintf(stderr, "%s\n", err); return 1;
+					}
+					fprintf(stderr, "recovered finalized pool (%" PRIu64 " matches)\n", state.matched);
+					return 0;
+				}
+			}
+			if (state.done) {
+				if (p->format != POOL_BINARY) {
+					FILE *finished = fopen(output, "rb");
+					int64_t actualBytes = finished ? bs_file_size(finished) : -1;
+					if (finished) fclose(finished);
+					if (actualBytes < 0 || (uint64_t)actualBytes != state.outputBytes) {
+						fprintf(stderr, "completed pool size does not match its state\n");
+						return 1;
+					}
+				}
+				fprintf(stderr, "pool is already complete (%" PRIu64 " matches)\n", state.matched);
+				return 0;
+			}
 			out = fopen(output, "r+b");
 			if (!out) { fprintf(stderr, "cannot open output for resume: %s\n", strerror(errno)); return 1; }
 			int64_t actualBytes = bs_file_size(out);
@@ -1431,8 +1577,8 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 			out = fopen(output, "w+b");
 			if (!out) { fprintf(stderr, "cannot create output: %s\n", strerror(errno)); return 1; }
 			if (p->format == POOL_BINARY) {
-				state.outputBytes = POOL_HEADER_SIZE;
-				if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
+				state.outputBytes = (uint64_t)p->headerBytes;
+				if (bs_fseeko(out, p->headerBytes, SEEK_SET) != 0
 						|| !pool_write_header(out, p, 0, 0, 0, err, sizeof err)) {
 					fprintf(stderr, "%s\n", err); fclose(out); return 1;
 				}
@@ -1495,7 +1641,7 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 			if (pos < 0) { fprintf(stderr, "cannot read output position\n"); fclose(out); return 1; }
 			state.outputBytes = (uint64_t)pos;
 			if (!pool_write_header(out, p, state.matched,
-					state.outputBytes - POOL_HEADER_SIZE, 0, err, sizeof err)) {
+					state.outputBytes - (uint64_t)p->headerBytes, 0, err, sizeof err)) {
 				fprintf(stderr, "%s\n", err); fclose(out); return 1;
 			}
 		}
@@ -1509,9 +1655,10 @@ static int pool_mode_scan(const Config *g, const PoolPlan *p, const char *output
 	state.elapsed = priorElapsed + (pool_now() - started);
 	if (out) {
 		uint64_t dataBytes = p->format == POOL_BINARY
-				? state.outputBytes - POOL_HEADER_SIZE : state.outputBytes;
+				? state.outputBytes - (uint64_t)p->headerBytes : state.outputBytes;
 		if (p->format == POOL_BINARY && state.done
-				&& !pool_append_index(out, p->space, state.matched, dataBytes,
+				&& !pool_append_index(out, p->outputSchema, p->headerBytes,
+						p->space, state.matched, dataBytes,
 						&state.outputBytes, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); fclose(out); return 1;
 		}
@@ -1735,31 +1882,42 @@ typedef struct {
 	int mergedParts;
 } PoolHeaderRewrite;
 
-static bool pool_write_repacked_header(FILE *f, const unsigned char original[POOL_HEADER_SIZE],
-		uint64_t records, uint64_t dataBytes, int complete,
+static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
+		int originalHeaderBytes, int outputSchema, int outputHeaderBytes,
+		uint64_t records, uint64_t dataBytes, int complete, int coverageComplete,
 		const PoolHeaderRewrite *rewrite, char *err, size_t errsz) {
-	unsigned char out[POOL_HEADER_SIZE];
-	char work[POOL_HEADER_SIZE + 1];
-	memcpy(work, original, POOL_HEADER_SIZE); work[POOL_HEADER_SIZE] = 0;
-	memset(out, 0, sizeof out);
+	if ((originalHeaderBytes != BSPOOL_HEADER_SIZE
+			&& originalHeaderBytes != BSPOOL_HEADER_EVENTS_SIZE)
+			|| (outputHeaderBytes != BSPOOL_HEADER_SIZE
+				&& outputHeaderBytes != BSPOOL_HEADER_EVENTS_SIZE)
+			|| (outputSchema != BSPOOL_SCHEMA_BLOCKS
+				&& outputSchema != BSPOOL_SCHEMA_EVENTS)) {
+		snprintf(err, errsz, "unsupported repacked pool format"); return false;
+	}
+	unsigned char out[BSPOOL_HEADER_EVENTS_SIZE];
+	char work[BSPOOL_HEADER_EVENTS_SIZE + 1];
+	memcpy(work, original, (size_t)originalHeaderBytes); work[originalHeaderBytes] = 0;
+	memset(out, 0, (size_t)outputHeaderBytes);
 	size_t used = 0;
 	char *line = work;
 	while (line && *line) {
 		char *nl = strchr(line, '\n');
 		if (nl) *nl = 0;
-		char copy[POOL_HEADER_SIZE + 1];
+		char copy[BSPOOL_HEADER_EVENTS_SIZE + 1];
 		snprintf(copy, sizeof copy, "%s", line);
 		char *sp = copy;
 		char *d = pool_tok(&sp);
 		if (!d || !strcmp(d, "end")) break;
 		const char *replacement = NULL;
-		char generated[96];
+		char generated[128];
 		if (!strcmp(d, "BRAINSTORM_SEED_POOL")) {
-			snprintf(generated, sizeof generated, "BRAINSTORM_SEED_POOL %d", BSPOOL_SCHEMA);
+			snprintf(generated, sizeof generated,
+					"BRAINSTORM_SEED_POOL %d\nheader_bytes %d", outputSchema, outputHeaderBytes);
 			replacement = generated;
-		} else if (!strcmp(d, "encoding")) replacement = "encoding delta-varint-blocks-v1";
+		} else if (!strcmp(d, "encoding")) replacement = outputSchema == BSPOOL_SCHEMA_EVENTS
+				? "encoding delta-varint-events-v1" : "encoding delta-varint-blocks-v1";
 		else if (!strcmp(d, "records") || !strcmp(d, "data_bytes") || !strcmp(d, "complete")
-				|| !strcmp(d, "header_bytes")) replacement = NULL;
+				|| !strcmp(d, "coverage_complete") || !strcmp(d, "header_bytes")) replacement = NULL;
 		else if (rewrite && rewrite->overrideRange
 				&& (!strcmp(d, "range_start") || !strcmp(d, "range_end")
 					|| !strcmp(d, "pool_id") || !strcmp(d, "label")
@@ -1767,7 +1925,7 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char original[POO
 		else replacement = line;
 		if (replacement) {
 			size_t n = strlen(replacement);
-			if (n + 1 > sizeof out - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+			if (n + 1 > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
 			memcpy(out + used, replacement, n); used += n; out[used++] = '\n';
 		}
 		line = nl ? nl + 1 : NULL;
@@ -1779,17 +1937,18 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char original[POO
 				rewrite->rangeStart, rewrite->rangeEnd,
 				rewrite->poolId ? rewrite->poolId : "-",
 				rewrite->label ? rewrite->label : "merged-pool", rewrite->mergedParts);
-		if (m < 0 || (size_t)m > sizeof out - used) { snprintf(err, errsz, "merged pool header overflow"); return false; }
+		if (m < 0 || (size_t)m > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "merged pool header overflow"); return false; }
 		memcpy(out + used, merged, (size_t)m); used += (size_t)m;
 	}
-	char tail[192];
+	char tail[224];
 	int n = snprintf(tail, sizeof tail,
-			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\nheader_bytes %d\nend\n",
-			records, dataBytes, complete, POOL_HEADER_SIZE);
-	if (n < 0 || (size_t)n > sizeof out - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\ncoverage_complete %d\nend\n",
+			records, dataBytes, complete, coverageComplete);
+	if (n < 0 || (size_t)n > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
 	memcpy(out + used, tail, (size_t)n);
 	int64_t at = bs_ftello(f);
-	if (bs_fseeko(f, 0, SEEK_SET) != 0 || fwrite(out, 1, sizeof out, f) != sizeof out
+	if (bs_fseeko(f, 0, SEEK_SET) != 0
+			|| fwrite(out, 1, (size_t)outputHeaderBytes, f) != (size_t)outputHeaderBytes
 			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
 		snprintf(err, errsz, "cannot update pool header: %s", strerror(errno)); return false;
 	}
@@ -1811,7 +1970,8 @@ static int pool_mode_convert(const char *input, const char *output) {
 	char err[256] = "";
 	if (!bspool_read_header(in, &h, err, sizeof err)) { fprintf(stderr, "%s\n", err); fclose(in); return 1; }
 	if (!h.complete) { fprintf(stderr, "finish the input pool before converting it\n"); fclose(in); return 1; }
-	if (h.encoding == BSPOOL_ENCODING_DELTA_BLOCKS) {
+	if (h.encoding == BSPOOL_ENCODING_DELTA_BLOCKS
+			|| h.encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
 		fprintf(stderr, "pool is already block-compressed; no output was created\n"); fclose(in); return 1;
 	}
 	int64_t inputBytes = bs_file_size(in);
@@ -1829,7 +1989,9 @@ static int pool_mode_convert(const char *input, const char *output) {
 	FILE *out = fopen(output, "w+b");
 	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
 	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
-			|| !pool_write_repacked_header(out, original, h.records, 0, 0, NULL, err, sizeof err)) {
+			|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
+					BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE,
+					h.records, 0, 0, 0, NULL, err, sizeof err)) {
 		fprintf(stderr, "%s\n", err); fclose(out); bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
 	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
@@ -1854,10 +2016,13 @@ static int pool_mode_convert(const char *input, const char *output) {
 	{
 		int64_t dataEnd = bs_ftello(out);
 		uint64_t finalBytes = 0;
-		if (dataEnd < POOL_HEADER_SIZE || !pool_append_index(out, h.space, h.records,
+		if (dataEnd < POOL_HEADER_SIZE || !pool_append_index(out, BSPOOL_SCHEMA_BLOCKS,
+				POOL_HEADER_SIZE, h.space, h.records,
 				(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err)
-				|| !pool_write_repacked_header(out, original, h.records,
-						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, NULL, err, sizeof err)) {
+				|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
+						BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE, h.records,
+						(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, h.coverageComplete,
+						NULL, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); goto fail;
 		}
 		if (fclose(out) != 0) { out = NULL; fprintf(stderr, "cannot close converted pool\n"); goto fail_no_out; }
@@ -1916,7 +2081,8 @@ static void pool_output_label(const char *path, char out[136]) {
 static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 		uint64_t *written, char *err, size_t errsz) {
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
-	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS) {
+	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS
+			|| part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
 		for (uint64_t b = 0; b < part->reader.nblocks; b++) {
 			const BspoolBlockIndex *e = &part->reader.blocks[b];
 			if (!bspool_decode_block(&part->reader, b, &scratch)) {
@@ -1926,9 +2092,11 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					|| scratch.ranks[i] >= part->header.rangeEnd) {
 				snprintf(err, errsz, "%s contains a rank outside its declared shard range", part->path); goto fail;
 			}
-			unsigned char header[BSPOOL_BLOCK_HEADER_SIZE];
-			if (bs_pread(part->reader.fd, header, sizeof header, (int64_t)e->offset) != (int64_t)sizeof header
-					|| fwrite(header, 1, sizeof header, out) != sizeof header
+			unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE];
+			size_t headerBytes = part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
+					? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
+			if (bs_pread(part->reader.fd, header, headerBytes, (int64_t)e->offset) != (int64_t)headerBytes
+					|| fwrite(header, 1, headerBytes, out) != headerBytes
 					|| (e->payloadBytes && fwrite(scratch.bytes, 1, e->payloadBytes, out) != e->payloadBytes)) {
 				snprintf(err, errsz, "cannot copy verified block from %s", part->path); goto fail;
 			}
@@ -1964,13 +2132,14 @@ fail:
 
 static bool pool_write_merge_manifest(const char *output, const PoolMergePart *parts,
 		int ninputs, int leafParts, uint64_t rangeStart, uint64_t rangeEnd, uint64_t records,
-		uint64_t fileBytes, const char *poolId, const char *label) {
+		uint64_t fileBytes, int schema, const char *poolId, const char *label) {
 	char path[1024];
 	if (snprintf(path, sizeof path, "%s.manifest", output) >= (int)sizeof path) return false;
 	FILE *f = fopen(path, "w");
 	if (!f) return false;
-	fprintf(f, "BRAINSTORM_SEED_POOL_MERGE %d\nmodelver %d\nencoding delta-varint-blocks-v1\n",
-			BSPOOL_SCHEMA, parts[0].header.modelver);
+	fprintf(f, "BRAINSTORM_SEED_POOL_MERGE %d\nmodelver %d\nencoding %s\n",
+			schema, parts[0].header.modelver, schema == BSPOOL_SCHEMA_EVENTS
+					? "delta-varint-events-v1" : "delta-varint-blocks-v1");
 	fprintf(f, "catalog_hash %016" PRIx64 "\ncriteria_hash %016" PRIx64 "\npool_id %s\nlabel %s\n",
 			parts[0].header.catalogHash, parts[0].header.criteriaHash, poolId, label);
 	fprintf(f, "space %s\nseedspace %" PRIu64 "\nrange_start %" PRIu64
@@ -1982,7 +2151,7 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 			parts[i].header.poolId[0] ? parts[i].header.poolId : "-",
 			parts[i].header.rangeStart, parts[i].header.rangeEnd,
 			parts[i].header.records, parts[i].path);
-	fprintf(f, "complete 1\nend\n");
+	fprintf(f, "complete 1\ncoverage_complete 1\nend\n");
 	return fclose(f) == 0;
 }
 
@@ -2001,6 +2170,12 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 		opened++;
 		if (!bspool_read_header(p->file, &p->header, err, sizeof err)) goto done;
 		if (!p->header.complete) { snprintf(err, sizeof err, "%s is incomplete", p->path); goto done; }
+		if (!p->header.coverageComplete) {
+			snprintf(err, sizeof err,
+					"%s is a provisional derivative; lineage-aware provisional merging is not available yet",
+					p->path);
+			goto done;
+		}
 		if (p->header.rangeStart >= p->header.rangeEnd || p->header.rangeEnd > p->header.seedspace) {
 			snprintf(err, sizeof err, "%s has an invalid shard range", p->path); goto done;
 		}
@@ -2014,6 +2189,10 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 		totalRecords += p->header.records;
 	}
 	qsort(parts, (size_t)ninputs, sizeof *parts, pool_merge_part_compare);
+	int outputSchema = parts[0].header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
+			? BSPOOL_SCHEMA_EVENTS : BSPOOL_SCHEMA_BLOCKS;
+	int outputHeaderBytes = outputSchema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL_HEADER_EVENTS_SIZE : BSPOOL_HEADER_SIZE;
 	for (int i = 1; i < ninputs; i++) {
 		const BspoolHeader *a = &parts[0].header, *b = &parts[i].header;
 		if (b->modelver != a->modelver || b->catalogHash != a->catalogHash
@@ -2028,24 +2207,39 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 					parts[i - 1].path, parts[i - 1].header.rangeEnd, parts[i].path, b->rangeStart);
 			goto done;
 		}
+		if ((b->encoding == BSPOOL_ENCODING_DELTA_EVENTS)
+				!= (outputSchema == BSPOOL_SCHEMA_EVENTS)) {
+			snprintf(err, sizeof err,
+					"%s cannot be merged with %s because their metadata schemas differ",
+					parts[i].path, parts[0].path);
+			goto done;
+		}
 	}
-	unsigned char original[POOL_HEADER_SIZE];
-	if (bs_pread(fileno(parts[0].file), original, sizeof original, 0) != (int64_t)sizeof original) {
+	unsigned char original[BSPOOL_HEADER_EVENTS_SIZE];
+	if (parts[0].header.headerBytes != outputHeaderBytes
+			|| bs_pread(fileno(parts[0].file), original, (size_t)outputHeaderBytes, 0)
+				!= (int64_t)outputHeaderBytes) {
 		snprintf(err, sizeof err, "cannot preserve source pool header"); goto done;
 	}
-	FILE *out = fopen(output, "w+b");
-	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
 	uint64_t rangeStart = parts[0].header.rangeStart;
 	uint64_t rangeEnd = parts[ninputs - 1].header.rangeEnd;
 	char poolId[24], label[136];
 	pool_compute_merged_id(&parts[0].header, rangeStart, rangeEnd, totalRecords, poolId);
 	pool_output_label(output, label);
 	int mergedParts = 0;
-	for (int i = 0; i < ninputs; i++) mergedParts += parts[i].header.mergedParts > 0
-			? parts[i].header.mergedParts : 1;
+	for (int i = 0; i < ninputs; i++) {
+		int leaves = parts[i].header.mergedParts > 0 ? parts[i].header.mergedParts : 1;
+		if (leaves > INT_MAX - mergedParts) {
+			snprintf(err, sizeof err, "merged leaf-part count overflows"); goto done;
+		}
+		mergedParts += leaves;
+	}
+	FILE *out = fopen(output, "w+b");
+	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
 	PoolHeaderRewrite rewrite = { 1, rangeStart, rangeEnd, poolId, label, mergedParts };
-	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
-			|| !pool_write_repacked_header(out, original, totalRecords, 0, 0,
+	if (bs_fseeko(out, outputHeaderBytes, SEEK_SET) != 0
+			|| !pool_write_repacked_header(out, original, outputHeaderBytes,
+					outputSchema, outputHeaderBytes, totalRecords, 0, 0, 0,
 					&rewrite, err, sizeof err)) { fclose(out); remove(output); goto done; }
 	uint64_t written = 0;
 	for (int i = 0; i < ninputs; i++) {
@@ -2059,18 +2253,21 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 	uint64_t finalBytes = 0;
 	/* Do not allow short-circuiting to skip fclose: Windows cannot remove a
 	 * failed output while it is open. */
-	bool finalOk = written == totalRecords && dataEnd >= POOL_HEADER_SIZE;
-	if (finalOk) finalOk = pool_append_index(out, parts[0].header.space, totalRecords,
-			(uint64_t)dataEnd - POOL_HEADER_SIZE, &finalBytes, err, sizeof err);
-	if (finalOk) finalOk = pool_write_repacked_header(out, original, totalRecords,
-			(uint64_t)dataEnd - POOL_HEADER_SIZE, 1, &rewrite, err, sizeof err);
+	bool finalOk = written == totalRecords && dataEnd >= outputHeaderBytes;
+	if (finalOk) finalOk = pool_append_index(out, outputSchema,
+			outputHeaderBytes, parts[0].header.space, totalRecords,
+			(uint64_t)dataEnd - (uint64_t)outputHeaderBytes, &finalBytes, err, sizeof err);
+	if (finalOk) finalOk = pool_write_repacked_header(out, original, outputHeaderBytes,
+			outputSchema, outputHeaderBytes, totalRecords,
+			(uint64_t)dataEnd - (uint64_t)outputHeaderBytes, 1, 1,
+			&rewrite, err, sizeof err);
 	int closeRc = fclose(out);
 	if (!finalOk || closeRc != 0) {
 		if (!err[0]) snprintf(err, sizeof err, "cannot finalize merged pool");
 		remove(output); goto done;
 	}
 	if (!pool_write_merge_manifest(output, parts, ninputs, mergedParts, rangeStart, rangeEnd,
-			totalRecords, finalBytes, poolId, label))
+			totalRecords, finalBytes, outputSchema, poolId, label))
 		fprintf(stderr, "warning: merged pool is complete but its optional manifest could not be written\n");
 	fprintf(stderr, "merged %d compatible shards: range=%" PRIu64 "-%" PRIu64
 			" records=%" PRIu64 " size=%.3f GB pool_id=%s\n",

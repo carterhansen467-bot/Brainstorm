@@ -47,6 +47,8 @@ POOL_BIN = os.path.join(NATIVE_DIR,
                         "brainstorm_seed_pool" + (".exe" if IS_WINDOWS else ""))
 SNAPSHOT = os.path.join(MOD_DIR, "native_search.cfg")
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
+POOL_HEADER_PREFIX_BYTES = 1024
+POOL_HEADER_MAX_BYTES = 256 * 1024
 SEEDSPACE = 1785793904896  # 34^8: seeds the game's generator can deal
 # 36^1 + ... + 36^8: every seed the game ACCEPTS typed in -- adds 0/O and
 # 1-7 character seeds. Only reachable by typing, never by rerolling.
@@ -386,19 +388,51 @@ def read_state(path):
     return read_manifest(path)
 
 
-def read_pool_header(path):
-    out = {}
+def read_pool_header_text(path):
+    """Read a bounded .bspool text header without touching its data payload.
+
+    Schemas 1 and 2 have the historical fixed 1 KiB header.  Schema 3 keeps
+    ``header_bytes`` in that first KiB so readers can safely discover a larger
+    metadata header before issuing a second, still-bounded read.
+    """
     try:
         with open(path, "rb") as f:
-            raw = f.read(1024).split(b"\0", 1)[0].decode("latin-1")
-        for line in raw.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                out[parts[0]] = parts[1].strip()
-            if parts and parts[0] == "end":
-                break
+            prefix = f.read(POOL_HEADER_PREFIX_BYTES)
+            raw = prefix
+            magic = re.match(
+                br"^BRAINSTORM_SEED_POOL[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
+                prefix,
+            )
+            if magic and int(magic.group(1)) == 3:
+                size_line = re.search(
+                    br"(?:^|\n)header_bytes[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
+                    prefix,
+                )
+                if not size_line:
+                    return ""
+                header_bytes = int(size_line.group(1))
+                if not (POOL_HEADER_PREFIX_BYTES <= header_bytes <= POOL_HEADER_MAX_BYTES):
+                    return ""
+                if header_bytes > len(prefix):
+                    raw += f.read(header_bytes - len(prefix))
+                    if len(raw) != header_bytes:
+                        return ""
+                else:
+                    raw = raw[:header_bytes]
+        return raw.split(b"\0", 1)[0].decode("latin-1")
     except OSError:
-        pass
+        return ""
+
+
+def read_pool_header(path):
+    out = {}
+    raw = read_pool_header_text(path)
+    for line in raw.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            out[parts[0]] = parts[1].strip()
+        if parts and parts[0] == "end":
+            break
     return out
 
 

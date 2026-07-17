@@ -206,14 +206,16 @@ count all
 format binary
 ```
 
-Then run the same command with an output name ending in `.bspool`. The
-canonical schema-2 pool stores sorted numeric seed-rank deltas in independently
-checksummed blocks, followed by an index for fast randomized access. Its 1 KiB
-header includes schema/model versions, the scanned range, record count,
-completion flag, alphabet, catalog/criteria fingerprints, and the criteria
-themselves, so a shared `.bspool` is self-describing. Compression changes only
-the representation: seed evaluation, checkpoint boundaries, and exhaustive
-search semantics are unchanged.
+Then run the same command with an output name ending in `.bspool`. New scans
+use schema 3: sorted numeric seed-rank deltas and a block-local occurrence
+metadata section share one CRC-protected block, followed by an index for fast
+randomized access. Its 8 KiB header includes schema/model versions, the scanned
+range, record count, completion flag, alphabet, catalog/criteria fingerprints,
+and the criteria themselves, leaving room for lineage and route identity while
+keeping a shared `.bspool` self-describing. Compression changes only the
+representation: seed evaluation, checkpoint boundaries, and exhaustive search
+semantics are unchanged. Schema-1 and schema-2 pools remain readable; schema-2
+conversion is kept as the compatibility target for finished legacy files.
 
 Current helpers still read existing schema-1 `u64le` pools. To shrink a
 finished legacy pool without rescanning the seed space, give the output a new
@@ -234,9 +236,8 @@ Conversion streams the old file, preserves its pool ID and embedded criteria,
 and reports the measured reduction. Keep the original until an export or
 refilter of the converted pool has been verified. If conversion is interrupted,
 delete the incomplete output and run it again; the input is never modified.
-Older Brainstorm helpers do
-not understand schema 2, so anyone receiving a newly compressed pool must also
-update both native helpers.
+Older Brainstorm helpers do not understand the current schema-3 format, so
+anyone receiving a newly generated pool must also update both native helpers.
 
 #### Filtering an existing pool again
 

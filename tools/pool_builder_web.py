@@ -93,19 +93,26 @@ def clamp_int(v, lo, hi):
 # ---------------------------------------------------------------- pools ----
 
 def read_pool_header(path):
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(1024).split(b"\0", 1)[0].decode("latin-1")
-    except OSError:
+    raw = core.read_pool_header_text(path)
+    if not raw:
         return {}
     out = {"criteria": []}
     for line in raw.splitlines():
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("records", "complete", "coverage_complete", "modelver", "pool_id", "space", "encoding",
+        if parts[0] == "BRAINSTORM_SEED_POOL":
+            out["schema"] = parts[1] if len(parts) > 1 else ""
+        if parts[0] in ("records", "complete", "coverage_complete", "modelver",
+                        "pool_id", "space", "encoding",
                         "refilter_depth", "source_pool_id", "range_start", "range_end",
-                        "merged_parts", "source_complete", "source_coverage_complete"):
+                        "merged_parts", "source_complete", "source_coverage_complete",
+                        "header_bytes", "family_id", "segment_id", "stage_hash",
+                        "lineage_id", "derivation_id", "snapshot_id",
+                        "membership_digest", "metadata_digest", "scan_cursor",
+                        "input_cursor", "parent_snapshot_id", "parent_segment_id",
+                        "parent_records", "parent_data_bytes", "parent_coverage_complete",
+                        "input_record_start", "input_record_end", "shard_index", "shard_total"):
             out[parts[0]] = parts[1] if len(parts) > 1 else ""
         elif parts[0] == "label":
             out["label"] = line.split(None, 1)[1] if len(parts) > 1 else ""
@@ -127,7 +134,7 @@ def list_pools():
         path = os.path.join(core.POOL_DIR, fn)
         head = read_pool_header(path)
         state = core.read_state(path + ".state")
-        pools.append({
+        pool = {
             "name": fn,
             "bytes": os.path.getsize(path),
             "records": int(head.get("records", "0") or 0),
@@ -144,7 +151,20 @@ def list_pools():
             "range_start": int(head.get("range_start", "0") or 0),
             "range_end": int(head.get("range_end", "0") or 0),
             "merged_parts": int(head.get("merged_parts", "0") or 0),
-        })
+        }
+        for key in ("family_id", "segment_id", "stage_hash", "lineage_id",
+                    "derivation_id", "snapshot_id", "membership_digest",
+                    "metadata_digest", "parent_snapshot_id", "parent_segment_id"):
+            if key in head:
+                pool[key] = head[key]
+        for key in ("schema", "header_bytes", "scan_cursor", "input_cursor",
+                    "parent_records", "parent_data_bytes", "input_record_start",
+                    "input_record_end", "shard_index", "shard_total"):
+            if key in head:
+                pool[key] = int(head[key] or 0)
+        if "parent_coverage_complete" in head:
+            pool["parent_coverage_complete"] = head["parent_coverage_complete"] == "1"
+        pools.append(pool)
     return pools
 
 
