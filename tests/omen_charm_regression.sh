@@ -17,8 +17,14 @@ if ! command -v "$LUAJIT_BIN" >/dev/null 2>&1; then
 	fail "luajit is required (set LUAJIT_BIN to its path)"
 fi
 
+luajit_text() {
+	# MSVC LuaJIT uses CRLF on Windows. Normalize its text output so the
+	# byte-for-byte golden comparisons and anchored greps stay platform-neutral.
+	"$LUAJIT_BIN" "$@" | tr -d '\r'
+}
+
 expected_summaries=$'SUMMARY\t11111111\tconverted=1\tsoul=0\tblack_hole=0\tnormal_spectral=1\tomen_advances=5\ttarot_advances=4\tspectral_advances=2\nSUMMARY\tM8111111\tconverted=3\tsoul=4\tblack_hole=0\tnormal_spectral=2\tomen_advances=5\ttarot_advances=2\tspectral_advances=5\nSUMMARY\tER111111\tconverted=1\tsoul=0\tblack_hole=4\tnormal_spectral=0\tomen_advances=5\ttarot_advances=4\tspectral_advances=2\nSUMMARY\tMV111111\tconverted=3\tsoul=0\tblack_hole=3\tnormal_spectral=2\tomen_advances=5\ttarot_advances=2\tspectral_advances=5'
-actual_summaries=$("$LUAJIT_BIN" "$ORACLE" fixtures)
+actual_summaries=$(luajit_text "$ORACLE" fixtures)
 if [[ "$actual_summaries" != "$expected_summaries" ]]; then
 	echo "Expected:" >&2
 	printf '%s\n' "$expected_summaries" >&2
@@ -29,31 +35,31 @@ fi
 echo "PASS five Omen advances per five-card Charm reward"
 echo "PASS converted Arcana cards use Spectral Soul advances"
 
-no_omen=$("$LUAJIT_BIN" "$ORACLE" trace M8111111 1 1 0 | sed -n '1p')
+no_omen=$(luajit_text "$ORACLE" trace M8111111 1 1 0 | sed -n '1p')
 expected_no_omen=$'SUMMARY\tM8111111\tconverted=0\tsoul=0\tblack_hole=0\tnormal_spectral=0\tomen_advances=0\ttarot_advances=5\tspectral_advances=0'
 [[ "$no_omen" == "$expected_no_omen" ]] \
 	|| fail "Arcana cards advanced Omen before the voucher was owned"
 echo "PASS Omen stream advances only while voucher is owned"
 
-ownership=$("$LUAJIT_BIN" "$ORACLE" ownership M8111111 1)
+ownership=$(luajit_text "$ORACLE" ownership M8111111 1)
 expected_ownership=$'OWNERSHIP\tseed=M8111111\tprepurchase_omen_advances=0\tpostpurchase_first_index=1\tmatches_fresh=1\tpostpurchase_first_roll=0.91469008459800394\tfresh_first_roll=0.91469008459800394'
 [[ "$ownership" == "$expected_ownership" ]] \
 	|| fail "buying Omen before a same-shop pack did not start its stream correctly"
 echo "PASS same-shop packs see Omen immediately after purchase"
 
-er_trace=$("$LUAJIT_BIN" "$ORACLE" trace ER111111 1)
+er_trace=$(luajit_text "$ORACLE" trace ER111111 1)
 er_overwrite=$'CHARM\tcard=4\tomen=0.98220106577863953\toi=4\tconverted=1\ttype=Spectral\tsoul=0.99810098171210226\tsi=1\tsoul_hit=1\tblack_hole=0.99854395350759328\tbi=2\tblack_hole_hit=1\toverwrite=1\toutcome=BlackHole'
 grep -Fqx "$er_overwrite" <<< "$er_trace" \
 	|| fail "ER111111 no longer proves same-card Black Hole overwrites Soul"
 echo "PASS Soul then Black Hole call order and overwrite"
 
-er_banned=$("$LUAJIT_BIN" "$ORACLE" trace ER111111 1 0 1)
+er_banned=$(luajit_text "$ORACLE" trace ER111111 1 0 1)
 er_banned_row=$'CHARM\tcard=4\tomen=0.98220106577863953\toi=4\tconverted=1\ttype=Spectral\tsoul=0.99810098171210226\tsi=1\tsoul_hit=1\tblack_hole=0.99854395350759328\tbi=2\tblack_hole_hit=1\toverwrite=1\toutcome=Spectral'
 grep -Fqx "$er_banned_row" <<< "$er_banned" \
 	|| fail "banned Black Hole did not consume/overwrite without entering the pack"
 echo "PASS banned Black Hole still consumes and overwrites its Soul roll"
 
-mv_trace=$("$LUAJIT_BIN" "$ORACLE" trace MV111111 1)
+mv_trace=$(luajit_text "$ORACLE" trace MV111111 1)
 mv_hit=$'CHARM\tcard=3\tomen=0.92214688932239164\toi=3\tconverted=1\ttype=Spectral\tsoul=0.26061661917003121\tsi=3\tsoul_hit=0\tblack_hole=0.99762013486912493\tbi=4\tblack_hole_hit=1\toverwrite=0\toutcome=BlackHole'
 mv_gate=$'CHARM\tcard=4\tomen=0.93573608203174441\toi=4\tconverted=1\ttype=Spectral\tsoul=0.4701017612242433\tsi=5\tsoul_hit=0\tblack_hole=-\tbi=0\tblack_hole_hit=0\toverwrite=0\toutcome=Spectral'
 grep -Fqx "$mv_hit" <<< "$mv_trace" \
@@ -62,7 +68,7 @@ grep -Fqx "$mv_gate" <<< "$mv_trace" \
 	|| fail "later Spectral card rerolled Black Hole after one entered the pack"
 echo "PASS pack-wide Black Hole gate is shared across converted cards"
 
-branch=$("$LUAJIT_BIN" "$ORACLE" branch M8111111 1 | sed -n '1p')
+branch=$(luajit_text "$ORACLE" branch M8111111 1 | sed -n '1p')
 expected_branch=$'BRANCH\tseed=M8111111\tcanonical_unchanged=1\tcharm_cards=5\tcanonical_cards=3\tcharm_soul=4\tcanonical_soul=0\trequired_charm=1'
 [[ "$branch" == "$expected_branch" ]] \
 	|| fail "targeted Charm branch did not isolate canonical RNG or mark a branch-only Soul"
@@ -236,12 +242,12 @@ PY
 		|| fail "active in-game Legendary filter missed its purchased-Omen route"
 	echo "PASS active Legendary overlay searches the purchased-Omen route"
 
-	"$LUAJIT_BIN" "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
+	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/omen.cfg" "$tmpdir/charm.bspool" "$tmpdir/seeds" \
 		> "$tmpdir/charm-lua.out"
 	grep -q '^M8111111 1$' "$tmpdir/charm-lua.out" \
 		|| fail "production Lua rejected the targeted-Charm pool member"
-	"$LUAJIT_BIN" "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
+	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/base.cfg" "$tmpdir/purchased.bspool" "$tmpdir/purchased.seed" \
 		> "$tmpdir/purchased-lua.out"
 	grep -q '^1SNK1111 1$' "$tmpdir/purchased-lua.out" \
@@ -261,7 +267,7 @@ PY
 	"$ROOT/native/brainstorm_seed_pool" scan "$tmpdir/no-offers-omen.cfg" \
 		"$tmpdir/no-offers-charm.cfg" "$tmpdir/no-offers-charm.bspool" \
 		>/dev/null 2>/dev/null
-	"$LUAJIT_BIN" "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
+	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/no-offers-omen.cfg" "$tmpdir/no-offers-charm.bspool" \
 		"$tmpdir/seeds" > "$tmpdir/no-offers-charm-lua.out"
 	grep -q '^M8111111 1$' "$tmpdir/no-offers-charm-lua.out" \
@@ -272,7 +278,7 @@ else
 fi
 
 if [[ -n "${BALATRO_SRC:-}" ]]; then
-	"$LUAJIT_BIN" "$ORACLE" source-check "$BALATRO_SRC"
+	luajit_text "$ORACLE" source-check "$BALATRO_SRC"
 else
 	echo "SKIP base-source text check (set BALATRO_SRC to an extracted Balatro source tree)"
 fi
