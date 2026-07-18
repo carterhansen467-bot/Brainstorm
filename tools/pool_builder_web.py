@@ -23,13 +23,17 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import brainstorm_pool_builder as core
+import pool_organizer_web as organizer_web
 
 DEFAULT_PORT = 8917
 LOCK = threading.Lock()
-JOB = {"runner": None, "kind": None, "started": 0.0, "summary": "", "error": ""}
+JOB = {"runner": None, "kind": None, "started": 0.0, "summary": "", "error": "",
+       "closing": False}
 
 
 # ------------------------------------------------------------- criteria ----
@@ -166,7 +170,7 @@ def pool_library():
 def job_state():
     r = JOB["runner"]
     out = {"running": False, "kind": JOB["kind"], "summary": JOB["summary"],
-           "error": JOB["error"]}
+           "error": JOB["error"], "closing": JOB["closing"]}
     if r is None:
         return out
     out.update({
@@ -184,6 +188,8 @@ def job_state():
 
 def start_job(kind, data, snap):
     with LOCK:
+        if JOB["closing"]:
+            raise ValueError("The Builder is closing; reopen it to start another job.")
         r = JOB["runner"]
         if r is not None and not r.done():
             raise ValueError("A scan is already running -- stop it first.")
@@ -202,9 +208,11 @@ def start_job(kind, data, snap):
             if crit.shard_total > 1:
                 raise ValueError("Distributed parts apply to Balatro's seed space, not an input pool.")
         if kind == "estimate":
-            sample = clamp_int(data.get("sample", 100_000_000), 100_000, SEEDCAP)
+            sample = clamp_int(data.get("sample", core.ESTIMATE_COUNT),
+                               100_000, SEEDCAP)
             out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-            text = crit.text("count", sample, apply_shard=False)
+            text = crit.text("count", sample, apply_shard=False,
+                             checkpoint=min(core.ESTIMATE_CHECKPOINT, sample))
         else:
             os.makedirs(core.POOL_DIR, exist_ok=True)
             out = os.path.join(core.POOL_DIR, crit.pool_name() + ".bspool")
@@ -215,13 +223,17 @@ def start_job(kind, data, snap):
             text = crit.text("binary", count)
         if input_pool and os.path.abspath(input_pool) == os.path.abspath(out):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
+        summary = crit.summary()
+        if kind == "estimate" and not input_pool:
+            summary += " [%s-seed quick sample]" % format(sample, ",")
         JOB.update(runner=core.Runner(snap.current_model_copy(), text, out, input_pool),
-                   kind=kind, started=time.time(), summary=crit.summary(),
-                   error="")
+                   kind=kind, started=time.time(), summary=summary, error="")
 
 
 def start_merge_job(data):
     with LOCK:
+        if JOB["closing"]:
+            raise ValueError("The Builder is closing; reopen it to start another job.")
         r = JOB["runner"]
         if r is not None and not r.done():
             raise ValueError("A scan or merge is already running.")
@@ -255,6 +267,25 @@ def start_merge_job(data):
                    error="")
 
 
+def shutdown_when_safe(server):
+    """Pause an active child at its next checkpoint, then stop the web server."""
+    time.sleep(0.2)  # let the POST response reach the browser first
+    r = JOB["runner"]
+    if r is not None and not r.done():
+        r.stop()
+        while not r.done():
+            time.sleep(0.1)
+    server.shutdown()
+
+
+def begin_shutdown(server):
+    with LOCK:
+        if JOB["closing"]:
+            return
+        JOB["closing"] = True
+    threading.Thread(target=shutdown_when_safe, args=(server,), daemon=True).start()
+
+
 SEEDCAP = core.SEEDSPACE_TOTAL  # UI clamp only; the scanner enforces per-space bounds
 
 
@@ -262,7 +293,7 @@ SEEDCAP = core.SEEDSPACE_TOTAL  # UI clamp only; the scanner enforces per-space 
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
-<title>Brainstorm Seed Pool Builder</title>
+<title>Brainstorm Seed Pool Tools</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root {
@@ -295,6 +326,12 @@ h1 { margin:0; font-size:clamp(23px, 3vw, 32px); line-height:1.1; letter-spacing
   background:#14251d; font-size:12px; font-weight:700; }
 .local-pill:before { content:""; width:8px; height:8px; border-radius:50%; background:var(--green);
   box-shadow:0 0 0 4px #55d8891f; }
+.server-tools { display:flex; gap:9px; align-items:center; }
+.appnav { display:flex; gap:7px; width:max-content; margin:-9px 0 20px; padding:5px;
+  border:1px solid #34394d; border-radius:12px; background:#10131c; }
+.appnav a { padding:8px 13px; border-radius:8px; color:var(--muted); font-size:12px;
+  font-weight:800; text-decoration:none; }
+.appnav a.active { background:#29213b; color:#ded6ff; }
 .notice { display:flex; gap:12px; align-items:flex-start; padding:13px 15px; margin-bottom:20px;
   border:1px solid #3b3551; border-radius:12px; background:#191624cc; color:#c9c4d7; font-size:13px; }
 .notice strong { color:var(--gold-2); }
@@ -438,6 +475,8 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .app { width:min(100% - 20px, 1180px); padding-top:20px; }
   .topbar { display:grid; gap:14px; }
   .local-pill { width:max-content; }
+  .appnav { width:100%; }
+  .appnav a { flex:1; text-align:center; }
   .card { padding:17px; border-radius:15px; }
   .field-grid, .field-grid.three, #legRange { grid-template-columns:1fr; }
   .rule { grid-template-columns:1fr 1fr; }
@@ -456,15 +495,18 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">B</div>
       <div>
-        <h1>Seed Pool Builder</h1>
-        <p class="sub">Create reusable seed pools for Brainstorm without touching the command line.</p>
+        <h1>Seed Pool Tools</h1>
+        <p class="sub">Build, search, organize, and combine reusable Brainstorm seed pools.</p>
       </div>
     </div>
-    <div class="local-pill" id="serverStatus">Running locally</div>
+    <div class="server-tools"><div class="local-pill" id="serverStatus">Running locally</div>
+      <button type="button" class="mini ghost" id="btnClose" onclick="closeBuilder()">Close Builder</button></div>
   </header>
 
+  <nav class="appnav"><a class="active" href="/">Build / Search</a><a href="/organize">Organize / Combine</a></nav>
+
   <div class="notice"><span aria-hidden="true">◆</span><div><strong>Your data stays here.</strong>
-    This page only talks to the builder on this computer. Closing it safely pauses an active scan at its next checkpoint.</div></div>
+    This page only talks to the builder on this computer. Closing the browser tab leaves the local Builder running; use <strong>Close Builder</strong> when finished. An active scan will pause safely at its next checkpoint.</div></div>
 
   <div class="workspace">
     <div class="stack">
@@ -589,7 +631,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
         </dl>
         <div class="primary-actions">
           <button class="go" onclick="run('build')" id="btnBuild">Build seed pool</button>
-          <button class="ghost" onclick="run('estimate')" id="btnEst">Estimate size and time</button>
+          <button class="ghost" onclick="run('estimate')" id="btnEst">Quick estimate (2M sample)</button>
           <button class="warn" onclick="stopJob()" id="btnStop" disabled>Pause active job</button>
         </div>
         <div id="error" role="alert"></div>
@@ -799,7 +841,10 @@ function spaceInfo(space){
 function updateSpaceHint(){
   const info = spaceInfo($("space").value);
   $("optAll").textContent = info.all;
-  $("spaceHint").textContent = info.hint;
+  const selectedPool = $("inputPool").selectedOptions[0];
+  $("spaceHint").textContent = selectedPool && selectedPool.dataset.composite === "1"
+    ? "This is a composite membership set. Its source-filter branches stay recorded for organizing, but a new search uses the selected seeds plus your current filters rather than stacking every source route."
+    : info.hint;
 }
 
 function selectedText(id){
@@ -874,6 +919,22 @@ async function run(kind){
   } catch (e) { $("error").textContent = "Could not reach the local builder. Reopen it and try again."; }
 }
 async function stopJob(){ await fetch("/api/stop", {method:"POST"}); }
+async function closeBuilder(){
+  if (lastRunning && !confirm("Pause the active job at its next checkpoint and close the Builder?")) return;
+  $("btnClose").disabled = true;
+  try {
+    const r = await fetch("/api/shutdown", {method:"POST"});
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    $("serverStatus").textContent = lastRunning ? "Pausing safely" : "Closing";
+    $("result").textContent = lastRunning
+      ? "Pausing at the next checkpoint. This page will disconnect when it is safe to close."
+      : "Builder closed. You can close this browser tab.";
+  } catch (e) {
+    $("serverStatus").textContent = "Builder disconnected";
+    $("result").textContent = "The local Builder is closed. You can close this browser tab.";
+  }
+}
 async function mergePools(){
   $("mergeError").textContent = "";
   const pools = [...document.querySelectorAll(".mergePick:checked")].map(x=>x.value);
@@ -887,14 +948,22 @@ function showResult(j){
   const m = j.manifest || {};
   let out = "";
   if (j.rc === 130) {
-    out = "Paused at a checkpoint. Press Build pool again (same name) to resume.";
+    out = j.kind === "estimate"
+      ? "Estimate canceled cleanly. No seed-pool file was changed."
+      : "Paused at a checkpoint. Press Build pool again (same name) to resume.";
   } else if (j.rc !== 0) {
     out = "The scanner reported a problem:\\n" + (j.lines||[]).join("\\n");
   } else if (j.kind === "estimate") {
     const scanned = +m.scanned || 1, matched = +m.matched || 0;
     out = `Sample: ${fmt(matched)} matching seeds in ${fmt(scanned)} scanned `
         + `(${(100*matched/scanned).toFixed(5)}%).`;
-    if (+m.projected_full_matches)
+    if (matched > 0 && matched < 25)
+      out += `\\nOnly ${fmt(matched)} matches appeared, so the size projection is rough. `
+          + `Use a larger test build if you need a precise file-size estimate.`;
+    if (matched === 0)
+      out += `\\nNo matches appeared in this quick sample. The filter may be very rare; `
+          + `use a larger test build before concluding that no matching seeds exist.`;
+    if (matched > 0 && +m.projected_full_matches)
       out += `\\nFull seed space: ~${fmt(Math.round(+m.projected_full_matches))} seeds, `
           + `~${fmtBytes(+(m.projected_compressed_bytes || m.projected_u64_bytes))} compressed file.`;
     if (+m.seeds_per_second)
@@ -923,7 +992,9 @@ function inputPoolOptions(groups){
           : p.status === "provisional" ? " · provisional snapshot"
           : p.resumable ? " · paused snapshot" : " · incomplete snapshot";
         const update = p.update_available ? ` · +${fmt(p.new_records)} source seeds` : "";
-        return `<option value="${esc(p.name)}" data-space="${esc(p.space)}">${esc(p.name)} (${fmt(p.records)} seeds${state}${update})</option>`;
+        const composite = p.composite
+          ? ` · ${p.composite_operation || "composite"} · ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
+        return `<option value="${esc(p.name)}" data-space="${esc(p.space)}" data-composite="${p.composite?"1":"0"}">${esc(p.name)} (${fmt(p.records)} seeds${state}${update}${composite})</option>`;
       }).join("") + `</optgroup>`;
     }
   }
@@ -945,12 +1016,16 @@ function renderPoolCard(p, mergeSelected){
     + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${esc(p.source_pool_id.slice(0,8))}` : "") : "";
   const enc = p.encoding === "u64le" ? " · legacy format" : "";
   const merged = p.merged_parts ? ` · merged ${p.merged_parts} parts` : "";
+  const composite = p.composite
+    ? ` · ${esc((p.composite_operation || "composite").toUpperCase())} of ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
   const range = p.range_end > p.range_start
     ? ` · ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}` : "";
-  const pick = p.complete
+  const pick = p.complete && !p.composite
     ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>`
     : "";
-  const criteriaText = p.criteria.length ? p.criteria.map(esc).join(" · ") : "No embedded criteria";
+  const criteriaText = p.composite
+    ? "Composite membership set · source routes retained as per-seed provenance"
+    : p.criteria.length ? p.criteria.map(esc).join(" · ") : "No embedded criteria";
   let relation = "";
   if (p.parent_name) {
     relation = `<div class="pool-relation">Derived from ${esc(p.parent_name)}`
@@ -963,7 +1038,7 @@ function renderPoolCard(p, mergeSelected){
     : "";
   return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
     + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
-    + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}</div>`
+    + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}${composite}</div>`
     + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}</article>`;
 }
 
@@ -1017,12 +1092,17 @@ async function tick(){
   updateSummary();
   const job = j.job;
   const running = !!job.running;
-  $("btnEst").disabled = running; $("btnBuild").disabled = running;
-  $("btnMerge").disabled = running;
+  const closing = !!job.closing;
+  $("btnEst").disabled = running || closing; $("btnBuild").disabled = running || closing;
+  $("btnMerge").disabled = running || closing;
   $("btnStop").disabled = !running;
+  $("btnStop").textContent = job.kind === "estimate" ? "Cancel estimate" : "Pause active job";
+  $("btnClose").disabled = closing;
   if (running || job.rc !== undefined){
     $("progressCard").style.display = "";
-    $("progressState").textContent = running ? "Working" : (job.rc === 0 ? "Complete" : job.rc === 130 ? "Paused" : "Stopped");
+    $("progressState").textContent = closing && running ? "Pausing safely"
+      : running ? (job.scanned ? "Working" : "Starting")
+      : (job.rc === 0 ? "Complete" : job.rc === 130 ? "Paused" : "Stopped");
     $("progTitle").textContent = (job.kind==="estimate"?"Estimating: ":job.kind==="merge"?"Merging: ":"Building: ")
       + (job.summary||"");
     const frac = job.total ? job.scanned/job.total : 0;
@@ -1070,6 +1150,7 @@ addEventListener("load", ()=>{
 
 class Handler(BaseHTTPRequestHandler):
     snap = None  # set at startup
+    pool_dir = core.POOL_DIR
 
     def log_message(self, *a):  # keep the terminal window calm
         pass
@@ -1082,60 +1163,173 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _page(self, value):
+        body = value.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _organizer_export(self, parsed):
+        query = parse_qs(parsed.query)
+        name = query.get("source", [""])[0]
+        reader = organizer_web.organizer.BSPoolReader(
+            organizer_web.resolve_source(name, self.pool_dir))
+        expected = query.get("snapshot", [""])[0].lower()
+        if expected != reader.snapshot_token:
+            raise organizer_web.organizer.PoolError(
+                "source snapshot changed; inspect before exporting")
+        filename = "%s-%s-records.ndjson" % (
+            os.path.splitext(name)[0], reader.snapshot_token[:8])
+        filename = re.sub(r"[^A-Za-z0-9._+-]+", "-", filename)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Content-Disposition", "attachment; filename=%s" %
+                         quote(filename))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        for line in organizer_web.iter_record_export(reader):
+            self.wfile.write(line)
+
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/index"):
-            body = PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/state":
-            tags = [{"key": k, "name": core.TAG_NAMES.get(k, k), "minAnte": ma}
-                    for k, ma in self.snap.usable_tags()]
-            legendaries = [{"key": k, "name": core.joker_name(k)}
-                           for k in self.snap.usable_legendaries()]
-            vouchers = [{"key": key, "name": core.voucher_name(key),
-                         "prerequisite": prerequisite,
-                         "prerequisiteName": core.voucher_name(prerequisite)
-                         if prerequisite else ""}
-                        for key, prerequisite in self.snap.usable_vouchers()]
-            pools, pool_groups = pool_library()
-            self._json({
-                "catalog": {"tags": tags, "legendaries": legendaries,
-                            "vouchers": vouchers, "cpus": os.cpu_count() or 8},
-                "pools": pools,
-                "pool_groups": pool_groups,
-                "job": job_state(),
-            })
-        else:
-            self._json({"error": "not found"}, 404)
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path in ("/", "/index.html"):
+                self._page(PAGE)
+            elif parsed.path in ("/organize", "/organize/"):
+                self._page(organizer_web.PAGE)
+            elif parsed.path == "/api/ping":
+                self._json({"app": "brainstorm-seed-pool-tools", "version": 1})
+            elif parsed.path == "/api/state":
+                tags = [{"key": k, "name": core.TAG_NAMES.get(k, k), "minAnte": ma}
+                        for k, ma in self.snap.usable_tags()]
+                legendaries = [{"key": k, "name": core.joker_name(k)}
+                               for k in self.snap.usable_legendaries()]
+                vouchers = [{"key": key, "name": core.voucher_name(key),
+                             "prerequisite": prerequisite,
+                             "prerequisiteName": core.voucher_name(prerequisite)
+                             if prerequisite else ""}
+                            for key, prerequisite in self.snap.usable_vouchers()]
+                pools, pool_groups = pool_library()
+                self._json({
+                    "catalog": {"tags": tags, "legendaries": legendaries,
+                                "vouchers": vouchers, "cpus": os.cpu_count() or 8},
+                    "pools": pools,
+                    "pool_groups": pool_groups,
+                    "job": job_state(),
+                })
+            elif parsed.path == "/organizer/api/pools":
+                self._json({"pools": organizer_web.list_sources(self.pool_dir)})
+            elif parsed.path == "/organizer/api/export":
+                self._organizer_export(parsed)
+            else:
+                self._json({"error": "not found"}, 404)
+        except (OSError, ValueError,
+                organizer_web.organizer.PoolError) as exc:
+            self._json({"error": str(exc)}, 400)
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        parsed = urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._json({"error": "invalid request length"}, 400)
+        if n < 0 or n > organizer_web.MAX_REQUEST_BYTES:
+            return self._json({"error": "request is too large"}, 400)
         try:
             data = json.loads(self.rfile.read(n) or b"{}")
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return self._json({"error": "bad request"}, 400)
-        if self.path == "/api/run":
+        if not isinstance(data, dict):
+            return self._json({"error": "request must be a JSON object"}, 400)
+        if parsed.path == "/api/run":
             try:
                 start_job(data.get("kind", "build"), data.get("criteria", {}), self.snap)
                 self._json({"ok": True})
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
-        elif self.path == "/api/merge":
+        elif parsed.path == "/api/merge":
             try:
                 start_merge_job(data)
                 self._json({"ok": True})
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
-        elif self.path == "/api/stop":
+        elif parsed.path == "/api/stop":
             r = JOB["runner"]
             if r is not None:
                 r.stop()
             self._json({"ok": True})
+        elif parsed.path == "/api/shutdown":
+            self._json({"ok": True, "pausing": bool(
+                JOB["runner"] is not None and not JOB["runner"].done())})
+            begin_shutdown(self.server)
+        elif parsed.path.startswith("/organizer/api/"):
+            try:
+                if parsed.path == "/organizer/api/inspect":
+                    value = organizer_web.inspect_source(
+                        data.get("source", ""), self.pool_dir)
+                elif parsed.path == "/organizer/api/plan":
+                    reader = organizer_web.organizer.BSPoolReader(
+                        organizer_web.resolve_source(
+                            data.get("source", ""), self.pool_dir))
+                    expected = str(data.get("snapshot", "")).lower()
+                    if expected and expected != reader.snapshot_token:
+                        raise organizer_web.organizer.PoolError(
+                            "source changed; inspect it again")
+                    value = organizer_web.build_split_plan(
+                        reader, data.get("selectedCategories"),
+                        data.get("choicePlan"))
+                elif parsed.path == "/organizer/api/combine/plan":
+                    value = organizer_web.build_combine_plan(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/split":
+                    if not organizer_web.SPLIT_LOCK.acquire(False):
+                        raise organizer_web.organizer.PoolError(
+                            "another organizer split is still running")
+                    try:
+                        value = organizer_web.execute_split(
+                            data.get("source", ""), data, self.pool_dir)
+                    finally:
+                        organizer_web.SPLIT_LOCK.release()
+                elif parsed.path == "/organizer/api/combine":
+                    if not organizer_web.COMBINE_LOCK.acquire(False):
+                        raise organizer_web.organizer.PoolError(
+                            "another pool combine is still running")
+                    try:
+                        value = organizer_web.execute_combine(data, self.pool_dir)
+                    finally:
+                        organizer_web.COMBINE_LOCK.release()
+                else:
+                    return self._json({"error": "not found"}, 404)
+                self._json(value)
+            except (OSError, ValueError,
+                    organizer_web.organizer.PoolError) as exc:
+                self._json({"error": str(exc)}, 400)
         else:
             self._json({"error": "not found"}, 404)
+
+
+def existing_builder_url(port):
+    """Return the current local Builder URL when that port is already ours."""
+    base = "http://127.0.0.1:%d/" % port
+    try:
+        with urlopen(base + "api/ping", timeout=0.75) as response:
+            value = json.loads(response.read().decode("utf-8"))
+        if value.get("app") == "brainstorm-seed-pool-tools":
+            return base
+    except Exception:
+        # Builders published before /api/ping can still be recognized by
+        # their state response, preventing a stale second tab/server pair.
+        try:
+            with urlopen(base + "api/state", timeout=0.75) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            if isinstance(value.get("job"), dict) and isinstance(
+                    value.get("catalog"), dict):
+                return base
+        except Exception:
+            pass
+    return None
 
 
 def main():
@@ -1146,10 +1340,17 @@ def main():
         input("Press Return to close...")
         return 1
     Handler.snap = core.Snapshot(core.SNAPSHOT)
+    JOB["closing"] = False
     port = DEFAULT_PORT
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
+        existing = existing_builder_url(port)
+        if existing:
+            print("Brainstorm Seed Pool Builder is already running at %s" % existing)
+            if "--no-browser" not in sys.argv:
+                webbrowser.open(existing)
+            return 0
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         port = server.server_address[1]
     url = "http://127.0.0.1:%d/" % port
@@ -1165,11 +1366,11 @@ def main():
         if r is not None and not r.done():
             print("\nPausing the scan at a checkpoint...")
             r.stop()
-            for _ in range(300):
-                if r.done():
-                    break
+            while not r.done():
                 time.sleep(0.1)
         print("Bye.")
+    finally:
+        server.server_close()
     return 0
 
 

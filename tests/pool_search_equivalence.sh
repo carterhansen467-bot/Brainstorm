@@ -118,6 +118,42 @@ grep -q "^E pool: no seed in the pool matches" "$OUT/status" \
 	|| { echo "FAIL: missing exhaustion verdict"; cat "$OUT/status"; exit 1; }
 echo "PASS: contradictory filter exhausts the pool with a definitive verdict"
 
+# General organizer combines use a larger BSP3 header plus forward-compatible
+# provenance descriptors. Prove both native consumers treat that result as the
+# same literal membership set: the search helper can search it, and the pool
+# helper can export and refilter it. Reapplying only the tag rule creates a
+# distinct compatible snapshot with the same members, so their union should be
+# byte-for-byte equivalent after export without relying on duplicate inputs.
+sed '/^legendary /d' "$OUT/criteria.cfg" > "$OUT/criteria_tag_refilter.cfg"
+"./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
+	"$OUT/criteria_tag_refilter.cfg" "$OUT/pool.bspool" "$OUT/tag-refilter.bspool"
+python3 tools/brainstorm_pool_organizer.py combine "$OUT/composite-union.bspool" \
+	"$OUT/pool.bspool" "$OUT/tag-refilter.bspool" --operation union \
+	--label "CI composite native compatibility"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/composite-union.bspool" \
+	"$OUT/composite-union.txt"
+sort "$OUT/pool.txt" > "$OUT/pool.sorted"
+sort "$OUT/composite-union.txt" > "$OUT/composite-union.sorted"
+cmp "$OUT/pool.sorted" "$OUT/composite-union.sorted"
+write_search_cfg j_perkeo "$OUT/search_composite.cfg" "$OUT/composite-union.bspool"
+date +%s > "$OUT/hb"
+rm -f "$OUT/status" "$OUT/stop"
+"./native/brainstorm_native_search$EXE" search "$OUT/search_composite.cfg" \
+	"$OUT/status" "$OUT/stop" "$OUT/hb"
+COMPOSITE_SEED=$(sed -n 's/^R \([A-Z0-9]*\) .*/\1/p' "$OUT/status")
+[ -n "$COMPOSITE_SEED" ] \
+	|| { echo "FAIL: native search could not read the composite pool"; cat "$OUT/status"; exit 1; }
+grep -qx "$COMPOSITE_SEED" "$OUT/composite-union.txt" \
+	|| { echo "FAIL: composite hit is not a recorded member"; exit 1; }
+"./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" \
+	"$OUT/criteria_tag_refilter.cfg" "$OUT/composite-union.bspool" \
+	"$OUT/composite-refilter.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/composite-refilter.bspool" \
+	"$OUT/composite-refilter.txt"
+sort "$OUT/composite-refilter.txt" > "$OUT/composite-refilter.sorted"
+cmp "$OUT/pool.sorted" "$OUT/composite-refilter.sorted"
+echo "PASS: native search/export/refilter accept composite provenance pools"
+
 # A pool's membership/route is only valid for the exact ordered profile
 # snapshot that built it. A mismatch must be fatal (the former warning could
 # return a seed with the right tag or Soul one ante/depth off).

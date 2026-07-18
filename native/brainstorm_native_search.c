@@ -237,6 +237,19 @@ typedef struct {
 	int npoolVoucherExclusions;
 	int poolVoucherExclusions[MAX_POOL_VOUCHER_EXCLUSIONS];
 	int poolVoucherMaxAnte;
+	/* Immutable catalog classifications resolved once at config load so the
+	 * per-candidate hot paths never rescan the catalog or strcmp identity
+	 * keys (config_finalize_catalog). */
+	int omenVoucherIdx;   /* v_omen_globe, -1 if absent */
+	int charmTagIdx;      /* tag_charm, -1 if absent */
+	int activeTagReward;  /* tag_reward_kind of the active tag filter */
+	uint8_t vouchIsReducer[MAX_VOUCH]; /* v_hieroglyph / v_petroglyph */
+	uint8_t tagRewardKindOf[MAX_TAGS]; /* 0 none, 1 Charm, 2 Ethereal */
+	/* Voucher-route availability bitmasks (defined only when nvouch <= 64,
+	 * which the route DFS already requires): bit i of vouchUnlocksMask[p] is
+	 * set when voucher i's prerequisite is voucher p. */
+	uint64_t vouchRouteEligibleMask, vouchNoPrereqMask;
+	uint64_t vouchUnlocksMask[MAX_VOUCH];
 } Config;
 
 enum { CK_PH = 1, CK_R13, CK_PR, CK_PRN };
@@ -427,6 +440,43 @@ static const char *K_SOULS[9] = { 0, "soul_Spectral1", "soul_Spectral2", "soul_S
 static const char *K_EDISOUA[9] = { 0, "edisou1", "edisou2", "edisou3", "edisou4",
 	"edisou5", "edisou6", "edisou7", "edisou8" };
 
+/* Precomputed RNG key strings for every ante/resample the engines can touch.
+ * The resample and deep-ante loops run per candidate on every worker thread;
+ * building these with snprintf there serializes threads on libc internals.
+ * Filled once by init_key_tables() before any worker starts, then read-only. */
+static char KT_TAG[MAX_SEARCH_ANTE + 1][12];
+static char KT_VOUCHER[MAX_SEARCH_ANTE + 1][12];
+static char KT_SHOPPACK[MAX_SEARCH_ANTE + 1][16];
+static char KT_SOULT[MAX_SEARCH_ANTE + 1][16];
+static char KT_SOULS[MAX_SEARCH_ANTE + 1][20];
+static char KT_EDISOU[MAX_SEARCH_ANTE + 1][12];
+static char RS_RBASE[RBASES][MAX_RESAMPLE][24];
+static char RS_TAG[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE][24];
+static char RS_VOUCHER[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE][24];
+
+static void init_key_tables(void) {
+	for (int a = 1; a <= MAX_SEARCH_ANTE; a++) {
+		snprintf(KT_TAG[a], sizeof KT_TAG[a], "Tag%d", a);
+		snprintf(KT_VOUCHER[a], sizeof KT_VOUCHER[a], "Voucher%d", a);
+		snprintf(KT_SHOPPACK[a], sizeof KT_SHOPPACK[a], "shop_pack%d", a);
+		snprintf(KT_SOULT[a], sizeof KT_SOULT[a], "soul_Tarot%d", a);
+		snprintf(KT_SOULS[a], sizeof KT_SOULS[a], "soul_Spectral%d", a);
+		snprintf(KT_EDISOU[a], sizeof KT_EDISOU[a], "edisou%d", a);
+		for (int it = 2; it < MAX_RESAMPLE + 2; it++) {
+			snprintf(RS_TAG[a][it - 2], sizeof RS_TAG[a][it - 2],
+					"Tag%d_resample%d", a, it);
+			snprintf(RS_VOUCHER[a][it - 2], sizeof RS_VOUCHER[a][it - 2],
+					"Voucher%d_resample%d", a, it);
+		}
+	}
+	for (int b = 0; b < RBASES; b++) {
+		for (int it = 2; it < MAX_RESAMPLE + 2; it++) {
+			snprintf(RS_RBASE[b][it - 2], sizeof RS_RBASE[b][it - 2],
+					"%s_resample%d", RBASE_KEY[b], it);
+		}
+	}
+}
+
 /* Brainstorm.pseudoseed(key..seed): lazy pseudohash init, round13 advance. */
 static inline double stream_next(Ctx *c, Stream *s, const char *key) {
 	if (s->gen != c->gen) {
@@ -443,9 +493,7 @@ static inline double resample_next(Ctx *c, int base, int it /* >=2 */) {
 		return NAN;
 	}
 	if (s->gen != c->gen) {
-		char kb[64];
-		snprintf(kb, sizeof kb, "%s_resample%d", RBASE_KEY[base], it);
-		s->state = pseudohash_ks(kb, c->seed);
+		s->state = pseudohash_ks(RS_RBASE[base][it - 2], c->seed);
 		s->gen = c->gen;
 	}
 	s->state = round13(lua_mod1(2.134453429141 + s->state * 1.72431234));
@@ -512,9 +560,7 @@ static void sim_packs(Ctx *c, int a, int count) {
 	}
 	int max = pack_max_slots(c, a);
 	if (count > max) count = max;
-	char dynamicKey[24];
-	const char *packKey = a <= 8 ? K_SHOPPACK[a] : dynamicKey;
-	if (a > 8) snprintf(dynamicKey, sizeof dynamicKey, "shop_pack%d", a);
+	const char *packKey = KT_SHOPPACK[a];
 	while (c->packs_n[a] < count) {
 		double poll = psr(c, stream_next(c, &c->shop_pack[a], packKey)) * g->boostCume;
 		double it = 0.0;
@@ -533,9 +579,7 @@ static void sim_packs(Ctx *c, int a, int count) {
  * shop. Those packs consume the same per-Ante Soul streams as shop packs. */
 static int tag_reward_kind(const Config *g, int tagIndex) {
 	if (tagIndex < 0 || tagIndex >= g->ntags) return 0;
-	if (!strcmp(g->tagKey[tagIndex], "tag_charm")) return 1;
-	if (!strcmp(g->tagKey[tagIndex], "tag_ethereal")) return 2;
-	return 0;
+	return g->tagRewardKindOf[tagIndex];
 }
 
 static int tag_reward_kind_key(const char *key) {
@@ -614,12 +658,6 @@ static int soul_pack_events(Ctx *c, int ante, SoulPackEvent events[8]) {
 	if (c->skipBig[ante]) append_tag_reward(c, ante, c->rewardBig[ante], 1, events, &n);
 	else append_shop_pair(c, ante, ante, SOUL_PHASE_BIG, &cursor, events, &n);
 	return n;
-}
-
-static int ctx_find_voucher(const Config *g, const char *key) {
-	for (int i = 0; i < g->nvouch; i++)
-		if (!strcmp(g->vouchKey[i], key)) return i;
-	return -1;
 }
 
 static bool ctx_voucher_owned_for_soul_event(const Ctx *c, int voucherIndex,
@@ -740,16 +778,12 @@ static int roll_tag_at(Ctx *c, int a, int blind) {
 	 * caller asks for Big before another predicate has read Small. */
 	if (blind == 1 && !c->tagRollDone[a][0] && roll_tag_at(c, a, 0) < 0) return -1;
 	const Config *g = c->g;
-	char key[32];
-	snprintf(key, sizeof key, "Tag%d", a);
-	int idx = psr_n(c, stream_next(c, &c->tagS[a], key), g->ntags);
+	int idx = psr_n(c, stream_next(c, &c->tagS[a], KT_TAG[a]), g->ntags);
 	int it = 1;
 	while (idx > 0 && !(g->tagReqOk[idx - 1] && (g->tagMinAnte[idx - 1] == 0 || g->tagMinAnte[idx - 1] <= a))) {
 		it++;
 		if (it - 2 >= MAX_RESAMPLE) return -1;
-		char rkey[48];
-		snprintf(rkey, sizeof rkey, "Tag%d_resample%d", a, it);
-		double sv = stream_next(c, &c->tagResample[a][it - 2], rkey);
+		double sv = stream_next(c, &c->tagResample[a][it - 2], RS_TAG[a][it - 2]);
 		idx = psr_n(c, sv, g->ntags);
 	}
 	idx = idx > 0 ? idx - 1 : -1;
@@ -839,34 +873,30 @@ static int roll_pool_voucher(Ctx *c, int ante, uint64_t purchased,
 	const Config *g = c->g;
 	if (ante < 1 || ante > MAX_SEARCH_ANTE || g->nvouch < 1 || g->nvouch > 64)
 		return -1;
-	char key[24];
-	snprintf(key, sizeof key, "Voucher%d", ante);
+	const char *key = KT_VOUCHER[ante];
 	undo->main = c->voucher[ante];
 	undo->nresample = 0;
 	undo->visits = c->poolVoucherVisits[ante];
 	c->poolVoucherVisits[ante]++;
 
-	uint8_t available[MAX_VOUCH] = { 0 };
-	int navailable = 0;
-	for (int i = 0; i < g->nvouch; i++) {
-		int prerequisite = g->vouchPrereq[i];
-		available[i] = g->vouchRouteAvail[i]
-			&& !(purchased & (UINT64_C(1) << i))
-			&& (prerequisite < 0 || (purchased & (UINT64_C(1) << prerequisite)));
-		if (available[i]) navailable++;
-	}
-	if (!navailable) return -1;
+	/* Bit i is available iff route-eligible, not yet purchased, and its
+	 * prerequisite (if any) is owned -- identical to the old per-entry
+	 * catalog walk, assembled from masks precomputed at config load. */
+	uint64_t unlocked = 0;
+	for (uint64_t owned = purchased; owned; owned &= owned - 1)
+		unlocked |= g->vouchUnlocksMask[__builtin_ctzll(owned)];
+	uint64_t availMask = g->vouchRouteEligibleMask & ~purchased
+			& (g->vouchNoPrereqMask | unlocked);
+	if (!availMask) return -1;
 
 	int idx = psr_n(c, stream_next(c, &c->voucher[ante], key), g->nvouch);
 	int it = 1;
-	while (idx > 0 && !available[idx - 1]) {
+	while (idx > 0 && !(availMask >> (idx - 1) & 1)) {
 		it++;
 		if (it - 2 >= MAX_RESAMPLE) return -1;
 		undo->resample[undo->nresample++] = c->poolVoucherResample[ante][it - 2];
-		char rkey[48];
-		snprintf(rkey, sizeof rkey, "Voucher%d_resample%d", ante, it);
-		idx = psr_n(c, stream_next(c,
-				&c->poolVoucherResample[ante][it - 2], rkey), g->nvouch);
+		idx = psr_n(c, stream_next(c, &c->poolVoucherResample[ante][it - 2],
+				RS_VOUCHER[ante][it - 2]), g->nvouch);
 	}
 	return idx > 0 ? idx - 1 : -1;
 }
@@ -942,15 +972,13 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 			&& !pool_voucher_excluded(g, index)) {
 		if ((best->requirePoolLegends || best->requireActiveLegend
 				|| g->npoolRouteRules)
-				&& (!strcmp(g->vouchKey[index], "v_hieroglyph")
-					|| !strcmp(g->vouchKey[index], "v_petroglyph")))
+				&& g->vouchIsReducer[index])
 			goto skip_pool_voucher_buy;
 		uint8_t oldAnte = c->poolVoucherPurchaseAnte[index];
 		uint8_t oldVisit = c->poolVoucherPurchaseVisit[index];
 		c->poolVoucherPurchaseAnte[index] = (uint8_t)ante;
 		c->poolVoucherPurchaseVisit[index] = visit;
-		int repeatsAnte = !strcmp(g->vouchKey[index], "v_hieroglyph")
-				|| !strcmp(g->vouchKey[index], "v_petroglyph");
+		int repeatsAnte = g->vouchIsReducer[index];
 		search_pool_voucher_route(c, repeatsAnte ? ante : ante + 1,
 				purchased | (UINT64_C(1) << index), nextMatched,
 				purchases + 1, best);
@@ -959,6 +987,41 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 	}
 skip_pool_voucher_buy:
 	undo_pool_voucher(c, ante, &undo);
+}
+
+/* Cheap Omen-timing gate. Omen affects the Soul streams only through its
+ * visit-1 activation Ante (reducers are never bought in legend-recovery
+ * modes, and any other purchased voucher is invisible to the Soul oracle),
+ * so if no hypothetical activation Ante can produce the required result the
+ * expensive purchase-tree DFS cannot succeed and must not run at all. */
+static bool omen_timing_possible(Ctx *c, int omenIndex, int maxAnte,
+		int requirePoolLegends, int requireActiveLegend) {
+	if (omenIndex < 0) return false;
+	uint64_t oldPurchased = c->poolVoucherPurchased;
+	uint8_t oldAnte = c->poolVoucherPurchaseAnte[omenIndex];
+	uint8_t oldVisit = c->poolVoucherPurchaseVisit[omenIndex];
+	bool possible = false;
+	for (int ante = 1; ante <= maxAnte && !possible; ante++) {
+		c->poolVoucherPurchased = oldPurchased | (UINT64_C(1) << omenIndex);
+		c->poolVoucherPurchaseAnte[omenIndex] = (uint8_t)ante;
+		c->poolVoucherPurchaseVisit[omenIndex] = 1;
+		bool valid = true;
+		if (requirePoolLegends) {
+			reset_pool_legend_streams(c);
+			valid = check_pool_legend_rules(c);
+		}
+		if (valid && requireActiveLegend) {
+			const char *unusedLocation = NULL;
+			reset_pool_legend_streams(c);
+			valid = check_legendary_anywhere(c, &unusedLocation);
+		}
+		possible = valid;
+	}
+	c->poolVoucherPurchased = oldPurchased;
+	c->poolVoucherPurchaseAnte[omenIndex] = oldAnte;
+	c->poolVoucherPurchaseVisit[omenIndex] = oldVisit;
+	reset_pool_legend_streams(c);
+	return possible;
 }
 
 static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
@@ -978,11 +1041,14 @@ static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
 		.requireOmen = requireOmen,
 		.requirePoolLegends = requirePoolLegends,
 		.requireActiveLegend = requireActiveLegend,
-		.omenIndex = ctx_find_voucher(g, "v_omen_globe"),
+		.omenIndex = g->omenVoucherIdx,
 	};
 	if (best.maxAnte < g->poolVoucherMaxAnte) best.maxAnte = g->poolVoucherMaxAnte;
 	if (best.maxAnte < 1 || best.maxAnte > 8) return false;
 	if (requireOmen && best.omenIndex < 0) return false;
+	if (requireOmen && (requirePoolLegends || requireActiveLegend)
+			&& !omen_timing_possible(c, best.omenIndex, best.maxAnte,
+					requirePoolLegends, requireActiveLegend)) return false;
 	uint64_t initialPurchased = 0;
 	for (int i = 0; i < g->nvouch; i++)
 		if (g->vouchInitiallyOwned[i]) initialPurchased |= UINT64_C(1) << i;
@@ -1060,13 +1126,13 @@ static bool check_pool_legend_rules(Ctx *c) {
 	int found = 0, eventAnte[3] = { 0 };
 	SoulPackEvent eventPack[3] = { 0 };
 	double eventEdition[3] = { 0.0 };
+	int omenIndex = g->omenVoucherIdx;
 	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
 		SoulPackEvent packs[8];
 		int npacks = soul_pack_events(c, ante, packs);
 		for (int slot = 0; slot < npacks && found < needDepth; slot++) {
 			int kind = packs[slot].soulKind, cards = packs[slot].cards;
 			if (!kind) continue;
-			int omenIndex = ctx_find_voucher(g, "v_omen_globe");
 			bool omenOwned = ctx_voucher_owned_for_soul_event(c, omenIndex, &packs[slot]);
 			bool soulInPack = false, blackHoleInPack = false;
 			for (int card = 0; card < cards && found < needDepth; card++) {
@@ -1075,9 +1141,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 						&& psr(c, stream_next(c, &c->omen, "omen_globe")) > 0.8)
 					contentKind = 2;
 				Stream *stream = contentKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
-				char soulKey[32];
-				snprintf(soulKey, sizeof soulKey, "soul_%s%d",
-						contentKind == 1 ? "Tarot" : "Spectral", ante);
+				const char *soulKey = contentKind == 1 ? KT_SOULT[ante] : KT_SOULS[ante];
 				bool soul = false;
 				if (!soulInPack)
 					soul = psr(c, stream_next(c, stream, soulKey)) > 0.997;
@@ -1093,10 +1157,8 @@ static bool check_pool_legend_rules(Ctx *c) {
 				found++;
 				eventAnte[found] = ante;
 				eventPack[found] = packs[slot];
-				char editionKey[24];
-				snprintf(editionKey, sizeof editionKey, "edisou%d", ante);
 				eventEdition[found] = psr(c,
-						stream_next(c, &c->edisouA[ante], editionKey));
+						stream_next(c, &c->edisouA[ante], KT_EDISOU[ante]));
 			}
 		}
 	}
@@ -1117,11 +1179,10 @@ static bool check_pool_legend_rules(Ctx *c) {
 	return true;
 }
 
-static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte) {
+static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte,
+		int requireOmen) {
 	const Config *g = c->g;
-	int charmIndex = -1;
-	for (int i = 0; i < g->ntags; i++)
-		if (!strcmp(g->tagKey[i], "tag_charm")) { charmIndex = i; break; }
+	int charmIndex = g->charmTagIdx;
 	if (charmIndex < 0) return false;
 	if (tagMaxAnte > MAX_SEARCH_ANTE) tagMaxAnte = MAX_SEARCH_ANTE;
 	int routeMaxAnte = soulMaxAnte > 8 ? 8 : soulMaxAnte;
@@ -1139,10 +1200,8 @@ static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte) {
 			*skip = 1;
 			*reward = 1;
 			resolve_forced_pack_ante(c);
-			for (int omenAttempt = 0; omenAttempt < 2; omenAttempt++) {
-				if (!check_pool_voucher_route_mode(c, omenAttempt, 1, 0,
-						routeMaxAnte))
-					continue;
+			if (check_pool_voucher_route_mode(c, requireOmen, 1, 0,
+					routeMaxAnte)) {
 				reset_pool_legend_streams(c);
 				if (check_pool_legend_rules(c)) return true;
 			}
@@ -1159,6 +1218,7 @@ static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte) {
 static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	const Config *g = c->g;
 	if (!g->soulAllowed) return false;
+	int omenIndex = g->omenVoucherIdx;
 	for (int a = 1; a <= 8; a++) {
 		SoulPackEvent packs[8];
 		int npacks = soul_pack_events(c, a, packs);
@@ -1166,7 +1226,6 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 			int sk = packs[slot].soulKind;
 			if (!sk) continue;
 			int ncards = packs[slot].cards;
-			int omenIndex = ctx_find_voucher(g, "v_omen_globe");
 			bool omenOwned = ctx_voucher_owned_for_soul_event(c, omenIndex, &packs[slot]);
 			bool soul_in_pack = false, bh_in_pack = false;
 			for (int card = 0; card < ncards; card++) {
@@ -1208,12 +1267,19 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	return false;
 }
 
-static bool try_active_targeted_charm(Ctx *c, const char **locOut) {
+static bool try_active_targeted_charm(Ctx *c, const char **locOut,
+		int requireOmen) {
 	const Config *g = c->g;
-	int charmIndex = -1;
-	for (int i = 0; i < g->ntags; i++)
-		if (!strcmp(g->tagKey[i], "tag_charm")) { charmIndex = i; break; }
+	int charmIndex = g->charmTagIdx;
 	if (charmIndex < 0) return false;
+	/* The zero-purchase branch must evaluate with no route purchases owned,
+	 * exactly as it did when it always ran after a failed (state-resetting)
+	 * Omen route search. */
+	if (!requireOmen) {
+		memset(c->poolVoucherPurchaseAnte, 0, sizeof c->poolVoucherPurchaseAnte);
+		memset(c->poolVoucherPurchaseVisit, 0, sizeof c->poolVoucherPurchaseVisit);
+		c->poolVoucherPurchased = 0;
+	}
 	for (int ante = 1; ante <= 8; ante++) {
 		for (int blind = 0; blind < 2; blind++) {
 			int idx = roll_tag_at(c, ante, blind);
@@ -1226,9 +1292,10 @@ static bool try_active_targeted_charm(Ctx *c, const char **locOut) {
 			*skip = 1;
 			*reward = 1;
 			resolve_forced_pack_ante(c);
-			reset_pool_legend_streams(c);
-			if (check_legendary_anywhere(c, locOut)) return true;
-			if (check_pool_voucher_route_mode(c, 1,
+			if (!requireOmen) {
+				reset_pool_legend_streams(c);
+				if (check_legendary_anywhere(c, locOut)) return true;
+			} else if (check_pool_voucher_route_mode(c, 1,
 					g->npoolLegendRules > 0, 1, 8)) {
 				reset_pool_legend_streams(c);
 				if (check_legendary_anywhere(c, locOut)) return true;
@@ -1392,7 +1459,7 @@ static bool passes_prepared(Ctx *c) {
 		c->rewardSm[1] = 1; /* classic filter's Ante-1 Charm-tag convention */
 	}
 	if (g->tag[0]) {
-		int reward = tag_reward_kind_key(g->tag);
+		int reward = g->activeTagReward;
 		if (g->tagAnywhere) {
 			int a = atoi(tagLoc + 4); /* "TagA<n>Sm|Big" */
 			if (a >= 1 && a <= 8) {
@@ -1414,6 +1481,9 @@ static bool passes_prepared(Ctx *c) {
 	if (g->npoolLegendRules) {
 		reset_pool_legend_streams(c);
 		if (!check_pool_legend_rules(c)) {
+			/* Alternate routes, cheapest and least-purchased first: an actual
+			 * Charm Tag with no Omen purchase, then an Omen voucher route,
+			 * then a Charm branch combined with Omen. */
 			int soulMaxAnte = 1;
 			for (int i = 0; i < g->npoolLegendRules; i++) {
 				int rngMax = g->poolLegendRules[i].maxAnte
@@ -1422,25 +1492,30 @@ static bool passes_prepared(Ctx *c) {
 				if (rngMax > soulMaxAnte) soulMaxAnte = rngMax;
 			}
 			int voucherMaxAnte = soulMaxAnte > 8 ? 8 : soulMaxAnte;
-			bool recovered = check_pool_voucher_route_mode(c, 1, 1, 0,
-					voucherMaxAnte);
-			if (recovered) {
-				reset_pool_legend_streams(c);
-				recovered = check_pool_legend_rules(c);
-			}
+			int tagMaxAnte = 1;
+			for (int i = 0; i < g->npoolLegendRules; i++)
+				if (g->poolLegendRules[i].maxAnte > tagMaxAnte)
+					tagMaxAnte = g->poolLegendRules[i].maxAnte;
+			bool recovered = try_pool_targeted_charm(c, soulMaxAnte,
+					tagMaxAnte, 0);
 			if (!recovered) {
-				int tagMaxAnte = 1;
-				for (int i = 0; i < g->npoolLegendRules; i++)
-					if (g->poolLegendRules[i].maxAnte > tagMaxAnte)
-						tagMaxAnte = g->poolLegendRules[i].maxAnte;
-				if (!try_pool_targeted_charm(c, soulMaxAnte, tagMaxAnte)) return false;
+				recovered = check_pool_voucher_route_mode(c, 1, 1, 0,
+						voucherMaxAnte);
+				if (recovered) {
+					reset_pool_legend_streams(c);
+					recovered = check_pool_legend_rules(c);
+				}
 			}
+			if (!recovered
+					&& !try_pool_targeted_charm(c, soulMaxAnte, tagMaxAnte, 1))
+				return false;
 		}
 		reset_pool_legend_streams(c);
 	}
 	/* 2.5) legendary ANYWHERE: first Soul across antes 1-8 */
 	if (legAnywhere) {
 		bool recovered = check_legendary_anywhere(c, &legLoc);
+		if (!recovered) recovered = try_active_targeted_charm(c, &legLoc, 0);
 		if (!recovered) {
 			recovered = check_pool_voucher_route_mode(c, 1,
 					g->npoolLegendRules > 0, 1, 8);
@@ -1449,7 +1524,7 @@ static bool passes_prepared(Ctx *c) {
 				recovered = check_legendary_anywhere(c, &legLoc);
 			}
 		}
-		if (!recovered && !try_active_targeted_charm(c, &legLoc)) return false;
+		if (!recovered && !try_active_targeted_charm(c, &legLoc, 1)) return false;
 	}
 	/* 3) pack: ALL of ante 1's physical slots (Small+Big shops only -- the
 	 * post-boss shop is ante 2's -- minus assumed skips; the forced buffoon
@@ -1554,6 +1629,156 @@ static void batch_hash_key(const char *key, const char seeds[ILV][9], double *ou
 	batch_hash_key_n(key, seeds, 8, out);
 }
 
+/* ------------------------------------------------ shared-suffix hashing --
+ * make_seed emits the fastest-changing digit at index 0 and pseudohash walks
+ * the string from its END to its START, so ILV candidates from consecutive
+ * ranks usually share seed[1..slen-1] -- and with it the whole chain state
+ * up to the final seed character. Compute that shared state once, then run
+ * only the last seed step (plus the key characters, which the walk visits
+ * after the seed) per candidate. Every candidate still performs the
+ * IDENTICAL operations in the IDENTICAL order as the serial pseudohash_ks --
+ * the shared prefix has the same value for each of them -- so results are
+ * bit-exact by construction (enforced by the selftests and end-to-end by
+ * the equivalence fixtures). */
+static bool batch_seeds_share_suffix(const char seeds[ILV][9], int slen) {
+	for (int i = 1; i < ILV; i++) {
+		if (memcmp(seeds[0] + 1, seeds[i] + 1, (size_t)(slen - 1))) return false;
+	}
+	return true;
+}
+
+/* Chain state after the shared characters seed[1..slen-1], which sit at
+ * string positions offset+2..offset+slen (offset = key length; 0 for the
+ * seed-only hash). */
+static double hash_shared_suffix(const char *seed, int slen, int offset) {
+	double num = 1.0;
+	for (int pos = slen; pos >= 2; pos--) {
+		num = lua_mod1((1.1239285023 / num) * (double)(unsigned char)seed[pos - 1] * LUA_PI
+				+ LUA_PI * (double)(pos + offset));
+	}
+	return num;
+}
+
+static void batch_hash_seed_shared(const char seeds[ILV][9], int slen, double *out) {
+	double suffix = hash_shared_suffix(seeds[0], slen, 0);
+	double pi_pos = LUA_PI * 1.0;
+	for (int i = 0; i < ILV; i++) {
+		double x = (1.1239285023 / suffix) * (double)(unsigned char)seeds[i][0] * LUA_PI + pi_pos;
+		out[i] = x - floor(x);
+	}
+}
+
+static void batch_hash_key_shared(const char *key, const char seeds[ILV][9],
+		int slen, double *out) {
+	int kl = (int)strlen(key);
+	double suffix = hash_shared_suffix(seeds[0], slen, kl);
+	double num[ILV];
+	double pi_first = LUA_PI * (double)(kl + 1);
+	for (int i = 0; i < ILV; i++) {
+		double x = (1.1239285023 / suffix) * (double)(unsigned char)seeds[i][0] * LUA_PI + pi_first;
+		num[i] = x - floor(x);
+	}
+	for (int pos = kl; pos >= 1; pos--) {
+		double pi_pos = LUA_PI * (double)pos;
+		double b = (double)(unsigned char)key[pos - 1];
+		for (int i = 0; i < ILV; i++) {
+			double x = (1.1239285023 / num[i]) * b * LUA_PI + pi_pos;
+			num[i] = x - floor(x);
+		}
+	}
+	for (int i = 0; i < ILV; i++) out[i] = num[i];
+}
+
+/* Per-lane-suffix variants: contiguous scans keep ONE suffix state alive
+ * across a whole base-N run and recompute it only when the odometer below
+ * carries past the seed's first digit, instead of rehashing it once per ILV
+ * group. Lanes carry their own suffix so a group may straddle a carry or a
+ * length change without breaking the eight-wide interleave. The last seed
+ * character always sits at string position 1 (seed hash) / kl+1 (key hash)
+ * regardless of seed length, so these are length-agnostic; all length
+ * dependence lives in the suffix values themselves. */
+static void batch_hash_seed_pre(const double sufSeed[ILV],
+		const char seeds[ILV][9], double *out) {
+	double pi_pos = LUA_PI * 1.0;
+	for (int i = 0; i < ILV; i++) {
+		double x = (1.1239285023 / sufSeed[i]) * (double)(unsigned char)seeds[i][0] * LUA_PI + pi_pos;
+		out[i] = x - floor(x);
+	}
+}
+
+static void batch_hash_key_pre(const char *key, int kl, const double sufKey[ILV],
+		const char seeds[ILV][9], double *out) {
+	double num[ILV];
+	double pi_first = LUA_PI * (double)(kl + 1);
+	for (int i = 0; i < ILV; i++) {
+		double x = (1.1239285023 / sufKey[i]) * (double)(unsigned char)seeds[i][0] * LUA_PI + pi_first;
+		num[i] = x - floor(x);
+	}
+	for (int pos = kl; pos >= 1; pos--) {
+		double pi_pos = LUA_PI * (double)pos;
+		double b = (double)(unsigned char)key[pos - 1];
+		for (int i = 0; i < ILV; i++) {
+			double x = (1.1239285023 / num[i]) * b * LUA_PI + pi_pos;
+			num[i] = x - floor(x);
+		}
+	}
+	for (int i = 0; i < ILV; i++) out[i] = num[i];
+}
+
+/* ------------------------------------------------------- seed odometer --
+ * Contiguous rank scans increment the little-endian digit string directly
+ * instead of re-deriving every seed with eight divisions. odometer_next
+ * advances exactly one rank (wrapping the whole space back to rank 0, and
+ * growing the length in the expanded spaces at block boundaries, exactly
+ * like make_seed_in) and reports whether any digit past index 0 changed --
+ * the signal that cached suffix chain states are stale. */
+typedef struct {
+	int space, len;
+	uint8_t dig[8];
+	char seed[9];
+} SeedOdometer;
+
+static void odometer_init(SeedOdometer *o, int space, uint64_t rank) {
+	o->space = space;
+	o->len = make_seed_in(space, rank, o->seed);
+	const char *cs = space_charset(space);
+	for (int j = 0; j < o->len; j++) {
+		o->dig[j] = (uint8_t)(strchr(cs, o->seed[j]) - cs);
+	}
+}
+
+static bool odometer_next(SeedOdometer *o) {
+	const char *cs = space_charset(o->space);
+	uint8_t base = o->space == SPACE_NATURAL ? CHARSET_N
+			: o->space == SPACE_SETTABLE ? CHARSET_SETTABLE_N : CHARSET_TOTAL_N;
+	int j = 0;
+	for (;;) {
+		if (++o->dig[j] < base) {
+			o->seed[j] = cs[o->dig[j]];
+			return j > 0;
+		}
+		o->dig[j] = 0;
+		o->seed[j] = cs[0];
+		j++;
+		if (j == o->len) {
+			if (o->space != SPACE_NATURAL && o->len < 8) {
+				/* end of this length's block: the next rank is the shortest
+				 * seed of the next length, all digits zero */
+				o->dig[o->len] = 0;
+				o->seed[o->len] = cs[0];
+				o->len++;
+				o->seed[o->len] = 0;
+			} else if (o->space != SPACE_NATURAL) {
+				/* wrap of the whole expanded space back to rank 0 */
+				o->len = 1;
+				o->seed[1] = 0;
+			}
+			/* natural space: all eight digits just wrapped to rank 0 */
+			return true;
+		}
+	}
+}
+
 static Stream *first_stream(Ctx *c) {
 	const Config *g = c->g;
 	switch (g->fsId) {
@@ -1595,6 +1820,29 @@ static bool batch_selftest(const Config *g) {
 		for (int i = 0; i < ILV; i++) {
 			if (hs[i] != pseudohash_ks("", seeds[i])) return false;
 			if (g->fsKey && hf[i] != pseudohash_ks(g->fsKey, seeds[i])) return false;
+		}
+	}
+	/* Shared-suffix fast path: consecutive ranks in every space/length the
+	 * scan loops can produce, verified against the serial reference. */
+	const int spaces[] = { SPACE_NATURAL, SPACE_SETTABLE, SPACE_TOTAL };
+	for (size_t si = 0; si < sizeof spaces / sizeof spaces[0]; si++) {
+		uint64_t base = 246813579ULL;
+		for (int r = 0; r < 4; r++) {
+			int l0 = make_seed_in(spaces[si], base % space_size(spaces[si]), seeds[0]);
+			int uniform = 1;
+			for (int i = 1; i < ILV; i++) {
+				int sl = make_seed_in(spaces[si], (base + (uint64_t)i) % space_size(spaces[si]), seeds[i]);
+				if (sl != l0) uniform = 0;
+			}
+			if (uniform && batch_seeds_share_suffix(seeds, l0)) {
+				batch_hash_seed_shared(seeds, l0, hs);
+				if (g->fsKey) batch_hash_key_shared(g->fsKey, seeds, l0, hf);
+				for (int i = 0; i < ILV; i++) {
+					if (hs[i] != pseudohash_ks("", seeds[i])) return false;
+					if (g->fsKey && hf[i] != pseudohash_ks(g->fsKey, seeds[i])) return false;
+				}
+			}
+			base = base * 31ULL + 17ULL;
 		}
 	}
 	return true;
@@ -1713,7 +1961,48 @@ static uint64_t config_single_bit(const char *d) {
 	return 0;
 }
 
+/* Resolve every immutable catalog classification the per-candidate paths
+ * would otherwise rescan: fixed key indices, reducer identity, tag reward
+ * kinds, and the voucher-route availability masks. Pure precomputation over
+ * already-parsed catalog data -- no eligibility or route semantics change. */
+static void config_finalize_catalog(Config *g) {
+	g->omenVoucherIdx = -1;
+	g->charmTagIdx = -1;
+	memset(g->vouchIsReducer, 0, sizeof g->vouchIsReducer);
+	memset(g->tagRewardKindOf, 0, sizeof g->tagRewardKindOf);
+	g->vouchRouteEligibleMask = 0;
+	g->vouchNoPrereqMask = 0;
+	memset(g->vouchUnlocksMask, 0, sizeof g->vouchUnlocksMask);
+	for (int i = 0; i < g->nvouch; i++) {
+		if (!strcmp(g->vouchKey[i], "v_omen_globe")) g->omenVoucherIdx = i;
+		if (!strcmp(g->vouchKey[i], "v_hieroglyph")
+				|| !strcmp(g->vouchKey[i], "v_petroglyph"))
+			g->vouchIsReducer[i] = 1;
+	}
+	if (g->nvouch <= 64) {
+		for (int i = 0; i < g->nvouch; i++) {
+			if (g->vouchRouteAvail[i]) g->vouchRouteEligibleMask |= UINT64_C(1) << i;
+			int prerequisite = g->vouchPrereq[i];
+			if (prerequisite < 0) g->vouchNoPrereqMask |= UINT64_C(1) << i;
+			else if (prerequisite < g->nvouch)
+				g->vouchUnlocksMask[prerequisite] |= UINT64_C(1) << i;
+		}
+	}
+	for (int i = 0; i < g->ntags; i++) {
+		if (!strcmp(g->tagKey[i], "tag_charm")) {
+			g->charmTagIdx = i;
+			g->tagRewardKindOf[i] = 1;
+		} else if (!strcmp(g->tagKey[i], "tag_ethereal")) {
+			g->tagRewardKindOf[i] = 2;
+		}
+	}
+	g->activeTagReward = tag_reward_kind_key(g->tag[0] ? g->tag : NULL);
+}
+
 static bool load_config(const char *path, Config *g, char *err, size_t errsz) {
+	/* Idempotent; anchored here (not only in the mains) so embedders like the
+	 * compat test harness can never evaluate with unfilled key tables. */
+	init_key_tables();
 	memset(g, 0, sizeof *g);
 	g->threads = 1;
 	FILE *f = fopen(path, "r");
@@ -2055,6 +2344,7 @@ bad_value:
 			if (g->maPacks[a]) { g->fsId = FS_JPACK; g->fsAnte = a; g->fsKey = K_SHOPPACK[a]; break; }
 		}
 	}
+	config_finalize_catalog(g);
 	return true;
 fail:
 	if (f) fclose(f);
@@ -3464,28 +3754,50 @@ static void *pool_worker(void *vp) {
 		for (uint64_t i = 0; i < n; i++) {
 			if (ranks[i] < space_size(g_pool.space)) ranks[m++] = ranks[i];
 		}
-		uint64_t i = 0;
-		/* The batched hash needs uniform seed lengths; variable-length pool
-		 * records mix lengths, so those go through the serial path below
-		 * (pool searches are record-bounded -- batching is a full-space
-		 * scan optimization, not a correctness requirement). */
-		for (; g_pool.space == SPACE_NATURAL && i + ILV <= m
+		uint64_t i = 0, done = 0;
+		/* The batched hash needs uniform seed lengths within one ILV group.
+		 * Pool ranks ascend between rotation wraps, so variable-length spaces
+		 * arrive as long same-length runs: batch each uniform group (sorted
+		 * dense pools frequently share suffixes too) and take the serial path
+		 * only for the rare group that straddles a length boundary. */
+		for (; i + ILV <= m
 				&& !atomic_load_explicit(&g_stop, memory_order_relaxed); i += ILV) {
-			for (int j = 0; j < ILV; j++) make_seed(ranks[i + (uint64_t)j], seeds[j]);
-			batch_hash_seed(seeds, hseed);
-			if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
-			for (int j = 0; j < ILV; j++) {
-				if (passes_pre(c, seeds[j], hseed[j], g->fsKey ? hfirst[j] : 0.0)) {
-					record_hit(c);
-					break;
+			int l0 = make_seed_in(g_pool.space, ranks[i], seeds[0]);
+			int uniform = 1;
+			for (int j = 1; j < ILV; j++) {
+				if (make_seed_in(g_pool.space, ranks[i + (uint64_t)j], seeds[j]) != l0)
+					uniform = 0;
+			}
+			if (uniform) {
+				if (batch_seeds_share_suffix(seeds, l0)) {
+					batch_hash_seed_shared(seeds, l0, hseed);
+					if (g->fsKey) batch_hash_key_shared(g->fsKey, seeds, l0, hfirst);
+				} else {
+					batch_hash_seed_n(seeds, l0, hseed);
+					if (g->fsKey) batch_hash_key_n(g->fsKey, seeds, l0, hfirst);
+				}
+				for (int j = 0; j < ILV; j++) {
+					done++;
+					if (passes_pre(c, seeds[j], hseed[j], g->fsKey ? hfirst[j] : 0.0)) {
+						record_hit(c);
+						break;
+					}
+				}
+			} else {
+				for (int j = 0; j < ILV
+						&& !atomic_load_explicit(&g_stop, memory_order_relaxed); j++) {
+					memcpy(c->seed, seeds[j], 9);
+					done++;
+					if (passes(c)) record_hit(c);
 				}
 			}
 		}
 		for (; i < m && !atomic_load_explicit(&g_stop, memory_order_relaxed); i++) {
 			make_seed_in(g_pool.space, ranks[i], c->seed);
+			done++;
 			if (passes(c)) record_hit(c);
 		}
-		atomic_fetch_add_explicit(&g_tried, (unsigned long long)m, memory_order_relaxed);
+		atomic_fetch_add_explicit(&g_tried, (unsigned long long)done, memory_order_relaxed);
 	}
 	bspool_scratch_destroy(&scratch);
 	free(ranks);
@@ -3493,6 +3805,12 @@ static void *pool_worker(void *vp) {
 	atomic_fetch_sub(&g_pool.live, 1);
 	return NULL;
 }
+
+/* Full-space candidates are dealt to workers in contiguous chunks from this
+ * shared counter (offset by the entropy-derived rotation). Contiguity is what
+ * lets the ILV batch share the seed-suffix chain state: with the old
+ * per-thread stride the eight candidates of a batch never shared a suffix. */
+static _Atomic uint64_t g_space_next;
 
 static void *worker(void *vp) {
 	WorkerArgs *w = (WorkerArgs *)vp;
@@ -3504,35 +3822,39 @@ static void *worker(void *vp) {
 		return NULL;
 	}
 	c->g = g;
-	uint64_t k = w->start + (uint64_t)w->tid;
-	uint64_t step = (uint64_t)g->threads;
-	const int BATCH = 16384; /* multiple of ILV */
+	const uint64_t BATCH = 16384; /* multiple of ILV */
+	int kl = g->fsKey ? (int)strlen(g->fsKey) : 0;
 	char seeds[ILV][9];
-	double hseed[ILV], hfirst[ILV];
+	double hseed[ILV], hfirst[ILV], sufS[ILV], sufK[ILV];
+	SeedOdometer od;
 	while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
-		for (int b = 0; b < BATCH; b += ILV) {
+		uint64_t i0 = atomic_fetch_add(&g_space_next, BATCH);
+		odometer_init(&od, SPACE_NATURAL, (w->start + i0) % SEEDSPACE);
+		double sufSeed = hash_shared_suffix(od.seed, 8, 0);
+		double sufKey = g->fsKey ? hash_shared_suffix(od.seed, 8, kl) : 0.0;
+		uint64_t done = 0;
+		for (uint64_t b = 0; b < BATCH; b += ILV) {
 			for (int i = 0; i < ILV; i++) {
-				make_seed(k % SEEDSPACE, seeds[i]);
-				k += step;
+				memcpy(seeds[i], od.seed, 9);
+				sufS[i] = sufSeed;
+				sufK[i] = sufKey;
+				if (odometer_next(&od)) {
+					sufSeed = hash_shared_suffix(od.seed, 8, 0);
+					if (g->fsKey) sufKey = hash_shared_suffix(od.seed, 8, kl);
+				}
 			}
-			batch_hash_seed(seeds, hseed);
-			if (g->fsKey) batch_hash_key(g->fsKey, seeds, hfirst);
+			batch_hash_seed_pre(sufS, seeds, hseed);
+			if (g->fsKey) batch_hash_key_pre(g->fsKey, kl, sufK, seeds, hfirst);
 			for (int i = 0; i < ILV; i++) {
+				done++;
 				if (passes_pre(c, seeds[i], hseed[i], g->fsKey ? hfirst[i] : 0.0)) {
-					bs_mutex_lock(&g_found_mtx);
-					if (!g_found) {
-						g_found = true;
-						memcpy(g_found_seed, c->seed, 9);
-						snprintf(g_found_label, sizeof g_found_label, "%s", c->label);
-					}
-					bs_mutex_unlock(&g_found_mtx);
-					atomic_store(&g_stop, true);
+					record_hit(c);
 					break;
 				}
 			}
 			if (atomic_load_explicit(&g_stop, memory_order_relaxed)) break;
 		}
-		atomic_fetch_add_explicit(&g_tried, (unsigned long long)BATCH, memory_order_relaxed);
+		atomic_fetch_add_explicit(&g_tried, (unsigned long long)done, memory_order_relaxed);
 	}
 	free(c);
 	return NULL;
@@ -3752,6 +4074,7 @@ static int mode_search(Config *g, const char *cfgPath, const char *statusPath,
 	uint64_t start = entropy % SEEDSPACE;
 	int n = g->threads < 1 ? 1 : (g->threads > 64 ? 64 : g->threads);
 	atomic_store(&g_worker_failed, false);
+	atomic_store(&g_space_next, 0);
 	if (g_pool_active) {
 		g_pool.rot = entropy % g_pool.records;
 		atomic_init(&g_pool.next, 0);
@@ -3911,6 +4234,7 @@ static int mode_bench(const Config *g0, int seconds) {
 		gb.threads = n;
 		atomic_store(&g_stop, false);
 		atomic_store(&g_tried, 0);
+		atomic_store(&g_space_next, 0);
 		g_found = false;
 		/* make it unfindable so we measure pure reject throughput */
 		snprintf(gb.tag, MAX_KEY, "tag_bench_impossible");
@@ -3930,6 +4254,7 @@ static int mode_bench(const Config *g0, int seconds) {
 
 int main(int argc, char **argv) {
 	bs_platform_init();
+	init_key_tables();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s search <cfg> <status> <stop> <hb> | fixture <cfg> <seeds> | verifychecks <cfg> | bench <cfg> <secs>\n", argv[0]);
 		return 2;

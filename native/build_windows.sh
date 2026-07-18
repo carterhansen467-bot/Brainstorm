@@ -17,7 +17,7 @@ else
 	echo "error: need zig (ziglang.org/download; or ZIG=/path/to/zig) or a MinGW-w64 gcc" >&2
 	exit 1
 fi
-$CC -O2 -Wall -ffp-contract=off -o brainstorm_native_search.exe brainstorm_native_search.c -lm
+$CC -O3 -Wall -ffp-contract=off -o brainstorm_native_search.exe brainstorm_native_search.c -lm
 echo "built: $(pwd)/brainstorm_native_search.exe"
 $CC -O3 -Wall -Wno-unused-function -ffp-contract=off -o brainstorm_seed_pool.exe brainstorm_seed_pool.c -lm
 echo "built: $(pwd)/brainstorm_seed_pool.exe"

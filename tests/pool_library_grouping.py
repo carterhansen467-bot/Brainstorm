@@ -56,12 +56,23 @@ def main():
             "pool_id": "old-pool", "records": 5,
             "complete": 1, "coverage_complete": 1,
         })
+        write_pool(directory, "composite.bspool", {
+            "family_id": "fam-c", "lineage_id": "line-composite",
+            "segment_id": "seg-composite", "records": 7,
+            "complete": 1, "coverage_complete": 0, "space": "natural",
+            "composite_schema": 1, "composite_operation": "union",
+            "composite_route_policy": "provenance-only",
+            "composite_metadata_complete": 1,
+            "composite_branch": "1111111111111111 2222222222222222 3333333333333333 1 - -",
+            "composite_operand": "4444444444444444 3333333333333333 2222222222222222 1 7 - composite",
+        })
 
         pools, groups = core.read_pool_library(directory)
         by_name = {pool["name"]: pool for pool in pools}
         root = by_name["root.bspool"]
         child = by_name["filtered.bspool"]
         legacy = by_name["legacy.bspool"]
+        composite = by_name["composite.bspool"]
 
         assert root["status"] == "paused" and root["resumable"]
         assert child["status"] == "provisional"
@@ -69,6 +80,11 @@ def main():
         assert child["parent_current_records"] == 20
         assert child["update_available"] and child["new_records"] == 8
         assert legacy["legacy"] and legacy["status"] == "complete"
+        assert composite["composite"]
+        assert composite["composite_operation"] == "union"
+        assert composite["composite_branch_count"] == 1
+        assert composite["composite_operand_count"] == 1
+        assert composite["composite_route_policy"] == "provenance-only"
 
         family_a = next(group for group in groups if group["family_id"] == "fam-a")
         assert len(family_a["lineages"]) == 2
@@ -85,9 +101,11 @@ def main():
             web_pools, web_groups = web.pool_library()
         finally:
             core.POOL_DIR = old_dir
-        assert len(web_pools) == 4 and len(web_groups) == 3
+        assert len(web_pools) == 5 and len(web_groups) == 4
         assert "<optgroup" in web.PAGE
         assert "document.activeElement === sel" in web.PAGE
+        assert "Composite membership set" in web.PAGE
+        assert "Organize / Combine" in web.PAGE
 
     print("pool library grouping: ok")
 

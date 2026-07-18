@@ -48,6 +48,18 @@ write_criteria 1 "$OUT/depth1.cfg"
 write_criteria 2 "$OUT/depth2.cfg"
 write_criteria any "$OUT/depthany.cfg"
 
+# Pinned reducer/Omen regression. The cheap Omen route probe must keep the
+# Soul timeline's Ante-reducer ban even while repeated Soul validation is
+# disabled. PFD21111 was formerly accepted only by buying Hieroglyph before
+# Omen; production Lua correctly rejects that unresolved route.
+printf '%s\n' PFD21111 > "$OUT/reducer-pfd.seed"
+PFD_RESULT=$("./native/brainstorm_seed_pool$EXE" fixture "$OUT/snapshot.cfg" \
+	"$OUT/depthany.cfg" "$OUT/reducer-pfd.seed")
+case "$PFD_RESULT" in
+	"PFD21111 0 -") ;;
+	*) echo "FAIL: Omen probe admitted the pinned Hieroglyph route: $PFD_RESULT"; exit 1 ;;
+esac
+
 # The criteria compiler targets ONE legendary; a second rule must be refused.
 sed '/^legendary j_perkeo 1 3 0$/a\
 legendary j_triboulet 1 8 0' "$OUT/depth1.cfg" > "$OUT/tworules.cfg"
@@ -115,6 +127,15 @@ cmp -s "$OUT/union.sorted" "$OUT/depthany.sorted" \
 	echo "soul_depth 2"
 	echo "end"
 } > "$OUT/refilter.cfg"
+
+# 94LE4111 exposed the same reducer leak in the composed Soul #2 stage.
+printf '%s\n' 94LE4111 > "$OUT/reducer-combo.seed"
+COMBO_REDUCER_RESULT=$("./native/brainstorm_seed_pool$EXE" fixture \
+	"$OUT/snapshot.cfg" "$OUT/refilter.cfg" "$OUT/reducer-combo.seed")
+case "$COMBO_REDUCER_RESULT" in
+	"94LE4111 0 -") ;;
+	*) echo "FAIL: combined Omen probe admitted the pinned Hieroglyph route: $COMBO_REDUCER_RESULT"; exit 1 ;;
+esac
 "./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" "$OUT/refilter.cfg" \
 	"$OUT/depthany.bspool" "$OUT/combo.bspool"
 "./native/brainstorm_seed_pool$EXE" refilter "$OUT/snapshot.cfg" "$OUT/refilter.cfg" \
@@ -144,6 +165,17 @@ grep -q '^first_soul_legendary j_perkeo 1 3 0$' "$OUT/depth1.bspool.manifest"
 grep -q '^either_soul_legendary j_perkeo 1 3 0$' "$OUT/depthany.bspool.manifest"
 grep -q '^source_route_legendary j_perkeo 1 3 0 0$' "$OUT/combo.bspool.manifest"
 grep -q '^second_soul_legendary j_triboulet 1 8 0$' "$OUT/combo.bspool.manifest"
+
+# Pin production replay too; the old first-200 sampling could miss these
+# false members when threaded block completion changed export order.
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua "$OUT/snapshot.cfg" \
+	"$OUT/depthany.bspool" "$OUT/reducer-pfd.seed" > "$OUT/reducer-pfd.lua"
+grep -qx 'PFD21111 0' "$OUT/reducer-pfd.lua" \
+	|| { echo "FAIL: production Lua unexpectedly accepted PFD21111"; exit 1; }
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua "$OUT/snapshot.cfg" \
+	"$OUT/combo.bspool" "$OUT/reducer-combo.seed" > "$OUT/reducer-combo.lua"
+grep -qx '94LE4111 0' "$OUT/reducer-combo.lua" \
+	|| { echo "FAIL: production Lua unexpectedly accepted 94LE4111"; exit 1; }
 
 H1=$(sed -n 's/^criteria_hash //p' "$OUT/depth1.bspool.manifest")
 H2=$(sed -n 's/^criteria_hash //p' "$OUT/depth2.bspool.manifest")

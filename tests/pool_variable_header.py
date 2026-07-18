@@ -90,6 +90,16 @@ def make_fixtures(directory):
     }
     late = [f"{key} {value}" for key, value in string_fields.items()]
     late += [f"{key} {value}" for key, value in numeric_fields.items()]
+    late += [
+        "composite_schema 1",
+        "composite_operation union",
+        "composite_inputs 2",
+        "composite_metadata_complete 1",
+        "composite_branch 1111111111111111 2222222222222222 3333333333333333 1 - -",
+        "composite_branch 4444444444444444 5555555555555555 6666666666666666 1 - -",
+        "composite_operand 7777777777777777 3333333333333333 2222222222222222 1 3 - first",
+        "composite_operand 8888888888888888 6666666666666666 5555555555555555 1 4 - second",
+    ]
     late += ["parent_coverage_complete 1", "end"]
     paths["v3"] = directory / "schema-3-valid.bspool"
     paths["v3"].write_bytes(
@@ -159,6 +169,9 @@ def check_python(paths, string_fields, numeric_fields):
     assert item["header_bytes"] == HEADER_V3
     assert item["coverage_complete"] is False
     assert item["parent_coverage_complete"] is True
+    assert item["composite"] is True
+    assert item["composite_branch_count"] == 2
+    assert item["composite_operand_count"] == 2
     for key, expected in string_fields.items():
         assert item[key] == expected and isinstance(item[key], str), (key, item[key])
     for key, expected in numeric_fields.items():
@@ -204,6 +217,8 @@ local v3 = assert(Brainstorm.readPoolHeader(v3Path))
 assert(v3.schema == 3 and v3.records == 7 and v3.header_bytes == 8192)
 assert(v3.lineage_id == "lineage-c" and v3.scan_cursor == 123456)
 assert(v3.parent_coverage_complete == 1)
+assert(v3.composite_schema == 1 and v3.composite_operation == "union")
+assert(#v3.composite_branches == 2 and #v3.composite_operands == 2)
 
 assert(Brainstorm.readPoolHeader(missingPath) == nil, "accepted missing header_bytes")
 assert(Brainstorm.readPoolHeader(smallPath) == nil, "accepted small header_bytes")

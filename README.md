@@ -394,14 +394,19 @@ leaves the machine) where you can:
   short seeds but excludes `0`), or every possible seed (2.90 trillion —
   includes `0` and requires Brainstorm's Illegal Seed Input support for
   affected results);
-- press **Estimate** to sample 100M seeds and see the projected pool size
-  and how long the full scan would take on your machine;
-- press **Build pool** and watch live progress. Closing the window (or
-  pressing **Pause scan**) stops at a checkpoint; pressing Build again with
-  the same name resumes exactly where it left off -- safe across reboots,
-  so a days-long full-space scan can be done in sittings;
+- press **Quick estimate** to sample 2M seeds with frequent progress updates
+  and see the projected pool size and full-scan time. If a rare filter produces
+  fewer than 25 sample matches, the app labels the size projection as rough;
+- press **Build pool** and watch live progress. Pressing **Pause scan**, closing
+  the launcher's Terminal/console window, or using **Close Builder** stops at a
+  checkpoint; pressing Build again with the same name resumes exactly where it
+  left off -- safe across reboots, so a days-long full-space scan can be done in
+  sittings. Closing only the browser tab leaves the local Builder running;
 - split an exhaustive scope into non-overlapping numbered parts for multiple
   computers, then validate and merge the finished shard files in the same app;
+- switch to **Organize / Combine** in that same Seed Pool Tools window to split
+  by recorded locations or perform a streaming **Union**, **Intersection**, or
+  **Difference** across unrelated pools—even when their base filters differ;
 - see every finished pool with its embedded criteria, its name, and its
   **pool id** -- a short fingerprint also shown by the in-game selector, so
   two people can confirm they're holding the same pool. Finished pools land
@@ -421,7 +426,7 @@ will tell you if it is missing or stale. Prefer a terminal UI? The same tool exi
 `python3 tools/brainstorm_pool_builder.py` (arrow-key menus, curses;
 macOS/Linux only -- Windows Python has no curses, use the browser UI).
 
-The Windows release groups the standalone UI and exhaustive scanner under one
+The Windows release groups the Seed Pool Tools UI and exhaustive scanner under one
 `Seed Pool Builder/` folder. A complete physical split from the mod would be
 counterproductive: Lovely needs `lovely.toml` and the loaded Lua files at the
 mod root, the running game expects its native search helper under `native/`,
@@ -429,11 +434,39 @@ and both the game and builder intentionally share root-level
 `native_search.cfg` and `seed_pools/`. Those are the only filesystem
 constraints; the builder's own executables no longer mix with the game helper.
 
-To split a BSP3 pool by its recorded exact tag, Legendary, or voucher
-occurrences without rerunning RNG, launch **`Seed Pool Organizer.command`** on
-macOS or **`Seed Pool Organizer.bat`** on Windows. Ambiguous seeds are shown for
-an explicit category choice, incomplete sources use only their committed
-checkpoint, and every derivative records the source snapshot and lineage.
+Launch the regular Seed Pool Builder and select **Organize / Combine** to work
+with existing files. The older **`Seed Pool Organizer.command`** (macOS) and
+**`Seed Pool Organizer.bat`** (Windows) entry points remain as compatible direct
+shortcuts. Exact-location splits show ambiguous seeds for an explicit category
+choice; incomplete sources use only their committed checkpoint; and every
+derivative records the source snapshot and lineage.
+
+General combining is separate from **Merge distributed pool parts**. The shard
+merge remains the strict fast path for completed, contiguous parts of one
+identical search. The organizer accepts 2–64 compatible recorded pools and:
+
+- **Union** keeps a seed found in any selected pool;
+- **Intersection** keeps a seed found in every selected pool;
+- **Difference** keeps seeds from the chosen base pool unless they occur in any
+  other selected pool;
+- deduplicates ranks while merging every available BSP3 occurrence descriptor;
+- records both the exact input-snapshot expression and, per seed, every
+  original source-filter branch it matched, so combining a Perkeo pool and a
+  Negative Tag pool remains `Perkeo OR Negative Tag` rather than being
+  mislabeled as a single `Perkeo AND Negative Tag` filter;
+- accepts paused/provisional inputs by reading only their checksummed committed
+  records and marks the result's coverage provisional; and
+- refuses differing RNG model, catalog/profile snapshot, or seed-space
+  encodings instead of producing a pool whose ranks could be misinterpreted.
+
+Composite pools are valid membership sets in-game and as later Builder inputs.
+Their exact input-snapshot expression and multiple original routes are retained
+as organizer provenance. When an existing `A AND B` pool is later unioned with
+`C`, that first pool remains one exact snapshot operand; it is never flattened
+into the incorrect `A OR B OR C`. A new search applies its current filters to
+those recorded members rather than silently stacking every source route into
+one condition. Previously combined pools can be combined or location-split
+again without losing their snapshot expression or source-filter map.
 
 ### Using a seed pool in-game (phase 2)
 

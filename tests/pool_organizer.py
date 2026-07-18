@@ -216,6 +216,159 @@ def write_bsp2(path, complete=False):
                                      len(ranks), len(block)))
 
 
+def write_custom_bsp3(path, ranks, per_record, criteria_hash,
+                      criteria_lines, complete=True, coverage_complete=None,
+                      catalog_hash="aaaaaaaaaaaaaaaa", modelver=6,
+                      range_start=0, range_end=100,
+                      charset=organizer.NATURAL_CHARSET,
+                      seedspace=organizer.NATURAL_SEEDSPACE,
+                      space="natural", segment=None):
+    """Write a small independently encoded pool for set-operation tests."""
+    if not ranks or len(ranks) != len(per_record):
+        raise ValueError("custom fixture needs matching non-empty records")
+    if coverage_complete is None:
+        coverage_complete = complete
+    block, metadata = event_block(ranks, per_record)
+    membership = independent_fnv64(block)
+    metadata_digest = independent_fnv64(metadata)
+    criteria_value = int(criteria_hash, 16)
+    if segment is None:
+        segment = hash_fields("test-segment", criteria_value, ranks[0],
+                              ranks[-1], len(ranks))
+    family = hash_fields("test-family", int(catalog_hash, 16), criteria_value, 0, 0)
+    lineage = hash_fields("test-lineage", family, criteria_value, 0, 0)
+    snapshot = hash_fields("snapshot", segment, len(ranks), len(block), membership)
+    lines = [
+        "BRAINSTORM_SEED_POOL 3",
+        "modelver %d" % modelver,
+        "encoding delta-varint-events-v1",
+        "header_bytes 8192",
+        "charset %s" % charset,
+        "seedspace %d" % seedspace,
+        "space %s" % space,
+        "range_start %d" % range_start,
+        "range_end %d" % range_end,
+        "catalog_hash %s" % catalog_hash,
+        "criteria_hash %s" % criteria_hash,
+        "pool_id fixture-%s" % criteria_hash[:8],
+        "family_id %016x" % family,
+        "segment_id %016x" % segment,
+        "stage_hash %016x" % criteria_value,
+        "lineage_id %016x" % lineage,
+        "derivation_id %016x" % hash_fields(
+            "test-derive", lineage, segment, snapshot, 0),
+        "snapshot_id %016x" % snapshot,
+        "membership_digest %016x" % membership,
+        "metadata_digest %016x" % metadata_digest,
+        "scan_cursor %d" % (range_end if complete else ranks[-1] + 1),
+        "label Fixture %s" % criteria_hash[:8],
+    ]
+    lines.extend(criteria_lines)
+    lines.extend([
+        "records %d" % len(ranks),
+        "data_bytes %d" % len(block),
+        "complete %d" % int(complete),
+        "coverage_complete %d" % int(coverage_complete),
+        "end",
+    ])
+    header = ("\n".join(lines) + "\n").encode("ascii")
+    header += b"\0" * (8192 - len(header))
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(block)
+        if complete:
+            index_offset = 8192 + len(block)
+            rank_bytes = sum(len(varint(ranks[index] - ranks[index - 1]))
+                             for index in range(1, len(ranks)))
+            associations = sum(len(set(items)) for items in per_record)
+            handle.write(struct.pack("<QQIIII", 8192, 0, len(ranks),
+                                     rank_bytes, len(metadata), associations))
+            footer = bytearray(80)
+            footer[:8] = b"BSPIDX3\n"
+            struct.pack_into("<QQQQQQ", footer, 8, index_offset, 1, len(ranks),
+                             len(block), membership, metadata_digest)
+            struct.pack_into("<Q", footer, 72,
+                             independent_crc64(bytes(footer[:72])))
+            handle.write(footer)
+        else:
+            handle.write(b"UNCOMMITTED-CUSTOM-TAIL")
+    return {
+        "snapshot": "%016x" % snapshot,
+        "family": "%016x" % family,
+        "segment": "%016x" % segment,
+    }
+
+
+def write_out_of_order_bsp3(path):
+    """Write two sorted, overlapping blocks in deliberately wrong order."""
+    specs = [([1, 5], [[TAG], [TAG]]), ([2, 4], [[TAG], [TAG]])]
+    encoded = [event_block(ranks, occurrences)
+               for ranks, occurrences in specs]
+    membership = FNV64_OFFSET
+    metadata_digest = FNV64_OFFSET
+    for block, metadata in encoded:
+        membership = independent_fnv64(block, membership)
+        metadata_digest = independent_fnv64(metadata, metadata_digest)
+    segment = 0x7654321012345678
+    data_bytes = sum(len(block) for block, _metadata in encoded)
+    snapshot = hash_fields("snapshot", segment, 4, data_bytes, membership)
+    lines = [
+        "BRAINSTORM_SEED_POOL 3",
+        "modelver 6",
+        "encoding delta-varint-events-v1",
+        "header_bytes 8192",
+        "charset %s" % organizer.NATURAL_CHARSET,
+        "seedspace %d" % organizer.NATURAL_SEEDSPACE,
+        "space natural",
+        "range_start 0",
+        "range_end 100",
+        "catalog_hash aaaaaaaaaaaaaaaa",
+        "criteria_hash 9999999999999999",
+        "pool_id out-of-order-fixture",
+        "family_id 1111111111111111",
+        "segment_id %016x" % segment,
+        "stage_hash 2222222222222222",
+        "lineage_id 3333333333333333",
+        "derivation_id 4444444444444444",
+        "snapshot_id %016x" % snapshot,
+        "membership_digest %016x" % membership,
+        "metadata_digest %016x" % metadata_digest,
+        "scan_cursor 100",
+        "label Out of order blocks",
+        "tag_route collect",
+        "tag tag_negative 1 small 4 big 1",
+        "records 4",
+        "data_bytes %d" % data_bytes,
+        "complete 1",
+        "coverage_complete 1",
+        "end",
+    ]
+    header = ("\n".join(lines) + "\n").encode("ascii").ljust(8192, b"\0")
+    index_rows = []
+    offset = 8192
+    first_record = 0
+    with open(path, "wb") as handle:
+        handle.write(header)
+        for block, _metadata in encoded:
+            count, rank_bytes, metadata_bytes, associations = struct.unpack_from(
+                "<IIII", block, 8)
+            handle.write(block)
+            index_rows.append((offset, first_record, count, rank_bytes,
+                               metadata_bytes, associations))
+            offset += len(block)
+            first_record += count
+        for row in index_rows:
+            handle.write(struct.pack("<QQIIII", *row))
+        footer = bytearray(80)
+        footer[:8] = b"BSPIDX3\n"
+        struct.pack_into("<QQQQQQ", footer, 8, 8192 + data_bytes,
+                         len(index_rows), 4, data_bytes, membership,
+                         metadata_digest)
+        struct.pack_into("<Q", footer, 72,
+                         independent_crc64(bytes(footer[:72])))
+        handle.write(footer)
+
+
 class OrganizerRegression(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="brainstorm-organizer-test-")
@@ -336,6 +489,290 @@ class OrganizerRegression(unittest.TestCase):
                 with open(exported, "r", encoding="ascii") as handle:
                     seeds = [line.strip() for line in handle if line.strip()]
                 self.assertEqual(len(seeds), output["records"])
+
+    def _mixed_filter_sources(self, paused_second=False):
+        first = os.path.join(self.temp.name, "tag-filter.bspool")
+        second = os.path.join(self.temp.name, "legendary-filter.bspool")
+        write_custom_bsp3(
+            first, [1, 3, 5], [[TAG], [TAG], [TAG]],
+            "1111111111111111", [
+                "tag_route collect",
+                "tag tag_negative 1 small 4 big 1",
+            ])
+        write_custom_bsp3(
+            second, [2, 3, 6], [[LEGENDARY], [LEGENDARY], [LEGENDARY]],
+            "2222222222222222", [
+                "tag_route observe",
+                "legendary j_perkeo 1 small 4 big 0 shop",
+                "soul_depth any",
+            ], complete=not paused_second,
+            coverage_complete=not paused_second)
+        return first, second
+
+    def test_union_different_filters_deduplicates_and_preserves_provenance(self):
+        first, second = self._mixed_filter_sources()
+        output = os.path.join(self.temp.name, "union.bspool")
+        result = organizer.combine_pools(
+            [organizer.BSPoolReader(first), organizer.BSPoolReader(second)],
+            output, "union", "Tag OR Perkeo")
+        self.assertEqual(result["records"], 5)
+        self.assertTrue(result["coverage_complete"])
+        self.assertEqual(result["branch_count"], 2)
+
+        reader = organizer.BSPoolReader(output)
+        self.assertTrue(reader.is_composite)
+        self.assertEqual(reader.composite_operation, "union")
+        self.assertEqual(len(reader.composite_branches), 2)
+        self.assertEqual(len(reader.composite_operands), 2)
+        self.assertEqual(reader.composite_expression["op"], "union")
+        self.assertFalse(reader.header.values.get("tag"))
+        self.assertFalse(reader.header.values.get("legendary"))
+        records = {record.rank: record for record in reader.iter_records()}
+        self.assertEqual(sorted(records), [1, 2, 3, 5, 6])
+        duplicate = records[3]
+        self.assertEqual({item.raw for item in duplicate.occurrences
+                          if item.known}, {TAG, LEGENDARY})
+        self.assertEqual(len({item.provenance_id for item in duplicate.occurrences
+                              if item.is_provenance}), 2)
+        self.assertEqual(len({item.operand_id for item in duplicate.occurrences
+                              if item.is_operand}), 2)
+        self.assertTrue(all(
+            any(item.is_provenance for item in record.occurrences)
+            for record in records.values()))
+        analysis = organizer.analyze(reader)
+        self.assertEqual(analysis["records_without_provenance"], 0)
+        self.assertEqual(sum(analysis["provenance_counts"].values()), 6)
+
+        # A forged expression may not repeat one input while silently omitting
+        # another declared operand. Header metadata is deliberately mutable,
+        # so the reader must enforce this relationship itself.
+        with open(output, "rb") as handle:
+            corrupted = bytearray(handle.read())
+        expression_line = next(
+            raw for key, _value, raw in reader.header.lines
+            if key == "composite_expression")
+        encoded = expression_line.split(None, 1)[1]
+        expression = json.loads(organizer._decode_header_token(encoded))
+        expression["inputs"][1] = dict(expression["inputs"][0])
+        replacement = "composite_expression " + organizer._header_token(
+            json.dumps(expression, sort_keys=True, separators=(",", ":")))
+        self.assertEqual(len(replacement), len(expression_line))
+        corrupted[:reader.header_bytes] = bytes(
+            corrupted[:reader.header_bytes]).replace(
+                expression_line.encode("ascii"), replacement.encode("ascii"), 1)
+        malformed = os.path.join(self.temp.name, "malformed-expression.bspool")
+        with open(malformed, "wb") as handle:
+            handle.write(corrupted)
+        with self.assertRaisesRegex(organizer.PoolError, "expression disagrees"):
+            organizer.BSPoolReader(malformed)
+
+        count_mismatch = os.path.join(
+            self.temp.name, "malformed-input-count.bspool")
+        with open(output, "rb") as handle:
+            corrupted = handle.read().replace(
+                b"composite_inputs 2\n", b"composite_inputs 3\n", 1)
+        with open(count_mismatch, "wb") as handle:
+            handle.write(corrupted)
+        with self.assertRaisesRegex(organizer.PoolError,
+                                    "composite_inputs disagrees"):
+            organizer.BSPoolReader(count_mismatch)
+
+        # A later category split must keep the branch dictionary alongside the
+        # selected records' provenance descriptors.
+        split_dir = os.path.join(self.temp.name, "union-split")
+        report, completed = organizer.split_pool(
+            reader, split_dir, [organizer.Occurrence.decode(TAG).category_id],
+            None, None, None, True)
+        self.assertTrue(completed)
+        derived = organizer.BSPoolReader(report["outputs"][0]["path"])
+        self.assertTrue(derived.is_composite)
+        self.assertEqual(set(derived.composite_branches),
+                         set(reader.composite_branches))
+
+        binary = os.path.join(ROOT, "native", "brainstorm_seed_pool" +
+                              (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(binary):
+            exported = output + ".txt"
+            native = subprocess.run([binary, "export", output, exported],
+                                    text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            self.assertEqual(native.returncode, 0, native.stderr)
+            with open(exported, "r", encoding="ascii") as handle:
+                self.assertEqual(len([line for line in handle if line.strip()]), 5)
+
+    def test_intersection_difference_empty_and_nested_combine(self):
+        first, second = self._mixed_filter_sources()
+        readers = [organizer.BSPoolReader(first), organizer.BSPoolReader(second)]
+        intersection = os.path.join(self.temp.name, "intersection.bspool")
+        organizer.combine_pools(readers, intersection, "intersection", "Both")
+        both = organizer.BSPoolReader(intersection)
+        self.assertEqual([record.rank for record in both.iter_records()], [3])
+        self.assertEqual(len([item for item in next(both.iter_records()).occurrences
+                              if item.is_provenance]), 2)
+
+        difference = os.path.join(self.temp.name, "difference.bspool")
+        organizer.combine_pools(readers, difference, "difference", "Tag only")
+        difference_reader = organizer.BSPoolReader(difference)
+        self.assertEqual([record.rank for record in
+                          difference_reader.iter_records()], [1, 5])
+        self.assertTrue(all(len([item for item in record.occurrences
+                                 if item.is_operand]) == 1
+                            for record in difference_reader.iter_records()))
+
+        third = os.path.join(self.temp.name, "voucher-filter.bspool")
+        write_custom_bsp3(
+            third, [3, 7], [[VOUCHER], [VOUCHER]], "3333333333333333",
+            ["tag_route observe", "voucher v_overstock_norm 1 4"])
+        nested_path = os.path.join(self.temp.name, "nested.bspool")
+        organizer.combine_pools(
+            [organizer.BSPoolReader(intersection), organizer.BSPoolReader(third)],
+            nested_path, "union", "Nested union")
+        nested = organizer.BSPoolReader(nested_path)
+        self.assertEqual(len(nested.composite_branches), 3)
+        # The exact intersection result is one atomic operand in this later
+        # union. It is not flattened into the incorrect A OR B OR C equation.
+        self.assertEqual(len(nested.composite_operands), 2)
+        self.assertEqual(nested.composite_expression["op"], "union")
+        self.assertEqual(len(nested.composite_expression["inputs"]), 2)
+        nested_records = {record.rank: record for record in nested.iter_records()}
+        self.assertEqual(sorted(nested_records), [3, 7])
+        self.assertEqual(len([item for item in nested_records[3].occurrences
+                              if item.is_provenance]), 3)
+
+        disjoint = os.path.join(self.temp.name, "disjoint.bspool")
+        write_custom_bsp3(
+            disjoint, [8], [[VOUCHER]], "4444444444444444",
+            ["tag_route observe", "voucher v_overstock_norm 1 4"])
+        empty_path = os.path.join(self.temp.name, "empty.bspool")
+        organizer.combine_pools(
+            [organizer.BSPoolReader(first), organizer.BSPoolReader(disjoint)],
+            empty_path, "intersection", "Empty intersection")
+        empty = organizer.BSPoolReader(empty_path)
+        self.assertEqual(empty.records, 0)
+        self.assertEqual(list(empty.iter_records()), [])
+        self.assertTrue(empty.complete)
+
+    def test_partial_literal_combine_is_provisional_and_incompatibilities_fail(self):
+        first, second = self._mixed_filter_sources(paused_second=True)
+        output = os.path.join(self.temp.name, "partial-union.bspool")
+        result = organizer.combine_pools(
+            [organizer.BSPoolReader(first), organizer.BSPoolReader(second)],
+            output, "union", "Current snapshots")
+        self.assertFalse(result["coverage_complete"])
+        combined = organizer.BSPoolReader(output)
+        self.assertTrue(combined.complete)
+        self.assertFalse(combined.coverage_complete)
+        self.assertEqual([record.rank for record in combined.iter_records()],
+                         [1, 2, 3, 5, 6])
+
+        incompatible = os.path.join(self.temp.name, "foreign-catalog.bspool")
+        write_custom_bsp3(
+            incompatible, [9], [[TAG]], "5555555555555555",
+            ["tag_route collect", "tag tag_negative 1 small 4 big 1"],
+            catalog_hash="bbbbbbbbbbbbbbbb")
+        with self.assertRaisesRegex(organizer.PoolError, "catalog/profile"):
+            organizer.prepare_combine([
+                organizer.BSPoolReader(first),
+                organizer.BSPoolReader(incompatible),
+            ], "union")
+
+        old = os.path.join(self.temp.name, "old-for-union.bspool")
+        write_bsp2(old, complete=True)
+        mixed_path = os.path.join(self.temp.name, "mixed-schema.bspool")
+        mixed = organizer.combine_pools([
+            organizer.BSPoolReader(first), organizer.BSPoolReader(old),
+        ], mixed_path, "union", "BSP2 plus BSP3")
+        self.assertFalse(mixed["metadata_complete"])
+        mixed_reader = organizer.BSPoolReader(mixed_path)
+        self.assertEqual(len(mixed_reader.composite_branches), 2)
+        self.assertTrue(all(any(item.is_provenance for item in record.occurrences)
+                            for record in mixed_reader.iter_records()))
+
+        nested_mixed_path = os.path.join(self.temp.name, "nested-mixed-schema.bspool")
+        nested_mixed = organizer.combine_pools([
+            mixed_reader, organizer.BSPoolReader(second),
+        ], nested_mixed_path, "union", "Nested missing metadata")
+        self.assertFalse(nested_mixed["metadata_complete"])
+
+    def test_sixty_four_input_limit_streams_and_scales_the_header(self):
+        paths = []
+        for index in range(organizer.COMPOSITE_MAX_INPUTS):
+            path = os.path.join(self.temp.name, "source-%02d.bspool" % index)
+            write_custom_bsp3(
+                path, [index + 20, 1000], [[TAG], [TAG]],
+                "%016x" % (0x1000 + index), [
+                    "tag_route collect",
+                    "tag tag_negative 1 small 4 big 1",
+                ], range_end=2000)
+            paths.append(path)
+        readers = [organizer.BSPoolReader(path) for path in paths]
+        output = os.path.join(self.temp.name, "sixty-four-way-union.bspool")
+        result = organizer.combine_pools(
+            readers, output, "union", "Maximum input union")
+        self.assertEqual(result["input_count"], organizer.COMPOSITE_MAX_INPUTS)
+        self.assertEqual(result["records"], organizer.COMPOSITE_MAX_INPUTS + 1)
+        combined = organizer.BSPoolReader(output)
+        self.assertEqual(len(combined.composite_operands),
+                         organizer.COMPOSITE_MAX_INPUTS)
+        self.assertEqual(len(combined.composite_branches),
+                         organizer.COMPOSITE_MAX_INPUTS)
+        self.assertGreater(combined.header_bytes, organizer.HEADER_EVENTS_BYTES)
+        text_bytes = len(organizer.read_pool_header_text(output).encode("latin-1"))
+        self.assertGreaterEqual(combined.header_bytes - text_bytes,
+                                organizer.COMPOSITE_HEADER_SPARE_BYTES)
+        common = next(record for record in combined.iter_records()
+                      if record.rank == 1000)
+        self.assertEqual(len([item for item in common.occurrences
+                              if item.is_operand]),
+                         organizer.COMPOSITE_MAX_INPUTS)
+        self.assertEqual(len([item for item in common.occurrences
+                              if item.is_provenance]),
+                         organizer.COMPOSITE_MAX_INPUTS)
+
+        binary = os.path.join(ROOT, "native", "brainstorm_seed_pool" +
+                              (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(binary):
+            exported = output + ".txt"
+            native = subprocess.run([binary, "export", output, exported],
+                                    text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            self.assertEqual(native.returncode, 0, native.stderr)
+            with open(exported, "r", encoding="ascii") as handle:
+                self.assertEqual(len([line for line in handle if line.strip()]),
+                                 organizer.COMPOSITE_MAX_INPUTS + 1)
+
+        with self.assertRaisesRegex(organizer.PoolError, "at most 64"):
+            organizer.prepare_combine(readers + [readers[0]], "union")
+
+    def test_native_style_out_of_order_blocks_are_globally_streamed(self):
+        unordered_path = os.path.join(self.temp.name, "unordered.bspool")
+        write_out_of_order_bsp3(unordered_path)
+        unordered = organizer.BSPoolReader(unordered_path)
+        self.assertEqual([record.rank for record in unordered.iter_records()],
+                         [1, 2, 4, 5])
+
+        other_path = os.path.join(self.temp.name, "ordered-other.bspool")
+        write_custom_bsp3(
+            other_path, [3, 6], [[TAG], [TAG]], "8888888888888888", [
+                "tag_route collect",
+                "tag tag_negative 1 small 4 big 1",
+            ])
+        combined_path = os.path.join(self.temp.name, "ordered-union.bspool")
+        organizer.combine_pools(
+            [unordered, organizer.BSPoolReader(other_path)], combined_path,
+            "union", "Ordered union")
+        combined = organizer.BSPoolReader(combined_path)
+        self.assertEqual([record.rank for record in combined.iter_records()],
+                         [1, 2, 3, 4, 5, 6])
+
+        category = organizer.Occurrence.decode(TAG).category_id
+        split_dir = os.path.join(self.temp.name, "unordered-split")
+        report, completed = organizer.split_pool(
+            unordered, split_dir, [category], None, None, None, False)
+        self.assertTrue(completed)
+        split = organizer.BSPoolReader(report["outputs"][0]["path"])
+        self.assertEqual([record.rank for record in split.iter_records()],
+                         [1, 2, 4, 5])
 
     def test_corruption_is_rejected_inside_committed_boundary(self):
         corrupt = os.path.join(self.temp.name, "corrupt.bspool")

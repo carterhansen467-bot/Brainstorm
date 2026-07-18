@@ -1876,6 +1876,55 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 		return true, finalSm, finalBig, finalRewardSm, finalRewardBig, voucherRoute
 	end
 	local voucherMaxAnte = math.min(maxAnte, 8)
+
+	-- Targeted alternate routes, cheapest and least-purchased first: an actual
+	-- Charm Tag with NO Omen purchase, then an Omen voucher route on the
+	-- canonical blinds, then a Charm branch combined with Omen. Each Charm
+	-- branch skips only that blind, opens its five-card reward immediately,
+	-- and is retained only when it satisfies all embedded Legendary rules.
+	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
+	local function tryCharmBranches(withOmen)
+		for ante = 1, tagMaxAnte do
+			if not rolls[ante] then
+				rolls[ante] = {
+					Brainstorm.rollTag(seed_found, ante),
+					Brainstorm.rollTag(seed_found, ante),
+				}
+			end
+			for blind = 1, 2 do
+				local alreadySkipped = (blind == 1 and finalSm and finalSm[ante])
+					or (blind == 2 and finalBig and finalBig[ante])
+				if rolls[ante][blind] == 'tag_charm' and not alreadySkipped then
+					local branchSm = Brainstorm.mergeSkipRoutes(finalSm,
+						blind == 1 and { [ante] = true } or nil)
+					local branchBig = Brainstorm.mergeSkipRoutes(finalBig,
+						blind == 2 and { [ante] = true } or nil)
+					local branchRewardSm = Brainstorm.mergeRewardRoutes(finalRewardSm,
+						blind == 1 and { [ante] = 'tag_charm' } or nil)
+					local branchRewardBig = Brainstorm.mergeRewardRoutes(finalRewardBig,
+						blind == 2 and { [ante] = 'tag_charm' } or nil)
+					local branchRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
+						branchSm, branchBig, {
+							requireOmen = withOmen or nil,
+							requireSouls = true, maxAnte = voucherMaxAnte,
+							legendPass = function(route)
+								return soulRoutePass(branchSm, branchBig,
+									branchRewardSm, branchRewardBig, route)
+							end,
+						})
+					if branchRoute then
+						return true, branchSm, branchBig, branchRewardSm, branchRewardBig,
+							branchRoute
+					end
+				end
+			end
+		end
+		return false
+	end
+	local okCharm, cSm, cBig, cRewardSm, cRewardBig, cRoute = tryCharmBranches(false)
+	if okCharm then
+		return true, cSm, cBig, cRewardSm, cRewardBig, cRoute
+	end
 	local omenRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
 		finalSm, finalBig, {
 			requireOmen = true, requireSouls = true, maxAnte = voucherMaxAnte,
@@ -1887,56 +1936,9 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 	if omenRoute then
 		return true, finalSm, finalBig, finalRewardSm, finalRewardBig, omenRoute
 	end
-
-	-- Targeted Charm branch: if the canonical route misses, test every actual
-	-- Charm Tag once. The branch skips only that blind, opens its five-card
-	-- reward immediately, and is retained only when it satisfies all embedded
-	-- Legendary rules.
-	Brainstorm.random_state = { hashed_seed = pseudohash(seed_found) }
-	for ante = 1, tagMaxAnte do
-		if not rolls[ante] then
-			rolls[ante] = {
-				Brainstorm.rollTag(seed_found, ante),
-				Brainstorm.rollTag(seed_found, ante),
-			}
-		end
-		for blind = 1, 2 do
-			local alreadySkipped = (blind == 1 and finalSm and finalSm[ante])
-				or (blind == 2 and finalBig and finalBig[ante])
-			if rolls[ante][blind] == 'tag_charm' and not alreadySkipped then
-				local branchSm = Brainstorm.mergeSkipRoutes(finalSm,
-					blind == 1 and { [ante] = true } or nil)
-				local branchBig = Brainstorm.mergeSkipRoutes(finalBig,
-					blind == 2 and { [ante] = true } or nil)
-				local branchRewardSm = Brainstorm.mergeRewardRoutes(finalRewardSm,
-					blind == 1 and { [ante] = 'tag_charm' } or nil)
-				local branchRewardBig = Brainstorm.mergeRewardRoutes(finalRewardBig,
-					blind == 2 and { [ante] = 'tag_charm' } or nil)
-				local branchRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
-					branchSm, branchBig, {
-						requireSouls = true, maxAnte = voucherMaxAnte,
-						legendPass = function(route)
-							return soulRoutePass(branchSm, branchBig,
-								branchRewardSm, branchRewardBig, route)
-						end,
-					})
-				if not branchRoute then
-					branchRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
-						branchSm, branchBig, {
-							requireOmen = true, requireSouls = true,
-							maxAnte = voucherMaxAnte,
-							legendPass = function(route)
-								return soulRoutePass(branchSm, branchBig,
-									branchRewardSm, branchRewardBig, route)
-							end,
-						})
-				end
-				if branchRoute then
-					return true, branchSm, branchBig, branchRewardSm, branchRewardBig,
-						branchRoute
-				end
-			end
-		end
+	okCharm, cSm, cBig, cRewardSm, cRewardBig, cRoute = tryCharmBranches(true)
+	if okCharm then
+		return true, cSm, cBig, cRewardSm, cRewardBig, cRoute
 	end
 	return false
 end
@@ -2900,7 +2902,8 @@ function Brainstorm.readPoolHeader(path)
 	local h = {
 		tags = {}, route_tags = {}, pool_legendaries = {}, legendaries = {},
 		vouchers = {}, route_vouchers = {}, voucher_exclusions = {},
-		route_voucher_exclusions = {},
+		route_voucher_exclusions = {}, composite_branches = {},
+		composite_operands = {},
 	}
 	local function words(value)
 		local out = {}
@@ -2922,13 +2925,20 @@ function Brainstorm.readPoolHeader(path)
 				or k == "scan_cursor" or k == "input_cursor" or k == "parent_records"
 				or k == "parent_data_bytes" or k == "parent_coverage_complete"
 				or k == "input_record_start" or k == "input_record_end"
-				or k == "shard_index" or k == "shard_total" then h[k] = tonumber(v)
+				or k == "shard_index" or k == "shard_total"
+				or k == "composite_schema" or k == "composite_inputs"
+				or k == "composite_metadata_complete" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
 				or k == "catalog_hash" or k == "tag_route" or k == "family_id"
 				or k == "segment_id" or k == "stage_hash" or k == "lineage_id"
 				or k == "derivation_id" or k == "snapshot_id"
 				or k == "membership_digest" or k == "metadata_digest"
-				or k == "parent_snapshot_id" or k == "parent_segment_id" then h[k] = v
+				or k == "parent_snapshot_id" or k == "parent_segment_id"
+				or k == "composite_operation" or k == "composite_route_policy" then h[k] = v
+		elseif k == "composite_branch" then
+			h.composite_branches[#h.composite_branches + 1] = v
+		elseif k == "composite_operand" then
+			h.composite_operands[#h.composite_operands + 1] = v
 		elseif k == "tag" then
 			local p = words(v)
 			local minPhase, maxPhase, count
@@ -3054,6 +3064,18 @@ function Brainstorm.poolInfoString(name)
 	elseif h.space == "total" then
 		bits[#bits + 1] = "all possible seeds (includes 0)"
 	end
+	if h.composite_schema then
+		local operation = (h.composite_operation or "composite"):upper()
+		local inputCount = #(h.composite_operands or {})
+		if inputCount == 0 then inputCount = #(h.composite_branches or {}) end
+		bits[#bits + 1] = operation .. " of "
+			.. tostring(inputCount) .. " input pools"
+		bits[#bits + 1] = tostring(#(h.composite_branches or {})) .. " source filters"
+		bits[#bits + 1] = "membership-only route"
+		if h.composite_metadata_complete == 0 then
+			bits[#bits + 1] = "some exact locations unavailable"
+		end
+	end
 	local hasSoul1, hasSoul2, hasEither = false, false, false
 	for _, rule in ipairs(h.pool_legendaries or {}) do
 		local depth = rule.soulDepth or 1
@@ -3063,7 +3085,11 @@ function Brainstorm.poolInfoString(name)
 	end
 	if hasEither then bits[#bits + 1] = "Soul #1 or #2"
 	elseif hasSoul2 then bits[#bits + 1] = hasSoul1 and "Souls #1 & #2" or "Soul #2 only" end
-	if h.records then bits[#bits + 1] = tostring(h.records) .. " seeds" end
+	if h.records == 0 then
+		bits[#bits + 1] = "EMPTY RESULT (not searchable)"
+	elseif h.records then
+		bits[#bits + 1] = tostring(h.records) .. " seeds"
+	end
 	if h.complete ~= 1 then
 		bits[#bits + 1] = "PARTIAL SCAN"
 	elseif h.coverage_complete == 0 then

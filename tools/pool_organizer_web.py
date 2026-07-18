@@ -63,6 +63,8 @@ POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 DEFAULT_PORT = 8918
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 SPLIT_LOCK = threading.Lock()
+COMBINE_LOCK = threading.Lock()
+MAX_COMBINE_INPUTS = organizer.COMPOSITE_MAX_INPUTS
 
 
 def _pool_root(pool_dir=None):
@@ -118,6 +120,23 @@ def list_sources(pool_dir=None):
                 "records": records,
                 "complete": complete,
                 "coverage_complete": coverage,
+                "metadata_capable": schema == 3,
+                "modelver": header.integer("modelver"),
+                "catalog_hash": header.one("catalog_hash"),
+                "criteria_hash": header.one("criteria_hash"),
+                "space": header.one("space", required=False, default="natural"),
+                "range_start": header.integer("range_start"),
+                "range_end": header.integer("range_end"),
+                "snapshot_id": header.one(
+                    "snapshot_id", required=False, default=""),
+                "label": header.one("label", required=False, default=""),
+                "composite": bool(header.values.get("composite_schema")),
+                "composite_operation": header.one(
+                    "composite_operation", required=False, default=""),
+                "composite_branch_count": len(
+                    header.values.get("composite_branch", [])),
+                "composite_operand_count": len(
+                    header.values.get("composite_operand", [])),
                 "error": "",
             })
         except (OSError, ValueError, organizer.PoolError) as exc:
@@ -380,6 +399,168 @@ def execute_split(name, request, pool_dir=None):
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def _combine_source_names(value):
+    if (not isinstance(value, list) or len(value) < 2
+            or len(value) > MAX_COMBINE_INPUTS
+            or not all(isinstance(item, str) for item in value)):
+        raise organizer.PoolError(
+            "select between 2 and %d source pools" % MAX_COMBINE_INPUTS)
+    names = []
+    for name in value:
+        if name in names:
+            raise organizer.PoolError("select each source pool only once")
+        names.append(name)
+    return names
+
+
+def _combine_operation(value):
+    operation = str(value or "union").lower()
+    if operation not in organizer.COMPOSITE_OPERATIONS:
+        raise organizer.PoolError("unknown combine operation")
+    return operation
+
+
+def _ordered_combine_names(request):
+    names = _combine_source_names(request.get("sources"))
+    operation = _combine_operation(request.get("operation"))
+    if operation == "difference":
+        base = str(request.get("base") or "")
+        if base not in names:
+            raise organizer.PoolError(
+                "choose which selected pool is the Difference base")
+        names = [base] + [name for name in names if name != base]
+    return names, operation
+
+
+def _combine_readers(request, pool_dir=None, pin_snapshots=False):
+    names, operation = _ordered_combine_names(request)
+    expected = request.get("snapshots", {})
+    if pin_snapshots and not isinstance(expected, dict):
+        raise organizer.PoolError("combined-pool snapshot pins are malformed")
+    readers = []
+    for name in names:
+        reader = organizer.BSPoolReader(resolve_source(name, pool_dir))
+        if pin_snapshots:
+            pinned = str(expected.get(name, "")).lower()
+            if pinned != reader.snapshot_token:
+                raise organizer.PoolError(
+                    "%s changed from snapshot %s to %s; check compatibility again" % (
+                        name, pinned or "(missing)", reader.snapshot_token))
+        readers.append(reader)
+    return names, operation, readers
+
+
+def _combine_notices(context):
+    notices = []
+    if len({branch.criteria_hash for branch in context.branches}) > 1:
+        notices.append({
+            "kind": "info",
+            "title": "Different base filters preserved",
+            "text": ("The output uses %s semantics and records exactly which "
+                     "source-filter branch admitted each seed. Source criteria "
+                     "are not incorrectly stacked into one AND filter.") %
+                    context.operation.upper(),
+        })
+    if not context.coverage_complete:
+        notices.append({
+            "kind": "warning",
+            "title": "Provisional combined coverage",
+            "text": ("The operation still uses every currently committed seed. "
+                     "At least one source is paused/provisional or the source "
+                     "ranges differ, so the output will not claim exhaustive coverage."),
+        })
+    if not context.metadata_complete:
+        notices.append({
+            "kind": "warning",
+            "title": "Some exact occurrence metadata is unavailable",
+            "text": ("At least one BSP2 source predates per-seed locations. Its "
+                     "membership and source provenance are preserved, but exact "
+                     "tag/Legendary/voucher locations cannot be reconstructed."),
+        })
+    if context.operation == "difference":
+        notices.append({
+            "kind": "info",
+            "title": "Difference keeps only the base",
+            "text": ("The first/base pool is kept, then every seed found in any "
+                     "other selected pool is removed."),
+        })
+    return notices
+
+
+def build_combine_plan(request, pool_dir=None):
+    names, operation, readers = _combine_readers(request, pool_dir)
+    context = organizer.prepare_combine(readers, operation)
+    report = context.as_dict()
+    report.update({
+        "organizer_schema": 2,
+        "source_names": [os.path.basename(reader.path)
+                         for reader in context.readers],
+        "selected_names": names,
+        "snapshots": {
+            os.path.basename(reader.path): reader.snapshot_token
+            for reader in readers
+        },
+        "notices": _combine_notices(context),
+    })
+    return report
+
+
+def sanitize_combine_name(value):
+    value = str(value or "combined-pool").strip()
+    if value.lower().endswith(".bspool"):
+        value = value[:-7]
+    value = re.sub(r"[^A-Za-z0-9._+-]+", "-", value).strip("-.")
+    if not value:
+        raise organizer.PoolError("combined pool name needs a letter or number")
+    return value[:96]
+
+
+def execute_combine(request, pool_dir=None):
+    root = _pool_root(pool_dir)
+    os.makedirs(root, exist_ok=True)
+    _names, operation, readers = _combine_readers(
+        request, root, pin_snapshots=True)
+    # Recompute the plan from the pinned reader instances immediately before
+    # writing, so compatibility and output semantics cannot drift between the
+    # preview and publication steps.
+    context = organizer.prepare_combine(readers, operation)
+    output_name = sanitize_combine_name(request.get("name"))
+    output_path = os.path.join(root, output_name + ".bspool")
+    label = str(request.get("label") or output_name).strip() or output_name
+    result = organizer.combine_pools(
+        context.readers, output_path, operation, label)
+    result["name"] = os.path.basename(output_path)
+    result["notices"] = _combine_notices(context)
+    if not result["records"]:
+        result["notices"].append({
+            "kind": "warning",
+            "title": "The result is empty",
+            "text": ("The operation was valid and found no shared/remaining "
+                     "seeds. Keep the file as a verified result or combine it "
+                     "again; an empty pool cannot be searched in-game."),
+        })
+    report_path = os.path.join(root, output_name + "-combine-report.json")
+    if os.path.exists(report_path):
+        suffix = 2
+        while os.path.exists(os.path.join(
+                root, "%s-combine-report-%d.json" % (output_name, suffix))):
+            suffix += 1
+        report_path = os.path.join(
+            root, "%s-combine-report-%d.json" % (output_name, suffix))
+    result["report_path"] = report_path
+    try:
+        organizer.atomic_json(report_path, result)
+    except Exception:
+        # Publication is one user action: never leave a seemingly successful
+        # pool behind when its pinned provenance report could not be saved.
+        try:
+            os.unlink(result["path"])
+        except OSError:
+            pass
+        raise
+    return result
+
+
 def iter_record_export(reader):
     for record in reader.iter_records():
         value = {
@@ -410,12 +591,20 @@ h1{font-size:clamp(23px,3vw,32px);line-height:1.1;margin:0}.sub{margin:7px 0 0;c
 .local{padding:8px 12px;border:1px solid #2d5943;border-radius:999px;background:#14251d;color:#a8e7bf;
  font-size:12px;font-weight:750;white-space:nowrap}.local:before{content:"";display:inline-block;width:8px;height:8px;
  margin-right:8px;border-radius:50%;background:var(--green)}
+.appnav{display:flex;gap:7px;margin:-8px 0 18px;padding:5px;width:max-content;border:1px solid #34394d;border-radius:12px;background:#10131c}
+.appnav a{padding:8px 13px;border-radius:8px;color:var(--muted);font-size:12px;font-weight:800;text-decoration:none}
+.appnav a.active{background:#29213b;color:#ded6ff}.toolnav{display:flex;gap:8px;margin-bottom:18px}
+.toolnav button{background:#171b27;border-color:#373d54;color:#aaa6b6}.toolnav button.active{background:#3a3155;border-color:#61548a;color:#eee9ff}
 .privacy{margin-bottom:18px;padding:12px 15px;border:1px solid #3c3650;border-radius:12px;background:#191624cc;color:#cac5d6;font-size:13px}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:18px;align-items:start}.stack{display:grid;gap:18px}
 .card{padding:21px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(180deg,#191c28f5,#141722f5);box-shadow:var(--shadow)}
 .head{display:flex;gap:12px;margin-bottom:17px}.step{flex:0 0 auto;display:grid;place-items:center;width:30px;height:30px;border:1px solid #443963;border-radius:9px;background:#29213b;color:#c7baff;font-weight:800}
 h2{margin:0;font-size:17px}.copy{margin:3px 0 0;color:var(--muted);font-size:13px}.field{display:grid;gap:6px;margin-top:12px}label,.label{font-size:12px;font-weight:750;color:#cbc6d5}
 select,input[type=text]{width:100%;min-height:42px;padding:9px 11px;border:1px solid #3b4159;border-radius:10px;background:#0f1119;color:var(--text)}
+select[multiple]{min-height:190px}.poolchoices{display:grid;gap:7px;max-height:390px;overflow:auto;margin-top:10px;padding-right:3px}
+.poolchoice{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:11px;border:1px solid #292e40;border-radius:10px;background:var(--card2);cursor:pointer}
+.poolchoice:hover{border-color:#4a526f}.poolchoice input{width:17px;height:17px;accent-color:var(--purple)}.poolchoice b{display:block;font-size:12px;overflow-wrap:anywhere}.poolchoice small{display:block;color:var(--faint);font-size:10px}.poolchoice .count{font-size:11px}
+.combine-settings{display:grid;grid-template-columns:1fr 1fr;gap:12px}.branchlist{display:grid;gap:7px;margin-top:12px}.branch{padding:9px 10px;border:1px solid #2d3245;border-radius:9px;background:#11141d;font-size:11px}.branch b{display:block}.branch span{color:var(--faint);overflow-wrap:anywhere}
 button{min-height:40px;padding:8px 14px;border:1px solid transparent;border-radius:10px;background:#3b5fd1;color:white;font-weight:750;cursor:pointer}
 button:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px)}button:disabled{background:#292d3c;color:#777482;cursor:not-allowed}
 button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.ghost{background:transparent;border-color:#3b425b;color:#d7d2df}button.small{min-height:33px;padding:5px 9px;background:#292e42;border-color:#3d435c;font-size:12px}
@@ -430,11 +619,13 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.ghost{backgr
 .plan{margin-top:18px}.planbar{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{padding:4px 8px;border-radius:999px;background:#3b3017;color:#f4d46b;font-size:10px;font-weight:850;text-transform:uppercase}.pill.ok{background:#163424;color:#80e4a6}
 .amb{display:grid;gap:8px;margin-top:12px}.ambrow{display:grid;grid-template-columns:100px 1fr;gap:10px;align-items:center;padding:10px;border:1px solid #292e40;border-radius:10px;background:var(--card2)}.ambrow b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.ambrow select{min-height:38px}
 .pager{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:11px;color:var(--muted);font-size:12px}.result{margin-top:13px}.output{padding:10px 0;border-top:1px solid #302c40;font-size:12px}.output b{display:block;overflow-wrap:anywhere}.output span{color:var(--muted)}
-[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static;grid-row:1}}@media(max-width:580px){.top{display:grid}.two,.source{grid-template-columns:1fr}.ambrow{grid-template-columns:1fr}.card{padding:17px}}
+[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static;grid-row:1}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings{grid-template-columns:1fr}.ambrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}}
 </style></head><body><main class="app">
-<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Inspect, export, and split recorded seed locations without rerunning the search.</p></div></div><div class="local">Running locally</div></header>
+<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Inspect, split, and combine recorded seed pools without rerunning their searches.</p></div></div><div class="local">Running locally</div></header>
+<nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
 <div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. Outputs are published into <code>seed_pools</code> so the mod can see them immediately.</div>
-<div class="grid"><div class="stack">
+<div class="toolnav"><button class="active" id="splitModeBtn">Split by recorded location</button><button id="combineModeBtn">Combine seed pools</button></div>
+<div class="grid" id="splitWorkspace"><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Both finished and paused BSP3 pools are supported. Only the committed checkpoint is read.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
  <div class="row"><button class="go" id="inspectBtn">Inspect pool</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
@@ -454,14 +645,33 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.ghost{backgr
 <aside class="side"><section class="card summary"><h2>Organizer summary</h2><dl>
  <div><dt>Source</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot</dt><dd id="sumSnapshot">—</dd></div><div><dt>Committed</dt><dd id="sumRecords">—</dd></div><div><dt>Categories</dt><dd id="sumCategories">—</dd></div><div><dt>Ambiguous</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Unmatched</dt><dd id="sumUnmatched">—</dd></div></dl>
  <div class="actions"><button class="go" id="splitBtn" disabled>Create organized pools</button></div><div class="error" id="error" role="alert"></div><div class="result" id="result"></div>
+</section></aside></div>
+<div class="grid" id="combineWorkspace" hidden><div class="stack">
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Select pools to combine</h2><p class="copy">Pools may have different base filters. Finished, paused, and previously combined pools are supported; only committed records are read.</p></div></div>
+ <div class="row"><button class="small" id="combineAllBtn">Select all readable pools</button><button class="small" id="combineNoneBtn">Select none</button><button class="ghost" id="combineRefreshBtn">Refresh list</button></div>
+ <div class="poolchoices" id="combineChoices"><div class="hint">Loading seed pools…</div></div>
+</section>
+<section class="card"><div class="head"><span class="step">2</span><div><h2>Choose the set operation</h2><p class="copy">Source filters remain separate branches, so a union means A OR B—not one accidental combined AND filter.</p></div></div>
+ <div class="combine-settings"><div class="field"><label for="combineOperation">Operation</label><select id="combineOperation"><option value="union">Union · keep seeds in any selected pool</option><option value="intersection">Intersection · keep seeds in every selected pool</option><option value="difference">Difference · keep base minus the others</option></select></div>
+ <div class="field" id="combineBaseField" hidden><label for="combineBase">Base pool to keep from</label><select id="combineBase"></select></div>
+ <div class="field"><label for="combineName">Output filename</label><input type="text" id="combineName" value="combined-pool"></div>
+ <div class="field"><label for="combineLabel">Display label</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
+ <div class="row"><button id="combinePlanBtn">Check compatibility</button></div><div id="combineNotices"></div>
+ <div id="combineBranches" class="branchlist"></div>
+</section></div>
+<aside class="side"><section class="card summary"><h2>Combine summary</h2><dl>
+ <div><dt>Operation</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Inputs</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Source filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Expression</dt><dd id="combineSumExpression">—</dd></div><div><dt>Coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Metadata</dt><dd id="combineSumMetadata">—</dd></div></dl>
+ <div class="actions"><button class="go" id="combineCreateBtn" disabled>Create combined pool</button></div><div class="error" id="combineError" role="alert"></div><div class="result" id="combineResult"></div>
 </section></aside></div></main>
 <script>
-const $=id=>document.getElementById(id);let inspected=null,plan=null,choices={},page=0;const PAGE_SIZE=100;
+const $=id=>document.getElementById(id);const UNIFIED=location.pathname.startsWith("/organize");
+const apiPath=path=>UNIFIED?"/organizer"+path:path;
+let inspected=null,plan=null,choices={},page=0,poolRows=[],combinePlan=null;const PAGE_SIZE=100;
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
-async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}:{};const r=await fetch(path,opt);const v=await r.json();if(!r.ok||v.error)throw Error(v.error||`Request failed (${r.status})`);return v}
+async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}:{};const r=await fetch(apiPath(path),opt);const v=await r.json();if(!r.ok||v.error)throw Error(v.error||`Request failed (${r.status})`);return v}
 function fail(e){$("error").textContent=e.message||String(e)}function clear(){$("error").textContent="";$("result").innerHTML=""}
-async function loadPools(){clear();const v=await api("/api/pools");const old=$("source").value;$("source").innerHTML=v.pools.length?v.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds${p.complete?"":" · paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';if([...$("source").options].some(o=>o.value===old))$("source").value=old}
+async function loadPools(){clear();const v=await api("/api/pools");poolRows=v.pools||[];const old=$("source").value;$("source").innerHTML=poolRows.length?poolRows.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds${p.complete?"":" · paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';if([...$("source").options].some(o=>o.value===old))$("source").value=old;renderCombineChoices()}
 function notices(rows){$("notices").innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
 function sourceMetrics(s){return `<div class="metric"><span>Committed seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Format</span><b>BSP${s.schema}${s.metadata_capable?" · exact metadata":" · no exact metadata"}</b></div><div class="metric"><span>Snapshot</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Lineage</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
 function categoryHTML(c){return `<label class="category"><input type="checkbox" class="cat" value="${esc(c.category_id)}" checked><span><b>${esc(c.label)}</b><br><span class="mono">${esc(c.category_id)}</span></span><span class="count">${fmt(c.records)}</span></label>`}
@@ -477,7 +687,48 @@ function download(name,type,text){const a=document.createElement("a");a.href=URL
 function savePlan(){if(!plan)return;download(`${$("prefix").value||"seed-pool"}-choices.json`,"application/json",JSON.stringify(choiceDoc(),null,2)+"\n")}
 function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("That plan belongs to a different committed snapshot.");choices={...(v.choices||{})};prepare()}catch(e){fail(e)}};r.readAsText(file)}
 async function split(){clear();if(!plan)return;$("splitBtn").disabled=true;$("splitBtn").textContent="Creating pools…";try{const v=await api("/api/split",{source:$("source").value,snapshot:inspected.source.snapshot_id,selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value});if(!v.completed){plan=v;choices={...v.choices};renderPlan();throw Error("The split still needs choices or an unmatched-seed policy.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} organized pool(s)</strong>They are ready in seed_pools. Report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds · lineage ${esc(o.lineage_id)}</span></div>`).join("");await loadPools()}catch(e){fail(e)}finally{$("splitBtn").textContent="Create organized pools";renderStatus()}}
-$("inspectBtn").onclick=inspect;$("refreshBtn").onclick=loadPools;$("allBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=true);$("noneBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=false);$("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("splitBtn").onclick=split;$("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";renderStatus()};$("exportBtn").onclick=()=>{if(!inspected)return;location.href=`/api/export?source=${encodeURIComponent($("source").value)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`};document.addEventListener("change",e=>{if(e.target.classList.contains("cat")){plan=null;choices={};$("plan").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true}});loadPools();
+function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
+function combineSelected(){return [...document.querySelectorAll(".combinePick:checked")].map(x=>x.value)}
+function renderCombineChoices(){
+ const selected=new Set(combineSelected());
+ $("combineChoices").innerHTML=poolRows.length?poolRows.map(p=>{
+  const state=p.error?"Unreadable":p.complete?(p.coverage_complete?"Finished":"Provisional"):"Paused / incomplete";
+  const extra=p.composite?` · ${esc(p.composite_operation||"composite")} · ${fmt(p.composite_operand_count||p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters`:p.criteria_hash?` · filter ${esc(p.criteria_hash.slice(0,8))}`:"";
+  return `<label class="poolchoice"><input type="checkbox" class="combinePick" value="${esc(p.name)}" ${selected.has(p.name)?"checked":""} ${p.error?"disabled":""}><span><b>${esc(p.name)}</b><small>${esc(state)} · BSP${esc(p.schema||"?")}${extra}</small></span><span class="count">${p.error?"—":fmt(p.records)}</span></label>`;
+ }).join(""):'<div class="hint">No .bspool files found.</div>';
+ document.querySelectorAll(".combinePick").forEach(input=>input.onchange=()=>{updateCombineBase();invalidateCombine()});
+ updateCombineBase();
+}
+function updateCombineBase(){
+ const names=combineSelected(),old=$("combineBase").value;
+ $("combineBase").innerHTML=names.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");
+ if(names.includes(old))$("combineBase").value=old;
+ $("combineBaseField").hidden=$("combineOperation").value!=="difference";
+ $("combineSumInputs").textContent=names.length?`${fmt(names.length)} selected`:"Choose at least two";
+ $("combineSumOperation").textContent=$("combineOperation").selectedOptions[0].textContent.split(" · ")[0];
+}
+function invalidateCombine(){combinePlan=null;$("combineCreateBtn").disabled=true;$("combineBranches").innerHTML="";$("combineNotices").innerHTML="";$("combineSumBranches").textContent="—";$("combineSumExpression").textContent="—";$("combineSumCoverage").textContent="—";$("combineSumMetadata").textContent="—";$("combineResult").innerHTML=""}
+function combineRequest(withPins){const value={sources:combineSelected(),operation:$("combineOperation").value,base:$("combineBase").value,name:$("combineName").value,label:$("combineLabel").value};if(withPins&&combinePlan)value.snapshots=combinePlan.snapshots;return value}
+function renderCombinePlan(v){
+ combinePlan=v;renderNoticeList("combineNotices",v.notices);$("combineSumInputs").textContent=`${fmt(v.operand_count)} exact pool snapshots`;$("combineSumBranches").textContent=fmt(v.branch_count);$("combineSumExpression").textContent=v.expression_text;$("combineSumCoverage").textContent=v.coverage_complete?"Complete":"Provisional";$("combineSumMetadata").textContent=v.metadata_complete?"Exact locations preserved":"Some membership only";
+ const inputs=v.operands.map((o,index)=>`<div class="branch"><b>Input ${fmt(index+1)} · ${esc(o.label||o.pool_id||o.operand_id)}</b><span>${fmt(o.records)} seeds · snapshot ${esc(o.snapshot_id.slice(0,8))} · operand ${esc(o.operand_id.slice(0,8))}</span></div>`).join("");
+ const sources=v.branches.map(b=>`<div class="branch"><b>Source filter · ${esc(b.label||b.pool_id||b.branch_id)}</b><span>source ${esc(b.branch_id.slice(0,8))} · filter ${esc(b.criteria_hash.slice(0,8))}${b.criteria.length?` · ${b.criteria.map(esc).join(" · ")}`:" · no embedded criteria"}</span></div>`).join("");
+ $("combineBranches").innerHTML=`<div class="notice"><strong>Exact snapshot expression</strong>${esc(v.expression_text)}</div><div class="hint">Exact input snapshots</div>${inputs}<div class="hint">Original source filters retained per seed</div>${sources}`;
+ $("combineCreateBtn").disabled=false;
+}
+async function checkCombine(){
+ $("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn");button.disabled=true;button.textContent="Checking…";
+ try{const v=await api("/api/combine/plan",combineRequest(false));renderCombinePlan(v)}catch(e){invalidateCombine();$("combineError").textContent=e.message||String(e)}finally{button.disabled=false;button.textContent="Check compatibility"}
+}
+async function createCombine(){
+ if(!combinePlan)return;$("combineError").textContent="";const button=$("combineCreateBtn");button.disabled=true;button.textContent="Combining…";
+ try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" This is a verified empty result and cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>${fmt(v.records)} unique seed(s) · ${esc(v.operation.toUpperCase())}.${esc(empty)} Report: ${esc(v.report_path)}</div>`;await loadPools();combinePlan=null}catch(e){$("combineError").textContent=e.message||String(e);button.disabled=false}finally{button.textContent="Create combined pool"}
+}
+function showMode(mode){const combine=mode==="combine";$("splitWorkspace").hidden=combine;$("combineWorkspace").hidden=!combine;$("splitModeBtn").classList.toggle("active",!combine);$("combineModeBtn").classList.toggle("active",combine)}
+$("inspectBtn").onclick=inspect;$("refreshBtn").onclick=loadPools;$("allBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=true);$("noneBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=false);$("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("splitBtn").onclick=split;$("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";renderStatus()};$("exportBtn").onclick=()=>{if(!inspected)return;location.href=apiPath(`/api/export?source=${encodeURIComponent($("source").value)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`)};
+$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineRefreshBtn").onclick=loadPools;$("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine()};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine()};$("combineOperation").onchange=()=>{updateCombineBase();invalidateCombine()};$("combineBase").onchange=invalidateCombine;
+document.addEventListener("change",e=>{if(e.target.classList.contains("cat")){plan=null;choices={};$("plan").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true}});
+if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/"}loadPools();
 </script></body></html>'''
 
 
@@ -502,7 +753,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         except ValueError:
             raise organizer.PoolError("invalid request length")
         if length < 0 or length > MAX_REQUEST_BYTES:
-            raise organizer.PoolError("choice plan request is too large")
+            raise organizer.PoolError("organizer request is too large")
         try:
             value = json.loads(self.rfile.read(length) or b"{}")
         except (UnicodeDecodeError, ValueError):
@@ -574,6 +825,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 reader = self._reader_for_request(data)
                 self._json(build_split_plan(
                     reader, data.get("selectedCategories"), data.get("choicePlan")))
+            elif parsed.path == "/api/combine/plan":
+                self._json(build_combine_plan(data, self.pool_dir))
             elif parsed.path == "/api/split":
                 if not SPLIT_LOCK.acquire(False):
                     raise organizer.PoolError("another organizer split is still running")
@@ -581,6 +834,14 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                     report = execute_split(data.get("source", ""), data, self.pool_dir)
                 finally:
                     SPLIT_LOCK.release()
+                self._json(report)
+            elif parsed.path == "/api/combine":
+                if not COMBINE_LOCK.acquire(False):
+                    raise organizer.PoolError("another pool combine is still running")
+                try:
+                    report = execute_combine(data, self.pool_dir)
+                finally:
+                    COMBINE_LOCK.release()
                 self._json(report)
             else:
                 self._json({"error": "not found"}, 404)

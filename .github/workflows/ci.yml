@@ -28,6 +28,8 @@ jobs:
         run: brew install luajit
       - name: Oracle equivalence (Lua vs native, this machine's LuaJIT)
         run: LUAJIT=luajit sh tests/native_equivalence.sh
+      - name: Hash/odometer generation equivalence
+        run: sh tests/hash_generation_equivalence.sh
       - name: Pool engine vs established reference equivalence
         run: TAG=tag_3 sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
       - name: Exclusive second-Soul pool criteria
@@ -78,6 +80,8 @@ jobs:
           "$(cygpath -u "$RUNNER_TEMP")/luajit/src/luajit.exe" -v
       - name: Oracle equivalence (Windows LuaJIT vs .exe) — the bit-exactness proof
         run: sh tests/native_equivalence.sh
+      - name: Hash/odometer generation equivalence
+        run: sh tests/hash_generation_equivalence.sh
       - name: Pool engine vs established reference equivalence
         run: TAG=tag_3 sh tests/seed_pool_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 300000
       - name: Exclusive second-Soul pool criteria
