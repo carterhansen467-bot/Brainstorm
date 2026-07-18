@@ -106,7 +106,7 @@ SORT_CACHE_BYTES = 64 * 1024 * 1024
 CRITERIA_DIRECTIVES = {
     "tag_route", "tag", "route_tag", "legendary", "route_legendary",
     "soul_depth", "voucher", "route_voucher", "voucher_exclude",
-    "route_voucher_exclude",
+    "route_voucher_exclude", "legendary_routes", "route_legendary_routes",
 }
 
 
@@ -1127,6 +1127,10 @@ def source_summary(reader: BSPoolReader) -> Dict[str, object]:
         "criteria_hash": "%016x" % reader.criteria_hash,
         "catalog_hash": "%016x" % reader.catalog_hash,
         "modelver": reader.modelver,
+        "legendary_routes": reader.header.one(
+            "legendary_routes", required=False, default="full"),
+        "route_legendary_routes": reader.header.one(
+            "route_legendary_routes", required=False, default="full"),
         "space": reader.space_name,
         "range_start": reader.range_start,
         "range_end": reader.range_end,

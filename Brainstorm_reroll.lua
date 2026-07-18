@@ -1925,6 +1925,15 @@ function Brainstorm.evaluatePoolCriteria(seed_found, header, overlaySm, overlayB
 	if okCharm then
 		return true, cSm, cBig, cRewardSm, cRewardBig, cRoute
 	end
+	-- Fast-exact pools intentionally stop after the canonical and non-Omen
+	-- Charm routes. A current-stage directive takes precedence; older pools may
+	-- carry only the inherited directive, so use that solely as a fallback.
+	local legendaryRoutes = header.legendary_routes
+	if legendaryRoutes == "canonical_charm"
+			or (not legendaryRoutes
+				and header.route_legendary_routes == "canonical_charm") then
+		return false
+	end
 	local omenRoute = Brainstorm.findPoolVoucherRoute(seed_found, header,
 		finalSm, finalBig, {
 			requireOmen = true, requireSouls = true, maxAnte = voucherMaxAnte,
@@ -2934,7 +2943,8 @@ function Brainstorm.readPoolHeader(path)
 				or k == "derivation_id" or k == "snapshot_id"
 				or k == "membership_digest" or k == "metadata_digest"
 				or k == "parent_snapshot_id" or k == "parent_segment_id"
-				or k == "composite_operation" or k == "composite_route_policy" then h[k] = v
+				or k == "composite_operation" or k == "composite_route_policy"
+				or k == "legendary_routes" or k == "route_legendary_routes" then h[k] = v
 		elseif k == "composite_branch" then
 			h.composite_branches[#h.composite_branches + 1] = v
 		elseif k == "composite_operand" then
@@ -3085,6 +3095,11 @@ function Brainstorm.poolInfoString(name)
 	end
 	if hasEither then bits[#bits + 1] = "Soul #1 or #2"
 	elseif hasSoul2 then bits[#bits + 1] = hasSoul1 and "Souls #1 & #2" or "Soul #2 only" end
+	if h.legendary_routes == "canonical_charm" then
+		bits[#bits + 1] = "fast exact Legendary routes (Shop + Charm)"
+	elseif h.route_legendary_routes == "canonical_charm" then
+		bits[#bits + 1] = "fast exact Legendary ancestry"
+	end
 	if h.records == 0 then
 		bits[#bits + 1] = "EMPTY RESULT (not searchable)"
 	elseif h.records then

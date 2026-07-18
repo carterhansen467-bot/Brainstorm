@@ -135,6 +135,17 @@ if [[ -f "$SNAPSHOT" ]]; then
 	[[ $(<"$tmpdir/omen.out") == 'M8111111 1 j_chicot=A1CharmBig CharmRequired=A1Big' ]] \
 		|| fail "native targeted Charm/Omen route did not match its pinned label"
 	echo "PASS native targeted Charm branch and starting-Omen timing"
+	printf '%s\n' \
+		'poolver 1' 'threads 1' 'start 0' 'count 8' 'checkpoint 8' \
+		'chunk 8' 'resume 0' 'format binary' 'tag_route collect' \
+		'legendary_routes canonical_charm' \
+		'legendary j_chicot 1 small 4 big 0 charm' 'end' > "$tmpdir/fast-charm.cfg"
+	"$ROOT/native/brainstorm_seed_pool" fixture "$tmpdir/omen.cfg" \
+		"$tmpdir/fast-charm.cfg" "$tmpdir/seeds" > "$tmpdir/fast-charm.out"
+	[[ $(<"$tmpdir/fast-charm.out") == \
+		'M8111111 1 j_chicot=A1CharmBig CharmRequired=A1Big' ]] \
+		|| fail "fast exact disabled a starting-Omen Charm route"
+	echo "PASS fast exact keeps starting-Omen and targeted Charm semantics"
 	printf '%s\n' 1SNK1111 > "$tmpdir/purchased.seed"
 	printf '%s\n' \
 		'poolver 1' 'threads 1' 'start 0' 'count 8' 'checkpoint 8' \
@@ -146,6 +157,17 @@ if [[ -f "$SNAPSHOT" ]]; then
 		'1SNK1111 1 BuyRoute=v_crystal_ball@A1V1,v_omen_globe@A2V1 j_chicot=A3ShopBoss' ]] \
 		|| fail "native purchased-Omen route did not activate before the later shop Soul"
 	echo "PASS native minimum purchase route activates Omen before later packs"
+	printf '%s\n' \
+		'poolver 1' 'threads 1' 'start 0' 'count 8' 'checkpoint 8' \
+		'chunk 8' 'resume 0' 'format binary' 'tag_route collect' \
+		'legendary_routes canonical_charm' \
+		'legendary j_chicot 1 small 4 big 0 shop' 'end' > "$tmpdir/fast-purchased.cfg"
+	"$ROOT/native/brainstorm_seed_pool" fixture "$tmpdir/base.cfg" \
+		"$tmpdir/fast-purchased.cfg" "$tmpdir/purchased.seed" \
+		> "$tmpdir/fast-purchased.out"
+	[[ $(<"$tmpdir/fast-purchased.out") == '1SNK1111 0 -' ]] \
+		|| fail "fast exact searched the automatic purchased-Omen fallback"
+	echo "PASS fast exact omits only automatic Omen-purchase recovery"
 
 	seed_rank() {
 		python3 - "$1" <<'PY'
@@ -199,6 +221,25 @@ PY
 		'legendary j_chicot 1 small 4 big 0 charm' "$tmpdir/charm-scan.cfg"
 	"$ROOT/native/brainstorm_seed_pool" scan "$tmpdir/omen.cfg" \
 		"$tmpdir/charm-scan.cfg" "$tmpdir/charm.bspool" >/dev/null 2>/dev/null
+	write_scan_criteria "$(seed_rank M8111111)" \
+		$'legendary_routes full\nlegendary j_chicot 1 small 4 big 0 charm' \
+		"$tmpdir/charm-full-explicit.cfg"
+	"$ROOT/native/brainstorm_seed_pool" scan "$tmpdir/omen.cfg" \
+		"$tmpdir/charm-full-explicit.cfg" "$tmpdir/charm-full-explicit.bspool" \
+		>/dev/null 2>/dev/null
+	cmp -s "$tmpdir/charm.bspool" "$tmpdir/charm-full-explicit.bspool" \
+		|| fail "explicit exhaustive mode changed the legacy full pool bytes/hash"
+	write_scan_criteria "$(seed_rank M8111111)" \
+		$'legendary_routes canonical_charm\nlegendary j_chicot 1 small 4 big 0 charm' \
+		"$tmpdir/charm-fast-scan.cfg"
+	"$ROOT/native/brainstorm_seed_pool" scan "$tmpdir/omen.cfg" \
+		"$tmpdir/charm-fast-scan.cfg" "$tmpdir/charm-fast.bspool" \
+		>/dev/null 2>/dev/null
+	grep -q '^legendary_routes canonical_charm$' "$tmpdir/charm-fast.bspool" \
+		|| fail "fast exact pool did not record its membership policy"
+	[[ $(awk '$1 == "criteria_hash" { print $2 }' "$tmpdir/charm.bspool") != \
+		$(awk '$1 == "criteria_hash" { print $2 }' "$tmpdir/charm-fast.bspool") ]] \
+		|| fail "fast and exhaustive criteria hashes collided"
 	write_overlay "$tmpdir/omen.cfg" "$tmpdir/charm.bspool" "$tmpdir/charm-overlay.cfg"
 	"$ROOT/native/brainstorm_native_search" fixture "$tmpdir/charm-overlay.cfg" \
 		"$tmpdir/seeds" > "$tmpdir/charm-overlay.out"
@@ -214,6 +255,40 @@ PY
 		"$tmpdir/purchased.seed" > "$tmpdir/purchased-overlay.out"
 	grep -q '^1SNK1111 1 ' "$tmpdir/purchased-overlay.out" \
 		|| fail "in-game pool loader did not replay a purchased-Omen branch"
+
+	# Revalidation must obey the policy in both production engines.  This
+	# deliberately relabels the known full-only member as Fast Exact inside a
+	# fixed-size copy of its header: membership still contains the seed, so the
+	# only correct result is rejection before automatic Omen-purchase recovery.
+	python3 - "$tmpdir/purchased.bspool" "$tmpdir/forced-fast-purchased.bspool" <<'PY'
+import re
+import sys
+
+raw = open(sys.argv[1], "rb").read()
+match = re.search(br"^header_bytes (\d+)$", raw[:65536], re.M)
+assert match
+header_bytes = int(match.group(1))
+header = raw[:header_bytes].split(b"\0", 1)[0]
+assert b"legendary_routes " not in header
+header = header.replace(
+    b"\nend\n", b"\nlegendary_routes canonical_charm\nend\n", 1)
+assert len(header) < header_bytes
+open(sys.argv[2], "wb").write(
+    header + bytes(header_bytes - len(header)) + raw[header_bytes:])
+PY
+	write_overlay "$tmpdir/base.cfg" "$tmpdir/forced-fast-purchased.bspool" \
+		"$tmpdir/forced-fast-purchased-overlay.cfg"
+	"$ROOT/native/brainstorm_native_search" fixture \
+		"$tmpdir/forced-fast-purchased-overlay.cfg" "$tmpdir/purchased.seed" \
+		> "$tmpdir/forced-fast-purchased-native.out"
+	grep -q '^1SNK1111 0 -$' "$tmpdir/forced-fast-purchased-native.out" \
+		|| fail "native pool revalidation ignored Fast Exact route coverage"
+	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
+		"$tmpdir/base.cfg" "$tmpdir/forced-fast-purchased.bspool" \
+		"$tmpdir/purchased.seed" > "$tmpdir/forced-fast-purchased-lua.out"
+	grep -q '^1SNK1111 0$' "$tmpdir/forced-fast-purchased-lua.out" \
+		|| fail "production Lua pool revalidation ignored Fast Exact route coverage"
+	echo "PASS native and production-Lua revalidation enforce Fast Exact coverage"
 
 	# Also exercise purchased Omen as the ACTIVE in-game filter over a pool
 	# that only contributes an observed tag route. The embedded-Legendary path
@@ -261,11 +336,16 @@ PY
 	grep -q '^M8111111 1$' "$tmpdir/charm-lua.out" \
 		|| fail "production Lua rejected the targeted-Charm pool member"
 	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
+		"$tmpdir/omen.cfg" "$tmpdir/charm-fast.bspool" "$tmpdir/seeds" \
+		> "$tmpdir/charm-fast-lua.out"
+	grep -q '^M8111111 1$' "$tmpdir/charm-fast-lua.out" \
+		|| fail "production Lua rejected a valid starting-Omen fast member"
+	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/base.cfg" "$tmpdir/purchased.bspool" "$tmpdir/purchased.seed" \
 		> "$tmpdir/purchased-lua.out"
 	grep -q '^1SNK1111 1$' "$tmpdir/purchased-lua.out" \
 		|| fail "production Lua rejected the purchased-Omen pool member"
-	echo "PASS native and production-Lua loaders replay targeted Charm and purchased Omen routes"
+	echo "PASS native and production-Lua loaders replay full and fast exact routes"
 
 	# Voucher availability is unrelated when there is no voucher predicate and
 	# the minimum route buys nothing. A challenge may ban every offer; starting

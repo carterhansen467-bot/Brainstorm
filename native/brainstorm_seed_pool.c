@@ -80,6 +80,9 @@ typedef struct {
 	int schema, sawEnd;
 	int outputSchema, headerBytes;
 	int threads, resume, collectTags;
+	int legendaryRoutes, legendaryRoutesExplicit;
+	int baseLegendaryRoutes; /* source pool's effective cumulative policy */
+	int inheritedFastLegendaryRoutes; /* sticky: any source stage was a subset */
 	int space; /* SPACE_NATURAL (default), SPACE_SETTABLE, or SPACE_TOTAL */
 	char label[136]; /* optional shareable pool name; not part of criteriaHash */
 	uint64_t start, count, checkpoint, chunk;
@@ -331,6 +334,14 @@ static uint64_t pool_hash_stage(const PoolPlan *p) {
 		n = snprintf(line, sizeof line, "space %s\n", space_name(p->space));
 		h = pool_hash_update(h, line, (size_t)n);
 	}
+	/* Fast route coverage is a different membership predicate and therefore a
+	 * different resumable pool identity. Omit the default so every existing
+	 * exhaustive criteria/state fingerprint remains byte-for-byte stable. */
+	if (p->legendaryRoutesExplicit
+			&& p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM) {
+		n = snprintf(line, sizeof line, "legendary_routes canonical_charm\n");
+		h = pool_hash_update(h, line, (size_t)n);
+	}
 	for (int i = 0; i < p->ntagRules; i++) {
 		const PoolTagRule *r = &p->tagRules[i];
 		if (r->minPhase == SOUL_PHASE_SMALL && r->maxPhase == SOUL_PHASE_BIG)
@@ -473,6 +484,8 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 	p->format = POOL_BINARY;
 	p->outputSchema = BSPOOL_SCHEMA_EVENTS;
 	p->headerBytes = BSPOOL_HEADER_EVENTS_SIZE;
+	p->legendaryRoutes = BSPOOL_LEGENDARY_ROUTES_FULL;
+	p->baseLegendaryRoutes = BSPOOL_LEGENDARY_ROUTES_FULL;
 	p->minTagAnte = POOL_MAX_ANTE + 1;
 	p->legendary[0].soulDepth = 1;
 	FILE *f = fopen(path, "r");
@@ -519,6 +532,15 @@ static bool pool_load_plan(const char *path, const Config *g, PoolPlan *p,
 			if (v && !strcmp(v, "collect")) p->collectTags = 1;
 			else if (v && !strcmp(v, "observe")) p->collectTags = 0;
 			else goto bad_value;
+		} else if (!strcmp(d, "legendary_routes")) {
+			if (p->legendaryRoutesExplicit) goto bad_value;
+			char *v = pool_tok(&sp);
+			if (v && !strcmp(v, "full"))
+				p->legendaryRoutes = BSPOOL_LEGENDARY_ROUTES_FULL;
+			else if (v && !strcmp(v, "canonical_charm"))
+				p->legendaryRoutes = BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM;
+			else goto bad_value;
+			p->legendaryRoutesExplicit = 1;
 		} else if (!strcmp(d, "space")) {
 			char *v = pool_tok(&sp);
 			if (v && !strcmp(v, "natural")) p->space = SPACE_NATURAL;
@@ -668,6 +690,10 @@ bad_value:
 	}
 	if (!p->nlegendary && p->legendary[0].soulDepth != 1) {
 		snprintf(err, errsz, "soul_depth requires a legendary rule");
+		return false;
+	}
+	if (p->legendaryRoutesExplicit && !p->nlegendary) {
+		snprintf(err, errsz, "legendary_routes requires a legendary rule");
 		return false;
 	}
 
@@ -1741,6 +1767,13 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 		if (pool_try_targeted_charm(c, label, labelCap, metadata,
 				beforeVoucherMetadata, beforeVoucherLabel,
 				soulMaxAnte, tagMaxAnte, 0)) return true;
+		/* Fast mode is still exact for every emitted seed: it accepts canonical
+		 * and real Charm-tag routes, then deliberately omits only the automatic
+		 * voucher-purchase search for an Omen-only recovery. Starting Omen and
+		 * Omen obtained by an explicit voucher route remain part of the normal
+		 * Soul walk above. */
+		if (p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM)
+			return false;
 		if (metadata) metadata->count = (uint8_t)beforeVoucherMetadata;
 		if (label) label[beforeVoucherLabel] = 0;
 		bool recovered = pool_check_vouchers_mode(c, label, labelCap, metadata,
@@ -2347,6 +2380,29 @@ static bool pool_write_header(FILE *f, const PoolPlan *p, uint64_t records,
 			p->derivationId, snapshotId, membershipDigest, metadataDigest, cursor,
 			p->collectTags ? "collect" : "observe");
 	if (n < 0 || (size_t)n >= headerCap) { snprintf(err, errsz, "binary header overflow"); return false; }
+	int hasLegendaryRoute = p->nbaseLegendaryRules || p->nlegendary;
+	if (hasLegendaryRoute
+			&& (p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM
+				|| p->inheritedFastLegendaryRoutes)) {
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"legendary_routes %s\n",
+				p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM
+					? "canonical_charm" : "full");
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from Legendary route scope");
+			return false;
+		}
+		n += rw;
+	}
+	if (p->inheritedFastLegendaryRoutes) {
+		int rw = snprintf((char *)buf + n, headerCap - (size_t)n,
+				"route_legendary_routes canonical_charm\n");
+		if (rw < 0 || (size_t)rw >= headerCap - (size_t)n) {
+			snprintf(err, errsz, "binary header overflow from inherited Legendary route scope");
+			return false;
+		}
+		n += rw;
+	}
 	if (p->label[0]) {
 		int lw = snprintf((char *)buf + n, headerCap - (size_t)n, "label %s\n", p->label);
 		if (lw < 0 || (size_t)lw >= headerCap - (size_t)n) { snprintf(err, errsz, "binary header overflow"); return false; }
@@ -2712,6 +2768,15 @@ static bool pool_write_manifest(const char *path, const PoolPlan *p,
 							? "delta-varint-events-v1" : "delta-varint-blocks-v1")
 					: p->format == POOL_TEXT ? "seed-text" : "count-only",
 			p->collectTags ? "collect-first-required" : "observe");
+	int hasLegendaryRoute = p->nbaseLegendaryRules || p->nlegendary;
+	if (hasLegendaryRoute
+			&& (p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM
+				|| p->inheritedFastLegendaryRoutes))
+		fprintf(f, "legendary_routes %s\n",
+				p->legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM
+					? "canonical_charm" : "full");
+	if (p->inheritedFastLegendaryRoutes)
+		fprintf(f, "source_route_legendary_routes canonical_charm\n");
 	if (p->refilter) fprintf(f,
 			"refilter_depth %d\ninput_records %" PRIu64 "\nsource_criteria_hash %016" PRIx64 "\nsource_pool_id %s\n"
 			"source_complete %d\nsource_coverage_complete %d\n"
@@ -3092,6 +3157,25 @@ static bool pool_prepare_refilter(const Config *g, PoolPlan *p, const char *inpu
 		snprintf(err, errsz, "input pool was built from a different pool/unlock snapshot");
 		fclose(f); return false;
 	}
+	/* A top-level directive is the effective policy of the source's latest
+	 * cumulative evaluation.  The route_ directive is its inherited fallback.
+	 * Preferring the top level matters when a full stage was intentionally run
+	 * on an earlier fast source: the next refilter must not silently switch the
+	 * cumulative predicate back to fast. */
+	p->baseLegendaryRoutes = h.legendaryRoutesExplicit
+		? h.legendaryRoutes : h.routeLegendaryRoutes;
+	/* Unlike the effective mode above, ancestry is deliberately sticky. A later
+	 * full refilter can evaluate every seed that reached it, but it cannot put
+	 * back Omen-only seeds omitted by an earlier fast scan. Keep that limitation
+	 * visible through every descendant header/manifest. */
+	p->inheritedFastLegendaryRoutes =
+		h.legendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM
+		|| h.routeLegendaryRoutes == BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM;
+	/* A tag/voucher-only refilter has no new Legendary policy of its own, so
+	 * retain the source pool's scope. An explicitly configured new Legendary
+	 * stage may independently choose full or fast coverage. */
+	if (!p->legendaryRoutesExplicit && !p->nlegendary)
+		p->legendaryRoutes = p->baseLegendaryRoutes;
 	if (h.nrouteTagRules + p->ntagRules > POOL_MAX_TAG_RULES) {
 		snprintf(err, errsz, "source + new tag routes exceed the %d-rule cumulative limit",
 				POOL_MAX_TAG_RULES);

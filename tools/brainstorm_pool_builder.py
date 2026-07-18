@@ -270,6 +270,11 @@ class Snapshot:
 SOUL_DEPTHS = [1, 0]
 SOUL_DEPTH_LABELS = ["1 Soul deep (the first Soul)",
                      "2 Souls deep (first or second Soul)"]
+LEGENDARY_ROUTES = ["full", "canonical_charm"]
+LEGENDARY_ROUTE_LABELS = [
+    "Exhaustive routes (Shop + Charm + Omen)",
+    "Fast exact (Shop + Charm; skip automatic Omen purchase)",
+]
 PHASES = ["small", "big", "boss"]
 TAG_PHASES = ["small", "big"]
 PHASE_LABELS = {"small": "Small", "big": "Big", "boss": "Boss"}
@@ -310,6 +315,7 @@ class Criteria:
         self.leg_human_location = True
         self.leg_neg = False
         self.leg_soul_depth = 1  # 1 = first Soul only, 0 = up to 2 Souls deep
+        self.leg_routes = "full"  # full or canonical_charm (exact subset)
         self.tag_rules = []      # [key, min, max, count, min_phase, max_phase]
         self.voucher_rules = []  # [key, min_ante, max_ante]
         # Vouchers here may still be offered, but a qualifying route may not
@@ -362,6 +368,8 @@ class Criteria:
             b += "-%s-%s" % (self.leg_min_phase, self.leg_max_phase)
             if self.leg_source != "any":
                 b += "-" + self.leg_source
+            if self.leg_routes == "canonical_charm":
+                b += "-fast-no-omen"
             bits.append(b)
         if self.space == "settable":
             bits.append("settable")
@@ -417,6 +425,10 @@ class Criteria:
         for key in self.voucher_exclusions:
             lines.append("voucher_exclude %s" % key)
         if self.legendary:
+            # Always make the user's current-stage choice explicit in the
+            # criteria file. The native engine deliberately omits default
+            # `full` from hashes/headers to preserve existing pool identity.
+            lines.append("legendary_routes %s" % self.leg_routes)
             if self.leg_human_location:
                 lines.append("legendary %s %d %s %d %s %d %s"
                              % (self.legendary, self.leg_min, self.leg_min_phase,
@@ -462,6 +474,8 @@ class Criteria:
                 s += ", %s" % LEGENDARY_SOURCE_LABELS[
                     LEGENDARY_SOURCES.index(self.leg_source)].replace(" only", "")
             s += ")"
+            if self.leg_routes == "canonical_charm":
+                s += " [fast exact; automatic Omen-purchase recovery omitted]"
             parts.append(s)
         out = " + ".join(parts) if parts else "(no criteria yet)"
         if self.space == "settable":
@@ -638,7 +652,7 @@ def read_pool_header(path):
 POOL_CRITERIA_FIELDS = (
     "tag", "route_tag", "legendary", "route_legendary", "soul_depth",
     "tag_route", "voucher", "route_voucher", "voucher_exclude",
-    "route_voucher_exclude",
+    "route_voucher_exclude", "legendary_routes", "route_legendary_routes",
 )
 POOL_IDENTITY_FIELDS = (
     "family_id", "segment_id", "stage_hash", "lineage_id",
@@ -943,10 +957,6 @@ class App:
                 if fn.endswith(".bspool") and int(head.get("records", "0") or 0) > 0:
                     self.input_pools.append(path)
         self.input_idx = 0
-        if "j_perkeo" in self.legendaries:
-            self.crit.legendary = "j_perkeo"
-        elif self.legendaries:
-            self.crit.legendary = self.legendaries[0]
         curses.curs_set(0)
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # selected
@@ -964,6 +974,11 @@ class App:
         f.append(Field("cycle", "Legendary", options=legopts,
                        idx=legidx, set=self._set_leg))
         if c.legendary:
+            route_idx = LEGENDARY_ROUTES.index(c.leg_routes) \
+                if c.leg_routes in LEGENDARY_ROUTES else 0
+            f.append(Field("cycle", "  Route coverage",
+                           options=LEGENDARY_ROUTE_LABELS,
+                           idx=route_idx, set=self._set_leg_routes))
             depth_idx = SOUL_DEPTHS.index(c.leg_soul_depth) \
                 if c.leg_soul_depth in SOUL_DEPTHS else 0
             f.append(Field("cycle", "  Search depth", options=SOUL_DEPTH_LABELS,
@@ -1074,6 +1089,9 @@ class App:
 
     def _set_leg_depth(self, i):
         self.crit.leg_soul_depth = SOUL_DEPTHS[i]
+
+    def _set_leg_routes(self, i):
+        self.crit.leg_routes = LEGENDARY_ROUTES[i]
 
     def _set_route(self, v):
         self.crit.route_collect = v
@@ -1429,6 +1447,15 @@ class App:
                 proj = float(manifest.get("projected_full_matches", "0") or 0)
                 projb = float(manifest.get("projected_compressed_bytes",
                                            manifest.get("projected_u64_bytes", "0")) or 0)
+                space_total = float(manifest.get("seedspace", "0") or 0) or SEEDSPACE
+                space_label = next(label for key, label, _limit in SPACES
+                                   if key == self.crit.space)
+                scope_name, scope_limit = SCOPES[self.crit.scope]
+                scope_start, scope_end = self.crit.shard_bounds(scope_limit)
+                scope_count = scope_end - scope_start
+                if self.crit.shard_total > 1:
+                    scope_name += " -- part %d of %d" % (
+                        self.crit.shard_index, self.crit.shard_total)
                 if matched == 0:
                     lines.append(("No matches appeared in this quick sample; use a larger "
                                   "test build for a rare filter.", 2))
@@ -1436,11 +1463,17 @@ class App:
                     lines.append(("Only %d matches appeared; the size projection is rough."
                                   % matched, 2))
                 if matched:
-                    lines.append(("Projected over the full seed space: ~%s seeds, ~%s on disk"
-                                  % (f"{int(proj):,}", human_bytes(projb)), 0))
+                    ratio = scope_count / space_total
+                    lines.append(("Selected scope (%s; %s seeds): ~%s matches, ~%s on disk"
+                                  % (scope_name, f"{scope_count:,}",
+                                     f"{int(proj * ratio):,}", human_bytes(projb * ratio)), 0))
+                    lines.append(("Complete chosen seed space (%s; %s seeds): ~%s matches, ~%s on disk"
+                                  % (space_label, f"{int(space_total):,}",
+                                     f"{int(proj):,}", human_bytes(projb)), 0))
                 if rate > 0:
-                    space_total = float(manifest.get("seedspace", "0") or 0) or SEEDSPACE
-                    lines.append(("Projected full-scan time at this rate: %s"
+                    lines.append(("Selected-scope time at this rate: %s"
+                                  % human_secs(scope_count / rate), 0))
+                    lines.append(("Complete chosen-seed-space time at this rate: %s"
                                   % human_secs(space_total / rate), 0))
             elif rc == 0:
                 lines.append(("Pool file: %s" % runner.output, 3))

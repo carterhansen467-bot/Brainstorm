@@ -14,5 +14,12 @@ The app reads native_search.cfg and writes seed_pools in the parent Brainstorm
 folder so Balatro sees exactly the same pools. Those are profile/runtime data,
 not app binaries, and the updater preserves them.
 
+Legendary builds now offer two route-coverage choices. Exhaustive checks Shop,
+Charm, and automatic Omen Globe purchase recovery. Fast Exact checks Shop and
+Charm, is substantially faster, and keeps every result valid, but omits seeds
+whose match requires the scanner to find and purchase Omen Globe. The chosen
+policy is recorded in the pool so it cannot be resumed or merged as the other
+mode by mistake.
+
 For a snapshot error, start Balatro and briefly toggle Ctrl+A on and off. For a
 Windows security warning, see README-WINDOWS.txt in the extracted release.

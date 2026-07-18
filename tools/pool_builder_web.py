@@ -33,7 +33,7 @@ import pool_organizer_web as organizer_web
 DEFAULT_PORT = 8917
 LOCK = threading.Lock()
 JOB = {"runner": None, "kind": None, "started": 0.0, "summary": "", "error": "",
-       "closing": False}
+       "closing": False, "estimate_context": None}
 
 
 # ------------------------------------------------------------- criteria ----
@@ -67,6 +67,9 @@ def criteria_from_json(data, snap):
         c.leg_soul_depth = depth_map.get(str(data.get("legSoulDepth")), 1)
     elif data.get("legSecondSoul"):
         c.leg_soul_depth = 2
+    c.leg_routes = str(data.get("legRoutes", "full"))
+    if c.leg_routes not in core.LEGENDARY_ROUTES:
+        raise ValueError("Unknown Legendary route coverage mode.")
     tag_keys = {k for k, _ in snap.usable_tags()}
     min_ante = dict(snap.usable_tags())
     for rule in data.get("rules", [])[: core.MAX_TAG_RULES]:
@@ -146,6 +149,43 @@ def clamp_int(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def estimate_context(criteria, data, input_name="", input_records=0):
+    """Freeze the range labels/numbers used by an estimate.
+
+    The estimate itself always samples a small prefix, but its result projects
+    both the requested build scope and the complete *chosen* seed space.  Keep
+    this server-side so editing the form after completion cannot relabel an old
+    result with new settings.
+    """
+    if input_name:
+        records = max(0, int(input_records or 0))
+        return {
+            "space": criteria.space,
+            "space_size": criteria.seedspace(),
+            "scope_count": records,
+            "scope_label": "All %s currently committed seeds" % format(records, ","),
+            "input_pool": input_name,
+        }
+    requested = clamp_int(data.get("count", 0), 0, SEEDCAP)
+    start, end = criteria.shard_bounds(requested)
+    selected_total = criteria.seedspace() if requested == 0 else min(
+        requested, criteria.seedspace())
+    if requested == 0:
+        label = "Entire chosen seed space"
+    else:
+        label = "First %s seeds" % format(selected_total, ",")
+    if criteria.shard_total > 1:
+        label += " — part %d of %d" % (
+            criteria.shard_index, criteria.shard_total)
+    return {
+        "space": criteria.space,
+        "space_size": criteria.seedspace(),
+        "scope_count": end - start,
+        "scope_label": label,
+        "input_pool": "",
+    }
+
+
 # ---------------------------------------------------------------- pools ----
 
 def read_pool_header(path):
@@ -170,7 +210,8 @@ def pool_library():
 def job_state():
     r = JOB["runner"]
     out = {"running": False, "kind": JOB["kind"], "summary": JOB["summary"],
-           "error": JOB["error"], "closing": JOB["closing"]}
+           "error": JOB["error"], "closing": JOB["closing"],
+           "estimate_context": JOB["estimate_context"]}
     if r is None:
         return out
     out.update({
@@ -196,12 +237,14 @@ def start_job(kind, data, snap):
         crit = criteria_from_json(data, snap)
         input_name = os.path.basename(str(data.get("inputPool", "")))
         input_pool = None
+        input_records = 0
         if input_name:
             candidate = os.path.join(core.POOL_DIR, input_name)
             head = read_pool_header(candidate)
             if not input_name.endswith(".bspool") or not os.path.isfile(candidate):
                 raise ValueError("The selected input pool no longer exists.")
-            if int(head.get("records", "0") or 0) <= 0:
+            input_records = int(head.get("records", "0") or 0)
+            if input_records <= 0:
                 raise ValueError("The selected pool has no committed seeds to process yet.")
             input_pool = candidate
             crit.space = head.get("space", "natural")
@@ -213,6 +256,7 @@ def start_job(kind, data, snap):
             out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
             text = crit.text("count", sample, apply_shard=False,
                              checkpoint=min(core.ESTIMATE_CHECKPOINT, sample))
+            context = estimate_context(crit, data, input_name, input_records)
         else:
             os.makedirs(core.POOL_DIR, exist_ok=True)
             out = os.path.join(core.POOL_DIR, crit.pool_name() + ".bspool")
@@ -221,13 +265,15 @@ def start_job(kind, data, snap):
                                  "name, or delete the old files first.")
             count = clamp_int(data.get("count", 0), 0, SEEDCAP)
             text = crit.text("binary", count)
+            context = None
         if input_pool and os.path.abspath(input_pool) == os.path.abspath(out):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
         summary = crit.summary()
         if kind == "estimate" and not input_pool:
             summary += " [%s-seed quick sample]" % format(sample, ",")
         JOB.update(runner=core.Runner(snap.current_model_copy(), text, out, input_pool),
-                   kind=kind, started=time.time(), summary=summary, error="")
+                   kind=kind, started=time.time(), summary=summary, error="",
+                   estimate_context=context)
 
 
 def start_merge_job(data):
@@ -264,7 +310,7 @@ def start_merge_job(data):
             raise ValueError("That output already exists. Pick a different merged-pool name.")
         JOB.update(runner=core.MergeRunner(inputs, output), kind="merge",
                    started=time.time(), summary="Merging %d shard pools" % len(inputs),
-                   error="")
+                   error="", estimate_context=None)
 
 
 def shutdown_when_safe(server):
@@ -346,6 +392,23 @@ h1 { margin:0; font-size:clamp(23px, 3vw, 32px); line-height:1.1; letter-spacing
 .card-copy { margin:3px 0 0; color:var(--muted); font-size:13px; }
 .section-label { margin:18px 0 9px; color:#d9d4e5; font-size:12px; font-weight:800;
   letter-spacing:.08em; text-transform:uppercase; }
+.active-filter-panel { margin:-2px 0 20px; padding:13px 14px; border:1px solid #383e55;
+  border-radius:12px; background:#10131d; }
+.active-filter-head { display:flex; justify-content:space-between; gap:12px; align-items:center;
+  margin-bottom:9px; color:#aaa5b5; font-size:11px; font-weight:800;
+  letter-spacing:.07em; text-transform:uppercase; }
+.active-filter-head strong { color:#d8d3e1; font-size:12px; letter-spacing:0; text-transform:none; }
+.active-filter-list { display:flex; flex-wrap:wrap; gap:7px; }
+.filter-chip { display:inline-flex; align-items:center; min-height:27px; padding:5px 9px;
+  border:1px solid #43506d; border-radius:999px; color:#cbd8f6; background:#172033;
+  font-size:11px; font-weight:750; line-height:1.25; }
+.filter-chip.legendary { border-color:#745b9e; color:#e3d1ff; background:#291f3c; }
+.filter-chip.voucher { border-color:#426b52; color:#b9e9c9; background:#17291f; }
+.filter-chip.exclusion { border-color:#71474c; color:#f2bec2; background:#2d1b1e; }
+.filter-chip.empty { border-style:dashed; border-color:#3b4052; color:#817e8b; background:transparent; }
+.filter-mode-hint { margin-top:9px; }
+.filter-mode-hint.tags-fast { color:#8edcaf; }
+.filter-mode-hint.legendary-active { color:#e8c976; }
 .field-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
 .field-grid.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
 .field { display:grid; gap:6px; align-content:start; min-width:0; }
@@ -510,11 +573,17 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 
   <div class="workspace">
     <div class="stack">
-      <section class="card" aria-labelledby="filterTitle">
+      <section class="card" id="filterCard" aria-labelledby="filterTitle">
         <div class="card-head"><span class="step">1</span><div>
           <h2 id="filterTitle">Choose what seeds must contain</h2>
           <p class="card-copy">Use a Legendary, tags, vouchers, or combine them.</p>
         </div></div>
+
+        <div class="active-filter-panel" aria-live="polite">
+          <div class="active-filter-head"><span>Active filters</span><strong id="filterModeTitle">No active filters</strong></div>
+          <div class="active-filter-list" id="activeFilters"><span class="filter-chip empty">No filters selected</span></div>
+          <div class="hint filter-mode-hint" id="filterModeHint">Add a tag requirement to use the tags-only fast path, or choose a Legendary to run exact Soul routing.</div>
+        </div>
 
         <div class="section-label">Legendary joker</div>
         <div class="field-grid">
@@ -525,6 +594,11 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
               <select id="legDepth" title="Two Souls deep also accepts a seed whose first Soul contains a different Legendary.">
                 <option value="1">First Soul only</option>
                 <option value="any">First or second Soul</option>
+              </select></div>
+            <div class="field"><label for="legRoutes">Legendary route coverage</label>
+              <select id="legRoutes">
+                <option value="full">Exhaustive — Shop, Charm, and Omen</option>
+                <option value="canonical_charm">Fast exact — Shop and Charm</option>
               </select></div>
             <div class="field"><label for="legMin">From ante</label><input type="number" id="legMin" min="1" max="39" value="1"></div>
             <div class="field"><label for="legMinPhase">From route point</label><select id="legMinPhase">
@@ -540,7 +614,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
             </select></div>
             <label class="check"><input type="checkbox" id="legNeg"> Require Negative</label>
           </div>
-          <div class="hint full">Souls are checked chronologically across reachable shop packs and collected Charm or Ethereal rewards.</div>
+          <div class="hint full">Souls are checked chronologically across reachable shop packs and collected Charm or Ethereal rewards. Fast exact keeps every result valid but omits seeds that only work by automatically finding and purchasing Omen Globe.</div>
         </div>
 
         <div class="section-label">Tag requirements</div>
@@ -598,6 +672,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
           <div class="field"><label for="name">Pool name</label>
             <input type="text" id="name" placeholder="Generated automatically" size="22"></div>
           <div class="hint full" id="spaceHint"></div>
+          <div class="hint full" id="scopeModeHint">Quick Estimate samples 2 million seeds, then projects both this selected scope and the complete chosen seed space.</div>
         </div>
 
         <details class="advanced">
@@ -814,6 +889,7 @@ function criteria(){
     legMinPhase:$("legMinPhase").value, legMaxPhase:$("legMaxPhase").value,
     legSource:$("legSource").value,
     legNeg:$("legNeg").checked, legSoulDepth:$("legDepth").value,
+    legRoutes:$("legRoutes").value,
     rules, voucherRules, voucherExclusions, route:$("route").value,
     threads:+$("threads").value, count:+$("count").value,
 	space:$("space").value, inputPool:$("inputPool").value,
@@ -847,6 +923,33 @@ function updateSpaceHint(){
     : info.hint;
 }
 
+function syncSourceControls(){
+  const selectedPool = $("inputPool").selectedOptions[0];
+  const fromPool = !!$("inputPool").value;
+  // Estimate activity never locks these controls. Only an input pool does,
+  // because its encoding and committed record set define the refilter scope.
+  for (const id of ["space", "count", "shardTotal", "shardIndex"])
+    $(id).disabled = fromPool;
+  if (fromPool) {
+    $("space").value = (selectedPool && selectedPool.dataset.space) || "natural";
+    $("shardTotal").value = "1";
+    $("scopeModeHint").textContent = "Locked to the selected input pool: estimates and builds process all of its currently committed seeds. Choose ‘Balatro’s seed space’ under Search within to unlock Seed space and Scan scope.";
+  } else {
+    $("scopeModeHint").textContent = "Editable before or after an estimate. Quick Estimate samples 2 million seeds, then projects both this selected scope and the complete chosen seed space.";
+  }
+  return fromPool;
+}
+
+function syncFilterControls(){
+  // Filter criteria are always editable, including while an estimate runs and
+  // after it completes.  Reassert that invariant on every state poll so a
+  // stale disabled property restored by the browser cannot survive a job.
+  for (const control of document.querySelectorAll("#filterCard select, #filterCard input"))
+    control.disabled = false;
+  // These two action buttons have criteria-based limits, not job locks.
+  refreshVoucherButtons();
+}
+
 function selectedText(id){
   const el = $(id);
   return el.selectedOptions.length ? el.selectedOptions[0].textContent : "";
@@ -856,28 +959,62 @@ function updateSummary(){
   if (!CAT) return;
   const c = criteria();
   const pieces = [];
+  const active = [];
   if (c.legendary) {
     let legendary = selectedText("legendary");
     if (c.legNeg) legendary = "Negative " + legendary;
     const source = c.legSource === "any" ? "" : ` · ${selectedText("legSource")}`;
-    pieces.push(legendary + (c.legSoulDepth === "any" ? " in either of 2 Souls" : " in the first Soul")
-      + ` · A${c.legMin} ${c.legMinPhase}–A${c.legMax} ${c.legMaxPhase}${source}`);
+    const routeScope = c.legRoutes === "canonical_charm" ? " · fast exact (no automatic Omen purchase)" : "";
+    const description = legendary + (c.legSoulDepth === "any" ? " in either of 2 Souls" : " in the first Soul")
+      + ` · A${c.legMin} ${c.legMinPhase}–A${c.legMax} ${c.legMaxPhase}${source}${routeScope}`;
+    pieces.push(description);
+    active.push({kind:"legendary", text:description});
   }
   for (const r of c.rules) {
     const tag = CAT.tags.find(t=>t.key === r.key);
-    pieces.push(`${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`);
+    const description = `${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`;
+    pieces.push(description);
+    active.push({kind:"tag", text:description});
   }
   for (const r of c.voucherRules) {
     const voucher = (CAT.vouchers || []).find(v=>v.key === r.key);
     const window = r.min === r.max ? `A${r.min}` : `A${r.min}–A${r.max}`;
-    pieces.push(`${(voucher && voucher.name) || r.key} voucher · ${window}`);
+    const description = `${(voucher && voucher.name) || r.key} voucher · ${window}`;
+    pieces.push(description);
+    active.push({kind:"voucher", text:description});
   }
   if (c.voucherExclusions.length) {
     const names = c.voucherExclusions.map(key=>{
       const voucher = (CAT.vouchers || []).find(v=>v.key === key);
       return (voucher && voucher.name) || key;
     });
-    pieces.push(`without purchasing ${names.join(", ")}`);
+    const description = `without purchasing ${names.join(", ")}`;
+    pieces.push(description);
+    active.push({kind:"exclusion", text:description});
+  }
+  $("activeFilters").innerHTML = active.length
+    ? active.map(item=>`<span class="filter-chip ${item.kind}">${esc(item.text)}</span>`).join("")
+    : `<span class="filter-chip empty">No filters selected</span>`;
+  const modeHint = $("filterModeHint");
+  modeHint.className = "hint filter-mode-hint";
+  if (c.legendary) {
+    const fast = c.legRoutes === "canonical_charm";
+    $("filterModeTitle").textContent = fast
+      ? "Fast exact Legendary search" : "Exhaustive Legendary route search";
+    modeHint.classList.add("legendary-active");
+    modeHint.textContent = fast
+      ? "Shop and real Charm-tag routes are checked exactly. Automatic Omen-purchase recovery is skipped: every retained seed is valid, but Omen-only seeds are omitted."
+      : "All chronological Shop, Charm, and automatic Omen-purchase recovery routes are active. This is exhaustive but substantially slower.";
+  } else if (c.voucherRules.length) {
+    $("filterModeTitle").textContent = "Voucher route search";
+    modeHint.textContent = "Voucher purchase-route evaluation is active. Tag requirements still reject non-matches before the more expensive route check.";
+  } else if (c.rules.length) {
+    $("filterModeTitle").textContent = "Tags-only fast path";
+    modeHint.classList.add("tags-fast");
+    modeHint.textContent = "No Legendary Soul, Arcana-pack, Omen, or voucher-route search is active.";
+  } else {
+    $("filterModeTitle").textContent = "No active filters";
+    modeHint.textContent = "Add a tag requirement to use the tags-only fast path, or choose a Legendary to run exact Soul routing.";
   }
   $("sumFilter").textContent = pieces.length ? pieces.join(" + ") : "Choose a Legendary, tag, or voucher";
   $("readyPill").textContent = pieces.length ? "Ready" : "Needs filter";
@@ -955,6 +1092,17 @@ function showResult(j){
     out = "The scanner reported a problem:\\n" + (j.lines||[]).join("\\n");
   } else if (j.kind === "estimate") {
     const scanned = +m.scanned || 1, matched = +m.matched || 0;
+    const estimate = j.estimate_context || {};
+    const chosen = spaceInfo(estimate.space || "natural");
+    const fullCount = +estimate.space_size || +m.seedspace || chosen.size;
+    const selectedCount = +estimate.scope_count || fullCount;
+    const selectedLabel = estimate.scope_label || "Entire chosen seed space";
+    const rate = +m.seeds_per_second || 0;
+    const matchRate = matched / scanned;
+    const fullMatches = +m.projected_full_matches || matchRate * fullCount;
+    const fullBytes = +(m.projected_compressed_bytes || m.projected_u64_bytes) || 0;
+    const selectedMatches = matchRate * selectedCount;
+    const selectedBytes = fullCount > 0 ? fullBytes * selectedCount / fullCount : 0;
     out = `Sample: ${fmt(matched)} matching seeds in ${fmt(scanned)} scanned `
         + `(${(100*matched/scanned).toFixed(5)}%).`;
     if (matched > 0 && matched < 25)
@@ -963,11 +1111,20 @@ function showResult(j){
     if (matched === 0)
       out += `\\nNo matches appeared in this quick sample. The filter may be very rare; `
           + `use a larger test build before concluding that no matching seeds exist.`;
-    if (matched > 0 && +m.projected_full_matches)
-      out += `\\nFull seed space: ~${fmt(Math.round(+m.projected_full_matches))} seeds, `
-          + `~${fmtBytes(+(m.projected_compressed_bytes || m.projected_u64_bytes))} compressed file.`;
-    if (+m.seeds_per_second)
-      out += `\\nFull scan at this speed: ~${fmtSecs((+m.seedspace || 1785793904896) / +m.seeds_per_second)}.`;
+    let selectedProjection = "";
+    if (matched > 0)
+      selectedProjection += `~${fmt(Math.round(selectedMatches))} matches, ~${fmtBytes(selectedBytes)}, `;
+    selectedProjection += rate ? `~${fmtSecs(selectedCount/rate)}` : "time unavailable";
+    out += `\\nSelected scope — ${selectedLabel} (${fmt(selectedCount)} seeds): ${selectedProjection}.`;
+    if (estimate.input_pool) {
+      out += `\\nComplete seed-space comparison is not shown for an input pool because only its recorded seeds are being refiltered.`;
+    } else {
+      let fullProjection = "";
+      if (matched > 0)
+        fullProjection += `~${fmt(Math.round(fullMatches))} matches, ~${fmtBytes(fullBytes)}, `;
+      fullProjection += rate ? `~${fmtSecs(fullCount/rate)}` : "time unavailable";
+      out += `\\nComplete chosen seed space — ${chosen.name} (${fmt(fullCount)} seeds): ${fullProjection}.`;
+    }
   } else if (j.kind === "merge") {
     out = `Done! ${fmt(j.matched||0)} seeds merged into seed_pools/${j.output}.\n`
         + `The source shard files were not changed.`;
@@ -1073,19 +1230,14 @@ async function tick(){
     CAT = j.catalog;
     $("legendary").innerHTML = `<option value="">(none)</option>` +
       CAT.legendaries.map(l=>`<option value="${esc(l.key)}">${esc(l.name)}</option>`).join("");
-    if (CAT.legendaries.some(l=>l.key==="j_perkeo")) $("legendary").value="j_perkeo";
+    $("legendary").value = "";
     const th = $("threads");
     for (let i=1;i<=CAT.cpus;i++) th.add(new Option(i,i));
     refreshVoucherButtons();
   }
 	setOptions($("inputPool"), inputPoolOptions(j.pool_groups || []), true);
-	const fromPool = !!$("inputPool").value;
-	if (fromPool) $("space").value = $("inputPool").selectedOptions[0].dataset.space || "natural";
-	if (fromPool) $("shardTotal").value = "1";
-	$("count").disabled = fromPool;
-	$("space").disabled = fromPool;
-	$("shardTotal").disabled = fromPool;
-	$("shardIndex").disabled = fromPool;
+	syncFilterControls();
+	syncSourceControls();
 	updateSpaceHint();
 	updateShard();
   $("legRange").style.display = $("legendary").value ? "grid" : "none";
@@ -1132,6 +1284,9 @@ async function tick(){
   }
 }
 addEventListener("load", ()=>{
+  $("inputPool").addEventListener("change", ()=>{
+    syncSourceControls(); updateSpaceHint(); updateShard(); updateSummary();
+  });
   $("space").addEventListener("change", ()=>{updateSpaceHint(); updateShard();});
   $("count").addEventListener("change", updateShard);
   $("shardTotal").addEventListener("change", updateShard);
@@ -1141,7 +1296,7 @@ addEventListener("load", ()=>{
     $("legRange").style.display = $("legendary").value ? "grid" : "none";
     updateSummary();
   });
-  updateSpaceHint(); updateShard();
+  syncFilterControls(); syncSourceControls(); updateSpaceHint(); updateShard();
   tick(); setInterval(tick, 1000);
 });
 </script></body></html>

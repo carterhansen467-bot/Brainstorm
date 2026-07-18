@@ -334,6 +334,7 @@ tag <key> <inclusive-min-ante> <inclusive-max-ante> <minimum-count>
 tag <key> <min-ante> <small|big> <max-ante> <small|big> <minimum-count>
 legendary <key> <inclusive-min-ante> <inclusive-max-ante> [require-negative]
 legendary <key> <min-ante> <boss|small|big> <max-ante> <boss|small|big> <negative-0|1> <any|shop|charm|ethereal>
+legendary_routes full|canonical_charm
 soul_depth 1|2|any
 voucher <key> <inclusive-min-ante> <inclusive-max-ante>
 voucher_exclude <key>
@@ -346,6 +347,11 @@ label <any name, spaces allowed>
 a `pool_id` (a short fingerprint of catalog + criteria + range + space +
 records), and both are shown by the Seed Pool Builder and the in-game
 selector — two people holding the same pool see the same id.
+
+`legendary_routes full` is exhaustive. `canonical_charm` is the Fast Exact
+subset: it retains canonical Shop and targeted Charm routes but skips automatic
+Omen Globe purchase recovery. The nondefault policy is part of the pool's
+criteria identity, so incompatible scans cannot resume or merge together.
 
 `tag_route collect` selects the first required matching tag occurrences as
 actual blind skips. Those missing shops are fed into the source-verified
@@ -384,6 +390,15 @@ leaves the machine) where you can:
 
 - pick a Legendary with an exact Ante/blind/source window and optional
   Negative, choose first, second, or either Soul, and add exact tag windows;
+- choose **Exhaustive** Legendary routes (Shop, Charm, and automatic
+  Omen-purchase recovery) or **Fast Exact** (Shop and Charm). Fast Exact keeps
+  every retained seed valid and restores most of the former search speed, but
+  deliberately omits the small fraction of seeds that work only after the
+  scanner finds and purchases Omen Globe;
+- see every active filter at the top of the form and whether the scan will use
+  the tags-only fast path or the substantially heavier exact Legendary route;
+- start with no Legendary selected, so a tags-only build cannot silently keep
+  Perkeo active from the Builder's defaults;
 - add multiple voucher targets with Ante windows and purchase exclusions; the
   result records the minimum qualifying buy route;
 - use a paused, split, or otherwise incomplete `.bspool` as an input—the
@@ -395,8 +410,11 @@ leaves the machine) where you can:
   includes `0` and requires Brainstorm's Illegal Seed Input support for
   affected results);
 - press **Quick estimate** to sample 2M seeds with frequent progress updates
-  and see the projected pool size and full-scan time. If a rare filter produces
-  fewer than 25 sample matches, the app labels the size projection as rough;
+  and see separate projections for the selected build scope and the complete
+  chosen seed space. “Complete chosen seed space” means Natural,
+  Vanilla-settable, or All possible—whichever is selected—not implicitly the
+  Natural space. If a rare filter produces fewer than 25 sample matches, the
+  app labels the size projection as rough;
 - press **Build pool** and watch live progress. Pressing **Pause scan**, closing
   the launcher's Terminal/console window, or using **Close Builder** stops at a
   checkpoint; pressing Build again with the same name resumes exactly where it

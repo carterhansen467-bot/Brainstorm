@@ -176,6 +176,11 @@ static double pseudohash_str(const char *s) { /* whole string (checks, seed) */
 #define SOUL_DEPTH_ANY 0
 #define MAX_SEARCH_ANTE 39
 
+enum {
+	BSPOOL_LEGENDARY_ROUTES_FULL = 0,
+	BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM = 1
+};
+
 typedef struct {
 	int threads;
 	double entropy;
@@ -226,6 +231,7 @@ typedef struct {
 	struct { int poolIndex, minAnte, minPhase, maxAnte, maxPhase, minCount, collect; }
 		poolRouteRules[MAX_POOL_ROUTE_RULES];
 	int npoolLegendRules;
+	int poolLegendaryRoutes;
 	struct {
 		int poolIndex, minAnte, minPhase, maxAnte, maxPhase;
 		int neg, source, humanLocation, soulDepth;
@@ -1498,6 +1504,9 @@ static bool passes_prepared(Ctx *c) {
 					tagMaxAnte = g->poolLegendRules[i].maxAnte;
 			bool recovered = try_pool_targeted_charm(c, soulMaxAnte,
 					tagMaxAnte, 0);
+			if (!recovered && g->poolLegendaryRoutes
+					== BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM)
+				return false;
 			if (!recovered) {
 				recovered = check_pool_voucher_route_mode(c, 1, 1, 0,
 						voucherMaxAnte);
@@ -2447,6 +2456,12 @@ typedef struct {
 	char sourcePoolId[24];
 	int sourceComplete, sourceCoverageComplete;
 	int route; /* 1 = collect (tag blinds skipped), 0 = observe */
+	/* Current-stage and inherited route-coverage provenance. Fast pools remain
+	 * exact subsets, but deliberately omit automatic Omen-purchase rescue. */
+	int legendaryRoutes;
+	int legendaryRoutesExplicit;
+	int routeLegendaryRoutes;
+	int routeLegendaryRoutesExplicit;
 	int ntagRules;
 	struct { char key[MAX_KEY]; int minAnte, minPhase, maxAnte, maxPhase, minCount; }
 		tagRules[BSPOOL_MAX_TAG_RULES];
@@ -2662,6 +2677,8 @@ static bool pool_hash_catalog_file(const char *path, uint64_t *out) {
  * own model/records policy on top. */
 static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz) {
 	memset(h, 0, sizeof *h);
+	h->legendaryRoutes = BSPOOL_LEGENDARY_ROUTES_FULL;
+	h->routeLegendaryRoutes = BSPOOL_LEGENDARY_ROUTES_FULL;
 	h->route = 1;
 	char buf[BSPOOL_HEADER_MAX_SIZE + 1];
 	if (bs_fseeko(f, 0, SEEK_SET) != 0) { snprintf(err, errsz, "cannot rewind pool"); return false; }
@@ -2815,6 +2832,29 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 			v = pool_tok(&sp);
 			if (!v || (strcmp(v, "collect") && strcmp(v, "observe")) || !pool_header_no_more(&sp)) malformed = 1;
 			else h->route = !strcmp(v, "collect");
+		}
+		else if (!strcmp(d, "legendary_routes")
+				|| !strcmp(d, "route_legendary_routes")) {
+			int inherited = !strcmp(d, "route_legendary_routes");
+			v = pool_tok(&sp);
+			int mode = BSPOOL_LEGENDARY_ROUTES_FULL;
+			if ((inherited && h->routeLegendaryRoutesExplicit)
+					|| (!inherited && h->legendaryRoutesExplicit)
+					|| !v || !pool_header_no_more(&sp)) malformed = 1;
+			else if (!strcmp(v, "full")) mode = BSPOOL_LEGENDARY_ROUTES_FULL;
+			else if (!strcmp(v, "canonical_charm"))
+				mode = BSPOOL_LEGENDARY_ROUTES_CANONICAL_CHARM;
+			else malformed = 1;
+			if (!malformed) {
+				if (inherited) {
+					h->routeLegendaryRoutes = mode;
+					h->routeLegendaryRoutesExplicit = 1;
+				}
+				else {
+					h->legendaryRoutes = mode;
+					h->legendaryRoutesExplicit = 1;
+				}
+			}
 		}
 		else if (!strcmp(d, "pool_id")) {
 			v = pool_tok(&sp); if (!v || strlen(v) >= sizeof h->poolId || !pool_header_no_more(&sp)) malformed = 1;
@@ -3217,6 +3257,11 @@ static bool bspool_read_header(FILE *f, BspoolHeader *h, char *err, size_t errsz
 				h->legendaries[i].humanLocation, h->legendaries[i].soulDepth)) {
 			snprintf(err, errsz, "pool has conflicting cumulative legendary rules"); return false;
 		}
+	}
+	if ((h->legendaryRoutesExplicit || h->routeLegendaryRoutesExplicit)
+			&& !h->nrouteLegendRules) {
+		snprintf(err, errsz, "pool has Legendary route scope without a Legendary rule");
+		return false;
 	}
 	for (int i = 0; i < h->nvoucherRules; i++) {
 		if (h->nrouteVoucherRules >= BSPOOL_MAX_VOUCHER_RULES) {
@@ -3940,6 +3985,8 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		g->poolRouteRules[j].collect = 1;
 	}
 	g->npoolLegendRules = 0;
+	g->poolLegendaryRoutes = h.legendaryRoutesExplicit
+		? h.legendaryRoutes : h.routeLegendaryRoutes;
 	for (int r = 0; r < h.nrouteLegendRules; r++) {
 		int idx = -1;
 		for (int i = 0; i < g->njoker[4]; i++) {
