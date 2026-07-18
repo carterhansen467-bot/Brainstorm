@@ -29,7 +29,9 @@ sh "$BUILD"
 # data (pools/checks) is version-independent, so rewrite only the handshake.
 cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 SNAPSHOT="$OUT/snapshot.cfg"
-${CC:-clang} -O3 -Wall -Wno-unused-function -ffp-contract=off -pthread \
+${CC:-clang} -O3 -DBRAINSTORM_VERIFY_OMEN_TRACE \
+	-DBRAINSTORM_VERIFY_VOUCHER_RAW_CACHE \
+	-Wall -Wno-unused-function -ffp-contract=off -pthread \
 	-o "$OUT/seed_pool_compat$EXE" tests/seed_pool_compat.c -lm
 
 {

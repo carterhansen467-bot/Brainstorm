@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
 	newctx.p = &plan;
 	uint64_t count = strtoull(argv[3], NULL, 10);
 	uint64_t intentionalExtensions = 0;
+	int result = 0;
 	for (uint64_t rank = 0; rank < count; rank++) {
 		char seed[9], label[POOL_LABEL];
 		make_seed(rank, seed);
@@ -70,11 +71,14 @@ int main(int argc, char **argv) {
 			}
 			fprintf(stderr, "mismatch rank=%" PRIu64 " seed=%s legacy=%d pool=%d label=%s\n",
 					rank, seed, oldok, newok, label);
-			return 1;
+			result = 1;
+			break;
 		}
 	}
-	printf("PASS: pool/Model-3 compatibility across %" PRIu64
-			" seeds (+%" PRIu64 " labeled Charm/Omen extensions)\n",
-			count, intentionalExtensions);
-	return 0;
+	if (!result)
+		printf("PASS: pool/Model-3 compatibility across %" PRIu64
+				" seeds (+%" PRIu64 " labeled Charm/Omen extensions)\n",
+				count, intentionalExtensions);
+	free(newctx.omenTrace);
+	return result;
 }
