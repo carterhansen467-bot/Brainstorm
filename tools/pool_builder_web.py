@@ -1131,9 +1131,9 @@ async function deletePool(name){
       body:JSON.stringify({name})});
     let plan = await r.json();
     if (plan.error) throw new Error(plan.error);
-    const exact = (plan.files||[]).map(file=>`  ${file.path}`).join("\n");
-    const message = `Permanently delete this completed seed pool and its related files?\n\n${exact}`
-      + `\n\nThis cannot be undone.`;
+    const exact = (plan.files||[]).map(file=>`  ${file.path}`).join("\\n");
+    const message = `Permanently delete this completed seed pool and its related files?\\n\\n${exact}`
+      + `\\n\\nThis cannot be undone.`;
     if (!confirm(message)) return;
     r = await fetch("/api/delete", {method:"POST", body:JSON.stringify({
       name:plan.name, token:plan.token, confirmed:true})});
