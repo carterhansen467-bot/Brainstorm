@@ -705,6 +705,9 @@ typedef struct {
 	char seed[9];
 	double hashed_seed;
 	uint64_t gen;
+	uint64_t gateLegendGen;
+	int gateLegendFirst;
+	double gateLegendState;
 	PRNG prng;
 	Stream joker4;
 	Stream tagS[MAX_SEARCH_ANTE + 1], soulT[MAX_SEARCH_ANTE + 1];
@@ -2585,8 +2588,15 @@ static bool passes_prepared(Ctx *c) {
 	 * Reject the other rarity-4 picks before paying for a physical Soul walk. */
 	if (legAnywhere) {
 		if (!g->soulAllowed) return false;
-		int first = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
-				g->jokerAvail[4], g->njoker[4], -1);
+		int first;
+		if (c->gateLegendGen == c->gen) {
+			first = c->gateLegendFirst;
+			c->joker4.state = c->gateLegendState;
+			c->joker4.gen = c->gen;
+		} else {
+			first = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
+					g->jokerAvail[4], g->njoker[4], -1);
+		}
 		if (first < 0 || first != g->activeLegendaryIdx) return false;
 	}
 
@@ -2996,16 +3006,24 @@ static Stream *first_stream(Ctx *c) {
 }
 
 /* Evaluate one candidate whose hashes were precomputed by the batch. */
-static bool passes_pre(Ctx *c, const char seed[9], double hseed, double hfirst) {
+static bool passes_pre_handoff(Ctx *c, const char seed[9], double hseed,
+		double hfirst, int legendFirst, double legendState) {
 	memcpy(c->seed, seed, 9);
 	c->gen++;
 	c->hashed_seed = hseed;
+	c->gateLegendGen = legendFirst >= 0 ? c->gen : 0;
+	c->gateLegendFirst = legendFirst;
+	c->gateLegendState = legendState;
 	Stream *fs = first_stream(c);
 	if (fs) {
 		fs->state = hfirst;
 		fs->gen = c->gen;
 	}
 	return passes_prepared(c);
+}
+
+static bool passes_pre(Ctx *c, const char seed[9], double hseed, double hfirst) {
+	return passes_pre_handoff(c, seed, hseed, hfirst, -1, 0.0);
 }
 
 /* Advance one round13 stream step for the whole group branch-free (fl + 1.0
@@ -3074,10 +3092,15 @@ static inline int gate_pick_outcome(uint8_t hi, int n, const uint8_t *avail,
 
 static void first_gate_batch(const Config *g, const char seeds[ILV][9],
 		int slen, const double hseed[ILV], const double hfirst[ILV],
-		uint8_t survive[ILV]) {
+		uint8_t survive[ILV], int outLegendFirst[ILV],
+		double outLegendState[ILV]) {
 	double st[ILV], sv[ILV];
 	uint8_t hi[ILV];
 	for (int i = 0; i < ILV; i++) st[i] = hfirst[i];
+	if (g->vgKind == 2) for (int i = 0; i < ILV; i++) {
+		outLegendFirst[i] = -1;
+		outLegendState[i] = 0.0;
+	}
 	if (g->vgKind == 1) {
 		/* Classic Soul filter: reject only when every card roll of the
 		 * ante-1 reward pack is certainly <= 0.997. */
@@ -3125,6 +3148,10 @@ static void first_gate_batch(const Config *g, const char seeds[ILV][9],
 	for (int i = 0; i < ILV; i++) {
 		int out = gate_pick_outcome(hi[i], g->vgN, avail, g->vgTarget);
 		survive[i] = out != 0;
+		if (g->vgKind == 2 && out == 1) {
+			outLegendFirst[i] = g->vgTarget;
+			outLegendState[i] = st[i];
+		}
 	}
 }
 
@@ -5235,9 +5262,12 @@ static void *pool_worker(void *vp) {
 					if (g->fsKey) batch_hash_key_n(g->fsKey, seeds, l0, hfirst);
 				}
 				uint8_t gateSurvive[ILV];
+				int gateLegendFirst[ILV];
+				double gateLegendState[ILV];
 				if (g->vgKind)
 					first_gate_batch(g, (const char (*)[9])seeds, l0,
-							hseed, hfirst, gateSurvive);
+							hseed, hfirst, gateSurvive,
+							gateLegendFirst, gateLegendState);
 				for (int j = 0; j < ILV; j++) {
 					done++;
 					if (g->vgKind && !gateSurvive[j]) {
@@ -5250,7 +5280,22 @@ static void *pool_worker(void *vp) {
 #endif
 						continue;
 					}
-					if (passes_pre(c, seeds[j], hseed[j], g->fsKey ? hfirst[j] : 0.0)) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+					if (g->vgKind == 2 && gateLegendFirst[j] >= 0) {
+						bool reference = passes_pre(c, seeds[j], hseed[j], hfirst[j]);
+						bool handed = passes_pre_handoff(c, seeds[j], hseed[j], hfirst[j],
+								gateLegendFirst[j], gateLegendState[j]);
+						if (reference != handed) {
+							fprintf(stderr, "legendary gate handoff diverged for seed %s\n",
+									seeds[j]);
+							abort();
+						}
+					}
+#endif
+					if (passes_pre_handoff(c, seeds[j], hseed[j],
+							g->fsKey ? hfirst[j] : 0.0,
+							g->vgKind == 2 ? gateLegendFirst[j] : -1,
+							g->vgKind == 2 ? gateLegendState[j] : 0.0)) {
 						record_hit(c);
 						break;
 					}
@@ -5319,9 +5364,12 @@ static void *worker(void *vp) {
 			batch_hash_seed_pre(sufS, seeds, hseed);
 			if (g->fsKey) batch_hash_key_pre(g->fsKey, kl, sufK, seeds, hfirst);
 			uint8_t gateSurvive[ILV];
+			int gateLegendFirst[ILV];
+			double gateLegendState[ILV];
 			if (g->vgKind)
 				first_gate_batch(g, (const char (*)[9])seeds, 8,
-						hseed, hfirst, gateSurvive);
+						hseed, hfirst, gateSurvive,
+						gateLegendFirst, gateLegendState);
 			for (int i = 0; i < ILV; i++) {
 				done++;
 				if (g->vgKind && !gateSurvive[i]) {
@@ -5334,7 +5382,22 @@ static void *worker(void *vp) {
 #endif
 					continue;
 				}
-				if (passes_pre(c, seeds[i], hseed[i], g->fsKey ? hfirst[i] : 0.0)) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+				if (g->vgKind == 2 && gateLegendFirst[i] >= 0) {
+					bool reference = passes_pre(c, seeds[i], hseed[i], hfirst[i]);
+					bool handed = passes_pre_handoff(c, seeds[i], hseed[i], hfirst[i],
+							gateLegendFirst[i], gateLegendState[i]);
+					if (reference != handed) {
+						fprintf(stderr, "legendary gate handoff diverged for seed %s\n",
+								seeds[i]);
+						abort();
+					}
+				}
+#endif
+				if (passes_pre_handoff(c, seeds[i], hseed[i],
+						g->fsKey ? hfirst[i] : 0.0,
+						g->vgKind == 2 ? gateLegendFirst[i] : -1,
+						g->vgKind == 2 ? gateLegendState[i] : 0.0)) {
 					record_hit(c);
 					break;
 				}

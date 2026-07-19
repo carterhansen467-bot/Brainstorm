@@ -99,8 +99,10 @@ Important architectural differences:
    measuring net losses. A later audit completed unrestricted FS_PACK using an
    exact weighted-catalog high-byte projection (2.52x on a two-target pack
    filter, 1.67x on a single target); route-dependent attached pools remain
-   scalar. Remaining candidates are searcher-side survivor rebatching/pick
-   handoff and the cost/selectivity planner below.*
+   scalar. The direct FS_LEGEND gate now also hands its decided first pick and
+   post-draw state to the scalar evaluator (about 7% additional throughput).
+   Remaining candidates are searcher-side survivor rebatching and the
+   cost/selectivity planner below.*
 2. **Compact and rebatch survivors.** Store a small staged candidate record
    containing rank, seed, hashed seed, first-stream result/state, and the
    post-seed hashes for required key lengths. Accumulate survivors across input
@@ -123,6 +125,13 @@ Important architectural differences:
    1.27x. Byte-identical scan and refilter pools, 200M-seed differential
    verify, and the oracle/soul-depth/search/refilter/partial/lineage/
    shard/voucher/Omen suites all pass.*
+
+   *Searcher follow-up assessment (2026-07-19): the current Soul gate leaves
+   only 19,280 of the first 1M lanes for scalar evaluation (1.93%). A second
+   staged Legendary gate can therefore address only that thin tail while
+   adding candidate copies, delayed evaluation, partial-batch flushing, and
+   separate full-space/poolfile logic. It remains a benchmark candidate, but
+   was not retained without a measured gain above that complexity cost.*
 3. **Use masked vector stages only where predicates are independent.** Specific
    Legendary selection and independent raw tag rolls are good candidates.
    Route-dependent tag collection, voucher purchasing, Charm/Omen recovery,
@@ -140,6 +149,12 @@ Important architectural differences:
    choose only among predicates proven independent. Preserve a deterministic
    choice in pool identity/telemetry when selection could affect traversal or
    reproducibility.
+
+   *Current gate ordering already tracks the measured common-case
+   selectivity: Soul rejects about 98%, unrestricted packs about 68-84%, tag
+   and Legendary about 79%, and exact-Ante voucher about 44% in the bounded
+   fixtures. A planner would usually select the existing first gate and adds
+   little until another independent multi-filter stage is proven profitable.*
 6. **Use a typed canonical predicate representation for pool attachment.** The
    valuable JAML lesson is one structured semantic model rather than matching
    filenames or UI text. Define versioned Brainstorm predicate atoms for item,

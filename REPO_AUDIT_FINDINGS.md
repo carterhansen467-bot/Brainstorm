@@ -11,14 +11,15 @@ overlapping passes.
 ## Repository and release state
 
 - Branch: `seed-pool-integrity-audit`
-- Audited committed head: `e9b5f5e`
-- Tracking branch: `myfork/seed-pool-integrity-audit`, synchronized after the
-  follow-up fetch found Luke's four-commit vector-gate stack
+- Luke's stack was audited through `e9b5f5e`; the follow-up fixes and completed
+  attachment work are recorded in the later commits listed in this report.
+- Tracking branch: `myfork/seed-pool-integrity-audit`, synchronized through
+  the latest published audit follow-up before this document's final update
 - Most recent published tag: `win-v10.8-seed-pool-overhaul` at `3b2dc23`;
   Luke's later `b6c667e..e9b5f5e` commits are not in that tag
-- The automatic-attachment implementation and the fixes described below are
-  still working-tree changes unless a later commit says otherwise. They are
-  not part of the v10.8 tag merely because this document describes them.
+- The automatic-attachment implementation and audit fixes were committed after
+  Luke's stack. They are not part of the v10.8 tag merely because this document
+  describes them.
 - Runtime/user state and generated native binaries remain ignored. No real
   `.attached` marker was present in the local pool library during inspection.
 
@@ -208,6 +209,14 @@ one test-coverage gap, and two audit/measurement infrastructure defects:
    scalar matches. Forced first-shop Buffoon targets disable the useless gate,
    absent targets reject safely, and `.bspool` routes remain scalar because an
    embedded collected tag can alter shop skips and RNG consumption.
+7. A decided FS_LEGEND hit was still recomputed immediately by
+   `passes_prepared`. The gate now hands its exact first Joker4 index and
+   post-draw stream state to both full-space and poolfile workers; ambiguous
+   and resampled lanes retain the untouched scalar path. The bounded harness
+   compares handed and scalar results for every eligible survivor. Corrected
+   Legendary-anywhere throughput rose from about 15.4M/s to 16.5M/s (roughly
+   7% additional gain), and the total gate ratio is now about 1.45x versus the
+   11.3M/s disabled path.
 
 Current bounded differential counts were 14,843, 23,706, 47,478, 66,341,
 133,587, and 311,391 scalar-passing seeds across the five gate kinds and two
@@ -217,8 +226,8 @@ tag-only gate and 19.88M/s versus 10.96M/s for the rebatch shape. The
 verification build is deliberately slower because it reruns rejected lanes
 and handed-off survivors through the scalar oracle; its rate is not a product
 benchmark. A four-thread TSan rebatch scan and Builder handoff ASan/UBSan scan
-also passed. The follow-up PGO build passed all 38 Lua/native cases and measured
-789,569/s on its exact Perkeo/first-Soul training workload.
+also passed. The follow-up PGO build passed all 38 Lua/native cases; repeated
+exact Perkeo/first-Soul training runs measured 753,427-789,569/s.
 
 The FUTURE note initially still listed handoff, Builder tag rebatching, and the
 exact-Ante voucher gate as future work after later commits in the same stack had

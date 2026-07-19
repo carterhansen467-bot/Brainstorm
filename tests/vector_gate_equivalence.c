@@ -46,6 +46,8 @@ static int check_loaded_config(Config *g, const char *label, uint64_t count) {
 	char seeds[ILV][9];
 	double hseed[ILV], hfirst[ILV];
 	uint8_t survive[ILV];
+	int legendFirst[ILV];
+	double legendState[ILV];
 	count -= count % ILV;
 	for (uint64_t rank = 0; rank < count; rank += ILV) {
 		for (int lane = 0; lane < ILV; lane++)
@@ -53,9 +55,21 @@ static int check_loaded_config(Config *g, const char *label, uint64_t count) {
 		batch_hash_seed_n((const char (*)[9])seeds, 8, hseed);
 		batch_hash_key_n(g->fsKey, (const char (*)[9])seeds, 8, hfirst);
 		first_gate_batch(g, (const char (*)[9])seeds, 8,
-				hseed, hfirst, survive);
+				hseed, hfirst, survive, legendFirst, legendState);
 		for (int lane = 0; lane < ILV; lane++) {
 			bool scalar = passes_pre(c, seeds[lane], hseed[lane], hfirst[lane]);
+			if (g->vgKind == 2 && legendFirst[lane] >= 0) {
+				bool handed = passes_pre_handoff(c, seeds[lane], hseed[lane],
+						hfirst[lane], legendFirst[lane], legendState[lane]);
+				if (handed != scalar) {
+					fprintf(stderr,
+							"FAIL legendary handoff diverged for seed %s from %s\n",
+							seeds[lane], label);
+					free(c->omenTrace);
+					free(c);
+					return 0;
+				}
+			}
 			accepted += scalar;
 			if (!survive[lane]) {
 				rejected++;

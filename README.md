@@ -614,7 +614,8 @@ the scalar evaluator.
   tag-only 1.27x.
 - **Searcher** (`brainstorm_native_search`, both full-space and poolfile
   workers): FS_SOUL ante-1 reward-pack roll chain (**1.94x** on the
-  classic Soul/legendary search), FS_LEGEND legendary-anywhere (1.33x),
+  classic Soul/legendary search), FS_LEGEND legendary-anywhere (**1.45x**
+  total after handing its decided pick/state to the scalar evaluator),
   ante-1 FS_TAG (1.28x), and exact-Ante FS_VOUCH (**1.64x** with the
   corrected family-specific benchmark).
   Unrestricted FS_PACK also projects the exact weighted booster picker onto
@@ -642,8 +643,9 @@ Removed per the keep-only-measured-gains rule in `FUTURE_CHANGES.md`.
 ### Remaining
 
 - Searcher-side survivor rebatching (e.g. Soul-gate survivors through a
-  batched legendary pick) and a searcher pick handoff mirroring the
-  Builder's.
+  batched legendary pick). The direct FS_LEGEND pick/state handoff is complete;
+  Soul survivors are only 1.93% in the bounded fixture, so a second staging
+  layer remains contingent on a measured gain that justifies its complexity.
 - Cost/selectivity planner for multi-filter ordering (deferred in
   FUTURE_CHANGES.md).
 - Known pre-existing issue to revisit for pool attachment: multi-thread
