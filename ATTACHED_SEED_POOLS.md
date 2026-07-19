@@ -47,11 +47,10 @@ After those gates, classify the attachment by coverage:
   `range_end 1785793904896`, covering the entire natural `34^8` space. It may
   replace unrestricted generation and its exhaustion is definitive.
 
-The Builder currently computes the stricter physical/full-space blockers as
-`attachment_blockers`/`attachment_base_eligible`; this must be split into base
-accelerator eligibility and authoritative eligibility. For example, the local
+The Builder now exposes separate `attachment_accelerator_*` and
+`attachment_authoritative_*` eligibility results. For example, the local
 `perkeo-a1-small-small-charm.bspool` is a completed 100M test with 19,777
-records. It is a useful accelerator but correctly cannot be authoritative.
+records: it is accepted as an accelerator and rejected as authoritative.
 
 ## Attachment contract
 
@@ -109,12 +108,16 @@ pool merely because several fields look similar.
 1. A manually selected pool always wins.
 2. With manual selection set to None, scan only `.attached` markers, validate
    their bound pool headers, and find proven compatible signature matches.
-3. Prefer a compatible authoritative pool. Otherwise choose the accelerator
-   expected to provide the best time-to-first-result; begin with fewest records
-   and break ties by pool ID/filename for deterministic behavior.
+3. Choose the compatible pool with the fewest records; authority is a
+   tie-break because it can terminate a miss. If an accelerator exhausts or a
+   pool-specific validation fails, retire only that marker and try the next
+   compatible attachment before falling back to unrestricted generation.
 4. Serialize that path through the existing `poolfile` directive. Keep running
    the current active filters over every decoded member as a correctness check.
 5. Show “Automatically using: <pool>” in the in-game UI and search telemetry.
+   Attached candidates are enriched rather than random full-space samples, so
+   geometric “chance by now” is deliberately unavailable during pool phases
+   and rebased when unrestricted generation begins.
 6. If an accelerator is exhausted, or any automatically chosen pool is missing,
    stale, or catalog-incompatible, warn and continue with unrestricted native
    search. An authoritative pool may finish on exhaustion. Preserve today's
@@ -131,19 +134,51 @@ pool merely because several fields look similar.
   pools refuse automatic selection.
 - Manual selection overrides automatic selection.
 - Multiple matching pools deterministically choose the smallest.
+- Exhausting the smallest accelerator advances to the next compatible marker
+  before unrestricted generation.
 - Accelerator exhaustion and automatic incompatibility fall back safely;
   authoritative exhaustion does not; manual incompatibility aborts.
 - Windows and macOS package/update tests preserve user pool and attachment
   sidecars.
 
+## Current implementation status
+
+Implemented on the seed-pool integrity branch:
+
+- separate accelerator and authoritative physical eligibility with current
+  catalog comparison in the Builder;
+- a versioned canonical Python criteria signature covering cumulative tag,
+  Legendary, route-policy, Soul-depth, voucher, and exclusion predicates;
+- atomic, identity-bound `.attached` creation/removal and stale-marker display;
+- Attach/Detach Builder controls, completed-pool cleanup, and Windows update
+  preservation;
+- bounded Lua marker/header validation, canonical signature reconstruction,
+  manual-selector precedence, deterministic automatic selection, and a small
+  conservative tag/Legendary implication lattice;
+- session-local effective-pool routing, main-thread criteria replay, accelerator
+  exhaustion/failure chaining, authoritative exhaustion revalidation, warning
+  telemetry, and live attached-pool status;
+- one shared native/Python writer-lock protocol covering scan, refilter,
+  convert, merge, Organizer publication, attachment creation/removal, and
+  deletion; the stable lock inode is retained intentionally after a pool is
+  removed;
+- Python, local HTTP, production-Lua, fallback-state, header, packaging, and
+  existing native pool equivalence regressions.
+
+Still intentionally deferred until dedicated differential proof exists:
+
+- voucher attachment matching;
+- composite Boolean membership;
+- broader Legendary source implications such as `any` versus `charm`;
+- automatic matching for the in-game Legendary-anywhere route;
+- avoiding the negligible chance of revisiting an accelerator member after the
+  unrestricted phase begins.
+
 ## Implementation sequence
 
-1. Split Builder eligibility into accelerator and authoritative roles, then
-   finish the canonical Python criteria-to-signature translator and small
-   proven implication lattice.
-2. Add Attach/Detach actions that atomically write/remove the bound sidecar.
-3. Add the equivalent Lua active-filter signature and marker discovery.
-4. Wire automatic choice into `buildNativeConfigText` without changing the
-   saved manual selector, including accelerator exhaustion-to-live fallback.
-5. Add native/Lua differential and stale-profile fallback tests before enabling
-   the control in release builds.
+1. Expand the differential matrix for every currently accepted implication and
+   deterministic multi-pool choice.
+2. Exercise stale-profile/open failures and accelerator fallback through the
+   real native status protocol on both platforms.
+3. Add each deferred predicate family one at a time only after proving its
+   implication direction against unrestricted search.

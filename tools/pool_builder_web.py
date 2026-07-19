@@ -200,9 +200,9 @@ def list_pool_groups():
     return core.read_pool_library(core.POOL_DIR)[1]
 
 
-def pool_library():
+def pool_library(current_catalog_hash=None, pool_dir=None):
     """Read once so flat and grouped API views describe the same snapshot."""
-    return core.read_pool_library(core.POOL_DIR)
+    return core.read_pool_library(pool_dir or core.POOL_DIR, current_catalog_hash)
 
 
 def _active_pool_paths():
@@ -244,6 +244,20 @@ def delete_pool(name, token, pool_dir=None):
     root = pool_dir or core.POOL_DIR
     return _with_delete_locks(
         lambda protected: core.delete_completed_pool(name, token, root, protected))
+
+
+def attach_pool(name, role, snapshot, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    catalog_hash = core.catalog_hash_file(snapshot.current_model_copy())
+    return _with_delete_locks(
+        lambda protected: core.attach_completed_pool(
+            name, role, root, catalog_hash, protected))
+
+
+def detach_pool(name, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    return _with_delete_locks(
+        lambda protected: core.detach_pool(name, root, protected))
 
 
 # ------------------------------------------------------------------ job ----
@@ -564,7 +578,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .pool-relation { margin-top:8px; color:#aaa5b7; }
 .pool-update { margin-top:9px; padding:8px 10px; border:1px solid #675829;
   border-radius:9px; background:#29230f; color:#f2d77a; }
-.pool-actions { display:flex; justify-content:flex-end; margin-top:11px; }
+.pool-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:7px; margin-top:11px; }
 .pool-delete { background:#3c2229 !important; border-color:#74404b !important; color:#ffc1c9 !important; }
 .empty-library { grid-column:1 / -1; padding:30px; text-align:center; border:1px dashed #34394e;
   border-radius:13px; color:var(--faint); }
@@ -1147,6 +1161,23 @@ async function deletePool(name){
   }
 }
 
+async function changePoolAttachment(name, role){
+  $("mergeError").textContent = "";
+  try {
+    const route = role ? "/api/attach" : "/api/detach";
+    const r = await fetch(route, {method:"POST", body:JSON.stringify({name, role})});
+    const result = await r.json();
+    if (result.error) throw new Error(result.error);
+    $("result").textContent = role
+      ? `Attached ${name} as an ${role} pool.`
+      : `Detached ${name}. The seed pool itself was not changed.`;
+    $("pools").dataset.rendered = "";
+    await tick();
+  } catch (e) {
+    $("mergeError").textContent = e.message || String(e);
+  }
+}
+
 function showResult(j){
   const m = j.manifest || {};
   let out = "";
@@ -1259,13 +1290,30 @@ function renderPoolCard(p, mergeSelected){
   const update = p.update_available
     ? `<div class="pool-update">Update available: the source now has ${fmt(p.new_records)} new recorded seeds. This pool still uses its pinned snapshot; automatic incremental updating is coming later.</div>`
     : "";
-  const remove = p.complete
-    ? `<div class="pool-actions"><button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete completed pool…</button></div>`
+  let attachmentState = "", attachmentAction = "";
+  if (p.attached) {
+    attachmentState = `<div class="pool-update">Attached to Brainstorm as ${esc(p.attachment_role)}.</div>`;
+    attachmentAction = `<button type="button" class="mini pool-detach" data-pool="${esc(p.name)}">Detach</button>`;
+  } else if (p.attachment) {
+    attachmentState = `<div class="pool-update">Attachment disabled: ${esc(p.attachment_invalid_reason || "marker validation failed")}</div>`;
+    attachmentAction = `<button type="button" class="mini pool-detach" data-pool="${esc(p.name)}">Remove stale attachment</button>`;
+  } else if (p.attachment_accelerator_eligible) {
+    attachmentAction = `<button type="button" class="mini pool-attach" data-pool="${esc(p.name)}" data-role="accelerator">Attach to Brainstorm · accelerator</button>`;
+    if (p.attachment_authoritative_eligible) {
+      attachmentAction += `<button type="button" class="mini pool-attach" data-pool="${esc(p.name)}" data-role="authoritative">Attach to Brainstorm · authoritative</button>`;
+    }
+  } else if (p.complete && p.attachment_accelerator_blockers?.length) {
+    attachmentState = `<div class="pool-relation">Not attachable: ${p.attachment_accelerator_blockers.map(esc).join("; ")}</div>`;
+  }
+  const deleteAction = p.complete
+    ? `<button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete completed pool…</button>`
     : "";
+  const actions = attachmentAction || deleteAction
+    ? `<div class="pool-actions">${attachmentAction}${deleteAction}</div>` : "";
   return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
     + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
     + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}${composite}</div>`
-    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}${remove}</article>`;
+    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}${attachmentState}${actions}</article>`;
 }
 
 function renderPoolLibrary(groups, pools, mergeSelected){
@@ -1366,8 +1414,12 @@ addEventListener("load", ()=>{
     updateSummary();
   });
   document.addEventListener("click", event=>{
-    const button = event.target.closest(".pool-delete");
-    if (button) deletePool(button.dataset.pool);
+    const attach = event.target.closest(".pool-attach");
+    const detach = event.target.closest(".pool-detach");
+    const remove = event.target.closest(".pool-delete");
+    if (attach) changePoolAttachment(attach.dataset.pool, attach.dataset.role);
+    else if (detach) changePoolAttachment(detach.dataset.pool, "");
+    else if (remove) deletePool(remove.dataset.pool);
   });
   syncFilterControls(); syncSourceControls(); updateSpaceHint(); updateShard();
   tick(); setInterval(tick, 1000);
@@ -1440,7 +1492,9 @@ class Handler(BaseHTTPRequestHandler):
                              "prerequisiteName": core.voucher_name(prerequisite)
                              if prerequisite else ""}
                             for key, prerequisite in self.snap.usable_vouchers()]
-                pools, pool_groups = pool_library()
+                catalog_hash = core.catalog_hash_file(
+                    self.snap.current_model_copy())
+                pools, pool_groups = pool_library(catalog_hash, self.pool_dir)
                 self._json({
                     "catalog": {"tags": tags, "legendaries": legendaries,
                                 "vouchers": vouchers, "cpus": os.cpu_count() or 8},
@@ -1500,6 +1554,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Deletion requires explicit confirmation.")
                 self._json(delete_pool(data.get("name", ""),
                                        data.get("token", ""), self.pool_dir))
+            except (ValueError, OSError) as e:
+                self._json({"error": str(e)}, 200)
+        elif parsed.path == "/api/attach":
+            try:
+                self._json(attach_pool(data.get("name", ""),
+                                       data.get("role", ""), self.snap,
+                                       self.pool_dir))
+            except (ValueError, OSError) as e:
+                self._json({"error": str(e)}, 200)
+        elif parsed.path == "/api/detach":
+            try:
+                self._json(detach_pool(data.get("name", ""), self.pool_dir))
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
         elif parsed.path == "/api/shutdown":

@@ -2996,14 +2996,29 @@ static inline void gate_reseed_hi(const double sv[ILV], uint8_t hi[ILV]) {
  * (the 1/256 gap dwarfs the scalar path's half-ulp d*n rounding). Undecided
  * or culled-resample lanes survive and rerun the unchanged scalar chain, so
  * a gate rejection is always one the scalar chain must also make. */
+/* Return the one math.random(n) bucket selected by every 52-bit output with
+ * this high byte, or -1 if the remaining 44 bits can cross a bucket boundary.
+ * The interval's upper endpoint is exclusive: using ((hi + 1) * n) >> 8
+ * treats exact boundaries as ambiguous even though the PRNG can only reach
+ * the preceding representable fraction.  Integer endpoints keep this exact
+ * for every supported catalog size and make n=32 fully decidable as intended. */
+static inline int gate_decided_bucket(uint8_t hi, int n) {
+	if (n < 1 || n > 256) return -1;
+	uint64_t first = (uint64_t)hi << 44;
+	uint64_t last = (((uint64_t)hi + 1u) << 44) - 1u;
+	unsigned lo = (unsigned)((first * (uint64_t)n) >> 52);
+	unsigned high = (unsigned)((last * (uint64_t)n) >> 52);
+	return lo == high ? (int)lo : -1;
+}
+
 /* One decided pick classification: -1 undecided (boundary or culled
  * resample), 0 decided miss, 1 decided hit of `target`. */
 static inline int gate_pick_outcome(uint8_t hi, int n, const uint8_t *avail,
 		int target) {
-	unsigned bucket = ((unsigned)hi * (unsigned)n) >> 8;
-	if (bucket != (((unsigned)hi + 1u) * (unsigned)n) >> 8) return -1;
+	int bucket = gate_decided_bucket(hi, n);
+	if (bucket < 0) return -1;
 	if (avail && !avail[bucket]) return -1;
-	return (int)bucket == target;
+	return bucket == target;
 }
 
 static void first_gate_batch(const Config *g, const char seeds[ILV][9],
@@ -3646,12 +3661,19 @@ bad_value:
 		g->vgKind = 3;
 		g->vgN = g->ntags;
 		g->vgTarget = -1;
+		int targetMatches = 0;
 		for (int i = 0; i < g->ntags; i++) {
 			g->vgTagAllowed[i] = (uint8_t)(g->tagReqOk[i]
 					&& (g->tagMinAnte[i] == 0 || g->tagMinAnte[i] <= 1));
-			if (g->vgTarget < 0 && !strcmp(g->tagKey[i], g->tag))
-				g->vgTarget = i;
+			if (!strcmp(g->tagKey[i], g->tag)) {
+				if (g->vgTarget < 0) g->vgTarget = i;
+				targetMatches++;
+			}
 		}
+		/* The scalar tag filter compares keys, not catalog indices. A modded
+		 * pool may contain the same target key more than once, in which case
+		 * either entry is a hit and a one-index gate would be unsound. */
+		if (targetMatches > 1) g->vgKind = 0;
 	} else if (g->fsId == FS_VOUCH && g->voucherAnte >= 1 && g->nvouch >= 1) {
 		/* check_voucher's exact Ante is decided by that Ante's pick alone
 		 * (earlier Antes' picks land on their own streams and only matter
@@ -3662,9 +3684,14 @@ bad_value:
 		g->vgAnte = g->voucherAnte;
 		g->vgN = g->nvouch;
 		g->vgTarget = -1;
-		for (int i = 0; i < g->nvouch; i++)
-			if (g->vgTarget < 0 && !strcmp(g->vouchKey[i], g->voucher))
-				g->vgTarget = i;
+		int targetMatches = 0;
+		for (int i = 0; i < g->nvouch; i++) {
+			if (!strcmp(g->vouchKey[i], g->voucher)) {
+				if (g->vgTarget < 0) g->vgTarget = i;
+				targetMatches++;
+			}
+		}
+		if (targetMatches > 1) g->vgKind = 0;
 	}
 	{
 		const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");

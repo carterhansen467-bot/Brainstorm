@@ -63,6 +63,11 @@ function Brainstorm.key_press_update(key)
 			-- A fresh search gets a fresh verdict: an earlier "nothing in the
 			-- seed pool matched" abort must not kill this run before it starts.
 			Brainstorm.AUTOREROLL.poolAbort = nil
+			Brainstorm.AUTOREROLL.autoPoolSelection = nil
+			Brainstorm.AUTOREROLL.autoPoolDisabled = nil
+			Brainstorm.AUTOREROLL.autoPoolTried = nil
+			Brainstorm.AUTOREROLL.autoPoolWarned = nil
+			Brainstorm.AUTOREROLL.autoPoolAbort = nil
 			Brainstorm.AUTOREROLL.autoRerollActive = true
 		end
 	end

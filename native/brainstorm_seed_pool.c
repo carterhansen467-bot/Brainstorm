@@ -2350,14 +2350,14 @@ static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
 		 * also dwarfs the half-ulp of the scalar path's d*n rounding, so a
 		 * decided bucket always equals the scalar pick. Boundary-straddling
 		 * lanes stay undecided and rerun the full scalar precheck. */
-		unsigned bucket = ((unsigned)hi[i] * (unsigned)n) >> 8;
+		int bucket = gate_decided_bucket(hi[i], n);
 		outFirst[i] = -1;
 		outState[i] = st[i];
-		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)n) >> 8)
+		if (bucket < 0)
 			survive[i] = 1;
 		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
 		else {
-			survive[i] = (int)bucket == p->vectorGateTarget;
+			survive[i] = bucket == p->vectorGateTarget;
 			/* A decided, uncalled pick is the exact scalar first draw:
 			 * survivors may hand it (and the post-draw stream state) to
 			 * pool_evaluate_pre instead of recomputing the same draw. */
@@ -2379,13 +2379,13 @@ static void pool_tag_gate_batch(const Config *g, const PoolPlan *p,
 	gate_reseed_hi(sv, hi);
 	int n = g->ntags;
 	for (int i = 0; i < ILV; i++) {
-		unsigned bucket = ((unsigned)hi[i] * (unsigned)n) >> 8;
-		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)n) >> 8)
+		int bucket = gate_decided_bucket(hi[i], n);
+		if (bucket < 0)
 			survive[i] = 1;
 		else if (!(g->tagReqOk[bucket] && (g->tagMinAnte[bucket] == 0
 				|| g->tagMinAnte[bucket] <= 1)))
 			survive[i] = 1; /* resample: undecided */
-		else survive[i] = (int)bucket == p->vectorTagTarget;
+		else survive[i] = bucket == p->vectorTagTarget;
 	}
 }
 
@@ -4238,22 +4238,28 @@ static double pool_now(void) {
 
 static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output);
 
-static int pool_mode_scan_locked(const Config *g, PoolPlan *p, const char *output) {
+static bool pool_acquire_writer_lock(const char *output, bs_file_lock_t *lock) {
 	char lockPath[1024];
 	if (snprintf(lockPath, sizeof lockPath, "%s.writer.lock", output)
 			>= (int)sizeof lockPath) {
 		fprintf(stderr, "output path is too long for its writer lock\n");
-		return 1;
+		return false;
 	}
 	bool busy = false;
-	bs_file_lock_t lock = bs_file_lock_acquire(lockPath, &busy);
-	if (lock == BS_FILE_LOCK_INVALID) {
+	*lock = bs_file_lock_acquire(lockPath, &busy);
+	if (*lock == BS_FILE_LOCK_INVALID) {
 		if (busy)
 			fprintf(stderr, "output is already being written by another scanner\n");
 		else
 			fprintf(stderr, "cannot acquire output writer lock: %s\n", strerror(errno));
-		return 1;
+		return false;
 	}
+	return true;
+}
+
+static int pool_mode_scan_locked(const Config *g, PoolPlan *p, const char *output) {
+	bs_file_lock_t lock;
+	if (!pool_acquire_writer_lock(output, &lock)) return 1;
 	int rc = pool_mode_scan(g, p, output);
 	bs_file_lock_release(lock);
 	return rc;
@@ -5446,6 +5452,22 @@ done:
 	return rc;
 }
 
+static int pool_mode_convert_locked(const char *input, const char *output) {
+	bs_file_lock_t lock;
+	if (!pool_acquire_writer_lock(output, &lock)) return 1;
+	int rc = pool_mode_convert(input, output);
+	bs_file_lock_release(lock);
+	return rc;
+}
+
+static int pool_mode_merge_locked(const char *output, int ninputs, char **inputs) {
+	bs_file_lock_t lock;
+	if (!pool_acquire_writer_lock(output, &lock)) return 1;
+	int rc = pool_mode_merge(output, ninputs, inputs);
+	bs_file_lock_release(lock);
+	return rc;
+}
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
@@ -5462,8 +5484,10 @@ int main(int argc, char **argv) {
 	bs_platform_init();
 	init_key_tables();
 	if (argc == 4 && !strcmp(argv[1], "export")) return pool_mode_export(argv[2], argv[3]);
-	if (argc == 4 && !strcmp(argv[1], "convert")) return pool_mode_convert(argv[2], argv[3]);
-	if (argc >= 5 && !strcmp(argv[1], "merge")) return pool_mode_merge(argv[2], argc - 3, argv + 3);
+	if (argc == 4 && !strcmp(argv[1], "convert"))
+		return pool_mode_convert_locked(argv[2], argv[3]);
+	if (argc >= 5 && !strcmp(argv[1], "merge"))
+		return pool_mode_merge_locked(argv[2], argc - 3, argv + 3);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);

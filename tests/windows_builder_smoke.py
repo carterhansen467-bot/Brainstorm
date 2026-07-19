@@ -9,6 +9,7 @@ usage: python tests/windows_builder_smoke.py <snapshot.cfg>
 (snapshot must contain tag_charm -- the synthetic fixture snapshots do)
 """
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,6 +53,18 @@ def main():
         "duplicate scanner unexpectedly opened the active output: %r" % list(duplicate.lines)
     assert any("already being written by another scanner" in line
                for line in duplicate.lines), list(duplicate.lines)
+
+    # Every native command that publishes a .bspool must share the same lock,
+    # not only scan/refilter. Inputs are intentionally bogus: lock rejection
+    # must happen before convert/merge can inspect them.
+    for command in (
+            [core.POOL_BIN, "convert", out, out],
+            [core.POOL_BIN, "merge", out, out, out]):
+        blocked = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        assert blocked.returncode == 1, blocked.stderr
+        assert "already being written by another scanner" in blocked.stderr, \
+            "publishing mode bypassed writer lock: %r" % command
 
     r.stop()  # Windows: CTRL_BREAK_EVENT -> checkpointed pause
     assert wait(r, 120), "scanner did not stop after CTRL_BREAK"

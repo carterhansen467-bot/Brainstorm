@@ -166,9 +166,14 @@ function Brainstorm.passesAllFilters(seed_found)
 	local finalSkipSm, finalSkipBig = filterSkipSm, filterSkipBig
 	local finalRewardSm, finalRewardBig = filterRewardSm, filterRewardBig
 	local finalVoucherRoute = nil
-	if ar.seedPoolFile and ar.seedPoolFile ~= "" and Brainstorm.readPoolHeader then
-		local poolPath = Brainstorm.seedPoolPath and Brainstorm.seedPoolPath()
-		local poolHeader = poolPath and Brainstorm.readPoolHeader(poolPath)
+	local effectivePool = ((ar.seedPoolFile and ar.seedPoolFile ~= "")
+		or Brainstorm.AUTOREROLL.autoPoolSelection)
+		and Brainstorm.effectiveSeedPoolSelection
+		and Brainstorm.effectiveSeedPoolSelection() or nil
+	if effectivePool and Brainstorm.readPoolHeader then
+		local poolPath = effectivePool.path
+		local poolHeader = effectivePool.header
+			or (poolPath and Brainstorm.readPoolHeader(poolPath))
 		if not poolHeader then return false end
 		local poolOK
 		-- Active tag/classic-Soul predicates were just read on their own pass.
@@ -2644,6 +2649,15 @@ function Brainstorm.updateAutoReroll(dt)
 	-- the search with a message: degrading to the full-space Lua search would
 	-- return seeds outside the selected pool.
 	local arS = Brainstorm.SETTINGS.autoreroll
+	if A.autoPoolAbort then
+		local reason = A.autoPoolAbort
+		A.autoPoolAbort = nil
+		A.autoRerollActive = false
+		Brainstorm.stopSearchThread()
+		Brainstorm.resetSearchUI()
+		Brainstorm.showSeedSlotAlert(reason)
+		return
+	end
 	if arS.seedPoolFile and arS.seedPoolFile ~= "" then
 		local reason = nil
 		if A.poolAbort then
@@ -2672,6 +2686,13 @@ function Brainstorm.updateAutoReroll(dt)
 	if useNative then
 		if not A.nativeActive then
 			if not Brainstorm.startNativeSearch() then
+				if A.autoPoolSelection then
+					A.autoPoolSelection = nil
+					A.autoPoolDisabled = true
+					if Brainstorm.setAttachedPoolEstimateMode then
+						Brainstorm.setAttachedPoolEstimateMode(false)
+					end
+				end
 				A.nativeFailed = true -- unserializable config (e.g. modded key with spaces)
 			end
 		end
@@ -2690,8 +2711,13 @@ function Brainstorm.updateAutoReroll(dt)
 					-- A calibrated helper should never diverge. A pool search is
 					-- native-only, so surface the embedded-criteria failure instead
 					-- of describing it as a missing helper on the next frame.
+					local selected = Brainstorm.effectiveSeedPoolSelection
+						and Brainstorm.effectiveSeedPoolSelection()
 					if arS.seedPoolFile and arS.seedPoolFile ~= "" then
 						A.poolAbort = "pool: in-game verification rejected the native result"
+					elseif selected and selected.automatic then
+						Brainstorm.retireAutomaticSeedPool(selected)
+						A.autoPoolWarned = "automatic pool result failed in-game verification; trying the next safe source"
 					else
 						A.nativeFailed = true
 					end
@@ -2977,6 +3003,7 @@ function Brainstorm.readPoolHeader(path)
 		if k == "end" then break end
 		if k == "records" or k == "complete" or k == "coverage_complete"
 				or k == "modelver" or k == "refilter_depth" or k == "header_bytes"
+				or k == "seedspace" or k == "range_start" or k == "range_end"
 				or k == "scan_cursor" or k == "input_cursor" or k == "parent_records"
 				or k == "parent_data_bytes" or k == "parent_coverage_complete"
 				or k == "input_record_start" or k == "input_record_end"
@@ -2984,7 +3011,8 @@ function Brainstorm.readPoolHeader(path)
 				or k == "composite_schema" or k == "composite_inputs"
 				or k == "composite_metadata_complete" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
-				or k == "catalog_hash" or k == "tag_route" or k == "family_id"
+				or k == "catalog_hash" or k == "criteria_hash" or k == "charset"
+				or k == "tag_route" or k == "family_id"
 				or k == "segment_id" or k == "stage_hash" or k == "lineage_id"
 				or k == "derivation_id" or k == "snapshot_id"
 				or k == "membership_digest" or k == "metadata_digest"
@@ -3050,7 +3078,7 @@ function Brainstorm.readPoolHeader(path)
 					minAnte = tonumber(p[2]), minPhase = minPhase,
 					maxAnte = maxAnte, maxPhase = maxPhase,
 					negative = neg == 1, source = source, soulDepth = depth,
-					humanLocation = #p == 8 }
+					humanLocation = #p == 8, inherited = true }
 			end
 		elseif k == "route_tag" then
 			local p = words(v)
@@ -3089,7 +3117,15 @@ function Brainstorm.readPoolHeader(path)
 	end
 	for _, rule in ipairs(h.legendaries) do
 		rule.soulDepth = rule.soulDepth or 1
+		rule.legendaryRoutes = h.legendary_routes or "full"
 		h.pool_legendaries[#h.pool_legendaries + 1] = rule
+	end
+	for _, rule in ipairs(h.pool_legendaries) do
+		if rule.inherited then
+			rule.legendaryRoutes = h.route_legendary_routes or "full"
+		else
+			rule.legendaryRoutes = rule.legendaryRoutes or h.legendary_routes or "full"
+		end
 	end
 	h.pool_vouchers = {}
 	for _, rule in ipairs(h.route_vouchers) do h.pool_vouchers[#h.pool_vouchers + 1] = rule end
@@ -3102,6 +3138,241 @@ function Brainstorm.readPoolHeader(path)
 		h.pool_voucher_exclusions[#h.pool_voucher_exclusions + 1] = key
 	end
 	return h
+end
+
+local ATTACHMENT_SEEDSPACE = 1785793904896
+
+local function attachmentWords(value)
+	local out = {}
+	for word in tostring(value or ""):gmatch("%S+") do out[#out + 1] = word end
+	return out
+end
+
+function Brainstorm.poolAttachmentPredicatesFromHeader(h)
+	if not h then return nil end
+	local out = {}
+	for _, rule in ipairs(h.route_tags or {}) do
+		out[#out + 1] = table.concat({ "tag", rule.collect and "collect" or "observe",
+			rule.key, rule.minAnte, rule.minPhase, rule.maxAnte, rule.maxPhase,
+			rule.count }, " ")
+	end
+	for _, rule in ipairs(h.pool_legendaries or {}) do
+		out[#out + 1] = table.concat({ "legendary", rule.key, rule.minAnte,
+			rule.minPhase, rule.maxAnte, rule.maxPhase, rule.negative and 1 or 0,
+			rule.source, rule.soulDepth, rule.legendaryRoutes or "full" }, " ")
+	end
+	for _, rule in ipairs(h.pool_vouchers or {}) do
+		out[#out + 1] = table.concat({ "voucher", rule.key, rule.minAnte,
+			rule.maxAnte }, " ")
+	end
+	for _, key in ipairs(h.pool_voucher_exclusions or {}) do
+		out[#out + 1] = "voucher_exclude " .. key
+	end
+	table.sort(out)
+	return out
+end
+
+local function sameStringList(a, b)
+	if not a or not b or #a ~= #b then return false end
+	for i = 1, #a do if a[i] ~= b[i] then return false end end
+	return true
+end
+
+function Brainstorm.readPoolAttachment(markerPath)
+	local nativefs = require("nativefs")
+	local raw = nativefs.read(markerPath, 256 * 1024)
+	if not raw or not raw:match("^BRAINSTORM_POOL_ATTACHMENT 1[\r\n]") then
+		return nil, "unsupported or unreadable attachment marker"
+	end
+	local marker = { predicates = {} }
+	local ended = false
+	for line in raw:gmatch("[^\r\n]+") do
+		local key, value = line:match("^(%S+)%s*(.-)%s*$")
+		if key == "end" then ended = true; break end
+		if key == "predicate" then
+			marker.predicates[#marker.predicates + 1] = value
+		elseif key ~= "BRAINSTORM_POOL_ATTACHMENT" then
+			if marker[key] ~= nil then return nil, "duplicate attachment field " .. key end
+			marker[key] = value
+		end
+	end
+	if not ended or marker.enabled ~= "1" then return nil, "disabled or truncated attachment marker" end
+	if marker.role ~= "accelerator" and marker.role ~= "authoritative" then
+		return nil, "invalid attachment role"
+	end
+	if marker.signature_schema ~= "1" then return nil, "unsupported attachment signature" end
+	if not marker.pool_file or marker.pool_file == "" or marker.pool_file:find("[\r\n/\\]") then
+		return nil, "unsafe attached pool filename"
+	end
+	local expectedMarker = markerPath:match("([^/\\]+)$")
+	if expectedMarker ~= marker.pool_file .. ".attached" then
+		return nil, "attachment marker filename does not match its pool"
+	end
+	local poolPath = Brainstorm.seedPoolDir() .. "/" .. marker.pool_file
+	local info = nativefs.getInfo(poolPath)
+	local h = info and Brainstorm.readPoolHeader(poolPath)
+	if not h then return nil, "attached pool is missing or unreadable" end
+	for _, key in ipairs({ "pool_id", "catalog_hash", "criteria_hash", "snapshot_id" }) do
+		if not h[key] or h[key] == "" or tostring(h[key]):lower() ~= tostring(marker[key] or ""):lower() then
+			return nil, "attachment " .. key .. " no longer matches the pool"
+		end
+	end
+	if tonumber(marker.file_size) ~= tonumber(info.size) then
+		return nil, "attached pool file size changed"
+	end
+	if info.modtime and tonumber(marker.file_mtime_ns)
+			and math.floor(tonumber(marker.file_mtime_ns) / 1000000000)
+				~= math.floor(tonumber(info.modtime)) then
+		return nil, "attached pool modification time changed"
+	end
+	if h.complete ~= 1 or h.coverage_complete ~= 1 or h.records == nil or h.records <= 0
+			or h.modelver ~= 6 or h.space ~= "natural"
+			or h.seedspace ~= ATTACHMENT_SEEDSPACE
+			or not h.range_start or not h.range_end or h.range_start < 0
+			or h.range_start >= h.range_end or h.range_end > ATTACHMENT_SEEDSPACE
+			or h.composite_schema then
+		return nil, "attached pool is not a complete natural-space conjunction"
+	end
+	if marker.role == "authoritative"
+			and (h.range_start ~= 0 or h.range_end ~= ATTACHMENT_SEEDSPACE) then
+		return nil, "authoritative attachment does not cover the full natural seed space"
+	end
+	local canonical = Brainstorm.poolAttachmentPredicatesFromHeader(h)
+	table.sort(marker.predicates)
+	if not sameStringList(marker.predicates, canonical) then
+		return nil, "attachment predicates no longer match the pool header"
+	end
+	marker.path, marker.poolPath, marker.header = markerPath, poolPath, h
+	marker.records = h.records
+	return marker
+end
+
+local function attachmentPredicate(value)
+	local p = attachmentWords(value)
+	if p[1] == "tag" and #p == 8 then
+		return { kind = "tag", mode = p[2], key = p[3], minAnte = tonumber(p[4]),
+			minPhase = p[5], maxAnte = tonumber(p[6]), maxPhase = p[7],
+			count = tonumber(p[8]) }
+	elseif p[1] == "legendary" and #p == 10 then
+		return { kind = "legendary", key = p[2], minAnte = tonumber(p[3]),
+			minPhase = p[4], maxAnte = tonumber(p[5]), maxPhase = p[6],
+			negative = p[7] == "1", source = p[8], depth = tonumber(p[9]),
+			routes = p[10] }
+	elseif p[1] == "voucher" or p[1] == "voucher_exclude" then
+		return { kind = p[1], unsupported = true }
+	end
+	return nil
+end
+
+function Brainstorm.activeAttachmentPredicates()
+	local ar = Brainstorm.SETTINGS.autoreroll or {}
+	local active = {}
+	if ar.searchTag and ar.searchTag ~= "" and not ar.searchTagAnywhere then
+		active[#active + 1] = { kind = "tag", mode = "collect", key = ar.searchTag,
+			minAnte = 1, minPhase = "small", maxAnte = 1,
+			maxPhase = "small", count = 1 }
+	end
+	if ar.searchLegendary and ar.searchLegendary ~= ""
+			and not ar.searchLegendaryAnywhere and (ar.searchForSoul or 0) <= 1 then
+		active[#active + 1] = { kind = "legendary", key = ar.searchLegendary,
+			minAnte = 1, minPhase = "small", maxAnte = 1, maxPhase = "small",
+			negative = ar.searchNegativeLegendary and true or false,
+			source = "charm", depth = 1, routes = "canonical_charm" }
+	end
+	return active
+end
+
+local function attachmentPosition(ante, phase)
+	local order = ({ small = 0, big = 1, boss = 2 })[phase]
+	return ante and order and ((ante - 1) * 3 + order) or nil
+end
+
+local function activeImpliesPoolPredicate(active, pool)
+	if not active or not pool or active.kind ~= pool.kind or active.key ~= pool.key then return false end
+	local amin, amax = attachmentPosition(active.minAnte, active.minPhase),
+		attachmentPosition(active.maxAnte, active.maxPhase)
+	local pmin, pmax = attachmentPosition(pool.minAnte, pool.minPhase),
+		attachmentPosition(pool.maxAnte, pool.maxPhase)
+	if not amin or not amax or not pmin or not pmax or amin ~= pmin or amax > pmax then
+		return false
+	end
+	if pool.kind == "tag" then
+		-- Equal route starts preserve which occurrence is collected; extending
+		-- only the end cannot change an active request's first matching tag.
+		return active.mode == pool.mode and active.count >= (pool.count or 1)
+	end
+	if pool.kind == "legendary" then
+		if active.source ~= pool.source then return false end -- widen only after differential proof
+		if pool.negative and not active.negative then return false end
+		if pool.depth ~= 0 and pool.depth ~= active.depth then return false end
+		if pool.routes == "canonical_charm" and active.routes ~= "canonical_charm" then return false end
+		return pool.routes == "full" or pool.routes == "canonical_charm"
+	end
+	return false
+end
+
+function Brainstorm.attachmentMatchesActiveFilters(marker)
+	local active = Brainstorm.activeAttachmentPredicates()
+	if #active == 0 then return false end
+	local decoded, hasTag, hasLegendary = {}, false, false
+	for _, encoded in ipairs(marker.predicates or {}) do
+		local pool = attachmentPredicate(encoded)
+		if not pool or pool.unsupported then return false end
+		decoded[#decoded + 1] = pool
+		hasTag = hasTag or pool.kind == "tag"
+		hasLegendary = hasLegendary or pool.kind == "legendary"
+	end
+	-- The classic in-game Legendary filter assumes an A1-Small Charm reward.
+	-- A combined pool must prove that exact physical tag; pairing the same
+	-- Legendary request with Rare/Negative/etc. would replay a different route.
+	if hasTag and hasLegendary then
+		for _, pool in ipairs(decoded) do
+			if pool.kind == "tag" and pool.key ~= "tag_charm" then return false end
+			if pool.kind == "legendary" and pool.source ~= "charm" then return false end
+		end
+	end
+	for _, pool in ipairs(decoded) do
+		local implied = false
+		for _, request in ipairs(active) do
+			if activeImpliesPoolPredicate(request, pool) then implied = true; break end
+		end
+		if not implied then return false end
+	end
+	return true
+end
+
+function Brainstorm.findAutomaticSeedPool()
+	local ar = Brainstorm.SETTINGS.autoreroll or {}
+	if ar.seedPoolFile and ar.seedPoolFile ~= "" then return nil end
+	local nativefs = require("nativefs")
+	local dir = Brainstorm.seedPoolDir()
+	local choices = {}
+	local tried = Brainstorm.AUTOREROLL.autoPoolTried or {}
+	local okItems, items = pcall(nativefs.getDirectoryItems, dir)
+	for _, name in ipairs(okItems and items or {}) do
+		if name:match("%.bspool%.attached$") then
+			local okMarker, marker, reason = pcall(
+				Brainstorm.readPoolAttachment, dir .. "/" .. name)
+			if not okMarker then marker, reason = nil, "attachment validation failed" end
+			if marker and not tried[marker.path]
+					and Brainstorm.attachmentMatchesActiveFilters(marker) then
+				choices[#choices + 1] = marker
+			elseif reason then
+				-- Invalid automatic markers are non-fatal; native validation remains
+				-- authoritative for a marker that passes this bounded Lua preflight.
+				Brainstorm.AUTOREROLL.autoPoolInvalid = reason
+			end
+		end
+	end
+	table.sort(choices, function(a, b)
+		if a.records ~= b.records then return a.records < b.records end
+		-- Either role is a sound first pass. Prefer fewer candidates; retain
+		-- authority only as a tie-break because it can terminate a miss.
+		if a.role ~= b.role then return a.role == "authoritative" end
+		if a.pool_id ~= b.pool_id then return tostring(a.pool_id) < tostring(b.pool_id) end
+		return a.pool_file < b.pool_file
+	end)
+	return choices[1]
 end
 
 -- One-line description shown under the in-game Seed Pool selector; the
@@ -3172,6 +3443,53 @@ function Brainstorm.seedPoolPath()
 	local p = Brainstorm.seedPoolDir() .. "/" .. name
 	if not nativefs.getInfo(p) then return nil end
 	return p
+end
+
+-- The saved selector remains strictly manual. Automatic attachments live only
+-- for the current search session and never rewrite that setting.
+function Brainstorm.effectiveSeedPoolSelection()
+	local manual = Brainstorm.seedPoolPath()
+	if manual then return { path = manual, role = "manual", automatic = false } end
+	local selected = Brainstorm.AUTOREROLL and Brainstorm.AUTOREROLL.autoPoolSelection
+	if selected then
+		return { path = selected.poolPath, role = selected.role, automatic = true,
+			name = selected.pool_file, pool_file = selected.pool_file,
+			markerPath = selected.path, pool_id = selected.pool_id,
+			header = selected.header }
+	end
+	return nil
+end
+
+function Brainstorm.revalidateAutomaticSeedPool(selected)
+	if not selected or not selected.automatic or not selected.markerPath then
+		return nil, "automatic attachment identity is unavailable"
+	end
+	local ok, fresh, reason = pcall(Brainstorm.readPoolAttachment, selected.markerPath)
+	if not ok or not fresh then
+		return nil, reason or "automatic attachment validation failed"
+	end
+	if fresh.role ~= selected.role or fresh.poolPath ~= selected.path
+			or fresh.pool_file ~= selected.pool_file
+			or (selected.pool_id and fresh.pool_id ~= selected.pool_id)
+			or not Brainstorm.attachmentMatchesActiveFilters(fresh) then
+		return nil, "automatic attachment changed after search selection"
+	end
+	return fresh
+end
+
+function Brainstorm.retireAutomaticSeedPool(selected)
+	local A = Brainstorm.AUTOREROLL
+	local markerPath = selected and (selected.markerPath or selected.path)
+	if markerPath then
+		A.autoPoolTried = A.autoPoolTried or {}
+		A.autoPoolTried[markerPath] = true
+	end
+	A.autoPoolSelection = nil
+end
+
+function Brainstorm.effectiveSeedPoolPath()
+	local selected = Brainstorm.effectiveSeedPoolSelection()
+	return selected and selected.path or nil
 end
 
 -- Parity checks: values computed with the GAME's own pseudohash /
@@ -3257,7 +3575,7 @@ function Brainstorm.buildNativeConfigText(session)
 	-- Seed-pool restriction: the helper only considers seeds recorded in this
 	-- .bspool. The directive consumes the rest of the line (mod paths contain
 	-- spaces), so it bypasses ck(); only a newline could break the format.
-	local poolPath = Brainstorm.seedPoolPath and Brainstorm.seedPoolPath()
+	local poolPath = Brainstorm.effectiveSeedPoolPath and Brainstorm.effectiveSeedPoolPath()
 	if poolPath then
 		if poolPath:find("\n") then return nil end
 		L[#L + 1] = "poolfile " .. poolPath
@@ -3342,6 +3660,18 @@ function Brainstorm.startNativeSearch()
 	local A = Brainstorm.AUTOREROLL
 	local nativefs = require("nativefs")
 	local p = Brainstorm.nativePaths()
+	local ar = Brainstorm.SETTINGS.autoreroll or {}
+	if ar.seedPoolFile and ar.seedPoolFile ~= "" then
+		A.autoPoolSelection = nil
+	elseif not A.autoPoolDisabled then
+		A.autoPoolSelection = Brainstorm.findAutomaticSeedPool
+			and Brainstorm.findAutomaticSeedPool() or nil
+	else
+		A.autoPoolSelection = nil
+	end
+	if Brainstorm.setAttachedPoolEstimateMode then
+		Brainstorm.setAttachedPoolEstimateMode(A.autoPoolSelection ~= nil)
+	end
 	A.searchSession = (A.searchSession or 0) + 1
 	local cfg = Brainstorm.buildNativeConfigText(A.searchSession)
 	if not cfg then return false end
@@ -3380,6 +3710,8 @@ function Brainstorm.startNativeSearch()
 		local backend = Brainstorm.nativeSearchBackendKey
 			and Brainstorm.nativeSearchBackendKey(threads)
 			or ("native-" .. tostring(threads))
+		local selected = Brainstorm.effectiveSeedPoolSelection()
+		if selected then backend = backend .. "-pool-" .. tostring(selected.role) end
 		Brainstorm.startSearchBackendCounter(backend)
 	end
 	A.nativeActive = true
@@ -3419,8 +3751,39 @@ function Brainstorm.pollNativeSearch()
 	end
 	local emsg = txt:match("E ([^\n]+)")
 	if emsg then
+		local selected = Brainstorm.effectiveSeedPoolSelection
+			and Brainstorm.effectiveSeedPoolSelection()
 		Brainstorm.stopNativeSearch()
-		if emsg:find("^pool") then
+		if emsg:find("^pool") and selected and selected.automatic then
+			if selected.role == "authoritative"
+					and emsg:find("no seed in the pool", 1, true) then
+				local fresh, revalidateError = Brainstorm.revalidateAutomaticSeedPool(selected)
+				if fresh then
+					A.autoPoolAbort = "No seed in the attached authoritative pool matches these filters"
+				else
+					Brainstorm.retireAutomaticSeedPool(selected)
+					A.autoPoolWarned = "automatic authoritative pool changed during search; trying the next safe source"
+					print("[Brainstorm] " .. A.autoPoolWarned .. ": "
+						.. tostring(revalidateError))
+				end
+			else
+				Brainstorm.retireAutomaticSeedPool(selected)
+				if not A.autoPoolWarned then
+					A.autoPoolWarned = "automatic " .. tostring(selected.role)
+						.. " pool unavailable or exhausted; trying the next safe source"
+					print("[Brainstorm] " .. A.autoPoolWarned .. ": " .. emsg)
+				end
+			end
+			elseif selected and selected.automatic then
+				A.autoPoolSelection = nil
+				A.autoPoolDisabled = true
+				A.autoPoolWarned = "automatic pool search failed; continuing unrestricted"
+				if Brainstorm.setAttachedPoolEstimateMode then
+					Brainstorm.setAttachedPoolEstimateMode(false)
+				end
+				print("[Brainstorm] " .. A.autoPoolWarned .. ": " .. emsg)
+				A.nativeFailed = true
+		elseif emsg:find("^pool") then
 			-- Pool problems (bad/missing/exhausted .bspool) must NOT degrade to
 			-- the full-space Lua search: that would return seeds outside the
 			-- pool. updateAutoReroll stops the search and shows this message.

@@ -43,6 +43,7 @@ import re
 import struct
 import sys
 import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -51,8 +52,10 @@ try:
     # Keep header discovery identical to the standalone builder, especially
     # the bounded schema-3 header_bytes second read.
     from brainstorm_pool_builder import read_pool_header_text
+    from pool_writer_lock import pool_writer_guard
 except ImportError:  # Imported as tools.brainstorm_pool_organizer in tests.
     from tools.brainstorm_pool_builder import read_pool_header_text
+    from tools.pool_writer_lock import pool_writer_guard
 
 
 HEADER_PREFIX_BYTES = 1024
@@ -1869,8 +1872,17 @@ def combine_pools(readers: Sequence[BSPoolReader], output_path: str,
                   operation: str = "union", label: str = "Combined seed pool",
                   progress=None) -> Dict[str, object]:
     """Stream a literal set operation and atomically publish one BSP3 pool."""
-    context = prepare_combine(readers, operation)
     output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with pool_writer_guard(output_path):
+        return _combine_pools_locked(
+            readers, output_path, operation, label, progress)
+
+
+def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
+                          operation: str, label: str,
+                          progress=None) -> Dict[str, object]:
+    context = prepare_combine(readers, operation)
     directory = os.path.dirname(output_path)
     os.makedirs(directory, exist_ok=True)
     if os.path.exists(output_path):
@@ -2088,12 +2100,25 @@ def split_pool(reader: BSPoolReader, output_dir: str,
     for row in category_rows:
         category = row["category_id"]
         destination = os.path.join(output_dir, safe_filename(category))
-        if os.path.exists(destination):
-            raise PoolError("output already exists: %s" % destination)
         if destination in destinations.values():
             raise PoolError("two categories resolve to the same output filename")
         destinations[category] = destination
         labels[category] = row["label"]
+    with ExitStack() as output_locks:
+        for destination in sorted(destinations.values()):
+            output_locks.enter_context(pool_writer_guard(destination))
+            if os.path.exists(destination):
+                raise PoolError("output already exists: %s" % destination)
+        return _write_split_outputs(
+            reader, selected, choices, remainder_id, destinations, labels,
+            report, report_path)
+
+
+def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
+                         choices: Dict[str, str], remainder_id: Optional[str],
+                         destinations: Dict[str, str], labels: Dict[str, str],
+                         report: Dict[str, object], report_path: str):
+    """Write and publish split outputs while the caller holds every lock."""
     writers = {}  # type: Dict[str, BSP3OutputWriter]
     linked = []  # type: List[str]
     try:

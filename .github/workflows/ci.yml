@@ -28,8 +28,12 @@ jobs:
         run: brew install luajit
       - name: Oracle equivalence (Lua vs native, this machine's LuaJIT)
         run: LUAJIT=luajit sh tests/native_equivalence.sh
+      - name: Analytical search telemetry
+        run: luajit tests/search_estimate.lua
       - name: Exact native arithmetic fast paths
         run: FASTPATH_CASES=1000000 sh tests/native_fastpath_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Vector first-gate differential
+        run: sh tests/vector_gate_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures"
       - name: Fresh profile-guided native helper builds
         run: BRAINSTORM_NATIVE_SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" sh native/build_pgo.sh train
       - name: PGO search oracle equivalence (no rebuild)
@@ -56,6 +60,8 @@ jobs:
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
           python3 tests/pool_builder_delete.py
+          python3 tests/pool_attachment.py
+          sh tests/pool_attachment_implication.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool compression + legacy conversion equivalence
         run: TAG=tag_charm sh tests/pool_compression_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Distributed shard planning + merge equivalence
@@ -91,8 +97,12 @@ jobs:
           "$(cygpath -u "$RUNNER_TEMP")/luajit/src/luajit.exe" -v
       - name: Oracle equivalence (Windows LuaJIT vs .exe) — the bit-exactness proof
         run: sh tests/native_equivalence.sh
+      - name: Analytical search telemetry
+        run: "$LUAJIT" tests/search_estimate.lua
       - name: Exact native arithmetic fast paths
         run: FASTPATH_CASES=1000000 sh tests/native_fastpath_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Vector first-gate differential
+        run: sh tests/vector_gate_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures"
       - name: Hash/odometer generation equivalence
         run: sh tests/hash_generation_equivalence.sh
       - name: Pool engine vs established reference equivalence
@@ -111,6 +121,8 @@ jobs:
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
           python tests/pool_builder_delete.py
+          python tests/pool_attachment.py
+          sh tests/pool_attachment_implication.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool compression + legacy conversion equivalence
         run: TAG=tag_charm sh tests/pool_compression_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Distributed shard planning + merge equivalence

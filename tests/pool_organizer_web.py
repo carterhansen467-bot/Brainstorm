@@ -75,14 +75,25 @@ class OrganizerWebRegression(unittest.TestCase):
         resolved = web.build_split_plan(reader, choice_plan=choices)
         self.assertEqual(resolved["unresolved_ambiguities"], 0)
 
-        result = web.execute_split(self.source_name, {
+        request = {
             "snapshot": self.identity["snapshot"],
             "selectedCategories": None,
             "choicePlan": choices,
             "unmatchedPolicy": "remainder",
             "remainderName": "Needs review",
             "prefix": "paused-test",
-        }, self.temp.name)
+        }
+        locked_final = os.path.join(
+            self.temp.name,
+            "paused-test--" + organizer.safe_filename(destination))
+        with organizer.pool_writer_guard(locked_final):
+            with self.assertRaisesRegex(ValueError, "currently being written"):
+                web.execute_split(self.source_name, request, self.temp.name)
+        self.assertFalse(any(name.startswith("paused-test--")
+                             and name.endswith(".bspool")
+                             for name in os.listdir(self.temp.name)))
+
+        result = web.execute_split(self.source_name, request, self.temp.name)
         self.assertTrue(result["completed"])
         self.assertEqual(len(result["outputs"]), 4)
         self.assertTrue(os.path.isfile(result["report_path"]))

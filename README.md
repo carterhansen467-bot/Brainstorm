@@ -101,8 +101,11 @@ wall-clock time elapsed, measured seeds/second, average time remaining, and the
 cumulative chance of a hit by that point. Candidate odds use the active
 profile's eligible pools, booster weights, physical pack route, and configured
 joker windows; time uses observed throughput on this machine. These are
-analytical planning estimates. For a higher-confidence match-rate measurement,
-the Seed Pool Builder's **Quick estimate** actually evaluates a 2M-seed sample.
+analytical planning estimates. Automatically attached pools contain enriched
+candidates rather than random full-space samples, so the chance is marked
+unavailable during those phases and rebased if unrestricted generation begins.
+For a higher-confidence match-rate measurement, the Seed Pool Builder's
+**Quick estimate** actually evaluates a 2M-seed sample.
 
 ### Deep search: tags and legendaries anywhere (antes 1-8)
 Two more toggles on the main Brainstorm tab: **Tag: any blind, antes 1-8**
@@ -437,10 +440,19 @@ leaves the machine) where you can:
   **Difference** across unrelated pools—even when their base filters differ;
 - see every finished pool with its embedded criteria, its name, and its
   **pool id** -- a short fingerprint also shown by the in-game selector, so
-  two people can confirm they're holding the same pool. Finished pools land
+  two people can confirm they're holding the same pool;
+- opt a completed natural-space pool into **Attach to Brainstorm**. A partial
+  range becomes an accelerator that falls back to unrestricted generation on
+  exhaustion; only proven full `34^8` coverage becomes authoritative. Detach
+  removes only the small local policy marker, and deleting a completed pool
+  removes that marker safely;
+- delete a completed pool and its checkpoint/manifest/attachment sidecars with
+  an identity-bound two-step confirmation. Finished pools land
   in `seed_pools/` and appear in the in-game Seed Pool selector
   automatically; sharing a pool = sending someone that one `.bspool` file
-  to drop into their own `seed_pools/` folder.
+  to drop into their own `seed_pools/` folder. A tiny `.writer.lock` may remain
+  after deletion; it is an intentional reusable coordination inode, contains
+  no seed data, and prevents cross-process writer races.
 
 First-run notes: macOS may ask to install the Command Line Developer Tools
 (the app compiles the scanner once, and `python3` ships with those tools) --
@@ -515,6 +527,22 @@ and every derived pool retains `coverage_complete 0` even after its own
 refilter finishes. Pool searches never fall back to the full-space Lua thread
 search -- that could return a seed outside the selected pool. They require the
 native helper (macOS: built by `native/build.sh`; Windows: release-zip exes).
+
+An attached pool is different from a manual selection. With **Seed Pool: None**,
+Brainstorm may automatically choose a compatible `.attached` pool whose
+embedded predicate is proven broader than the active request. Manual selection
+always wins. Automatic records still pass the native filters and the independent
+main-thread Lua verification. Brainstorm tries compatible attachments from
+fewest to most records; an exhausted or invalid accelerator advances to the
+next safe attachment and then to unrestricted generation. An authoritative
+full-natural-space pool revalidates its marker and file identity before it may
+report definitive exhaustion. The initial conservative matcher supports classic tag
+and classic Legendary/Charm relationships, including wider ending windows,
+optional Negative, first-or-second Soul breadth, and full versus Fast Exact
+coverage. Voucher, Legendary-anywhere, composite, tag-anywhere, and ambiguous
+route/source relationships are ignored for automatic selection until their
+implication rules have separate differential proofs; they remain available via
+the manual selector.
 
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
 their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model
@@ -593,7 +621,11 @@ the scalar evaluator.
   handoff divergence checks, byte-identical single-thread scan and
   refilter pools with gates on/off, and the Lua-oracle, soul-depth,
   fastpath, search/refilter/partial/lineage/shard, voucher-route, and
-  Omen/Charm suites.
+  Omen/Charm suites. `tests/vector_gate_equivalence.sh` keeps a bounded,
+  non-vacuous version of the four-kind differential and byte-identical
+  Builder checks in CI on macOS and Windows. It also exhausts every high-byte
+  bucket interval for catalog sizes 1 through 256; duplicate modded target
+  keys conservatively disable index-specific tag/voucher gates.
 
 ### Evaluated and rejected
 

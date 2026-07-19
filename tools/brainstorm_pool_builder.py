@@ -37,6 +37,11 @@ import threading
 import time
 from collections import deque
 
+try:
+    from pool_writer_lock import pool_writer_guard as _pool_writer_guard
+except ImportError:  # Imported as tools.brainstorm_pool_builder.
+    from tools.pool_writer_lock import pool_writer_guard as _pool_writer_guard
+
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 if IS_FROZEN:
     # __file__ points into PyInstaller's temporary onefile extraction folder.
@@ -264,7 +269,6 @@ class Snapshot:
         raise ValueError("native_search.cfg is stale or missing current profile data. "
                          "Launch Balatro, toggle Ctrl+A on and off once, then "
                          "reopen the Seed Pool Builder.")
-
 
 # Soul search depth in UI order. 1 = the first Soul only; 0 ("any") = up to
 # two Souls deep -- the first Soul, or failing that the second. The legacy
@@ -692,14 +696,196 @@ def _pool_identity(value):
     return value
 
 
-def pool_attachment_base_blockers(pool):
-    """Physical/coverage blockers before semantic filter matching.
+ATTACHMENT_SCHEMA = 1
+ATTACHMENT_SIGNATURE_SCHEMA = 1
+ATTACHMENT_ROLES = ("accelerator", "authoritative")
+ATTACHMENT_PHASES = ("boss", "small", "big")
+ATTACHMENT_SOURCES = ("any", "shop", "charm", "ethereal")
+ATTACHMENT_ROUTE_POLICIES = ("full", "canonical_charm")
+ATTACHMENT_CATALOG_DIRECTIVES = {
+    "modelver", "tagdef", "vouchdef", "vouchroute", "vouchowned",
+    "jokerdef", "boostdef", "specialdef",
+}
 
-    ``coverage_complete`` means complete coverage of a pool's *declared
-    source*, which may be a 100M test range or one distributed shard.  An
-    automatically substituted pool must cover the whole natural space that
-    the live native search would otherwise generate.
+
+def catalog_hash_file(path):
+    """Mirror the native helper's immutable profile/catalog fingerprint."""
+    value = 1469598103934665603
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            tokens = line.split()
+            if not tokens or (tokens[0] not in ATTACHMENT_CATALOG_DIRECTIVES
+                              and not tokens[0].startswith("check_")):
+                continue
+            for token in tokens:
+                for byte in token.encode("utf-8") + b"\0":
+                    value ^= byte
+                    value = (value * 1099511628211) & 0xffffffffffffffff
+            value ^= ord("\n")
+            value = (value * 1099511628211) & 0xffffffffffffffff
+    return "%016x" % value
+
+
+def _attachment_int(value, field, lo=None, hi=None):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("invalid %s" % field)
+    if lo is not None and number < lo or hi is not None and number > hi:
+        raise ValueError("invalid %s" % field)
+    return number
+
+
+def _attachment_phase(value, field, allow_boss=True):
+    value = str(value).lower()
+    allowed = ATTACHMENT_PHASES if allow_boss else ("small", "big")
+    if value not in allowed:
+        raise ValueError("invalid %s" % field)
+    return value
+
+
+def pool_attachment_predicates(pool):
+    """Translate a pool header's cumulative criteria into canonical tokens.
+
+    These strings are the cross-language contract consumed by the future Lua
+    matcher.  They describe semantics rather than the criteria hash, so a
+    refiltered pool retains every inherited route predicate explicitly.
     """
+    lines = list(pool.get("criteria") or ())
+    tag_route = "collect"
+    legendary_routes = "full"
+    inherited_legendary_routes = "full"
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "tag_route":
+            if parts[1] not in ("collect", "observe"):
+                raise ValueError("invalid tag route policy")
+            tag_route = parts[1]
+        elif len(parts) == 2 and parts[0] == "legendary_routes":
+            if parts[1] not in ATTACHMENT_ROUTE_POLICIES:
+                raise ValueError("invalid Legendary route policy")
+            legendary_routes = parts[1]
+        elif len(parts) == 2 and parts[0] == "route_legendary_routes":
+            if parts[1] not in ATTACHMENT_ROUTE_POLICIES:
+                raise ValueError("invalid inherited Legendary route policy")
+            inherited_legendary_routes = parts[1]
+
+    tags = []
+    legendaries = []
+    vouchers = []
+    exclusions = []
+    last_current_legendary = None
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        kind = parts[0]
+        if kind == "tag":
+            if len(parts) == 5:
+                key, lo, hi, count = parts[1:]
+                min_phase, max_phase = "small", "big"
+            elif len(parts) == 7:
+                key, lo, min_phase, hi, max_phase, count = parts[1:]
+            else:
+                raise ValueError("invalid tag predicate")
+            tags.append((tag_route, key,
+                         _attachment_int(lo, "tag minimum Ante", 1, MAX_ANTE),
+                         _attachment_phase(min_phase, "tag minimum phase", False),
+                         _attachment_int(hi, "tag maximum Ante", 1, MAX_ANTE),
+                         _attachment_phase(max_phase, "tag maximum phase", False),
+                         _attachment_int(count, "tag count", 1)))
+        elif kind == "route_tag":
+            if len(parts) == 6:
+                mode, key, lo, hi, count = parts[1:]
+                min_phase, max_phase = "small", "big"
+            elif len(parts) == 8:
+                mode, key, lo, min_phase, hi, max_phase, count = parts[1:]
+            else:
+                raise ValueError("invalid inherited tag predicate")
+            if mode not in ("collect", "observe"):
+                raise ValueError("invalid inherited tag route policy")
+            tags.append((mode, key,
+                         _attachment_int(lo, "tag minimum Ante", 1, MAX_ANTE),
+                         _attachment_phase(min_phase, "tag minimum phase", False),
+                         _attachment_int(hi, "tag maximum Ante", 1, MAX_ANTE),
+                         _attachment_phase(max_phase, "tag maximum phase", False),
+                         _attachment_int(count, "tag count", 1)))
+        elif kind in ("legendary", "route_legendary"):
+            inherited = kind == "route_legendary"
+            if (not inherited and len(parts) == 5) or (inherited and len(parts) == 6):
+                key, lo, hi, neg = parts[1:5]
+                depth = parts[5] if inherited else "1"
+                min_phase, max_phase, source = "boss", "big", "any"
+            elif (not inherited and len(parts) == 8) or (inherited and len(parts) == 9):
+                key, lo, min_phase, hi, max_phase, neg, source = parts[1:8]
+                depth = parts[8] if inherited else "1"
+            else:
+                raise ValueError("invalid Legendary predicate")
+            source = source.lower()
+            if source not in ATTACHMENT_SOURCES:
+                raise ValueError("invalid Legendary source")
+            rule = [key,
+                    _attachment_int(lo, "Legendary minimum Ante", 1, MAX_ANTE),
+                    _attachment_phase(min_phase, "Legendary minimum phase"),
+                    _attachment_int(hi, "Legendary maximum Ante", 1, MAX_ANTE),
+                    _attachment_phase(max_phase, "Legendary maximum phase"),
+                    _attachment_int(neg, "Legendary Negative flag", 0, 1),
+                    source,
+                    _attachment_int(depth, "Soul depth", 0, 2),
+                    inherited_legendary_routes if inherited else legendary_routes]
+            legendaries.append(rule)
+            last_current_legendary = None if inherited else rule
+        elif kind == "soul_depth":
+            if len(parts) != 2 or last_current_legendary is None:
+                raise ValueError("Soul depth has no preceding Legendary predicate")
+            last_current_legendary[7] = 0 if parts[1] == "any" else \
+                _attachment_int(parts[1], "Soul depth", 1, 2)
+        elif kind in ("voucher", "route_voucher"):
+            if len(parts) != 4:
+                raise ValueError("invalid voucher predicate")
+            vouchers.append((parts[1],
+                             _attachment_int(parts[2], "voucher minimum Ante", 1, MAX_ANTE),
+                             _attachment_int(parts[3], "voucher maximum Ante", 1, MAX_ANTE)))
+        elif kind in ("voucher_exclude", "route_voucher_exclude"):
+            if len(parts) != 2:
+                raise ValueError("invalid voucher exclusion")
+            exclusions.append(parts[1])
+
+    predicates = []
+    for mode, key, lo, min_phase, hi, max_phase, count in tags:
+        if route_position(lo, min_phase) > route_position(hi, max_phase):
+            raise ValueError("tag route start follows its end")
+        if count > tag_location_count(lo, min_phase, hi, max_phase):
+            raise ValueError("tag count exceeds its route window")
+    for value in legendaries:
+        if route_position(value[1], value[2]) > route_position(value[3], value[4]):
+            raise ValueError("Legendary route start follows its end")
+    for key, lo, hi in vouchers:
+        if lo > hi:
+            raise ValueError("voucher route start follows its end")
+    predicates.extend("tag %s %s %d %s %d %s %d" % value for value in tags)
+    predicates.extend("legendary %s %d %s %d %s %d %s %d %s" % tuple(value)
+                      for value in legendaries)
+    predicates.extend("voucher %s %d %d" % value for value in vouchers)
+    predicates.extend("voucher_exclude %s" % value for value in exclusions)
+    if not predicates:
+        raise ValueError("the pool has no canonical attachment predicates")
+    return sorted(predicates)
+
+
+def pool_attachment_signature(pool):
+    predicates = pool_attachment_predicates(pool)
+    body = ("signature_schema %d\n" % ATTACHMENT_SIGNATURE_SCHEMA) \
+        + "".join("predicate %s\n" % value for value in predicates)
+    return {
+        "schema": ATTACHMENT_SIGNATURE_SCHEMA,
+        "predicates": predicates,
+        "hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    }
+
+
+def pool_attachment_accelerator_blockers(pool, current_catalog_hash=None):
+    """Physical blockers shared by every automatic accelerator."""
     blockers = []
     if not pool.get("complete"):
         blockers.append("the pool operation is not complete")
@@ -708,8 +894,11 @@ def pool_attachment_base_blockers(pool):
     if pool.get("space", "natural") != "natural" \
             or pool.get("seedspace", 0) != SEEDSPACE:
         blockers.append("automatic search substitution currently requires the natural seed space")
-    if pool.get("range_start", -1) != 0 or pool.get("range_end", -1) != SEEDSPACE:
-        blockers.append("the pool does not cover every natural-space rank")
+    range_start = pool.get("range_start", -1)
+    range_end = pool.get("range_end", -1)
+    if not isinstance(range_start, int) or not isinstance(range_end, int) \
+            or range_start < 0 or range_start >= range_end or range_end > SEEDSPACE:
+        blockers.append("the pool has an invalid natural-space rank range")
     if pool.get("records", 0) <= 0:
         blockers.append("the pool contains no searchable seed records")
     if pool.get("composite"):
@@ -718,11 +907,33 @@ def pool_attachment_base_blockers(pool):
         blockers.append("the pool was not built with the current route model")
     if not _pool_identity(pool.get("pool_id")) \
             or not _pool_identity(pool.get("catalog_hash")) \
-            or not _pool_identity(pool.get("criteria_hash")):
+            or not _pool_identity(pool.get("criteria_hash")) \
+            or not _pool_identity(pool.get("snapshot_id")):
         blockers.append("the pool lacks attachment identity metadata")
     if not pool.get("criteria"):
         blockers.append("the pool has no embedded filter criteria")
+    else:
+        try:
+            pool_attachment_signature(pool)
+        except ValueError as exc:
+            blockers.append("the embedded criteria cannot be attached: %s" % exc)
+    if current_catalog_hash and str(pool.get("catalog_hash", "")).lower() \
+            != str(current_catalog_hash).lower():
+        blockers.append("the pool was built from a different profile/catalog snapshot")
     return blockers
+
+
+def pool_attachment_authoritative_blockers(pool, current_catalog_hash=None):
+    """Additional proof required before pool exhaustion may be definitive."""
+    blockers = pool_attachment_accelerator_blockers(pool, current_catalog_hash)
+    if pool.get("range_start", -1) != 0 or pool.get("range_end", -1) != SEEDSPACE:
+        blockers.append("the pool does not cover every natural-space rank")
+    return blockers
+
+
+def pool_attachment_base_blockers(pool):
+    """Compatibility alias for the original preliminary API."""
+    return pool_attachment_accelerator_blockers(pool)
 
 
 class PoolInfo:
@@ -760,7 +971,7 @@ class PoolInfo:
                 break
         self.state = read_state(path + ".state")
 
-    def as_dict(self):
+    def as_dict(self, include_attachment=True, current_catalog_hash=None):
         h = self.header
         complete = h.get("complete") == "1"
         coverage_complete = h.get("coverage_complete", h.get("complete")) == "1"
@@ -821,8 +1032,31 @@ class PoolInfo:
             _pool_identity(pool.get("family_id"))
             and _pool_identity(pool.get("lineage_id"))
         )
-        pool["attachment_blockers"] = pool_attachment_base_blockers(pool)
-        pool["attachment_base_eligible"] = not pool["attachment_blockers"]
+        pool["attachment_accelerator_blockers"] = \
+            pool_attachment_accelerator_blockers(pool, current_catalog_hash)
+        pool["attachment_accelerator_eligible"] = \
+            not pool["attachment_accelerator_blockers"]
+        pool["attachment_authoritative_blockers"] = \
+            pool_attachment_authoritative_blockers(pool, current_catalog_hash)
+        pool["attachment_authoritative_eligible"] = \
+            not pool["attachment_authoritative_blockers"]
+        # Compatibility names used by the first attachment prototype. "Base"
+        # now correctly means accelerator eligibility rather than full-space
+        # authority.
+        pool["attachment_blockers"] = list(
+            pool["attachment_accelerator_blockers"])
+        pool["attachment_base_eligible"] = \
+            pool["attachment_accelerator_eligible"]
+        attachment = read_pool_attachment(
+            self.path, pool, current_catalog_hash) \
+            if include_attachment else None
+        pool["attachment"] = attachment
+        pool["attached"] = bool(attachment and attachment.get("valid")
+                                and attachment.get("enabled"))
+        pool["attachment_role"] = attachment.get("role", "") \
+            if attachment else ""
+        pool["attachment_invalid_reason"] = "" if not attachment \
+            else "; ".join(attachment.get("blockers", ()))
         return pool
 
 
@@ -936,13 +1170,14 @@ def group_pool_library(pools):
     return groups
 
 
-def read_pool_library(pool_dir=POOL_DIR):
+def read_pool_library(pool_dir=POOL_DIR, current_catalog_hash=None):
     """Return ``(flat_pools, grouped_pools)`` for the standalone builder."""
     pools = []
     if os.path.isdir(pool_dir):
         for name in sorted(os.listdir(pool_dir)):
             if name.endswith(".bspool"):
-                pools.append(PoolInfo(os.path.join(pool_dir, name)).as_dict())
+                pools.append(PoolInfo(os.path.join(pool_dir, name)).as_dict(
+                    current_catalog_hash=current_catalog_hash))
     _link_pool_parents(pools)
     return pools, group_pool_library(pools)
 
@@ -950,16 +1185,20 @@ def read_pool_library(pool_dir=POOL_DIR):
 # A Builder scan deliberately keeps its criteria and checkpoint metadata next
 # to the shareable pool.  An attached-pool marker is reserved for the automatic
 # in-game pool-selection work; deleting a pool must not leave that marker
-# pointing at a file that no longer exists.
+# pointing at a file that no longer exists.  The writer lock is deliberately
+# *not* deleted: POSIX flock protects an inode rather than a pathname, so
+# unlinking it while a scanner still has the old inode locked would let a
+# second scanner create and lock a different inode for the same pool.
 POOL_DELETE_SUFFIXES = (
-    "", ".state", ".manifest", ".criteria.cfg", ".attached", ".writer.lock",
+    "", ".state", ".manifest", ".criteria.cfg", ".attached",
 )
 
 
 def _safe_pool_path(name, pool_dir):
     """Resolve one direct child of ``pool_dir`` without accepting traversal."""
     if not isinstance(name, str) or name != os.path.basename(name) \
-            or not name.lower().endswith(".bspool"):
+            or not name.lower().endswith(".bspool") \
+            or any(ch in name for ch in ("\0", "\r", "\n")):
         raise ValueError("Select a .bspool file directly from the seed-pool library.")
     root = os.path.abspath(pool_dir)
     path = os.path.abspath(os.path.join(root, name))
@@ -970,6 +1209,188 @@ def _safe_pool_path(name, pool_dir):
     if not inside or os.path.dirname(path) != root:
         raise ValueError("The selected pool is outside the seed-pool library.")
     return path
+
+
+def _pool_is_protected(path, protected_paths):
+    protected = {os.path.normcase(os.path.abspath(value))
+                 for value in protected_paths if value}
+    return os.path.normcase(os.path.abspath(path)) in protected
+
+
+def _attachment_file_identity(path):
+    stat = os.stat(path)
+    return {
+        "file_size": int(stat.st_size),
+        "file_mtime_ns": int(getattr(
+            stat, "st_mtime_ns", int(stat.st_mtime * 1000000000))),
+    }
+
+
+def _attachment_marker_hash(signature_schema, predicates):
+    body = ("signature_schema %d\n" % signature_schema) \
+        + "".join("predicate %s\n" % value for value in predicates)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def read_pool_attachment(path, pool=None, current_catalog_hash=None):
+    """Read and validate ``<pool>.attached`` without trusting its claims."""
+    marker_path = path + ".attached"
+    if not os.path.isfile(marker_path):
+        return None
+    marker = {"path": marker_path, "predicates": [], "blockers": []}
+    try:
+        with open(marker_path, "r", encoding="utf-8", errors="strict") as handle:
+            lines = handle.read().splitlines()
+    except (OSError, UnicodeError) as exc:
+        marker["blockers"].append("the attachment marker cannot be read: %s" % exc)
+        marker["valid"] = False
+        return marker
+    if not lines or lines[0] != "BRAINSTORM_POOL_ATTACHMENT %d" % ATTACHMENT_SCHEMA:
+        marker["blockers"].append("the attachment marker schema is unsupported")
+    saw_end = False
+    for line in lines[1:]:
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        key = parts[0]
+        value = parts[1].strip() if len(parts) == 2 else ""
+        if key == "end":
+            saw_end = True
+            break
+        if key == "predicate":
+            marker["predicates"].append(value)
+        elif key not in marker:
+            marker[key] = value
+        else:
+            marker["blockers"].append("the attachment marker repeats %s" % key)
+    if not saw_end:
+        marker["blockers"].append("the attachment marker is truncated")
+    marker["enabled"] = marker.get("enabled") == "1"
+    if not marker["enabled"]:
+        marker["blockers"].append("the attachment marker is disabled")
+    marker["role"] = marker.get("role", "")
+    if marker["role"] not in ATTACHMENT_ROLES:
+        marker["blockers"].append("the attachment role is invalid")
+    if marker.get("pool_file") != os.path.basename(path):
+        marker["blockers"].append("the attachment marker names a different pool file")
+    try:
+        signature_schema = int(marker.get("signature_schema", "0"))
+    except ValueError:
+        signature_schema = 0
+    if signature_schema != ATTACHMENT_SIGNATURE_SCHEMA:
+        marker["blockers"].append("the attachment signature schema is unsupported")
+    expected_marker_hash = _attachment_marker_hash(
+        signature_schema, marker["predicates"])
+    if marker.get("signature_hash", "").lower() != expected_marker_hash:
+        marker["blockers"].append("the attachment signature checksum is stale")
+
+    if pool is None:
+        pool = PoolInfo(path).as_dict(include_attachment=False)
+    for field in ("pool_id", "catalog_hash", "criteria_hash", "snapshot_id"):
+        expected = str(pool.get(field, ""))
+        actual = str(marker.get(field, ""))
+        if not expected or actual.lower() != expected.lower():
+            marker["blockers"].append("the attachment %s no longer matches the pool" % field)
+    try:
+        identity = _attachment_file_identity(path)
+    except OSError as exc:
+        marker["blockers"].append("the attached pool cannot be statted: %s" % exc)
+        identity = {}
+    for field in ("file_size", "file_mtime_ns"):
+        if str(marker.get(field, "")) != str(identity.get(field, "")):
+            marker["blockers"].append("the attached pool file identity changed")
+            break
+    try:
+        current_signature = pool_attachment_signature(pool)
+        if marker["predicates"] != current_signature["predicates"] \
+                or marker.get("signature_hash", "").lower() != current_signature["hash"]:
+            marker["blockers"].append("the attachment predicates no longer match the pool header")
+    except ValueError as exc:
+        marker["blockers"].append("the pool criteria are no longer attachable: %s" % exc)
+    role_blockers = pool_attachment_authoritative_blockers \
+        if marker["role"] == "authoritative" \
+        else pool_attachment_accelerator_blockers
+    marker["blockers"].extend(role_blockers(pool, current_catalog_hash))
+    marker["blockers"] = list(dict.fromkeys(marker["blockers"]))
+    marker["valid"] = not marker["blockers"]
+    return marker
+
+
+def attach_completed_pool(name, role, pool_dir=POOL_DIR,
+                          current_catalog_hash=None, protected_paths=()):
+    """Atomically bind one completed pool to automatic in-game selection."""
+    path = _safe_pool_path(name, pool_dir)
+    if _pool_is_protected(path, protected_paths):
+        raise ValueError("That pool is an active Builder input or output; finish the job first.")
+    if role not in ATTACHMENT_ROLES:
+        raise ValueError("Choose accelerator or authoritative attachment.")
+    with _pool_writer_guard(path):
+        if not os.path.isfile(path):
+            raise ValueError("The selected seed pool no longer exists.")
+        return _attach_completed_pool_locked(
+            path, name, role, pool_dir, current_catalog_hash)
+
+
+def _attach_completed_pool_locked(path, name, role, pool_dir,
+                                  current_catalog_hash):
+    pool = PoolInfo(path).as_dict()
+    blockers = (pool_attachment_authoritative_blockers
+                if role == "authoritative"
+                else pool_attachment_accelerator_blockers)(
+                    pool, current_catalog_hash)
+    if blockers:
+        raise ValueError("Cannot attach this pool as %s: %s."
+                         % (role, "; ".join(blockers)))
+    signature = pool_attachment_signature(pool)
+    identity = _attachment_file_identity(path)
+    lines = [
+        "BRAINSTORM_POOL_ATTACHMENT %d" % ATTACHMENT_SCHEMA,
+        "enabled 1",
+        "role %s" % role,
+        "pool_file %s" % name,
+        "pool_id %s" % pool["pool_id"],
+        "catalog_hash %s" % pool["catalog_hash"],
+        "criteria_hash %s" % pool["criteria_hash"],
+        "snapshot_id %s" % pool.get("snapshot_id", "-"),
+        "signature_schema %d" % signature["schema"],
+        "signature_hash %s" % signature["hash"],
+        "file_size %d" % identity["file_size"],
+        "file_mtime_ns %d" % identity["file_mtime_ns"],
+    ]
+    lines.extend("predicate %s" % value for value in signature["predicates"])
+    lines.extend(("end", ""))
+    marker_path = path + ".attached"
+    fd, temporary = tempfile.mkstemp(
+        prefix=".%s.attached." % os.path.basename(path), dir=pool_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker_path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    marker = read_pool_attachment(path, pool, current_catalog_hash)
+    if not marker or not marker.get("valid"):
+        raise ValueError("The attachment marker failed validation after writing.")
+    return marker
+
+
+def detach_pool(name, pool_dir=POOL_DIR, protected_paths=()):
+    """Remove an attachment policy without changing the pool itself."""
+    path = _safe_pool_path(name, pool_dir)
+    if _pool_is_protected(path, protected_paths):
+        raise ValueError("That pool is an active Builder input or output; finish the job first.")
+    with _pool_writer_guard(path):
+        marker_path = path + ".attached"
+        if not os.path.lexists(marker_path):
+            return {"name": name, "detached": False}
+        os.unlink(marker_path)
+        return {"name": name, "detached": True}
 
 
 def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
@@ -1016,20 +1437,24 @@ def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
 
 def delete_completed_pool(name, token, pool_dir=POOL_DIR, protected_paths=()):
     """Delete a still-identical completed pool plan, main file last."""
-    plan = pool_delete_plan(name, pool_dir, protected_paths)
-    if not isinstance(token, str) or not hmac.compare_digest(plan["token"], token):
-        raise ValueError("The pool files changed after confirmation; review the deletion again.")
-    paths = [item["path"] for item in plan["files"]]
-    # Sidecars first keeps the usable .bspool present if an earlier unlink
-    # fails.  A completed pool does not require its sidecars to remain usable.
-    main = plan["path"]
-    ordered = [value for value in paths if value != main] + [main]
-    removed = []
-    for value in ordered:
-        os.unlink(value)
-        removed.append(os.path.basename(value))
-    plan["removed"] = removed
-    return plan
+    path = _safe_pool_path(name, pool_dir)
+    with _pool_writer_guard(path):
+        plan = pool_delete_plan(name, pool_dir, protected_paths)
+        if not isinstance(token, str) \
+                or not hmac.compare_digest(plan["token"], token):
+            raise ValueError(
+                "The pool files changed after confirmation; review the deletion again.")
+        paths = [item["path"] for item in plan["files"]]
+        # Sidecars first keeps the usable .bspool present if an earlier unlink
+        # fails.  A completed pool does not require its sidecars to remain usable.
+        main = plan["path"]
+        ordered = [value for value in paths if value != main] + [main]
+        removed = []
+        for value in ordered:
+            os.unlink(value)
+            removed.append(os.path.basename(value))
+        plan["removed"] = removed
+        return plan
 
 
 def human_bytes(n):

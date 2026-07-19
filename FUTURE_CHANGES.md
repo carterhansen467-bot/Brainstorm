@@ -93,9 +93,11 @@ Important architectural differences:
    anywhere 1.33x, ante-1 tag 1.28x; the gated loop also serves poolfile
    searches. Verified: differential bench on six filter shapes, the 38-case
    native_equivalence Lua oracle, 1M-case fastpath, and pool-search suites.
-   Next steps: hand the decided pick to `pool_evaluate_pre` to skip the
-   survivor recompute, survivor rebatching for the Builder's tag roll
-   (FUTURE item 2), and FS_TAG-anywhere/FS_PACK/FS_VOUCH gate kinds.*
+   Same-day follow-ups completed the Builder pick/state handoff, the item-2
+   tag survivor rebatch, and the searcher's profitable exact-Ante FS_VOUCH
+   gate. Any-window voucher and FS_TAG-anywhere prototypes were removed after
+   measuring net losses. Remaining candidates are FS_PACK, searcher-side
+   survivor rebatching/pick handoff, and the cost/selectivity planner below.*
 2. **Compact and rebatch survivors.** Store a small staged candidate record
    containing rank, seed, hashed seed, first-stream result/state, and the
    post-seed hashes for required key lengths. Accumulate survivors across input
@@ -275,10 +277,11 @@ the practical value of automatic attachment.
    saved manual selector.
 2. When the manual selector is None, discover enabled `.attached` sidecars,
    validate their bound headers, and evaluate semantic compatibility.
-3. Prefer an authoritative compatible pool. Otherwise choose the accelerator
-   expected to be most useful—initially the smallest compatible non-empty pool,
-   with a stable pool-ID/filename tie-break. Revisit selection using measured
-   density and coverage if real workloads show that size alone is insufficient.
+3. Choose the smallest compatible non-empty pool, using authority and then
+   pool ID/filename as stable tie-breaks. Retire only an exhausted/invalid
+   marker and try the next compatible attachment before unrestricted search.
+   Revisit selection using measured density and coverage if real workloads
+   show that record count alone is insufficient.
 4. Feed the selected path through the existing native `poolfile` path and run
    all active filters again over decoded records. Do not create a second pool
    membership implementation in Lua.
@@ -289,20 +292,43 @@ the practical value of automatic attachment.
    repeating candidates where practical. Authoritative exhaustion may finish
    the search. Never silently broaden a manually requested pool search.
 
+### Implemented foundation
+
+- Builder eligibility is split into accelerator and authoritative roles, with
+  current-catalog and semantic-translation blockers.
+- The Python canonical signature covers cumulative tag, Legendary, route,
+  Soul-depth, voucher, and exclusion criteria. Atomic identity-bound sidecars,
+  Attach/Detach controls, stale-marker reporting, and deletion cleanup are in
+  place.
+- Lua reconstructs and validates the canonical pool signature, discovers
+  markers only when the manual selector is None, chooses deterministically,
+  and currently accepts only directly proven tag/classic-Legendary relations.
+- The selected pool remains session-local. Native results and embedded routes
+  are rechecked on the main thread. Accelerators fall back to unrestricted
+  search on exhaustion/opening failure after trying other compatible markers;
+  authoritative exhaustion is revalidated immediately before becoming
+  definitive. The live display reports the role/transition and suppresses the
+  full-space geometric chance while candidates come from an enriched pool.
+- Native scan/refilter/convert/merge, Organizer publication, attachment
+  creation/removal, and deletion now share one cross-platform writer lock. Its
+  stable lock file is intentionally retained so POSIX cannot split `flock`
+  ownership across two inodes.
+- Builder, HTTP, Lua matcher/fallback, header, deletion, packaging, and existing
+  native pool-equivalence regressions cover this initial contract.
+
 ### Remaining implementation work
 
-1. Split the existing physical eligibility result into accelerator eligibility
-   and authoritative/full-space eligibility, with human-readable blockers for
-   both roles.
-2. Implement and version the Python criteria-to-signature translator, the Lua
-   active-filter translator, and the small proven implication lattice.
-3. Implement atomic Attach/Detach sidecar controls and show attachment state,
-   role, coverage, compatibility, and invalidation reasons in the Seed Pool UI.
-4. Add Lua marker discovery and automatic choice to `buildNativeConfigText`,
-   then implement the accelerator-to-unrestricted continuation path without
-   resetting user-visible search intent.
-5. Add deterministic multiple-pool selection, stale marker handling, catalog
-   invalidation, update preservation, and observability.
+1. Complete controlled automatic-versus-unrestricted differential runs for
+   every accepted window, Negative, depth, and full-versus-fast implication.
+2. Add real end-to-end native-status stale-catalog/missing/corruption fallback
+   tests on macOS and Windows. The production-Lua harness already covers
+   deterministic multi-pool ordering/chaining and mid-search marker mutation.
+3. Add voucher, Legendary-anywhere, wider-source, and composite matching only
+   after each implication direction has an independent proof. Ambiguous cases
+   continue to ignore the attachment and search unrestricted.
+4. Measure marker discovery and accelerator-to-live transition overhead, and
+   decide whether avoiding possible repeated accelerator members is worth the
+   additional native state.
 
 ### Required correctness and performance proof
 

@@ -3,6 +3,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,6 +30,7 @@ def write_pool(path, complete=True, range_end=core.SEEDSPACE):
         "catalog_hash 1111111111111111",
         "criteria_hash 2222222222222222",
         "pool_id fixture-delete",
+        "snapshot_id 3333333333333333",
         "legendary j_perkeo 1 small 1 small 0 charm",
         "records 1",
         "complete %d" % int(complete),
@@ -55,12 +58,14 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     plan = core.pool_delete_plan(name, pool_dir)
     assert [item["name"] for item in plan["files"]] == [
         name, name + ".state", name + ".manifest",
-        name + ".criteria.cfg", name + ".attached", name + ".writer.lock",
+        name + ".criteria.cfg", name + ".attached",
     ]
     assert all(os.path.isabs(item["path"]) for item in plan["files"])
     complete_info = core.PoolInfo(path).as_dict()
     assert complete_info["attachment_base_eligible"]
     assert complete_info["attachment_blockers"] == []
+    assert complete_info["attachment_accelerator_eligible"]
+    assert complete_info["attachment_authoritative_eligible"]
 
     # A stale confirmation must never delete a newly changed/replaced pool.
     with open(path + ".manifest", "a", encoding="utf-8") as handle:
@@ -114,9 +119,23 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     finally:
         web.organizer_web.SPLIT_LOCK.release()
 
+    # Deletion must contend on the same persistent lock as a native scanner.
+    # Removing the lock file would split POSIX flock ownership across two
+    # inodes and allow a writer/deleter race.
+    plan = core.pool_delete_plan(name, pool_dir)
+    with core._pool_writer_guard(path):
+        try:
+            core.delete_completed_pool(name, plan["token"], pool_dir)
+        except ValueError as exc:
+            assert "currently being written" in str(exc)
+        else:
+            raise AssertionError("deletion ignored the native writer lock")
+    assert os.path.isfile(path)
+
     result = core.delete_completed_pool(name, plan["token"], pool_dir)
     assert set(result["removed"]) == {item["name"] for item in plan["files"]}
     assert not any(os.path.lexists(item["path"]) for item in plan["files"])
+    assert os.path.isfile(path + ".writer.lock")
     assert os.path.isfile(unrelated)
 
     incomplete = os.path.join(pool_dir, "paused.bspool")
@@ -131,9 +150,11 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     limited = os.path.join(pool_dir, "limited.bspool")
     write_pool(limited, range_end=100_000_000)
     limited_info = core.PoolInfo(limited).as_dict()
-    assert not limited_info["attachment_base_eligible"]
+    assert limited_info["attachment_base_eligible"]
+    assert limited_info["attachment_accelerator_eligible"]
+    assert not limited_info["attachment_authoritative_eligible"]
     assert "does not cover every natural-space rank" in " ".join(
-        limited_info["attachment_blockers"])
+        limited_info["attachment_authoritative_blockers"])
 
     for unsafe in ("../outside.bspool", "nested/pool.bspool", "not-a-pool.txt"):
         try:
@@ -187,5 +208,15 @@ for marker in ("/api/delete-plan", 'parsed.path == "/api/delete"',
                "Delete completed pool…", "This cannot be undone.",
                "data-pool"):
     assert marker in web.PAGE or marker in open(web.__file__, encoding="utf-8").read()
+
+# The July 18 newline-escaping fix was release-critical. Validate the actual
+# JavaScript emitted by the Python template, not only the Python source text.
+script = web.PAGE.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+assert 'join("\\n")' in script
+node = shutil.which("node")
+if node:
+    checked = subprocess.run((node, "--check", "-"), input=script, text=True,
+                             capture_output=True)
+    assert checked.returncode == 0, checked.stderr
 
 print("pool builder completed-pool deletion: ok")

@@ -447,6 +447,15 @@ class OrganizerRegression(unittest.TestCase):
                 "source_snapshot_id": plan["source"]["snapshot_id"],
                 "choices": {ambiguity["seed"]: legendary_category},
             }, handle)
+        locked_output = os.path.join(
+            output_dir, organizer.safe_filename(legendary_category))
+        with organizer.pool_writer_guard(locked_output):
+            with self.assertRaisesRegex(ValueError, "currently being written"):
+                organizer.split_pool(
+                    organizer.BSPoolReader(self.source), output_dir, None,
+                    choices_path, report_path, "Needs review", False)
+        self.assertFalse([name for name in os.listdir(output_dir)
+                          if name.endswith(".bspool")])
         result = self.run_tool("split", self.source, output_dir,
                                "--report", report_path, "--choices", choices_path,
                                "--remainder", "Needs review")
@@ -508,6 +517,28 @@ class OrganizerRegression(unittest.TestCase):
             ], complete=not paused_second,
             coverage_complete=not paused_second)
         return first, second
+
+    def test_combine_respects_native_output_writer_lock(self):
+        first, second = self._mixed_filter_sources()
+        output = os.path.join(self.temp.name, "locked-union.bspool")
+        with organizer.pool_writer_guard(output):
+            with self.assertRaisesRegex(ValueError, "currently being written"):
+                organizer.combine_pools(
+                    [organizer.BSPoolReader(first), organizer.BSPoolReader(second)],
+                    output, "union", "Locked output")
+        self.assertFalse(os.path.exists(output))
+        self.assertTrue(os.path.isfile(output + ".writer.lock"))
+
+    def test_combine_creates_output_directory_before_locking(self):
+        first, second = self._mixed_filter_sources()
+        output = os.path.join(
+            self.temp.name, "new", "nested", "union.bspool")
+        result = organizer.combine_pools(
+            [organizer.BSPoolReader(first), organizer.BSPoolReader(second)],
+            output, "union", "Nested output")
+        self.assertEqual(result["records"], 5)
+        self.assertTrue(os.path.isfile(output))
+        self.assertTrue(os.path.isfile(output + ".writer.lock"))
 
     def test_union_different_filters_deduplicates_and_preserves_provenance(self):
         first, second = self._mixed_filter_sources()

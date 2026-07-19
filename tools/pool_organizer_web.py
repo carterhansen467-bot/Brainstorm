@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -348,6 +349,7 @@ def execute_split(name, request, pool_dir=None):
     prefix = sanitize_prefix(request.get("prefix"), name)
     stage = tempfile.mkdtemp(prefix=".organizer-stage-", dir=root)
     linked = []
+    publish_locks = ExitStack()
     try:
         choices_path = os.path.join(stage, "choices.json")
         organizer.atomic_json(choices_path, {
@@ -368,6 +370,7 @@ def execute_split(name, request, pool_dir=None):
             old_path = output["path"]
             final_name = prefix + "--" + os.path.basename(old_path)
             final_path = os.path.join(root, final_name)
+            publish_locks.enter_context(organizer.pool_writer_guard(final_path))
             if os.path.exists(final_path):
                 raise organizer.PoolError(
                     "output already exists; choose another prefix: %s" % final_name)
@@ -396,6 +399,7 @@ def execute_split(name, request, pool_dir=None):
                 pass
         raise
     finally:
+        publish_locks.close()
         shutil.rmtree(stage, ignore_errors=True)
 
 

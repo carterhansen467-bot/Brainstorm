@@ -674,6 +674,8 @@ function Brainstorm.beginSearchStats()
 	A.searchTotalTried = 0
 	A.searchLiveRate = nil
 	A.searchLikelihood = 0
+	A.searchLikelihoodBase = 0
+	A.searchEstimateUnavailable = nil
 	A.searchHeadline = A.searchHeadline or { value = "" }
 	A.searchHeadline.value = "Searching... (0 / ~"
 		.. Brainstorm.formatSeedEstimate(est.expectedSeeds) .. ")"
@@ -693,6 +695,35 @@ function Brainstorm.startSearchBackendCounter(backend)
 	A.searchTotalTried = previous
 end
 
+-- Automatic pools are selected because every member already satisfies a
+-- broader predicate. Their candidates are therefore not independent draws
+-- from the full-space analytical distribution. Suppress the geometric chance
+-- during that enriched phase; if an accelerator exhausts, rebase the normal
+-- estimate at the first unrestricted candidate instead of counting the pool
+-- candidates a second time as random full-space misses.
+function Brainstorm.setAttachedPoolEstimateMode(attached)
+	local A = Brainstorm.AUTOREROLL
+	if not A.searchStatsActive then return end
+	if attached then
+		if A.searchEstimateUnavailable then return end
+		A.searchEstimateUnavailable =
+			"Chance estimate unavailable while scanning an attached pool"
+		A.searchProbability = nil
+		A.searchExpectedSeeds = math.huge
+		A.searchLikelihood = nil
+		return
+	end
+	if not A.searchEstimateUnavailable then return end
+	local est = Brainstorm.estimateSearch()
+	A.searchEstimateUnavailable = nil
+	A.searchProbability = est.probability
+	A.searchExpectedSeeds = est.expectedSeeds
+	A.searchPoolRecords = est.poolRecords
+	A.searchLikelihoodBase = A.searchTotalTried or
+		((A.searchBackendBase or 0) + (A.searchTried or 0))
+	A.searchLikelihood = 0
+end
+
 function Brainstorm.updateSearchStats()
 	local A = Brainstorm.AUTOREROLL
 	if not A.searchStatsActive then return end
@@ -702,8 +733,13 @@ function Brainstorm.updateSearchStats()
 	A.searchTotalTried = tried
 	A.searchWallElapsed = elapsed
 	if elapsed >= 0.25 and tried > 0 then A.searchLiveRate = tried / elapsed end
-	A.searchLikelihood = Brainstorm.searchHitLikelihood(tried,
-		A.searchProbability or 0)
+	if A.searchEstimateUnavailable then
+		A.searchLikelihood = nil
+	else
+		local likelihoodTried = math.max(0, tried - (A.searchLikelihoodBase or 0))
+		A.searchLikelihood = Brainstorm.searchHitLikelihood(likelihoodTried,
+			A.searchProbability or 0)
+	end
 	local expected = A.searchExpectedSeeds or math.huge
 	local suffix = expected < math.huge and
 		(" / ~" .. Brainstorm.formatSeedEstimate(expected)) or ""
@@ -778,13 +814,22 @@ function Brainstorm.liveSearchTextLines()
 		line2 = line2 .. "  |  Avg. remaining ~"
 			.. Brainstorm.formatSearchDuration(expected / A.searchLiveRate)
 	end
-	local line3 = "Chance by now "
-		.. Brainstorm.formatSearchPercent(A.searchLikelihood or 0)
+	local line3 = A.searchEstimateUnavailable
+		and tostring(A.searchEstimateUnavailable)
+		or ("Chance by now "
+			.. Brainstorm.formatSearchPercent(A.searchLikelihood or 0))
 	if A.searchLiveRate and A.searchLiveRate > 0 then
 		line3 = line3 .. "  |  "
 			.. Brainstorm.formatSeedEstimate(A.searchLiveRate) .. " seeds/s"
 	else
 		line3 = line3 .. "  |  measuring speed..."
 	end
-	return {line1, line2, line3}
+	local lines = {line1, line2, line3}
+	if A.autoPoolSelection then
+		lines[#lines + 1] = "Attached " .. tostring(A.autoPoolSelection.role)
+			.. ": " .. tostring(A.autoPoolSelection.pool_file)
+	elseif A.autoPoolWarned then
+		lines[#lines + 1] = tostring(A.autoPoolWarned)
+	end
+	return lines
 end

@@ -230,6 +230,28 @@ close(Brainstorm.AUTOREROLL.searchTotalTried, 50, "backend handoff total")
 close(Brainstorm.AUTOREROLL.searchLikelihood, 1 - (3 / 4) ^ 50,
 	"live likelihood uses total progress", 1e-9)
 
+-- Attached-pool candidates are enriched, not random full-space samples. The
+-- chance is unavailable during that phase and restarts at zero only for the
+-- unrestricted suffix after an accelerator hands off.
+Brainstorm.setAttachedPoolEstimateMode(true)
+assert(Brainstorm.AUTOREROLL.searchEstimateUnavailable)
+assert(Brainstorm.AUTOREROLL.searchProbability == nil)
+Brainstorm.AUTOREROLL.searchTried = 30
+now = 104
+Brainstorm.updateSearchStats()
+assert(Brainstorm.AUTOREROLL.searchLikelihood == nil)
+local attachedLines = table.concat(Brainstorm.liveSearchTextLines(), "\n")
+assert(attachedLines:find("Chance estimate unavailable", 1, true))
+Brainstorm.setAttachedPoolEstimateMode(false)
+Brainstorm.startSearchBackendCounter("native-2")
+Brainstorm.AUTOREROLL.searchTried = 4
+now = 105
+Brainstorm.updateSearchStats()
+close(Brainstorm.AUTOREROLL.searchTotalTried, 74,
+	"attached fallback retains total progress")
+close(Brainstorm.AUTOREROLL.searchLikelihood, 1 - (3 / 4) ^ 4,
+	"attached fallback likelihood is rebased", 1e-9)
+
 -- The settings text is useful before a search even when no matching-history
 -- rate exists; after a backend rate has been learned it includes a time.
 Brainstorm.SETTINGS.searchRateFallback = { ["sync-500"] = {rate = 4, updated = 1} }

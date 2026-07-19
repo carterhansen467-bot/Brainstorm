@@ -44,6 +44,7 @@ class WindowsReleaseLayoutTests(unittest.TestCase):
         write(self.repo / "settings.lua", b"private settings")
         write(self.repo / "native_search.cfg", b"profile snapshot")
         write(self.repo / "seed_pools" / "huge.bspool", b"pool")
+        write(self.repo / "seed_pools" / "huge.bspool.attached", b"attachment")
         write(self.repo / "native" / "stale.pdb", b"symbols")
         write(self.repo / "tools" / "developer-only.py", b"source")
         self.builder = self.base / "artifacts" / "Seed Pool Builder.exe"
