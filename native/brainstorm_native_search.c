@@ -536,8 +536,9 @@ typedef struct {
 	int fsId; int fsAnte; const char *fsKey;
 	/* lane-parallel first gate over one hashed ILV group (derived; plain
 	 * arrays only so mode_bench's by-value Config copy stays self-contained) */
-	int vgKind; /* 0 none, 1 first-Soul threshold chain, 2 Joker4 pick, 3 A1Sm tag pick */
-	int vgRolls, vgN, vgTarget;
+	int vgKind; /* 0 none, 1 first-Soul threshold chain, 2 Joker4 pick,
+	             * 3 A1Sm tag pick, 4 exact-Ante voucher pick */
+	int vgRolls, vgN, vgTarget, vgAnte;
 	uint8_t vgTagAllowed[MAX_TAGS];
 	/* optional .bspool restricting search to a prebuilt seed set (may contain
 	 * spaces: the directive consumes the rest of its config line) */
@@ -2995,8 +2996,19 @@ static inline void gate_reseed_hi(const double sv[ILV], uint8_t hi[ILV]) {
  * (the 1/256 gap dwarfs the scalar path's half-ulp d*n rounding). Undecided
  * or culled-resample lanes survive and rerun the unchanged scalar chain, so
  * a gate rejection is always one the scalar chain must also make. */
-static void first_gate_batch(const Config *g, const double hseed[ILV],
-		const double hfirst[ILV], uint8_t survive[ILV]) {
+/* One decided pick classification: -1 undecided (boundary or culled
+ * resample), 0 decided miss, 1 decided hit of `target`. */
+static inline int gate_pick_outcome(uint8_t hi, int n, const uint8_t *avail,
+		int target) {
+	unsigned bucket = ((unsigned)hi * (unsigned)n) >> 8;
+	if (bucket != (((unsigned)hi + 1u) * (unsigned)n) >> 8) return -1;
+	if (avail && !avail[bucket]) return -1;
+	return (int)bucket == target;
+}
+
+static void first_gate_batch(const Config *g, const char seeds[ILV][9],
+		int slen, const double hseed[ILV], const double hfirst[ILV],
+		uint8_t survive[ILV]) {
 	double st[ILV], sv[ILV];
 	uint8_t hi[ILV];
 	for (int i = 0; i < ILV; i++) st[i] = hfirst[i];
@@ -3012,15 +3024,27 @@ static void first_gate_batch(const Config *g, const double hseed[ILV],
 		}
 		return;
 	}
+	if (g->vgKind == 4) {
+		/* Exact-Ante voucher: only that Ante's pick decides; its stream is
+		 * the prehashed first stream exactly when the Ante is 1. */
+		if (g->vgAnte != 1) {
+			batch_hash_key_n(K_VOUCHER[g->vgAnte], seeds, slen, st);
+		}
+		gate_stream_step(st, hseed, sv);
+		gate_reseed_hi(sv, hi);
+		for (int i = 0; i < ILV; i++) {
+			int out = gate_pick_outcome(hi[i], g->vgN, g->vouchAvail,
+					g->vgTarget);
+			survive[i] = out != 0;
+		}
+		return;
+	}
 	gate_stream_step(st, hseed, sv);
 	gate_reseed_hi(sv, hi);
 	const uint8_t *avail = g->vgKind == 2 ? g->jokerAvail[4] : g->vgTagAllowed;
 	for (int i = 0; i < ILV; i++) {
-		unsigned bucket = ((unsigned)hi[i] * (unsigned)g->vgN) >> 8;
-		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)g->vgN) >> 8)
-			survive[i] = 1; /* bucket boundary: undecided */
-		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
-		else survive[i] = (int)bucket == g->vgTarget;
+		int out = gate_pick_outcome(hi[i], g->vgN, avail, g->vgTarget);
+		survive[i] = out != 0;
 	}
 }
 
@@ -3616,6 +3640,9 @@ bad_value:
 		g->vgN = g->njoker[4];
 		g->vgTarget = g->activeLegendaryIdx;
 	} else if (g->fsId == FS_TAG && !g->tagAnywhere && g->ntags >= 1) {
+		/* tagAnywhere measured as a net loss: rejection needs sixteen
+		 * decided misses and the culled-tag resample rate leaves too many
+		 * lanes undecided to pay for the per-Ante hashes. */
 		g->vgKind = 3;
 		g->vgN = g->ntags;
 		g->vgTarget = -1;
@@ -3625,6 +3652,19 @@ bad_value:
 			if (g->vgTarget < 0 && !strcmp(g->tagKey[i], g->tag))
 				g->vgTarget = i;
 		}
+	} else if (g->fsId == FS_VOUCH && g->voucherAnte >= 1 && g->nvouch >= 1) {
+		/* check_voucher's exact Ante is decided by that Ante's pick alone
+		 * (earlier Antes' picks land on their own streams and only matter
+		 * through the astronomically rare resample-overflow reject). The
+		 * any-window modes measured as net losses: with roughly half the
+		 * catalog locked, all-Antes-decided rejection is too rare. */
+		g->vgKind = 4;
+		g->vgAnte = g->voucherAnte;
+		g->vgN = g->nvouch;
+		g->vgTarget = -1;
+		for (int i = 0; i < g->nvouch; i++)
+			if (g->vgTarget < 0 && !strcmp(g->vouchKey[i], g->voucher))
+				g->vgTarget = i;
 	}
 	{
 		const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");
@@ -5099,7 +5139,8 @@ static void *pool_worker(void *vp) {
 				}
 				uint8_t gateSurvive[ILV];
 				if (g->vgKind)
-					first_gate_batch(g, hseed, hfirst, gateSurvive);
+					first_gate_batch(g, (const char (*)[9])seeds, l0,
+							hseed, hfirst, gateSurvive);
 				for (int j = 0; j < ILV; j++) {
 					done++;
 					if (g->vgKind && !gateSurvive[j]) {
@@ -5182,7 +5223,8 @@ static void *worker(void *vp) {
 			if (g->fsKey) batch_hash_key_pre(g->fsKey, kl, sufK, seeds, hfirst);
 			uint8_t gateSurvive[ILV];
 			if (g->vgKind)
-				first_gate_batch(g, hseed, hfirst, gateSurvive);
+				first_gate_batch(g, (const char (*)[9])seeds, 8,
+						hseed, hfirst, gateSurvive);
 			for (int i = 0; i < ILV; i++) {
 				done++;
 				if (g->vgKind && !gateSurvive[i]) {

@@ -2335,7 +2335,7 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
  * a culled-catalog resample leaves the lane undecided rather than guessing. */
 static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
 		const double hseed[ILV], const double hfirst[ILV],
-		uint8_t survive[ILV]) {
+		uint8_t survive[ILV], int outFirst[ILV], double outState[ILV]) {
 	double st[ILV], sv[ILV];
 	uint8_t hi[ILV];
 	for (int i = 0; i < ILV; i++) st[i] = hfirst[i];
@@ -2351,10 +2351,18 @@ static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
 		 * decided bucket always equals the scalar pick. Boundary-straddling
 		 * lanes stay undecided and rerun the full scalar precheck. */
 		unsigned bucket = ((unsigned)hi[i] * (unsigned)n) >> 8;
+		outFirst[i] = -1;
+		outState[i] = st[i];
 		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)n) >> 8)
 			survive[i] = 1;
 		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
-		else survive[i] = (int)bucket == p->vectorGateTarget;
+		else {
+			survive[i] = (int)bucket == p->vectorGateTarget;
+			/* A decided, uncalled pick is the exact scalar first draw:
+			 * survivors may hand it (and the post-draw stream state) to
+			 * pool_evaluate_pre instead of recomputing the same draw. */
+			if (survive[i]) outFirst[i] = (int)bucket;
+		}
 	}
 }
 
@@ -2848,8 +2856,9 @@ static void pool_reset_route_state(PoolCtx *c, char *label, size_t labelCap,
 	if (metadata) metadata->count = 0;
 }
 
-static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
-		double hfirst, char *label, size_t labelCap, PoolMetadata *metadata) {
+static bool pool_evaluate_pre_first(PoolCtx *c, const char seed[9], double hseed,
+		double hfirst, int firstResolved, double firstState,
+		char *label, size_t labelCap, PoolMetadata *metadata) {
 	const PoolPlan *p = c->p;
 	memcpy(c->seed, seed, 9);
 	c->seedLen = (uint8_t)strlen(seed);
@@ -2868,7 +2877,14 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 	}
 	/* Specific legendary selection is independent of route streams and rejects
 	 * roughly 80% of vanilla candidates, so route clearing stays deferred. */
-	if (!pool_precheck_all_legendaries(c)) return false;
+	if (firstResolved >= 0 && p->firstKind == 1 && pool_legend_rule_count(p)) {
+		/* The batched gate already consumed the first Joker4 draw with the
+		 * identical stream advance and reseed; adopt its post-draw state so
+		 * every later consumer of the stream sees the scalar chain. */
+		c->joker4.state = firstState;
+		if (!pool_precheck_legendaries_after_first(c, firstResolved))
+			return false;
+	} else if (!pool_precheck_all_legendaries(c)) return false;
 	pool_reset_route_state(c, label, labelCap, metadata);
 	if (p->nbaseTagRules && !pool_apply_base_route(c, metadata)) return false;
 	if (p->ntagRules && !pool_check_tags(c, label, labelCap, metadata)) return false;
@@ -2935,6 +2951,12 @@ static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
 		}
 	}
 	return true;
+}
+
+static bool pool_evaluate_pre(PoolCtx *c, const char seed[9], double hseed,
+		double hfirst, char *label, size_t labelCap, PoolMetadata *metadata) {
+	return pool_evaluate_pre_first(c, seed, hseed, hfirst, -1, 0.0,
+			label, labelCap, metadata);
 }
 
 static bool pool_batch_selftest(const PoolPlan *p) {
@@ -3401,11 +3423,25 @@ typedef struct {
 } PoolEvalSink;
 
 static bool pool_eval_emit(PoolEvalSink *k, uint64_t rank, const char seed[9],
-		double hs, double hf) {
-	bool passed = pool_evaluate_pre(k->c, seed, hs, hf, NULL, 0,
+		double hs, double hf, int firstResolved, double firstState) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+	if (firstResolved >= 0) {
+		bool ref = pool_evaluate_pre(k->c, seed, hs, hf, NULL, 0, NULL);
+		bool got = pool_evaluate_pre_first(k->c, seed, hs, hf,
+				firstResolved, firstState, NULL, 0, NULL);
+		if (ref != got) {
+			fprintf(stderr, "pick handoff diverged for seed %s (ref=%d got=%d)\n",
+					seed, (int)ref, (int)got);
+			abort();
+		}
+	}
+#endif
+	bool passed = pool_evaluate_pre_first(k->c, seed, hs, hf,
+			firstResolved, firstState, NULL, 0,
 			k->eventMode && !k->decisionReplay ? k->metadata : NULL);
 	if (passed && k->decisionReplay) {
-		passed = pool_evaluate_pre(k->c, seed, hs, hf, NULL, 0, k->metadata);
+		passed = pool_evaluate_pre_first(k->c, seed, hs, hf,
+				firstResolved, firstState, NULL, 0, k->metadata);
 		if (!passed) {
 			fprintf(stderr, "internal decision/metadata replay mismatch for seed %s\n",
 					seed);
@@ -3431,7 +3467,8 @@ static bool pool_eval_emit(PoolEvalSink *k, uint64_t rank, const char seed[9],
 #define POOL_STAGE_CAP (ILV * 2)
 
 static bool pool_eval_staged_batch(PoolEvalSink *k, uint64_t *stRank,
-		char (*stSeed)[9], double *stHs, double *stHf, int *nStaged) {
+		char (*stSeed)[9], double *stHs, double *stHf, int *stFirst,
+		double *stFState, int *nStaged) {
 	double htag[ILV];
 	uint8_t survive[ILV];
 	batch_hash_key_n(KT_TAG[1], (const char (*)[9])stSeed, 8, htag);
@@ -3447,14 +3484,16 @@ static bool pool_eval_staged_batch(PoolEvalSink *k, uint64_t *stRank,
 #endif
 			continue;
 		}
-		if (!pool_eval_emit(k, stRank[i], stSeed[i], stHs[i], stHf[i]))
-			return false;
+		if (!pool_eval_emit(k, stRank[i], stSeed[i], stHs[i], stHf[i],
+				stFirst[i], stFState[i])) return false;
 	}
 	int rem = *nStaged - ILV;
 	memmove(stRank, stRank + ILV, (size_t)rem * sizeof *stRank);
 	memmove(stSeed, stSeed + ILV, (size_t)rem * sizeof *stSeed);
 	memmove(stHs, stHs + ILV, (size_t)rem * sizeof *stHs);
 	memmove(stHf, stHf + ILV, (size_t)rem * sizeof *stHf);
+	memmove(stFirst, stFirst + ILV, (size_t)rem * sizeof *stFirst);
+	memmove(stFState, stFState + ILV, (size_t)rem * sizeof *stFState);
 	*nStaged = rem;
 	return true;
 }
@@ -3489,6 +3528,8 @@ static void *pool_scan_worker(void *arg) {
 	uint64_t stRank[POOL_STAGE_CAP];
 	char stSeed[POOL_STAGE_CAP][9];
 	double stHs[POOL_STAGE_CAP], stHf[POOL_STAGE_CAP];
+	int stFirst[POOL_STAGE_CAP];
+	double stFState[POOL_STAGE_CAP];
 	int nStaged = 0;
 	uint64_t chunkMatched = 0;
 	PoolEvalSink sink = {
@@ -3555,12 +3596,16 @@ static void *pool_scan_worker(void *arg) {
 				batch_hash_key_pre(s->p->firstKey, firstKeyLen, sufK, seeds, hfirst);
 			}
 			uint8_t gateSurvive[ILV];
+			int gateFirst[ILV];
+			double gateState[ILV];
 			int gated = 1;
-			if (s->p->vectorTagGate == 1)
+			if (s->p->vectorTagGate == 1) {
 				pool_tag_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive);
-			else if (s->p->vectorFirstGate)
-				pool_first_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive);
-			else gated = 0;
+				for (int i = 0; i < ILV; i++) gateFirst[i] = -1;
+			} else if (s->p->vectorFirstGate) {
+				pool_first_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive,
+						gateFirst, gateState);
+			} else gated = 0;
 			for (int i = 0; i < ILV; i++) {
 				if (gated && !gateSurvive[i]) {
 #ifdef BRAINSTORM_VERIFY_VECTOR_GATE
@@ -3573,27 +3618,31 @@ static void *pool_scan_worker(void *arg) {
 #endif
 					continue;
 				}
+				int first = gated ? gateFirst[i] : -1;
+				double fstate = first >= 0 ? gateState[i] : 0.0;
 				if (s->p->vectorTagGate == 2) {
 					stRank[nStaged] = ranks[i];
 					memcpy(stSeed[nStaged], seeds[i], 9);
 					stHs[nStaged] = hseed[i];
 					stHf[nStaged] = hfirst[i];
+					stFirst[nStaged] = first;
+					stFState[nStaged] = fstate;
 					nStaged++;
 					continue;
 				}
 				if (!pool_eval_emit(&sink, ranks[i], seeds[i],
-						hseed[i], hfirst[i])) goto done;
+						hseed[i], hfirst[i], first, fstate)) goto done;
 			}
 			while (nStaged >= ILV) {
 				if (!pool_eval_staged_batch(&sink, stRank, stSeed,
-						stHs, stHf, &nStaged)) goto done;
+						stHs, stHf, stFirst, stFState, &nStaged)) goto done;
 			}
 		}
 		/* Staged survivors precede the sub-group remainder ranks below;
 		 * evaluate them now (ungated) so emission stays rank-ascending. */
 		for (int i = 0; i < nStaged; i++) {
 			if (!pool_eval_emit(&sink, stRank[i], stSeed[i],
-					stHs[i], stHf[i])) goto done;
+					stHs[i], stHf[i], stFirst[i], stFState[i])) goto done;
 		}
 		nStaged = 0;
 		for (; rank < end; rank++) {
