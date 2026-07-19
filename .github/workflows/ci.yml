@@ -98,7 +98,8 @@ jobs:
       - name: Oracle equivalence (Windows LuaJIT vs .exe) — the bit-exactness proof
         run: sh tests/native_equivalence.sh
       - name: Analytical search telemetry
-        run: "$LUAJIT" tests/search_estimate.lua
+        run: |
+          "$LUAJIT" tests/search_estimate.lua
       - name: Exact native arithmetic fast paths
         run: FASTPATH_CASES=1000000 sh tests/native_fastpath_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Vector first-gate differential

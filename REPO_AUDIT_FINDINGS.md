@@ -184,6 +184,11 @@ edge cases and one test-coverage gap:
    verifies duplicate-key fallback; runs a bounded ASan/UBSan differential;
    and requires byte-identical gate-on/off Seed Pool output for direct and
    survivor-rebatched tag paths. It is wired into both macOS and Windows CI.
+4. The first pushed CI revision encoded the Windows LuaJIT telemetry command
+   as an invalid mixed YAML/shell scalar, so GitHub rejected the workflow
+   before creating jobs. It now uses a literal command block; the workflow is
+   parsed locally before republishing and the replacement run is required to
+   pass before this audit is closed.
 
 Current bounded differential counts were 14,843, 23,706, 47,478, and 66,341
 scalar-passing seeds for the four gate kinds, with zero gate-dropped matches.
