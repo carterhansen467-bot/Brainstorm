@@ -103,6 +103,21 @@ Important architectural differences:
    independent vector gate. Flush the final partial batch with an explicit
    validity mask. This can improve utilization substantially when a cheap first
    gate rejects most candidates.
+
+   *Prototyped 2026-07-18 in the Builder (`pool_eval_staged_batch` +
+   `pool_tag_gate_batch`): legendary-gate survivors accumulate as
+   rank/seed/hash records, and each full group of eight batch-hashes Tag1
+   and runs a second conservative gate on the ante-1 Small tag pick. Gate
+   eligibility requires a tag rule pinned exactly to that window (the roll
+   is the Tag1 stream's first draw and a decided miss is a certain scalar
+   rejection) and the natural seed space; culled tags stay undecided. FIFO
+   staging preserves ascending-rank emission, remainders flush ungated at
+   chunk end. Tag-only plans skip staging: Tag1 is already the prehashed
+   first stream. Measured with both gates: Perkeo+Charm build 3.08s to
+   1.82s single-thread (1.70x total), 1.83x on all cores; pinned tag-only
+   1.27x. Byte-identical scan and refilter pools, 200M-seed differential
+   verify, and the oracle/soul-depth/search/refilter/partial/lineage/
+   shard/voucher/Omen suites all pass.*
 3. **Use masked vector stages only where predicates are independent.** Specific
    Legendary selection and independent raw tag rolls are good candidates.
    Route-dependent tag collection, voucher purchasing, Charm/Omen recovery,

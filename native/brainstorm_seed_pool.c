@@ -119,6 +119,7 @@ typedef struct {
 	int legendaryNeedsEdition; /* derived; not part of criteria identity */
 	int simpleFirstSoul, simpleSoulMinAnte, simpleSoulMaxAnte; /* derived hot path */
 	int vectorFirstGate, vectorGateTarget; /* derived hot path */
+	int vectorTagGate, vectorTagTarget; /* derived: 1 first-stream, 2 staged */
 	uint64_t catalogHash, criteriaHash, stageHash;
 	uint64_t familyId, segmentId, lineageId, derivationId;
 	int refilter, refilterDepth;
@@ -2248,8 +2249,37 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 					p->vectorGateTarget = -2; /* contradictory rules: no lane passes */
 		}
 	}
+	/* The ante-1 Small tag roll is the Tag1 stream's first draw, and a rule
+	 * pinned to exactly that window makes a decided miss there a certain
+	 * scalar rejection (pool_check_tags fails the rule at its window end).
+	 * Natural space only: the staged rebatch hashes Tag1 at fixed length 8. */
+	p->vectorTagGate = 0;
+	p->vectorTagTarget = -2;
+	if (p->space == SPACE_NATURAL && p->ntagRules) {
+		int found = 0;
+		for (int r = 0; r < p->ntagRules; r++) {
+			const PoolTagRule *rule = &p->tagRules[r];
+			if (rule->minAnte == 1 && rule->maxAnte == 1
+					&& rule->minPhase == SOUL_PHASE_SMALL
+					&& rule->maxPhase == SOUL_PHASE_SMALL
+					&& rule->minCount >= 1) {
+				if (!found) { p->vectorTagTarget = rule->poolIndex; found = 1; }
+				else if (rule->poolIndex != p->vectorTagTarget)
+					p->vectorTagTarget = -2; /* contradictory: no lane passes */
+			}
+		}
+		if (found) {
+			if (p->firstKind == 2 && p->firstAnte == 1)
+				p->vectorTagGate = 1; /* Tag1 is the prehashed first stream */
+			else if (p->vectorFirstGate)
+				p->vectorTagGate = 2; /* rebatch legendary-gate survivors */
+		}
+	}
 	const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");
-	if (gateEnv && !strcmp(gateEnv, "0")) p->vectorFirstGate = 0;
+	if (gateEnv && !strcmp(gateEnv, "0")) {
+		p->vectorFirstGate = 0;
+		p->vectorTagGate = 0;
+	}
 }
 
 /* All refilter stages constrain one cumulative Soul sequence. Resolve the
@@ -2306,25 +2336,11 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
 static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
 		const double hseed[ILV], const double hfirst[ILV],
 		uint8_t survive[ILV]) {
-	double sv[ILV], frac[ILV];
-	/* round13's data-dependent rounding branch is a coin flip per lane, so
-	 * the scalar helper mispredicts constantly here. Evaluate its fast path
-	 * branch-free across the group (fl + 1.0 is exact, matching the helper's
-	 * increment) and patch the rare near-half-way lanes with the exact form. */
-	for (int i = 0; i < ILV; i++) {
-		double x = lua_mod1(2.134453429141 + hfirst[i] * 1.72431234);
-		double q = x * 1e13, fl = floor(q), f = q - fl;
-		frac[i] = f;
-		sv[i] = ((fl + (double)(f > 0.5015)) / 1e13 + hseed[i]) / 2.0;
-	}
-	for (int i = 0; i < ILV; i++) {
-		if (frac[i] > 0.4985 && frac[i] <= 0.5015) {
-			double x = lua_mod1(2.134453429141 + hfirst[i] * 1.72431234);
-			sv[i] = (round13_exact(x) + hseed[i]) / 2.0;
-		}
-	}
-	uint64_t word[4][PRNG_BATCH_MAX];
-	lj_random_seed_components_batch(sv, ILV, word);
+	double st[ILV], sv[ILV];
+	uint8_t hi[ILV];
+	for (int i = 0; i < ILV; i++) st[i] = hfirst[i];
+	gate_stream_step(st, hseed, sv);
+	gate_reseed_hi(sv, hi);
 	int n = g->njoker[4];
 	const uint8_t *avail = g->jokerAvail[4];
 	for (int i = 0; i < ILV; i++) {
@@ -2334,14 +2350,34 @@ static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
 		 * also dwarfs the half-ulp of the scalar path's d*n rounding, so a
 		 * decided bucket always equals the scalar pick. Boundary-straddling
 		 * lanes stay undecided and rerun the full scalar precheck. */
-		unsigned high = (unsigned)(uint8_t)((prng_first_hi_0(word[0][i])
-				^ prng_first_hi_1(word[1][i])
-				^ prng_first_hi_2(word[2][i])
-				^ prng_first_hi_3(word[3][i])) >> 44);
-		unsigned bucket = (high * (unsigned)n) >> 8;
-		if (bucket != ((high + 1u) * (unsigned)n) >> 8) survive[i] = 1;
+		unsigned bucket = ((unsigned)hi[i] * (unsigned)n) >> 8;
+		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)n) >> 8)
+			survive[i] = 1;
 		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
 		else survive[i] = (int)bucket == p->vectorGateTarget;
+	}
+}
+
+/* Same conservative shape over the Tag1 stream's first draw (the ante-1
+ * Small roll): reject only lanes whose decided, ante-1-eligible tag pick
+ * misses the window-pinned rule; culled tags resample and stay undecided. */
+static void pool_tag_gate_batch(const Config *g, const PoolPlan *p,
+		const double hseed[ILV], const double htag[ILV],
+		uint8_t survive[ILV]) {
+	double st[ILV], sv[ILV];
+	uint8_t hi[ILV];
+	for (int i = 0; i < ILV; i++) st[i] = htag[i];
+	gate_stream_step(st, hseed, sv);
+	gate_reseed_hi(sv, hi);
+	int n = g->ntags;
+	for (int i = 0; i < ILV; i++) {
+		unsigned bucket = ((unsigned)hi[i] * (unsigned)n) >> 8;
+		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)n) >> 8)
+			survive[i] = 1;
+		else if (!(g->tagReqOk[bucket] && (g->tagMinAnte[bucket] == 0
+				|| g->tagMinAnte[bucket] <= 1)))
+			survive[i] = 1; /* resample: undecided */
+		else survive[i] = (int)bucket == p->vectorTagTarget;
 	}
 }
 
@@ -3348,6 +3384,81 @@ static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf,
 	return true;
 }
 
+/* Everything one worker needs to evaluate a candidate and emit a hit; lets
+ * the immediate, staged-rebatch, and remainder paths share one exact
+ * evaluate/replay/buffer sequence. Returns false on the abort conditions the
+ * inline code answered with goto done. */
+typedef struct {
+	PoolScanShared *s;
+	PoolCtx *c;
+	bool eventMode, decisionReplay;
+	PoolEventHit *eventHits;
+	size_t *eventUsed;
+	unsigned char *outbuf, *encoded;
+	size_t *outUsed;
+	PoolMetadata *metadata;
+	uint64_t *chunkMatched;
+} PoolEvalSink;
+
+static bool pool_eval_emit(PoolEvalSink *k, uint64_t rank, const char seed[9],
+		double hs, double hf) {
+	bool passed = pool_evaluate_pre(k->c, seed, hs, hf, NULL, 0,
+			k->eventMode && !k->decisionReplay ? k->metadata : NULL);
+	if (passed && k->decisionReplay) {
+		passed = pool_evaluate_pre(k->c, seed, hs, hf, NULL, 0, k->metadata);
+		if (!passed) {
+			fprintf(stderr, "internal decision/metadata replay mismatch for seed %s\n",
+					seed);
+			atomic_store(&k->s->ioError, true);
+			return false;
+		}
+	}
+	if (passed) {
+		(*k->chunkMatched)++;
+		if (k->eventMode) {
+			if (!pool_buffer_event_hit(k->s, k->eventHits, k->eventUsed,
+					rank, k->metadata)) return false;
+		} else if (!pool_buffer_hit(k->s, k->outbuf, k->encoded, k->outUsed,
+				rank, seed)) return false;
+	}
+	return true;
+}
+
+/* Stage-two rebatch: legendary-gate survivors arrive sparse, so their Tag1
+ * hashes are computed only after eight have accumulated, keeping the batched
+ * hash and the tag gate fully occupied. FIFO order over ascending appends
+ * preserves the scalar path's ascending-rank evaluation and emission. */
+#define POOL_STAGE_CAP (ILV * 2)
+
+static bool pool_eval_staged_batch(PoolEvalSink *k, uint64_t *stRank,
+		char (*stSeed)[9], double *stHs, double *stHf, int *nStaged) {
+	double htag[ILV];
+	uint8_t survive[ILV];
+	batch_hash_key_n(KT_TAG[1], (const char (*)[9])stSeed, 8, htag);
+	pool_tag_gate_batch(k->s->g, k->s->p, stHs, htag, survive);
+	for (int i = 0; i < ILV; i++) {
+		if (!survive[i]) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+			if (pool_evaluate_pre(k->c, stSeed[i], stHs[i], stHf[i],
+					NULL, 0, NULL)) {
+				fprintf(stderr, "tag gate dropped passing seed %s\n", stSeed[i]);
+				abort();
+			}
+#endif
+			continue;
+		}
+		if (!pool_eval_emit(k, stRank[i], stSeed[i], stHs[i], stHf[i]))
+			return false;
+	}
+	int rem = *nStaged - ILV;
+	memmove(stRank, stRank + ILV, (size_t)rem * sizeof *stRank);
+	memmove(stSeed, stSeed + ILV, (size_t)rem * sizeof *stSeed);
+	memmove(stHs, stHs + ILV, (size_t)rem * sizeof *stHs);
+	memmove(stHf, stHf + ILV, (size_t)rem * sizeof *stHf);
+	*nStaged = rem;
+	return true;
+}
+
 static void *pool_scan_worker(void *arg) {
 	PoolScanShared *s = arg;
 	PoolCtx *c = calloc(1, sizeof *c);
@@ -3375,13 +3486,24 @@ static void *pool_scan_worker(void *arg) {
 	uint64_t ranks[ILV];
 	PoolMetadata metadata;
 	int firstKeyLen = (int)strlen(s->p->firstKey);
+	uint64_t stRank[POOL_STAGE_CAP];
+	char stSeed[POOL_STAGE_CAP][9];
+	double stHs[POOL_STAGE_CAP], stHf[POOL_STAGE_CAP];
+	int nStaged = 0;
+	uint64_t chunkMatched = 0;
+	PoolEvalSink sink = {
+		.s = s, .c = c, .eventMode = eventMode, .decisionReplay = decisionReplay,
+		.eventHits = eventHits, .eventUsed = &eventUsed,
+		.outbuf = outbuf, .encoded = encoded, .outUsed = &outUsed,
+		.metadata = &metadata, .chunkMatched = &chunkMatched,
+	};
 	while (!atomic_load(&s->ioError)) {
 		uint64_t begin = atomic_fetch_add(&s->next, s->p->chunk);
 		if (begin >= s->end) break;
 		uint64_t end = begin + s->p->chunk;
 		if (end > s->end) end = s->end;
 		uint64_t rank = begin;
-		uint64_t chunkMatched = 0;
+		chunkMatched = 0;
 		int space = s->p->space;
 		/* Fresh scans walk contiguous ranks: the odometer advances the seed
 		 * string in place and one suffix chain state survives across a whole
@@ -3433,10 +3555,14 @@ static void *pool_scan_worker(void *arg) {
 				batch_hash_key_pre(s->p->firstKey, firstKeyLen, sufK, seeds, hfirst);
 			}
 			uint8_t gateSurvive[ILV];
-			if (s->p->vectorFirstGate)
+			int gated = 1;
+			if (s->p->vectorTagGate == 1)
+				pool_tag_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive);
+			else if (s->p->vectorFirstGate)
 				pool_first_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive);
+			else gated = 0;
 			for (int i = 0; i < ILV; i++) {
-				if (s->p->vectorFirstGate && !gateSurvive[i]) {
+				if (gated && !gateSurvive[i]) {
 #ifdef BRAINSTORM_VERIFY_VECTOR_GATE
 					if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i],
 							NULL, 0, NULL)) {
@@ -3447,28 +3573,29 @@ static void *pool_scan_worker(void *arg) {
 #endif
 					continue;
 				}
-				bool passed = pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i],
-						NULL, 0, eventMode && !decisionReplay ? &metadata : NULL);
-				if (passed && decisionReplay) {
-					passed = pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i],
-							NULL, 0, &metadata);
-					if (!passed) {
-						fprintf(stderr, "internal decision/metadata replay mismatch for seed %s\n",
-								seeds[i]);
-						atomic_store(&s->ioError, true);
-						goto done;
-					}
+				if (s->p->vectorTagGate == 2) {
+					stRank[nStaged] = ranks[i];
+					memcpy(stSeed[nStaged], seeds[i], 9);
+					stHs[nStaged] = hseed[i];
+					stHf[nStaged] = hfirst[i];
+					nStaged++;
+					continue;
 				}
-				if (passed) {
-					chunkMatched++;
-					if (eventMode) {
-						if (!pool_buffer_event_hit(s, eventHits, &eventUsed,
-								ranks[i], &metadata)) goto done;
-					} else if (!pool_buffer_hit(s, outbuf, encoded, &outUsed,
-							ranks[i], seeds[i])) goto done;
-				}
+				if (!pool_eval_emit(&sink, ranks[i], seeds[i],
+						hseed[i], hfirst[i])) goto done;
+			}
+			while (nStaged >= ILV) {
+				if (!pool_eval_staged_batch(&sink, stRank, stSeed,
+						stHs, stHf, &nStaged)) goto done;
 			}
 		}
+		/* Staged survivors precede the sub-group remainder ranks below;
+		 * evaluate them now (ungated) so emission stays rank-ascending. */
+		for (int i = 0; i < nStaged; i++) {
+			if (!pool_eval_emit(&sink, stRank[i], stSeed[i],
+					stHs[i], stHf[i])) goto done;
+		}
+		nStaged = 0;
 		for (; rank < end; rank++) {
 			if (s->p->refilter && !pool_read_input_batch(s, rank, 1, ranks, &inputScratch)) {
 				atomic_store(&s->ioError, true); goto done;
