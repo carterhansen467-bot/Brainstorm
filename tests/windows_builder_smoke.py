@@ -47,6 +47,7 @@ def main():
 
     duplicate = core.Runner(snap.current_model_copy(), text, out)
     assert wait(duplicate, 30), "duplicate scanner did not reject the active output"
+    duplicate.reader.join(timeout=5)
     assert duplicate.returncode() == 1, \
         "duplicate scanner unexpectedly opened the active output: %r" % list(duplicate.lines)
     assert any("already being written by another scanner" in line
