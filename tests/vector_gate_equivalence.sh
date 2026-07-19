@@ -2,7 +2,8 @@
 # Reproducible correctness gate for the lane-parallel first filters:
 #   - exhaustively validate every high-byte/n bucket interval;
 #   - compare every gate rejection with the unchanged scalar searcher over
-#     bounded natural ranks for Soul, Legendary, tag, and exact-Ante voucher;
+#     bounded natural ranks for Soul, Legendary, tag, exact-Ante voucher, and
+#     unrestricted Ante-1 physical packs;
 #   - prove duplicate modded tag/voucher keys disable index-specific shortcuts;
 #   - compile the Builder's internal rejection/handoff verifier and require
 #     gate-on/off BSP3 bytes to match for direct and survivor-rebatched tags.
@@ -17,7 +18,7 @@ OUT=${TMPDIR:-/tmp}/brainstorm_vector_gate_equivalence
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-for case_name in case1 case2 case7 case20 case26; do
+for case_name in case1 case2 case6 case7 case20 case26 case31 case36; do
 	test -f "$FIXTURES/$case_name.cfg" || {
 		echo "FAIL: missing fixture $FIXTURES/$case_name.cfg; run tests/native_equivalence.sh first" >&2
 		exit 1
@@ -40,6 +41,15 @@ awk '
 		copied=1
 	}
 ' "$FIXTURES/case20.cfg" > "$OUT/duplicate-voucher.cfg"
+awk '
+	$1 == "pack" && !replaced { print "pack p_bench_missing"; replaced=1; next }
+	$1 == "pack" { next }
+	{ print }
+' "$FIXTURES/case6.cfg" > "$OUT/missing-pack.cfg"
+awk '
+	$1 == "end" { print "poolfile /definitely/missing/route-dependent.bspool" }
+	{ print }
+' "$FIXTURES/case6.cfg" > "$OUT/poolfile-pack.cfg"
 
 $CC_BIN -O3 -Wall -Wno-unused-function -ffp-contract=off $THREAD_FLAG \
 	-o "$OUT/vector_gate_equivalence$EXE" \
@@ -47,7 +57,9 @@ $CC_BIN -O3 -Wall -Wno-unused-function -ffp-contract=off $THREAD_FLAG \
 "$OUT/vector_gate_equivalence$EXE" "$SEARCH_COUNT" \
 	"$FIXTURES/case7.cfg" "$FIXTURES/case26.cfg" \
 	"$FIXTURES/case2.cfg" "$FIXTURES/case20.cfg" \
-	"$OUT/duplicate-tag.cfg" "$OUT/duplicate-voucher.cfg"
+	"$FIXTURES/case6.cfg" "$FIXTURES/case36.cfg" \
+	"$OUT/duplicate-tag.cfg" "$OUT/duplicate-voucher.cfg" \
+	"$FIXTURES/case31.cfg" "$OUT/missing-pack.cfg" "$OUT/poolfile-pack.cfg"
 
 if test -z "$EXE"; then
 	$CC_BIN -O1 -g -Wall -Wno-unused-function -ffp-contract=off \
@@ -57,7 +69,9 @@ if test -z "$EXE"; then
 	"$OUT/vector_gate_equivalence_san" "$SAN_COUNT" \
 		"$FIXTURES/case7.cfg" "$FIXTURES/case26.cfg" \
 		"$FIXTURES/case2.cfg" "$FIXTURES/case20.cfg" \
-		"$OUT/duplicate-tag.cfg" "$OUT/duplicate-voucher.cfg"
+		"$FIXTURES/case6.cfg" "$FIXTURES/case36.cfg" \
+		"$OUT/duplicate-tag.cfg" "$OUT/duplicate-voucher.cfg" \
+		"$FIXTURES/case31.cfg" "$OUT/missing-pack.cfg" "$OUT/poolfile-pack.cfg"
 	echo "PASS vector gate searcher differential under ASan/UBSan"
 fi
 

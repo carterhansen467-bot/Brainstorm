@@ -96,8 +96,11 @@ Important architectural differences:
    Same-day follow-ups completed the Builder pick/state handoff, the item-2
    tag survivor rebatch, and the searcher's profitable exact-Ante FS_VOUCH
    gate. Any-window voucher and FS_TAG-anywhere prototypes were removed after
-   measuring net losses. Remaining candidates are FS_PACK, searcher-side
-   survivor rebatching/pick handoff, and the cost/selectivity planner below.*
+   measuring net losses. A later audit completed unrestricted FS_PACK using an
+   exact weighted-catalog high-byte projection (2.52x on a two-target pack
+   filter, 1.67x on a single target); route-dependent attached pools remain
+   scalar. Remaining candidates are searcher-side survivor rebatching/pick
+   handoff and the cost/selectivity planner below.*
 2. **Compact and rebatch survivors.** Store a small staged candidate record
    containing rank, seed, hashed seed, first-stream result/state, and the
    post-seed hashes for required key lengths. Accumulate survivors across input

@@ -179,7 +179,8 @@ one test-coverage gap, and two audit/measurement infrastructure defects:
 3. The original compile-time verifier was strong but its ad hoc benchmark
    shape could be vacuous and was not in CI. `tests/vector_gate_equivalence.sh`
    now runs a non-vacuous one-million-candidate differential for each of Soul,
-   Legendary, tag, and voucher; exhausts all high-byte/catalog intervals;
+   Legendary, tag, voucher, and unrestricted physical packs; exhausts all
+   high-byte/catalog intervals;
    verifies duplicate-key fallback; runs a bounded ASan/UBSan differential;
    and requires byte-identical gate-on/off Seed Pool output for direct and
    survivor-rebatched tag paths. It is wired into both macOS and Windows CI.
@@ -197,9 +198,20 @@ one test-coverage gap, and two audit/measurement infrastructure defects:
    confirming a real 1.64x gain close to Luke's stated 1.68x. The prior
    multi-million/s absolute voucher figures measured the artificial tag miss
    and should not be used for capacity planning.
+6. The remaining unrestricted FS_PACK candidate was implemented after the
+   corrected harness established its real baseline. At config load it projects
+   every exact weighted booster-picker change point into 256 conservative
+   high-byte intervals. A lane is rejected only when none of its three/four
+   raw Ante-1 pack draws can select any requested key. It measured 15.86M/s
+   versus 6.29M/s (2.52x) for two requested packs and 10.49M/s versus 6.27M/s
+   (1.67x) for one. Separate million-candidate differentials found zero dropped
+   scalar matches. Forced first-shop Buffoon targets disable the useless gate,
+   absent targets reject safely, and `.bspool` routes remain scalar because an
+   embedded collected tag can alter shop skips and RNG consumption.
 
-Current bounded differential counts were 14,843, 23,706, 47,478, and 66,341
-scalar-passing seeds for the four gate kinds, with zero gate-dropped matches.
+Current bounded differential counts were 14,843, 23,706, 47,478, 66,341,
+133,587, and 311,391 scalar-passing seeds across the five gate kinds and two
+pack shapes, with zero gate-dropped matches.
 Production PGO Seed Pool measurements were 12.34M/s versus 10.55M/s for the
 tag-only gate and 19.88M/s versus 10.96M/s for the rebatch shape. The
 verification build is deliberately slower because it reruns rejected lanes

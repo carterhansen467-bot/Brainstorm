@@ -537,9 +537,11 @@ typedef struct {
 	/* lane-parallel first gate over one hashed ILV group (derived; plain
 	 * arrays only so mode_bench's by-value Config copy stays self-contained) */
 	int vgKind; /* 0 none, 1 first-Soul threshold chain, 2 Joker4 pick,
-	             * 3 A1Sm tag pick, 4 exact-Ante voucher pick */
+	             * 3 A1Sm tag pick, 4 exact-Ante voucher pick,
+	             * 5 unrestricted A1 physical-pack picks */
 	int vgRolls, vgN, vgTarget, vgAnte;
 	uint8_t vgTagAllowed[MAX_TAGS];
+	uint8_t vgPackMayHit[256];
 	/* optional .bspool restricting search to a prebuilt seed set (may contain
 	 * spaces: the directive consumes the rest of its config line) */
 	char poolFile[1024];
@@ -1030,7 +1032,6 @@ static inline int boost_pick_index(const Config *g, double poll) {
 	return lo < g->nboostAvailable ? g->boostAvailableIndex[lo] : -1;
 }
 
-#ifdef BRAINSTORM_NATIVE_CORE_ONLY
 static inline double boost_poll_from_fraction(const Config *g,
 		uint64_t fraction) {
 	U64double u = { .u64 = (fraction & UINT64_C(0x000fffffffffffff))
@@ -1051,6 +1052,56 @@ static uint64_t boost_fraction_lower_bound(const Config *g, double boundary,
 	}
 	return lo;
 }
+
+static bool boost_pick_matches_active_pack(const Config *g, int pick) {
+	if (pick < 0) return false;
+	for (int i = 0; i < g->npack; i++)
+		if (!strcmp(g->boostKey[pick], g->packKeys[i])) return true;
+	return false;
+}
+
+/* Build a conservative high-byte projection of the exact weighted booster
+ * picker.  Its output can change only where the rounded poll first crosses a
+ * cumulative upper or lower bound.  Check the start of every such segment
+ * inside each high-byte interval: a zero entry then proves no reachable
+ * 52-bit fraction in that interval can select an active pack target. */
+static bool config_build_pack_gate(Config *g) {
+	for (int i = 0; i < g->npack; i++) {
+		if (g->forceBuffoon
+				&& (!strcmp(g->packKeys[i], "p_buffoon_normal_1")
+					|| !strcmp(g->packKeys[i], "p_buffoon_normal_2")))
+			return false; /* forced first-shop pack makes every seed a hit */
+	}
+	const uint64_t limit = UINT64_C(1) << 52;
+	int certainMissBytes = 0;
+	for (int hi = 0; hi < 256; hi++) {
+		uint64_t first = (uint64_t)hi << 44;
+		uint64_t last = (((uint64_t)hi + 1u) << 44) - 1u;
+		bool mayHit = boost_pick_matches_active_pack(g,
+				boost_pick_index(g, boost_poll_from_fraction(g, first)));
+		for (int at = 0; at < g->nboostAvailable && !mayHit; at++) {
+			uint64_t boundary = boost_fraction_lower_bound(g,
+					g->boostAvailableCume[at], 1);
+			if (boundary < limit && boundary >= first && boundary <= last)
+				mayHit = boost_pick_matches_active_pack(g,
+						boost_pick_index(g, boost_poll_from_fraction(g, boundary)));
+			boundary = boost_fraction_lower_bound(g,
+					g->boostAvailableLower[at], 0);
+			if (!mayHit && boundary < limit && boundary >= first && boundary <= last)
+				mayHit = boost_pick_matches_active_pack(g,
+						boost_pick_index(g, boost_poll_from_fraction(g, boundary)));
+		}
+		g->vgPackMayHit[hi] = (uint8_t)mayHit;
+		if (!mayHit) certainMissBytes++;
+	}
+	if (!certainMissBytes) return false;
+	/* Ante 1 has four physical Small+Big shop slots. The forced normal
+	 * Buffoon occupies the first without consuming this RNG stream. */
+	g->vgRolls = 4 - (g->forceBuffoon ? 1 : 0);
+	return true;
+}
+
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
 
 static void boost_add_soul_run(Config *g, uint64_t end, uint16_t cls) {
 	int n = g->nboostSoulRuns;
@@ -3054,6 +3105,20 @@ static void first_gate_batch(const Config *g, const char seeds[ILV][9],
 		}
 		return;
 	}
+	if (g->vgKind == 5) {
+		/* Unrestricted pack-only route: no earlier filter can skip a blind,
+		 * so the three/four raw Ante-1 pack draws are route-independent. A
+		 * lane survives if any high-byte interval could contain a requested
+		 * weighted pick; otherwise the scalar scan must miss every slot. */
+		for (int i = 0; i < ILV; i++) survive[i] = 0;
+		for (int roll = 0; roll < g->vgRolls; roll++) {
+			gate_stream_step(st, hseed, sv);
+			gate_reseed_hi(sv, hi);
+			for (int i = 0; i < ILV; i++)
+				if (g->vgPackMayHit[hi[i]]) survive[i] = 1;
+		}
+		return;
+	}
 	gate_stream_step(st, hseed, sv);
 	gate_reseed_hi(sv, hi);
 	const uint8_t *avail = g->vgKind == 2 ? g->jokerAvail[4] : g->vgTagAllowed;
@@ -3674,6 +3739,11 @@ bad_value:
 		 * pool may contain the same target key more than once, in which case
 		 * either entry is a hit and a one-index gate would be unsound. */
 		if (targetMatches > 1) g->vgKind = 0;
+	} else if (g->fsId == FS_PACK && !g->poolFile[0]
+			&& config_build_pack_gate(g)) {
+		/* Pool-attached routes remain scalar: their embedded collected tags
+		 * can skip a shop and change both the raw draw count and forced slot. */
+		g->vgKind = 5;
 	} else if (g->fsId == FS_VOUCH && g->voucherAnte >= 1 && g->nvouch >= 1) {
 		/* check_voucher's exact Ante is decided by that Ante's pick alone
 		 * (earlier Antes' picks land on their own streams and only matter

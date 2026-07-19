@@ -615,14 +615,19 @@ the scalar evaluator.
 - **Searcher** (`brainstorm_native_search`, both full-space and poolfile
   workers): FS_SOUL ante-1 reward-pack roll chain (**1.94x** on the
   classic Soul/legendary search), FS_LEGEND legendary-anywhere (1.33x),
-  ante-1 FS_TAG (1.28x), and exact-Ante FS_VOUCH (**1.68x**).
+  ante-1 FS_TAG (1.28x), and exact-Ante FS_VOUCH (**1.64x** with the
+  corrected family-specific benchmark).
+  Unrestricted FS_PACK also projects the exact weighted booster picker onto
+  conservative high-byte intervals: **2.52x** on a two-target pack filter and
+  **1.67x** on a single-target filter. Attached-pool pack searches remain
+  scalar because collected route tags can change shop skips and draw counts.
 - **Verification**: 14M-seed gate-vs-scalar differential harness across
   every gate kind (zero drops over 300k+ passing seeds), 200M-rank
   handoff divergence checks, byte-identical single-thread scan and
   refilter pools with gates on/off, and the Lua-oracle, soul-depth,
   fastpath, search/refilter/partial/lineage/shard, voucher-route, and
   Omen/Charm suites. `tests/vector_gate_equivalence.sh` keeps a bounded,
-  non-vacuous version of the four-kind differential and byte-identical
+  non-vacuous version of the five-kind differential and byte-identical
   Builder checks in CI on macOS and Windows. It also exhausts every high-byte
   bucket interval for catalog sizes 1 through 256; duplicate modded target
   keys conservatively disable index-specific tag/voucher gates.
@@ -636,9 +641,6 @@ Removed per the keep-only-measured-gains rule in `FUTURE_CHANGES.md`.
 
 ### Remaining
 
-- FS_PACK first-stream gate (route-dependent weighted pack simulation;
-  deliberately skipped, see FUTURE_CHANGES.md guidance on
-  state-sharing predicates).
 - Searcher-side survivor rebatching (e.g. Soul-gate survivors through a
   batched legendary pick) and a searcher pick handoff mirroring the
   Builder's.
