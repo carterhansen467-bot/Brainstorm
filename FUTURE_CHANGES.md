@@ -71,6 +71,31 @@ Important architectural differences:
    roll with an active-lane mask, and performs masked resamples. Pass only the
    surviving candidates to `pool_evaluate_pre`. Keep identical floating-point
    operations and verify every lane against the scalar path.
+
+   *Prototyped 2026-07-18 in the Builder (`pool_first_gate_batch`,
+   `BRAINSTORM_VECTOR_GATE=0` to disable, `-DBRAINSTORM_VERIFY_VECTOR_GATE`
+   for the differential build). The gate replays only the first Joker4 draw
+   per lane, decides `math.random(n)` buckets from output bits 44..51 alone,
+   and leaves boundary/culled-resample lanes undecided, so a rejection is
+   always one the scalar precheck must also make; survivors rerun the
+   unmodified `pool_evaluate_pre`. Eligible only when every cumulative
+   legendary rule is soul_depth 1. Measured on M1 Max: 1.29x on the
+   Perkeo+Charm-tag pool build (16.4M/s to 21.0M/s single-thread, same ratio
+   on all cores), 1.10x on a legendary-only build (Soul-walk bound). Verified:
+   200M-seed differential run, byte-identical single-thread pools gate
+   on/off, and the Lua-oracle, soul-depth, search-, refilter-, voucher-route,
+   and Omen/Charm suites. Same-day port to the in-game searcher
+   (`first_gate_batch`, same env/verify switches) covering its FS_SOUL,
+   FS_LEGEND, and non-anywhere FS_TAG first streams — FS_SOUL rejects on the
+   whole ante-1 reward-pack roll chain, where bits 44..51 decide each 0.997
+   threshold 255/256 of the time. Measured (`bench`, M1 Max single thread):
+   classic Soul/legendary search 12.7M to 24.5M seeds/s (1.94x), legendary
+   anywhere 1.33x, ante-1 tag 1.28x; the gated loop also serves poolfile
+   searches. Verified: differential bench on six filter shapes, the 38-case
+   native_equivalence Lua oracle, 1M-case fastpath, and pool-search suites.
+   Next steps: hand the decided pick to `pool_evaluate_pre` to skip the
+   survivor recompute, survivor rebatching for the Builder's tag roll
+   (FUTURE item 2), and FS_TAG-anywhere/FS_PACK/FS_VOUCH gate kinds.*
 2. **Compact and rebatch survivors.** Store a small staged candidate record
    containing rank, seed, hashed seed, first-stream result/state, and the
    post-seed hashes for required key lengths. Accumulate survivors across input

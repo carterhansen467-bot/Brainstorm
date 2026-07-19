@@ -118,6 +118,7 @@ typedef struct {
 	char firstKey[32];
 	int legendaryNeedsEdition; /* derived; not part of criteria identity */
 	int simpleFirstSoul, simpleSoulMinAnte, simpleSoulMaxAnte; /* derived hot path */
+	int vectorFirstGate, vectorGateTarget; /* derived hot path */
 	uint64_t catalogHash, criteriaHash, stageHash;
 	uint64_t familyId, segmentId, lineageId, derivationId;
 	int refilter, refilterDepth;
@@ -2229,6 +2230,26 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 			p->simpleSoulMaxAnte = r->maxAnte;
 		}
 	}
+	/* The batched first gate can only reject a lane on evidence the scalar
+	 * precheck would also reject on: the very first Joker4 draw. That draw
+	 * fully decides the precheck only when every cumulative rule pins Soul #1
+	 * (soul_depth 1); ANY/2 rules keep a second, stream-dependent chance. */
+	p->vectorFirstGate = 0;
+	p->vectorGateTarget = -2;
+	if (pool_legend_rule_count(p) && p->firstKind == 1) {
+		int allFirst = 1;
+		for (int i = 0; i < pool_legend_rule_count(p); i++)
+			if (pool_legend_rule_at(p, i)->soulDepth != 1) allFirst = 0;
+		if (allFirst) {
+			p->vectorFirstGate = 1;
+			p->vectorGateTarget = pool_legend_rule_at(p, 0)->poolIndex;
+			for (int i = 1; i < pool_legend_rule_count(p); i++)
+				if (pool_legend_rule_at(p, i)->poolIndex != p->vectorGateTarget)
+					p->vectorGateTarget = -2; /* contradictory rules: no lane passes */
+		}
+	}
+	const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");
+	if (gateEnv && !strcmp(gateEnv, "0")) p->vectorFirstGate = 0;
 }
 
 /* All refilter stages constrain one cumulative Soul sequence. Resolve the
@@ -2275,6 +2296,53 @@ static bool pool_precheck_all_legendaries(PoolCtx *c) {
 			RS_RBASE[RB_JOKER4], KL_RS_RBASE[RB_JOKER4],
 			c->jokerResample, g->jokerAvail[4], g->njoker[4]);
 	return first >= 0 && pool_precheck_legendaries_after_first(c, first);
+}
+
+/* Lane-parallel prefilter over one hashed ILV group: replay only the first
+ * Joker4 draw (identical stream advance, reseed, and pick arithmetic) and
+ * clear lanes it already proves the scalar precheck must reject. Survivors
+ * re-enter pool_evaluate_pre unchanged, so this stage owns no route state and
+ * a culled-catalog resample leaves the lane undecided rather than guessing. */
+static void pool_first_gate_batch(const Config *g, const PoolPlan *p,
+		const double hseed[ILV], const double hfirst[ILV],
+		uint8_t survive[ILV]) {
+	double sv[ILV], frac[ILV];
+	/* round13's data-dependent rounding branch is a coin flip per lane, so
+	 * the scalar helper mispredicts constantly here. Evaluate its fast path
+	 * branch-free across the group (fl + 1.0 is exact, matching the helper's
+	 * increment) and patch the rare near-half-way lanes with the exact form. */
+	for (int i = 0; i < ILV; i++) {
+		double x = lua_mod1(2.134453429141 + hfirst[i] * 1.72431234);
+		double q = x * 1e13, fl = floor(q), f = q - fl;
+		frac[i] = f;
+		sv[i] = ((fl + (double)(f > 0.5015)) / 1e13 + hseed[i]) / 2.0;
+	}
+	for (int i = 0; i < ILV; i++) {
+		if (frac[i] > 0.4985 && frac[i] <= 0.5015) {
+			double x = lua_mod1(2.134453429141 + hfirst[i] * 1.72431234);
+			sv[i] = (round13_exact(x) + hseed[i]) / 2.0;
+		}
+	}
+	uint64_t word[4][PRNG_BATCH_MAX];
+	lj_random_seed_components_batch(sv, ILV, word);
+	int n = g->njoker[4];
+	const uint8_t *avail = g->jokerAvail[4];
+	for (int i = 0; i < ILV; i++) {
+		/* Output bits 44..51 bound the 52-bit draw to [high, high+1)/256.
+		 * math.random(n)'s bucket is decided whenever that whole interval
+		 * floors to one bucket; the strict 1/256 gap to the next integer
+		 * also dwarfs the half-ulp of the scalar path's d*n rounding, so a
+		 * decided bucket always equals the scalar pick. Boundary-straddling
+		 * lanes stay undecided and rerun the full scalar precheck. */
+		unsigned high = (unsigned)(uint8_t)((prng_first_hi_0(word[0][i])
+				^ prng_first_hi_1(word[1][i])
+				^ prng_first_hi_2(word[2][i])
+				^ prng_first_hi_3(word[3][i])) >> 44);
+		unsigned bucket = (high * (unsigned)n) >> 8;
+		if (bucket != ((high + 1u) * (unsigned)n) >> 8) survive[i] = 1;
+		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
+		else survive[i] = (int)bucket == p->vectorGateTarget;
+	}
 }
 
 /* Count/decision scans overwhelmingly use one ordinary first-Soul Ante range.
@@ -3364,7 +3432,21 @@ static void *pool_scan_worker(void *arg) {
 				batch_hash_seed_pre(sufS, seeds, hseed);
 				batch_hash_key_pre(s->p->firstKey, firstKeyLen, sufK, seeds, hfirst);
 			}
+			uint8_t gateSurvive[ILV];
+			if (s->p->vectorFirstGate)
+				pool_first_gate_batch(s->g, s->p, hseed, hfirst, gateSurvive);
 			for (int i = 0; i < ILV; i++) {
+				if (s->p->vectorFirstGate && !gateSurvive[i]) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+					if (pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i],
+							NULL, 0, NULL)) {
+						fprintf(stderr, "vector gate dropped passing seed %s\n",
+								seeds[i]);
+						abort();
+					}
+#endif
+					continue;
+				}
 				bool passed = pool_evaluate_pre(c, seeds[i], hseed[i], hfirst[i],
 						NULL, 0, eventMode && !decisionReplay ? &metadata : NULL);
 				if (passed && decisionReplay) {

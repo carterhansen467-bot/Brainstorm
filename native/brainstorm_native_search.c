@@ -534,6 +534,11 @@ typedef struct {
 	struct { int kind; char str[MAX_KEY]; double x; int n; double expect; } checks[MAX_CHECKS];
 	/* first RNG stream the active filter chain touches (batched-hash preload) */
 	int fsId; int fsAnte; const char *fsKey;
+	/* lane-parallel first gate over one hashed ILV group (derived; plain
+	 * arrays only so mode_bench's by-value Config copy stays self-contained) */
+	int vgKind; /* 0 none, 1 first-Soul threshold chain, 2 Joker4 pick, 3 A1Sm tag pick */
+	int vgRolls, vgN, vgTarget;
+	uint8_t vgTagAllowed[MAX_TAGS];
 	/* optional .bspool restricting search to a prebuilt seed set (may contain
 	 * spaces: the directive consumes the rest of its config line) */
 	char poolFile[1024];
@@ -2951,6 +2956,74 @@ static bool passes_pre(Ctx *c, const char seed[9], double hseed, double hfirst) 
 	return passes_prepared(c);
 }
 
+/* Advance one round13 stream step for the whole group branch-free (fl + 1.0
+ * matches the scalar increment exactly) and patch the rare near-half-way
+ * lanes with the exact form; round13's rounding branch is a per-seed coin
+ * flip that mispredicts constantly in a lane loop. */
+static inline void gate_stream_step(double st[ILV], const double hseed[ILV],
+		double sv[ILV]) {
+	double xarr[ILV], frac[ILV];
+	for (int i = 0; i < ILV; i++) {
+		double x = lua_mod1(2.134453429141 + st[i] * 1.72431234);
+		double q = x * 1e13, fl = floor(q), f = q - fl;
+		xarr[i] = x;
+		frac[i] = f;
+		st[i] = (fl + (double)(f > 0.5015)) / 1e13;
+	}
+	for (int i = 0; i < ILV; i++) {
+		if (frac[i] > 0.4985 && frac[i] <= 0.5015)
+			st[i] = round13_exact(xarr[i]);
+	}
+	for (int i = 0; i < ILV; i++) sv[i] = (st[i] + hseed[i]) / 2.0;
+}
+
+static inline void gate_reseed_hi(const double sv[ILV], uint8_t hi[ILV]) {
+	uint64_t word[4][PRNG_BATCH_MAX];
+	lj_random_seed_components_batch(sv, ILV, word);
+	for (int i = 0; i < ILV; i++) {
+		hi[i] = (uint8_t)((prng_first_hi_0(word[0][i])
+				^ prng_first_hi_1(word[1][i])
+				^ prng_first_hi_2(word[2][i])
+				^ prng_first_hi_3(word[3][i])) >> 44);
+	}
+}
+
+/* Lane-parallel prefilter over one hashed ILV group, mirroring only the very
+ * first checks of passes_prepared for the active fsId. Output bits 44..51
+ * decide a 0.997 threshold whenever they differ from 0xff, and pin a
+ * math.random(n) bucket whenever [high, high+1)/256 floors into one bucket
+ * (the 1/256 gap dwarfs the scalar path's half-ulp d*n rounding). Undecided
+ * or culled-resample lanes survive and rerun the unchanged scalar chain, so
+ * a gate rejection is always one the scalar chain must also make. */
+static void first_gate_batch(const Config *g, const double hseed[ILV],
+		const double hfirst[ILV], uint8_t survive[ILV]) {
+	double st[ILV], sv[ILV];
+	uint8_t hi[ILV];
+	for (int i = 0; i < ILV; i++) st[i] = hfirst[i];
+	if (g->vgKind == 1) {
+		/* Classic Soul filter: reject only when every card roll of the
+		 * ante-1 reward pack is certainly <= 0.997. */
+		for (int i = 0; i < ILV; i++) survive[i] = 0;
+		for (int roll = 0; roll < g->vgRolls; roll++) {
+			gate_stream_step(st, hseed, sv);
+			gate_reseed_hi(sv, hi);
+			for (int i = 0; i < ILV; i++)
+				if (hi[i] == UINT8_C(0xff)) survive[i] = 1;
+		}
+		return;
+	}
+	gate_stream_step(st, hseed, sv);
+	gate_reseed_hi(sv, hi);
+	const uint8_t *avail = g->vgKind == 2 ? g->jokerAvail[4] : g->vgTagAllowed;
+	for (int i = 0; i < ILV; i++) {
+		unsigned bucket = ((unsigned)hi[i] * (unsigned)g->vgN) >> 8;
+		if (bucket != (((unsigned)hi[i] + 1u) * (unsigned)g->vgN) >> 8)
+			survive[i] = 1; /* bucket boundary: undecided */
+		else if (!avail[bucket]) survive[i] = 1; /* resample: undecided */
+		else survive[i] = (int)bucket == g->vgTarget;
+	}
+}
+
 /* Always-on guard: batched hashing must agree with the serial reference. */
 static bool batch_selftest(const Config *g) {
 	char seeds[ILV][9];
@@ -3530,6 +3603,33 @@ bad_value:
 		}
 	}
 	config_finalize_catalog(g);
+	/* First-gate eligibility. Each kind may only reject on evidence the
+	 * scalar chain's very first checks would also reject on; anything the
+	 * gate cannot decide from the first stream alone must survive. */
+	g->vgKind = 0;
+	if (g->fsId == FS_SOUL && g->soulAllowed
+			&& g->tagRewardCards[1] >= 1 && g->tagRewardCards[1] <= 8) {
+		g->vgKind = 1;
+		g->vgRolls = g->tagRewardCards[1];
+	} else if (g->fsId == FS_LEGEND && g->soulAllowed && g->njoker[4] >= 1) {
+		g->vgKind = 2;
+		g->vgN = g->njoker[4];
+		g->vgTarget = g->activeLegendaryIdx;
+	} else if (g->fsId == FS_TAG && !g->tagAnywhere && g->ntags >= 1) {
+		g->vgKind = 3;
+		g->vgN = g->ntags;
+		g->vgTarget = -1;
+		for (int i = 0; i < g->ntags; i++) {
+			g->vgTagAllowed[i] = (uint8_t)(g->tagReqOk[i]
+					&& (g->tagMinAnte[i] == 0 || g->tagMinAnte[i] <= 1));
+			if (g->vgTarget < 0 && !strcmp(g->tagKey[i], g->tag))
+				g->vgTarget = i;
+		}
+	}
+	{
+		const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");
+		if (gateEnv && !strcmp(gateEnv, "0")) g->vgKind = 0;
+	}
 	return true;
 fail:
 	if (f) fclose(f);
@@ -4997,8 +5097,21 @@ static void *pool_worker(void *vp) {
 					batch_hash_seed_n(seeds, l0, hseed);
 					if (g->fsKey) batch_hash_key_n(g->fsKey, seeds, l0, hfirst);
 				}
+				uint8_t gateSurvive[ILV];
+				if (g->vgKind)
+					first_gate_batch(g, hseed, hfirst, gateSurvive);
 				for (int j = 0; j < ILV; j++) {
 					done++;
+					if (g->vgKind && !gateSurvive[j]) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+						if (passes_pre(c, seeds[j], hseed[j], hfirst[j])) {
+							fprintf(stderr, "vector gate dropped passing seed %s\n",
+									seeds[j]);
+							abort();
+						}
+#endif
+						continue;
+					}
 					if (passes_pre(c, seeds[j], hseed[j], g->fsKey ? hfirst[j] : 0.0)) {
 						record_hit(c);
 						break;
@@ -5067,8 +5180,21 @@ static void *worker(void *vp) {
 			}
 			batch_hash_seed_pre(sufS, seeds, hseed);
 			if (g->fsKey) batch_hash_key_pre(g->fsKey, kl, sufK, seeds, hfirst);
+			uint8_t gateSurvive[ILV];
+			if (g->vgKind)
+				first_gate_batch(g, hseed, hfirst, gateSurvive);
 			for (int i = 0; i < ILV; i++) {
 				done++;
+				if (g->vgKind && !gateSurvive[i]) {
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+					if (passes_pre(c, seeds[i], hseed[i], hfirst[i])) {
+						fprintf(stderr, "vector gate dropped passing seed %s\n",
+								seeds[i]);
+						abort();
+					}
+#endif
+					continue;
+				}
 				if (passes_pre(c, seeds[i], hseed[i], g->fsKey ? hfirst[i] : 0.0)) {
 					record_hit(c);
 					break;
