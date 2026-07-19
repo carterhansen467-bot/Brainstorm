@@ -3731,18 +3731,25 @@ static bool pool_write_state(const char *path, const PoolPlan *p, const PoolStat
 	 * Apart from leaking a descriptor, leaving it open prevents cleanup or
 	 * replacement on Windows. Preserve the first useful errno for the caller. */
 	int saved = 0;
+	const char *phase = "write";
 	if (ferror(f) || fflush(f) != 0) saved = errno ? errno : EIO;
-	if (!saved && bs_fsync_file(f) != 0) saved = errno ? errno : EIO;
-	if (fclose(f) != 0 && !saved) saved = errno ? errno : EIO;
+	if (!saved && bs_fsync_file(f) != 0) {
+		saved = errno ? errno : EIO;
+		phase = "sync";
+	}
+	if (fclose(f) != 0 && !saved) {
+		saved = errno ? errno : EIO;
+		phase = "close";
+	}
 	if (saved) {
 		remove(tmp);
-		snprintf(err, errsz, "cannot commit state: %s", strerror(saved));
+		snprintf(err, errsz, "cannot %s state checkpoint: %s", phase, strerror(saved));
 		return false;
 	}
 	if (bs_rename_overwrite(tmp, path) != 0) {
 		saved = errno ? errno : EIO;
 		remove(tmp);
-		snprintf(err, errsz, "cannot commit state: %s", strerror(saved));
+		snprintf(err, errsz, "cannot replace state checkpoint: %s", strerror(saved));
 		return false;
 	}
 	return true;
@@ -4009,25 +4016,56 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 	if (p->resume && stateExists) {
 		if (!pool_load_state(statePath, p, &state, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
 		if (p->format != POOL_COUNT) {
+			bool headerIdentityOk = p->format != POOL_BINARY
+					|| (resumeHeader.catalogHash == p->catalogHash
+						&& resumeHeader.criteriaHash == p->criteriaHash
+						&& (!resumeHeader.familyId || resumeHeader.familyId == p->familyId)
+						&& (!resumeHeader.segmentId || resumeHeader.segmentId == p->segmentId)
+						&& (!resumeHeader.lineageId || resumeHeader.lineageId == p->lineageId)
+						&& resumeHeader.rangeStart == p->outputRangeStart
+						&& resumeHeader.rangeEnd == p->outputRangeEnd);
+			uint64_t headerCursor = p->refilter
+					? resumeHeader.inputCursor : resumeHeader.scanCursor;
+			uint64_t nextCheckpoint = state.cursor + p->checkpoint;
+			if (nextCheckpoint < state.cursor
+					|| nextCheckpoint > p->start + p->count)
+				nextCheckpoint = p->start + p->count;
+			/* The binary header is flushed before the atomic .state replacement.
+			 * If Windows denied that replacement, the header and its checksummed
+			 * data describe one more durable checkpoint than the old state file.
+			 * Accept only a forward, incomplete checkpoint from the same pool;
+			 * the digest verification below proves its full payload before the
+			 * state is repaired. */
+			bool checkpointAhead = p->format == POOL_BINARY && headerIdentityOk
+					&& !state.done && !resumeHeader.complete
+					&& headerCursor == nextCheckpoint
+					&& resumeHeader.records >= state.matched
+					&& resumeHeader.dataBytes
+						>= state.outputBytes - (uint64_t)p->headerBytes
+					&& resumeHeader.dataBytes
+						<= (uint64_t)INT64_MAX - (uint64_t)p->headerBytes;
 			bool finalizedAhead = p->format == POOL_BINARY && !state.done
 					&& resumeHeader.complete && state.cursor == p->start + p->count
 					&& resumeHeader.dataBytes
 							== state.outputBytes - (uint64_t)p->headerBytes;
 			if (p->format == POOL_BINARY
-					&& (resumeHeader.catalogHash != p->catalogHash
-						|| resumeHeader.criteriaHash != p->criteriaHash
-						|| (resumeHeader.familyId && resumeHeader.familyId != p->familyId)
-						|| (resumeHeader.segmentId && resumeHeader.segmentId != p->segmentId)
-						|| (resumeHeader.lineageId && resumeHeader.lineageId != p->lineageId)
-						|| resumeHeader.rangeStart != p->outputRangeStart
-						|| resumeHeader.rangeEnd != p->outputRangeEnd
-						|| resumeHeader.records != state.matched
+					&& (!headerIdentityOk
+						|| (!checkpointAhead && resumeHeader.records != state.matched)
 						|| (state.done && !resumeHeader.complete)
-						|| (!state.done && !finalizedAhead && (resumeHeader.complete
+						|| (!state.done && !checkpointAhead && !finalizedAhead
+								&& (resumeHeader.complete
 								|| resumeHeader.dataBytes
 										!= state.outputBytes - (uint64_t)p->headerBytes)))) {
 				fprintf(stderr, "output header does not match its resumable state\n");
 				return 1;
+			}
+			if (checkpointAhead) {
+				state.cursor = headerCursor;
+				state.scanned = headerCursor - p->start;
+				state.matched = resumeHeader.records;
+				state.outputBytes = (uint64_t)p->headerBytes + resumeHeader.dataBytes;
+				state.membershipDigest = resumeHeader.membershipDigest;
+				state.metadataDigest = resumeHeader.metadataDigest;
 			}
 			FILE *digestFile = fopen(output, "rb");
 			uint64_t committedDigest = 0;
@@ -4039,7 +4077,9 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 					digestOffset, digestBytes, &committedDigest);
 			if (digestFile) fclose(digestFile);
 			if (!digestOk || (state.membershipDigest
-					&& state.membershipDigest != committedDigest)) {
+					&& state.membershipDigest != committedDigest)
+					|| (checkpointAhead
+						&& resumeHeader.membershipDigest != committedDigest)) {
 				fprintf(stderr, "committed output digest does not match its resumable state\n");
 				return 1;
 			}
@@ -4056,13 +4096,22 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 				if (metadataOk) bspool_reader_destroy(&metadataReader);
 				if (metadataFile) fclose(metadataFile);
 				if (!metadataOk || (state.metadataDigest
-						&& state.metadataDigest != committedMetadata)) {
+						&& state.metadataDigest != committedMetadata)
+						|| (checkpointAhead
+							&& resumeHeader.metadataDigest != committedMetadata)) {
 					fprintf(stderr, "committed metadata digest does not match its resumable state\n");
 					return 1;
 				}
 				state.metadataDigest = committedMetadata;
 			} else {
 				state.metadataDigest = 0;
+			}
+			if (checkpointAhead) {
+				if (!pool_write_state(statePath, p, &state, err, sizeof err)) {
+					fprintf(stderr, "%s\n", err); return 1;
+				}
+				fprintf(stderr, "recovered committed checkpoint at %s %" PRIu64 "\n",
+						p->refilter ? "input record" : "rank", state.cursor);
 			}
 			if (p->format == POOL_BINARY && resumeHeader.complete) {
 				FILE *finished = fopen(output, "rb");

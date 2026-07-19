@@ -648,6 +648,35 @@ local seedsPerFrame = {"500", "750", "1000", "2500", "5000", "10000"}
 Brainstorm.searchThreadsOptions = {"Auto", "1", "2", "3", "4", "6", "8", "12", "16"}
 Brainstorm.searchThreadsValues  = {["Auto"]=0, ["1"]=1, ["2"]=2, ["3"]=3, ["4"]=4, ["6"]=6, ["8"]=8, ["12"]=12, ["16"]=16}
 
+-- Shared ref tables let the estimate change in place while this tab is open.
+-- The calculation lives in Brainstorm_estimate.lua and uses the same eligible
+-- pools and route helpers as passesAllFilters.
+Brainstorm.SEARCH_ESTIMATE_DISPLAY = Brainstorm.SEARCH_ESTIMATE_DISPLAY or {
+	text = "Estimated search: calculating...",
+	note = "",
+	colour = {1, 1, 1, 1},
+}
+
+G.FUNCS.brainstorm_refresh_search_estimate = function()
+	if Brainstorm.refreshSearchEstimateDisplay then
+		Brainstorm.refreshSearchEstimateDisplay(false)
+	end
+end
+
+function Brainstorm.compactSearchEstimateRow()
+	return {n = G.UIT.R, config = {
+		align = "cm", padding = 0.005,
+		func = "brainstorm_refresh_search_estimate",
+	}, nodes = {
+		{n = G.UIT.T, config = {
+			ref_table = Brainstorm.SEARCH_ESTIMATE_DISPLAY,
+			ref_value = "text",
+			scale = 0.27,
+			colour = Brainstorm.SEARCH_ESTIMATE_DISPLAY.colour,
+		}},
+	}}
+end
+
 Brainstorm.G_FUNCS_options_ref = G.FUNCS.options
 G.FUNCS.options = function(e)
 	Brainstorm.G_FUNCS_options_ref(e)
@@ -707,6 +736,9 @@ function create_tabs(args)
 					end
 				end
 				Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(savedPool or "")
+				if Brainstorm.refreshSearchEstimateDisplay then
+					Brainstorm.refreshSearchEstimateDisplay(true)
+				end
 				-- Left column: the core search settings
 				local leftColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
 					create_option_cycle({
@@ -879,6 +911,28 @@ function create_tabs(args)
 								}),
 							}},
 						}},
+						-- Immediate seed-count estimate from Brainstorm's live pools and
+						-- route model. The func runs only while this UI row exists; its
+						-- signature cache avoids repeating the catalog/route calculation.
+						{n = G.UIT.R, config = {
+							align = "cm", padding = 0.01,
+							func = "brainstorm_refresh_search_estimate",
+						}, nodes = {
+							{n = G.UIT.T, config = {
+								ref_table = Brainstorm.SEARCH_ESTIMATE_DISPLAY,
+								ref_value = "text",
+								scale = 0.30,
+								colour = Brainstorm.SEARCH_ESTIMATE_DISPLAY.colour,
+							}},
+						}},
+						{n = G.UIT.R, config = {align = "cm", padding = 0.005}, nodes = {
+							{n = G.UIT.T, config = {
+								ref_table = Brainstorm.SEARCH_ESTIMATE_DISPLAY,
+								ref_value = "note",
+								scale = 0.21,
+								colour = G.C.UI.TEXT_INACTIVE,
+							}},
+						}},
 					},
 				}
 			end,
@@ -1000,6 +1054,7 @@ function create_tabs(args)
 						}},
 						matchModeRow,
 						slotsSection,
+						Brainstorm.compactSearchEstimateRow(),
 					},
 				}
 			end,
@@ -1077,6 +1132,7 @@ function create_tabs(args)
 						}},
 					}}
 				end
+				anteRows[#anteRows + 1] = Brainstorm.compactSearchEstimateRow()
 				return {
 					n = G.UIT.ROOT,
 					config = { align = "cm", padding = 0.05, colour = G.C.CLEAR, minh = 6.5 },

@@ -64,6 +64,51 @@ if "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
   echo "FAIL: inconsistent resume state was accepted"; exit 1
 fi
 
+# A Windows sharing violation can happen after the new header/data checkpoint
+# is durable but before its atomic .state replacement.  Recreate that exact
+# ordering: keep a valid incomplete header at the final scan cursor while the
+# state sidecar is one cursor behind.  Resume must validate the header payload,
+# repair the sidecar, and finalize without rescanning or duplicating records.
+cp "$OUT/native-v3.bspool" "$OUT/ahead.bspool"
+cp "$OUT/native-v3.bspool.state" "$OUT/ahead.bspool.state"
+python3 - "$OUT/ahead.bspool" "$OUT/ahead.bspool.state" <<'PY'
+import re, sys
+pool, state = sys.argv[1:]
+with open(pool, "r+b") as f:
+    prefix = f.read(8192)
+    text = prefix.split(b"\0", 1)[0].decode("ascii")
+    header_bytes = int(re.search(r"^header_bytes (\d+)$", text, re.M).group(1))
+    data_bytes = int(re.search(r"^data_bytes (\d+)$", text, re.M).group(1))
+    cursor = int(re.search(r"^scan_cursor (\d+)$", text, re.M).group(1))
+    assert cursor > 1 and re.search(r"^complete 1$", text, re.M)
+    raw = prefix[:header_bytes]
+    raw, changed = re.subn(br"(?m)^complete 1$", b"complete 0", raw)
+    assert changed == 1
+    raw, changed = re.subn(br"(?m)^coverage_complete 1$",
+                           b"coverage_complete 0", raw)
+    assert changed == 1
+    f.seek(0)
+    f.write(raw)
+    f.truncate(header_bytes + data_bytes)
+
+with open(state, encoding="ascii") as f:
+    saved = f.read()
+old_cursor = cursor // 2
+saved, n1 = re.subn(r"(?m)^cursor \d+$", "cursor %d" % old_cursor, saved)
+saved, n2 = re.subn(r"(?m)^scanned \d+$", "scanned %d" % old_cursor, saved)
+saved, n3 = re.subn(r"(?m)^output_bytes \d+$",
+                    "output_bytes %d" % (header_bytes + data_bytes), saved)
+saved, n4 = re.subn(r"(?m)^done 1$", "done 0", saved)
+assert (n1, n2, n3, n4) == (1, 1, 1, 1)
+with open(state, "w", encoding="ascii", newline="\n") as f:
+    f.write(saved)
+PY
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+  "$OUT/resume.cfg" "$OUT/ahead.bspool" 2>"$OUT/ahead.log"
+grep -q '^recovered committed checkpoint at rank ' "$OUT/ahead.log"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/ahead.bspool" "$OUT/ahead.txt"
+cmp "$OUT/native-v3.txt" "$OUT/ahead.txt"
+
 # Re-encode the exact exported set as the former schema-1 u64le format.
 python3 - "$OUT/native-v3.bspool" "$OUT/native-v3.txt" "$OUT/legacy-v1.bspool" <<'PY'
 import re, struct, sys

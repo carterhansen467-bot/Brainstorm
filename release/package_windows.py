@@ -20,6 +20,7 @@ from pathlib import Path
 
 RUNTIME_FILES = (
     "Brainstorm.lua",
+    "Brainstorm_estimate.lua",
     "Brainstorm_UI.lua",
     "Brainstorm_keyhandler.lua",
     "Brainstorm_main.lua",

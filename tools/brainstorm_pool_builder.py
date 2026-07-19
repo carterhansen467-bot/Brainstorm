@@ -25,6 +25,8 @@ try:
     import curses
 except ImportError:  # Windows: use tools/pool_builder_web.py instead
     curses = None
+import hashlib
+import hmac
 import os
 import re
 import signal
@@ -551,6 +553,7 @@ class MergeRunner:
     def __init__(self, inputs, output):
         self.output = output
         self.input_pool = None
+        self.inputs = tuple(inputs)
         self.lines = deque(maxlen=200)
         self.scanned = 0
         self.total = sum(int(read_pool_header(p).get("records", "0") or 0)
@@ -658,9 +661,11 @@ POOL_IDENTITY_FIELDS = (
     "family_id", "segment_id", "stage_hash", "lineage_id",
     "derivation_id", "snapshot_id", "membership_digest",
     "metadata_digest", "parent_snapshot_id", "parent_segment_id",
+    "catalog_hash", "criteria_hash",
 )
 POOL_INTEGER_FIELDS = (
-    "schema", "header_bytes", "records", "refilter_depth", "range_start",
+    "schema", "modelver", "header_bytes", "seedspace", "records",
+    "refilter_depth", "range_start",
     "range_end", "merged_parts", "scan_cursor", "input_cursor",
     "parent_records", "parent_data_bytes", "input_record_start",
     "input_record_end", "shard_index", "shard_total",
@@ -685,6 +690,39 @@ def _pool_identity(value):
     if compact and all(ch == "0" for ch in compact):
         return ""
     return value
+
+
+def pool_attachment_base_blockers(pool):
+    """Physical/coverage blockers before semantic filter matching.
+
+    ``coverage_complete`` means complete coverage of a pool's *declared
+    source*, which may be a 100M test range or one distributed shard.  An
+    automatically substituted pool must cover the whole natural space that
+    the live native search would otherwise generate.
+    """
+    blockers = []
+    if not pool.get("complete"):
+        blockers.append("the pool operation is not complete")
+    if not pool.get("coverage_complete"):
+        blockers.append("the pool descends from an incomplete source snapshot")
+    if pool.get("space", "natural") != "natural" \
+            or pool.get("seedspace", 0) != SEEDSPACE:
+        blockers.append("automatic search substitution currently requires the natural seed space")
+    if pool.get("range_start", -1) != 0 or pool.get("range_end", -1) != SEEDSPACE:
+        blockers.append("the pool does not cover every natural-space rank")
+    if pool.get("records", 0) <= 0:
+        blockers.append("the pool contains no searchable seed records")
+    if pool.get("composite"):
+        blockers.append("composite boolean membership needs a separate filter matcher")
+    if pool.get("modelver", 0) != 6:
+        blockers.append("the pool was not built with the current route model")
+    if not _pool_identity(pool.get("pool_id")) \
+            or not _pool_identity(pool.get("catalog_hash")) \
+            or not _pool_identity(pool.get("criteria_hash")):
+        blockers.append("the pool lacks attachment identity metadata")
+    if not pool.get("criteria"):
+        blockers.append("the pool has no embedded filter criteria")
+    return blockers
 
 
 class PoolInfo:
@@ -783,6 +821,8 @@ class PoolInfo:
             _pool_identity(pool.get("family_id"))
             and _pool_identity(pool.get("lineage_id"))
         )
+        pool["attachment_blockers"] = pool_attachment_base_blockers(pool)
+        pool["attachment_base_eligible"] = not pool["attachment_blockers"]
         return pool
 
 
@@ -905,6 +945,89 @@ def read_pool_library(pool_dir=POOL_DIR):
                 pools.append(PoolInfo(os.path.join(pool_dir, name)).as_dict())
     _link_pool_parents(pools)
     return pools, group_pool_library(pools)
+
+
+# A Builder scan deliberately keeps its criteria and checkpoint metadata next
+# to the shareable pool.  An attached-pool marker is reserved for the automatic
+# in-game pool-selection work; deleting a pool must not leave that marker
+# pointing at a file that no longer exists.
+POOL_DELETE_SUFFIXES = ("", ".state", ".manifest", ".criteria.cfg", ".attached")
+
+
+def _safe_pool_path(name, pool_dir):
+    """Resolve one direct child of ``pool_dir`` without accepting traversal."""
+    if not isinstance(name, str) or name != os.path.basename(name) \
+            or not name.lower().endswith(".bspool"):
+        raise ValueError("Select a .bspool file directly from the seed-pool library.")
+    root = os.path.abspath(pool_dir)
+    path = os.path.abspath(os.path.join(root, name))
+    try:
+        inside = os.path.commonpath((root, path)) == root
+    except ValueError:  # different Windows drives
+        inside = False
+    if not inside or os.path.dirname(path) != root:
+        raise ValueError("The selected pool is outside the seed-pool library.")
+    return path
+
+
+def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
+    """Return a snapshot-bound deletion plan for one completed pool.
+
+    The token covers every currently existing related file and its lstat
+    identity.  The caller must recompute the plan immediately before deleting;
+    this turns a stale browser confirmation into a refusal instead of deleting
+    a newly resumed/replaced pool.
+    """
+    path = _safe_pool_path(name, pool_dir)
+    if not os.path.isfile(path):
+        raise ValueError("The selected seed pool no longer exists.")
+    header = read_pool_header(path)
+    if header.get("complete") != "1":
+        raise ValueError("Only completed seed pools can be deleted from the Builder.")
+
+    protected = {os.path.normcase(os.path.abspath(value))
+                 for value in protected_paths if value}
+    related = [path + suffix for suffix in POOL_DELETE_SUFFIXES
+               if os.path.lexists(path + suffix)]
+    blocked = [value for value in related
+               if os.path.normcase(os.path.abspath(value)) in protected]
+    if blocked:
+        raise ValueError("That pool is an active Builder input or output; stop or finish the job first.")
+
+    digest = hashlib.sha256()
+    entries = []
+    total_bytes = 0
+    for value in related:
+        stat = os.lstat(value)
+        size = int(stat.st_size)
+        total_bytes += size
+        entries.append({"name": os.path.basename(value), "path": value,
+                        "bytes": size})
+        digest.update(os.path.normcase(os.path.abspath(value)).encode("utf-8"))
+        digest.update(("\0%d\0%d\0%d\0%d\n" % (
+            int(stat.st_dev), int(stat.st_ino), size,
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000))),
+        )).encode("ascii"))
+    return {"name": name, "path": path, "files": entries,
+            "bytes": total_bytes, "token": digest.hexdigest()}
+
+
+def delete_completed_pool(name, token, pool_dir=POOL_DIR, protected_paths=()):
+    """Delete a still-identical completed pool plan, main file last."""
+    plan = pool_delete_plan(name, pool_dir, protected_paths)
+    if not isinstance(token, str) or not hmac.compare_digest(plan["token"], token):
+        raise ValueError("The pool files changed after confirmation; review the deletion again.")
+    paths = [item["path"] for item in plan["files"]]
+    # Sidecars first keeps the usable .bspool present if an earlier unlink
+    # fails.  A completed pool does not require its sidecars to remain usable.
+    main = plan["path"]
+    ordered = [value for value in paths if value != main] + [main]
+    removed = []
+    for value in ordered:
+        os.unlink(value)
+        removed.append(os.path.basename(value))
+    plan["removed"] = removed
+    return plan
 
 
 def human_bytes(n):

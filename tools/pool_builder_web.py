@@ -205,6 +205,47 @@ def pool_library():
     return core.read_pool_library(core.POOL_DIR)
 
 
+def _active_pool_paths():
+    """Paths a live scan/refilter/merge currently owns. LOCK must be held."""
+    runner = JOB["runner"]
+    if runner is None or runner.done():
+        return ()
+    values = [getattr(runner, "output", None),
+              getattr(runner, "input_pool", None)]
+    values.extend(getattr(runner, "inputs", ()) or ())
+    return tuple(value for value in values if value)
+
+
+def _with_delete_locks(callback):
+    """Serialize deletion against Builder jobs and organizer mutations."""
+    with LOCK:
+        if JOB["closing"]:
+            raise ValueError("The Builder is closing; reopen it before deleting a pool.")
+        if not organizer_web.SPLIT_LOCK.acquire(False):
+            raise ValueError("An organizer split is using the pool library; wait for it to finish.")
+        try:
+            if not organizer_web.COMBINE_LOCK.acquire(False):
+                raise ValueError("An organizer combine is using the pool library; wait for it to finish.")
+            try:
+                return callback(_active_pool_paths())
+            finally:
+                organizer_web.COMBINE_LOCK.release()
+        finally:
+            organizer_web.SPLIT_LOCK.release()
+
+
+def plan_pool_deletion(name, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    return _with_delete_locks(
+        lambda protected: core.pool_delete_plan(name, root, protected))
+
+
+def delete_pool(name, token, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    return _with_delete_locks(
+        lambda protected: core.delete_completed_pool(name, token, root, protected))
+
+
 # ------------------------------------------------------------------ job ----
 
 def job_state():
@@ -523,6 +564,8 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .pool-relation { margin-top:8px; color:#aaa5b7; }
 .pool-update { margin-top:9px; padding:8px 10px; border:1px solid #675829;
   border-radius:9px; background:#29230f; color:#f2d77a; }
+.pool-actions { display:flex; justify-content:flex-end; margin-top:11px; }
+.pool-delete { background:#3c2229 !important; border-color:#74404b !important; color:#ffc1c9 !important; }
 .empty-library { grid-column:1 / -1; padding:30px; text-align:center; border:1px dashed #34394e;
   border-radius:13px; color:var(--faint); }
 .merge-panel { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }
@@ -1081,6 +1124,29 @@ async function mergePools(){
   if (j.error) $("mergeError").textContent = j.error;
 }
 
+async function deletePool(name){
+  $("mergeError").textContent = "";
+  try {
+    let r = await fetch("/api/delete-plan", {method:"POST",
+      body:JSON.stringify({name})});
+    let plan = await r.json();
+    if (plan.error) throw new Error(plan.error);
+    const exact = (plan.files||[]).map(file=>`  ${file.path}`).join("\n");
+    const message = `Permanently delete this completed seed pool and its related files?\n\n${exact}`
+      + `\n\nThis cannot be undone.`;
+    if (!confirm(message)) return;
+    r = await fetch("/api/delete", {method:"POST", body:JSON.stringify({
+      name:plan.name, token:plan.token, confirmed:true})});
+    const result = await r.json();
+    if (result.error) throw new Error(result.error);
+    $("result").textContent = `Deleted ${result.removed.length} files for ${result.name}.`;
+    $("pools").dataset.rendered = "";
+    await tick();
+  } catch (e) {
+    $("mergeError").textContent = e.message || String(e);
+  }
+}
+
 function showResult(j){
   const m = j.manifest || {};
   let out = "";
@@ -1193,10 +1259,13 @@ function renderPoolCard(p, mergeSelected){
   const update = p.update_available
     ? `<div class="pool-update">Update available: the source now has ${fmt(p.new_records)} new recorded seeds. This pool still uses its pinned snapshot; automatic incremental updating is coming later.</div>`
     : "";
+  const remove = p.complete
+    ? `<div class="pool-actions"><button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete completed pool…</button></div>`
+    : "";
   return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
     + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
     + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}${composite}</div>`
-    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}</article>`;
+    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}${remove}</article>`;
 }
 
 function renderPoolLibrary(groups, pools, mergeSelected){
@@ -1295,6 +1364,10 @@ addEventListener("load", ()=>{
   document.addEventListener("change", ()=>{
     $("legRange").style.display = $("legendary").value ? "grid" : "none";
     updateSummary();
+  });
+  document.addEventListener("click", event=>{
+    const button = event.target.closest(".pool-delete");
+    if (button) deletePool(button.dataset.pool);
   });
   syncFilterControls(); syncSourceControls(); updateSpaceHint(); updateShard();
   tick(); setInterval(tick, 1000);
@@ -1416,6 +1489,19 @@ class Handler(BaseHTTPRequestHandler):
             if r is not None:
                 r.stop()
             self._json({"ok": True})
+        elif parsed.path == "/api/delete-plan":
+            try:
+                self._json(plan_pool_deletion(data.get("name", ""), self.pool_dir))
+            except (ValueError, OSError) as e:
+                self._json({"error": str(e)}, 200)
+        elif parsed.path == "/api/delete":
+            try:
+                if data.get("confirmed") is not True:
+                    raise ValueError("Deletion requires explicit confirmation.")
+                self._json(delete_pool(data.get("name", ""),
+                                       data.get("token", ""), self.pool_dir))
+            except (ValueError, OSError) as e:
+                self._json({"error": str(e)}, 200)
         elif parsed.path == "/api/shutdown":
             self._json({"ok": True, "pausing": bool(
                 JOB["runner"] is not None and not JOB["runner"].done())})

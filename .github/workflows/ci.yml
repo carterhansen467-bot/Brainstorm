@@ -55,6 +55,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
+          python3 tests/pool_builder_delete.py
       - name: Pool compression + legacy conversion equivalence
         run: TAG=tag_charm sh tests/pool_compression_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Distributed shard planning + merge equivalence
@@ -109,6 +110,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" LUAJIT_BIN="$LUAJIT" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
+          python tests/pool_builder_delete.py
       - name: Pool compression + legacy conversion equivalence
         run: TAG=tag_charm sh tests/pool_compression_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Distributed shard planning + merge equivalence

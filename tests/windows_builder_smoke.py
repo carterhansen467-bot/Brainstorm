@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import time
+import ctypes
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 os.pardir, "tools"))
@@ -51,6 +52,49 @@ def main():
     assert rc == 130, "expected checkpointed-pause rc 130, got %s: %r" % (rc, list(r.lines))
     assert state.get("done") == "0", "state should be resumable"
     assert int(state.get("cursor", "0")) > 0, "no checkpoint was committed"
+
+    # Hold the state sidecar without FILE_SHARE_DELETE while a stopped scan
+    # tries to replace it. This models antivirus/indexer/UI readers that used
+    # to turn one unlucky checkpoint into a fatal sharing violation.
+    if core.IS_WINDOWS:
+        state_path = out + ".state"
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        locked = kernel32.CreateFileW(
+            state_path, 0x80000000, 0x00000001 | 0x00000002,
+            None, 3, 0x80, None)
+        assert locked not in (None, ctypes.c_void_p(-1).value), \
+            "could not lock checkpoint sidecar"
+        locked_runner = core.Runner(snap.current_model_copy(), text, out)
+        assert wait(locked_runner, 30, until=lambda r: any(
+            "resuming at rank" in line for line in r.lines)), \
+            "locked resume never started: %r" % list(locked_runner.lines)
+        time.sleep(0.5)  # let the resumed process install its CTRL_BREAK handler
+        locked_runner.stop()
+        prior_cursor = int(state["cursor"])
+
+        def header_advanced(_runner):
+            raw = core.read_pool_header_text(out)
+            for line in raw.splitlines():
+                if line.startswith("scan_cursor "):
+                    return int(line.split()[1]) > prior_cursor
+            return False
+
+        assert wait(locked_runner, 120, until=header_advanced), \
+            "locked scan never reached its checkpoint: %r" % list(locked_runner.lines)
+        assert not locked_runner.done(), \
+            "scanner aborted instead of retrying the locked state replacement: %r" \
+            % list(locked_runner.lines)
+        kernel32.CloseHandle(ctypes.c_void_p(locked))
+        assert wait(locked_runner, 120), "scanner did not finish after checkpoint unlock"
+        assert locked_runner.returncode() == 130, \
+            "locked checkpoint did not pause cleanly: %r" % list(locked_runner.lines)
 
     r2 = core.Runner(snap.current_model_copy(), text, out)
     assert wait(r2, 600), "resumed scan did not finish"

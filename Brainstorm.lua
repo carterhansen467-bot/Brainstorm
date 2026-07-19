@@ -48,6 +48,10 @@ function initBrainstorm()
 	assert(load(nativefs.read(MOD .. "/Brainstorm_UI.lua")))()
 	assert(load(nativefs.read(MOD .. "/Brainstorm_keyhandler.lua")))()
 	assert(load(nativefs.read(MOD .. "/Brainstorm_reroll.lua")))()
+	-- Estimates/live telemetry are main-thread UI concerns. Keep them in a
+	-- separate module so Brainstorm_reroll.lua can still be copied into each
+	-- Lua search worker without making every worker parse unused UI math.
+	assert(load(nativefs.read(MOD .. "/Brainstorm_estimate.lua")))()
 	-- Full defaults for a fresh install. settings.lua is NOT shipped in the repo
 	-- (it's user state, rewritten by the mod on every settings change -- shipping
 	-- it made every `git pull` conflict); it's created on first save. A loaded
@@ -145,5 +149,4 @@ function initBrainstorm()
 	end
   _RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
 end
-
 

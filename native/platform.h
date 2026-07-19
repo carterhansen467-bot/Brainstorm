@@ -23,6 +23,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,10 +101,58 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 static inline int bs_dup(int fd) { return _dup(fd); }
 static inline int bs_close(int fd) { return _close(fd); }
 
+static inline void bs_set_errno_from_win32(DWORD code) {
+	switch (code) {
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_PATH_NOT_FOUND:
+	case ERROR_INVALID_DRIVE:
+	case ERROR_BAD_NETPATH:
+		errno = ENOENT; break;
+	case ERROR_ACCESS_DENIED:
+	case ERROR_SHARING_VIOLATION:
+	case ERROR_LOCK_VIOLATION:
+		errno = EACCES; break;
+	case ERROR_FILE_EXISTS:
+	case ERROR_ALREADY_EXISTS:
+		errno = EEXIST; break;
+	case ERROR_DISK_FULL:
+	case ERROR_HANDLE_DISK_FULL:
+		errno = ENOSPC; break;
+	case ERROR_TOO_MANY_OPEN_FILES:
+		errno = EMFILE; break;
+	case ERROR_INVALID_HANDLE:
+		errno = EBADF; break;
+	case ERROR_NOT_ENOUGH_MEMORY:
+	case ERROR_OUTOFMEMORY:
+		errno = ENOMEM; break;
+	case ERROR_WRITE_PROTECT:
+		errno = EROFS; break;
+	case ERROR_INVALID_PARAMETER:
+		errno = EINVAL; break;
+	default:
+		errno = EIO; break;
+	}
+}
+
 static inline int bs_fsync_file(FILE *f) {
 	HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
-	if (h == INVALID_HANDLE_VALUE) return -1;
-	return FlushFileBuffers(h) ? 0 : -1;
+	if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+	DWORD saved = ERROR_SUCCESS;
+	unsigned waited = 0;
+	for (;;) {
+		if (FlushFileBuffers(h)) return 0;
+		saved = GetLastError();
+		bool transient = saved == ERROR_SHARING_VIOLATION
+				|| saved == ERROR_LOCK_VIOLATION
+				|| saved == ERROR_BUSY
+				|| saved == ERROR_NOT_READY
+				|| saved == ERROR_RETRY;
+		if (!transient || waited >= 5000u) break;
+		Sleep(50u);
+		waited += 50u;
+	}
+	bs_set_errno_from_win32(saved);
+	return -1;
 }
 
 static inline int bs_fseeko(FILE *f, int64_t off, int whence) { return _fseeki64(f, off, whence); }
@@ -115,7 +164,31 @@ static inline int bs_ftruncate_file(FILE *f, int64_t size) {
 }
 
 static inline int bs_rename_overwrite(const char *from, const char *to) {
-	return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+	/* Python's ordinary open() and some antivirus/indexing tools omit
+	 * FILE_SHARE_DELETE.  A reader that catches the tiny replacement window
+	 * then makes MoveFileEx fail with a sharing/access error even though both
+	 * files and the disk are healthy.  Checkpoints run for hours or days, so a
+	 * single collision must not terminate the scan.  Retry only errors that
+	 * can be caused by a temporary handle/lock; permanent path and disk errors
+	 * still fail promptly. */
+	DWORD saved = ERROR_SUCCESS;
+	unsigned waited = 0;
+	for (;;) {
+		if (MoveFileExA(from, to,
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+		saved = GetLastError();
+		bool transient = saved == ERROR_ACCESS_DENIED
+				|| saved == ERROR_SHARING_VIOLATION
+				|| saved == ERROR_LOCK_VIOLATION
+				|| saved == ERROR_BUSY
+				|| saved == ERROR_DELETE_PENDING;
+		if (!transient || waited >= 30000u) break;
+		unsigned delay = waited < 100u ? 10u : waited < 1000u ? 50u : 100u;
+		Sleep(delay);
+		waited += delay;
+	}
+	bs_set_errno_from_win32(saved);
+	return -1;
 }
 
 static inline bool bs_file_exists(const char *path) { return _access(path, 0) == 0; }

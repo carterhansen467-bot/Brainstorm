@@ -94,6 +94,16 @@ Brainstorm can automatically reroll for parameters as specified by the user.
 You can edit the Auto-Reroll parameters in the Brainstorm in-game settings page.
 > To Auto-Reroll:	Press `Ctrl + a`
 
+The main Brainstorm tab shows the estimated seeds per match and, after
+Brainstorm has measured this search/backend once, an estimated search time.
+During a search the corner panel reports the backend-confirmed seeds checked,
+wall-clock time elapsed, measured seeds/second, average time remaining, and the
+cumulative chance of a hit by that point. Candidate odds use the active
+profile's eligible pools, booster weights, physical pack route, and configured
+joker windows; time uses observed throughput on this machine. These are
+analytical planning estimates. For a higher-confidence match-rate measurement,
+the Seed Pool Builder's **Quick estimate** actually evaluates a 2M-seed sample.
+
 ### Deep search: tags and legendaries anywhere (antes 1-8)
 Two more toggles on the main Brainstorm tab: **Tag: any blind, antes 1-8**
 matches the searched tag on any Small/Big blind up to ante 8 (labels like

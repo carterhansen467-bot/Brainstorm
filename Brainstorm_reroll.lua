@@ -334,6 +334,12 @@ function Brainstorm.auto_reroll()
 			seed_found = nil
 		end
 	end
+	-- The background and native paths publish authoritative progress of their
+	-- own. Keep the synchronous fallback on the same counter contract so the
+	-- live estimate UI never has to infer work from frames or configured batch
+	-- size (the final batch may stop early on a hit).
+	Brainstorm.AUTOREROLL.searchTried =
+		(Brainstorm.AUTOREROLL.searchTried or 0) + rerollsThisFrame
 	return seed_found
 end
 
@@ -2404,6 +2410,7 @@ function Brainstorm.checkLegendarySearch(seed_found, target_key)
 
 	return chosen_key == target_key
 end
+
 -- ===========================================================================
 -- Background seed search (love.thread)
 -- ---------------------------------------------------------------------------
@@ -2546,9 +2553,13 @@ function Brainstorm.startSearchThread()
 	local rerollSrc = Brainstorm.getRerollSource()
 
 	local n = Brainstorm.getSearchThreadCount()
+	if Brainstorm.startSearchBackendCounter then
+		local backend = Brainstorm.luaSearchBackendKey
+			and Brainstorm.luaSearchBackendKey(n) or ("lua-" .. tostring(n))
+		Brainstorm.startSearchBackendCounter(backend)
+	end
 	A.searchThreads = {}
 	A.searchProgress = {}
-	A.searchTried = 0
 	A.searchThreadCount = n
 	for i = 0, n - 1 do
 		local t = love.thread.newThread(Brainstorm.SEARCH_WORKER_SRC)
@@ -2615,12 +2626,13 @@ function Brainstorm.stopSearchThread()
 end
 
 -- Drives autoreroll each frame. Threaded path polls the worker; fallback path
--- runs the old synchronous auto_reroll. Owns the "Rerolling..." text + the
+-- runs the old synchronous auto_reroll. Owns the live search text + the
 -- found-joker alert so Brainstorm.update just delegates here.
 function Brainstorm.updateAutoReroll(dt)
 	local A = Brainstorm.AUTOREROLL
 	if not A.autoRerollActive then return end
 	A.autoRerollFrames = A.autoRerollFrames or 0
+	if not A.searchStatsActive then Brainstorm.beginSearchStats() end
 
 	local useThread = (Brainstorm.SETTINGS.useSearchThread ~= false)
 		and love and love.thread and not A.searchThreadFailed
@@ -2708,6 +2720,11 @@ function Brainstorm.updateAutoReroll(dt)
 			end
 		end
 	else
+		if A.searchCounterBackend ~= "sync-"
+				.. tostring(Brainstorm.SETTINGS.autoreroll.seedsPerFrame or 500) then
+			Brainstorm.startSearchBackendCounter("sync-"
+				.. tostring(Brainstorm.SETTINGS.autoreroll.seedsPerFrame or 500))
+		end
 		A.rerollTimer = A.rerollTimer + dt
 		if A.rerollTimer >= A.rerollInterval then
 			A.rerollTimer = A.rerollTimer - A.rerollInterval
@@ -2715,6 +2732,7 @@ function Brainstorm.updateAutoReroll(dt)
 			jokerFoundAt = A.jokerFoundAt
 		end
 	end
+	Brainstorm.updateSearchStats()
 
 	if seed_found then
 		-- Search always stops after a find. Destination depends on the setting:
@@ -2745,7 +2763,7 @@ function Brainstorm.updateAutoReroll(dt)
 
 	-- Search-in-progress UI phases (time-based so it's framerate-independent):
 	--   0 .. BIG_SHOW_AT      : nothing (avoids a flash on instant finds)
-	--   BIG_SHOW_AT .. HIDE   : big centered "Rerolling..." text
+	--   BIG_SHOW_AT .. HIDE   : big centered live checked/expected text
 	--   after BIG_HIDE_AT     : small spinner in the top-left corner (drawn by
 	--                           Brainstorm.draw_search_indicator), no big text
 	local BIG_SHOW_AT, BIG_HIDE_AT = 0.25, 2.5
@@ -2754,7 +2772,8 @@ function Brainstorm.updateAutoReroll(dt)
 		A.bigTextShown = true
 		A.rerollText = Brainstorm.attention_text({
 			scale = 1.4,
-			text = "Rerolling...",
+			maxw = 10,
+			text = {{ref_table = A.searchHeadline, ref_value = "value"}},
 			align = 'cm',
 			offset = { x = 0, y = -3.5 },
 			major = G.STAGE == G.STAGES.RUN and G.play or G.title_top,
@@ -2774,6 +2793,7 @@ end
 -- the phase flags so the next search starts clean. Safe to call anytime.
 function Brainstorm.resetSearchUI()
 	local A = Brainstorm.AUTOREROLL
+	if A.searchStatsActive then Brainstorm.finishSearchStats() end
 	A.searchElapsed = 0
 	A.autoRerollFrames = 0
 	A.bigTextShown = false
@@ -2799,7 +2819,24 @@ function Brainstorm.draw_search_indicator()
 	love.graphics.setBlendMode("alpha")
 
 	local t = (love.timer and love.timer.getTime()) or os.clock()
-	local cx, cy, r = 44, 44, 16
+	local lines = Brainstorm.liveSearchTextLines and Brainstorm.liveSearchTextLines()
+		or {"Searching..."}
+	local font = love.graphics.getFont()
+	local textWidth = 0
+	for _, line in ipairs(lines) do
+		textWidth = math.max(textWidth, font:getWidth(line))
+	end
+	local panelX, panelY = 12, 12
+	local panelW = 72 + textWidth + 14
+	local panelH = math.max(64, 12 + #lines * (font:getHeight() + 2))
+	love.graphics.setColor(0.035, 0.025, 0.06, 0.86)
+	love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 9, 9)
+	love.graphics.setColor(0.72, 0.58, 1, 0.55)
+	love.graphics.setLineWidth(1)
+	love.graphics.rectangle("line", panelX + 0.5, panelY + 0.5,
+		panelW - 1, panelH - 1, 9, 9)
+
+	local cx, cy, r = 44, panelY + panelH / 2, 16
 	local segs = 12
 	love.graphics.setLineWidth(3)
 	for i = 1, segs do
@@ -2811,6 +2848,15 @@ function Brainstorm.draw_search_indicator()
 			cx + math.cos(a) * inner, cy + math.sin(a) * inner,
 			cx + math.cos(a) * r, cy + math.sin(a) * r
 		)
+	end
+
+	local textX = 72
+	local textY = panelY + 7
+	for i, line in ipairs(lines) do
+		if i == 1 then love.graphics.setColor(1, 1, 1, 1)
+		elseif i == 2 then love.graphics.setColor(0.83, 0.80, 0.88, 1)
+		else love.graphics.setColor(0.74, 0.64, 0.94, 1) end
+		love.graphics.print(line, textX, textY + (i - 1) * (font:getHeight() + 2))
 	end
 
 	love.graphics.pop()
@@ -3329,10 +3375,16 @@ function Brainstorm.startNativeSearch()
 		os.execute(shq(p.bin) .. " search " .. shq(p.cfg) .. " " .. shq(p.status)
 			.. " " .. shq(p.stop) .. " " .. shq(p.hb) .. " >/dev/null 2>&1 &")
 	end
+	if Brainstorm.startSearchBackendCounter then
+		local threads = Brainstorm.getSearchThreadCount()
+		local backend = Brainstorm.nativeSearchBackendKey
+			and Brainstorm.nativeSearchBackendKey(threads)
+			or ("native-" .. tostring(threads))
+		Brainstorm.startSearchBackendCounter(backend)
+	end
 	A.nativeActive = true
 	A.nativeStartedAt = love.timer and love.timer.getTime and love.timer.getTime() or os.clock()
 	A.nativeHbFrame = 0
-	A.searchTried = 0
 	return true
 end
 
