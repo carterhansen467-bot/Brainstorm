@@ -160,8 +160,8 @@ This is a four-commit stack:
   losses. It changes documentation only.
 
 The stack therefore benefits both products, although the individual gates are
-specialized to their different pipelines. The audit found and fixed two real
-edge cases and one test-coverage gap:
+specialized to their different pipelines. The audit fixed two gate edge cases,
+one test-coverage gap, and two audit/measurement infrastructure defects:
 
 1. The original bucket-boundary check compared the high-byte interval's
    excluded upper endpoint. For catalog size 32 this left 32 of 256 intervals
@@ -169,9 +169,8 @@ edge cases and one test-coverage gap:
    bucket, reducing the advertised exact-Ante voucher gain. The replacement
    classifies the inclusive first and last reachable 52-bit integers exactly.
    It exhaustively agrees with scalar `math.random(n)` interval endpoints for
-   every catalog size 1 through 256. On the local bounded voucher benchmark,
-   throughput increased from about 6.57M/s at Luke's tip to 7.08M/s, versus a
-   5.35M/s gate-disabled baseline.
+   every catalog size 1 through 256 and eliminates all high-byte boundary
+   fallbacks at the base-game voucher catalog size of 32.
 2. The scalar tag/voucher filters compare catalog key strings, but the gate
    targeted one catalog index. A modded catalog containing the requested key
    twice could therefore reject the second valid entry. Duplicate active
@@ -187,8 +186,17 @@ edge cases and one test-coverage gap:
 4. The first pushed CI revision encoded the Windows LuaJIT telemetry command
    as an invalid mixed YAML/shell scalar, so GitHub rejected the workflow
    before creating jobs. It now uses a literal command block; the workflow is
-   parsed locally before republishing and the replacement run is required to
-   pass before this audit is closed.
+   parsed locally before republishing. Replacement run `29705477272` passed
+   every macOS and real-Windows job.
+5. `mode_bench` made every workload unfindable by adding an impossible tag.
+   For voucher, pack, and joker configurations this inserted a different
+   predicate ahead of the path being measured, so its absolute rates were not
+   representative. The harness now makes the active filter family impossible
+   while retaining its calibrated stream/gate. On the corrected exact-Ante-7
+   voucher workload, the gate measured about 563k/s versus 344k/s disabled,
+   confirming a real 1.64x gain close to Luke's stated 1.68x. The prior
+   multi-million/s absolute voucher figures measured the artificial tag miss
+   and should not be used for capacity planning.
 
 Current bounded differential counts were 14,843, 23,706, 47,478, and 66,341
 scalar-passing seeds for the four gate kinds, with zero gate-dropped matches.

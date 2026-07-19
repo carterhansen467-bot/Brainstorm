@@ -5656,6 +5656,60 @@ static int mode_verifychecks(const Config *g) {
 	return 0;
 }
 
+/* Keep a timed benchmark running without inserting a new predicate ahead of
+ * the path it claims to measure.  The old blanket impossible-tag mutation was
+ * representative for tag-first configurations, but it made exact-voucher,
+ * pack, and joker benchmarks time a different filter order.  Derived stream
+ * and gate fields intentionally remain unchanged: the gate sees the original
+ * target, while surviving lanes traverse the same scalar family and fail on
+ * an impossible target of that family. */
+static void bench_make_unfindable(Config *g) {
+	switch (g->fsId) {
+	case FS_SOUL:
+		/* Classic Soul then an impossible rarity-4 identity. */
+		if (g->njoker[4] > 0) {
+			snprintf(g->legendary, MAX_KEY, "j_bench_impossible");
+			g->negLegendary = 0;
+		} else {
+			/* A pathological modded snapshot may allow Soul but expose no
+			 * rarity-4 catalog; fail after Soul without asking pick_culled(n=0). */
+			snprintf(g->tag, MAX_KEY, "tag_bench_impossible");
+		}
+		break;
+	case FS_TAG:
+		snprintf(g->tag, MAX_KEY, "tag_bench_impossible");
+		break;
+	case FS_LEGEND:
+		/* Legendary-anywhere resolves identity by its calibrated pool index;
+		 * append the impossible tag only after that full route has passed. */
+		snprintf(g->tag, MAX_KEY, "tag_bench_impossible");
+		break;
+	case FS_PACK:
+		g->npack = 1;
+		snprintf(g->packKeys[0], MAX_KEY, "p_bench_impossible");
+		break;
+	case FS_VOUCH:
+		snprintf(g->voucher, MAX_KEY, "v_bench_impossible");
+		break;
+	case FS_JCDT:
+	case FS_JPACK:
+		memset(g->jslot, 0, sizeof g->jslot);
+		g->jslot[0].used = 1;
+		g->jslot[0].wild = -1;
+		snprintf(g->jslot[0].key, MAX_KEY, "j_bench_impossible");
+		g->ntargets = 1;
+		g->matchAny = 0;
+		g->needNeg = 0;
+		g->wanted[1] = g->wanted[2] = g->wanted[3] = 1;
+		break;
+	default:
+		/* A no-filter configuration needs some terminal miss to prevent the
+		 * first candidate ending the timed run. */
+		snprintf(g->tag, MAX_KEY, "tag_bench_impossible");
+		break;
+	}
+}
+
 static int mode_bench(const Config *g0, int seconds) {
 	Config g = *g0;
 	char err[256];
@@ -5668,8 +5722,7 @@ static int mode_bench(const Config *g0, int seconds) {
 		atomic_store(&g_tried, 0);
 		atomic_store(&g_space_next, 0);
 		g_found = false;
-		/* make it unfindable so we measure pure reject throughput */
-		snprintf(gb.tag, MAX_KEY, "tag_bench_impossible");
+		bench_make_unfindable(&gb);
 		bs_thread_t th[64];
 		WorkerArgs wa[64];
 		for (int i = 0; i < n; i++) {
