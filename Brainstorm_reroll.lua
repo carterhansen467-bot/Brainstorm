@@ -3148,6 +3148,97 @@ local function attachmentWords(value)
 	return out
 end
 
+-- The Builder binds the canonical predicate list with SHA-256. Verify the
+-- same checksum in-game instead of treating signature_hash as decorative
+-- metadata. This tiny implementation runs only while discovering attachments;
+-- it deliberately has no dependency on LOVE's optional data module so the
+-- exact same reader remains testable under bare LuaJIT on Windows and macOS.
+local ATTACHMENT_SHA256_CONSTANTS = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+	0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+	0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+	0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+	0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+local ATTACHMENT_SHA256_INITIAL = {
+	0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+	0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+}
+
+local function attachmentSha256(message)
+	local bit = require("bit")
+	local band, bnot, bxor = bit.band, bit.bnot, bit.bxor
+	local ror, rshift, tobit = bit.ror, bit.rshift, bit.tobit
+	local constants, state = ATTACHMENT_SHA256_CONSTANTS, {}
+	for i = 1, 8 do state[i] = ATTACHMENT_SHA256_INITIAL[i] end
+	local function be32(value)
+		value = value % 4294967296
+		return string.char(math.floor(value / 16777216) % 256,
+			math.floor(value / 65536) % 256, math.floor(value / 256) % 256,
+			value % 256)
+	end
+	local bitLength = #message * 8
+	message = message .. "\128"
+		.. string.rep("\0", (56 - (#message + 1) % 64) % 64)
+		.. be32(math.floor(bitLength / 4294967296)) .. be32(bitLength)
+	for offset = 1, #message, 64 do
+		local words = {}
+		for i = 0, 15 do
+			local at = offset + i * 4
+			local a, b, c, d = message:byte(at, at + 3)
+			words[i] = tobit(a * 16777216 + b * 65536 + c * 256 + d)
+		end
+		for i = 16, 63 do
+			local x, y = words[i - 15], words[i - 2]
+			local s0 = bxor(ror(x, 7), ror(x, 18), rshift(x, 3))
+			local s1 = bxor(ror(y, 17), ror(y, 19), rshift(y, 10))
+			words[i] = tobit(words[i - 16] + s0 + words[i - 7] + s1)
+		end
+		local a, b, c, d = state[1], state[2], state[3], state[4]
+		local e, f, g, h = state[5], state[6], state[7], state[8]
+		for i = 0, 63 do
+			local sum1 = bxor(ror(e, 6), ror(e, 11), ror(e, 25))
+			local choice = bxor(band(e, f), band(bnot(e), g))
+			local t1 = tobit(h + sum1 + choice + constants[i + 1] + words[i])
+			local sum0 = bxor(ror(a, 2), ror(a, 13), ror(a, 22))
+			local majority = bxor(band(a, b), band(a, c), band(b, c))
+			local t2 = tobit(sum0 + majority)
+			h, g, f, e, d, c, b, a = g, f, e, tobit(d + t1), c, b, a,
+				tobit(t1 + t2)
+		end
+		state[1], state[2], state[3], state[4] = tobit(state[1] + a),
+			tobit(state[2] + b), tobit(state[3] + c), tobit(state[4] + d)
+		state[5], state[6], state[7], state[8] = tobit(state[5] + e),
+			tobit(state[6] + f), tobit(state[7] + g), tobit(state[8] + h)
+	end
+	local out = {}
+	for i = 1, 8 do
+		local value = state[i]
+		if value < 0 then value = value + 4294967296 end
+		out[i] = string.format("%08x", value)
+	end
+	return table.concat(out)
+end
+
+function Brainstorm.poolAttachmentSignatureHash(schema, predicates)
+	local body = { "signature_schema " .. tostring(schema) .. "\n" }
+	for _, predicate in ipairs(predicates or {}) do
+		body[#body + 1] = "predicate " .. tostring(predicate) .. "\n"
+	end
+	return attachmentSha256(table.concat(body))
+end
+
 function Brainstorm.poolAttachmentPredicatesFromHeader(h)
 	if not h then return nil end
 	local out = {}
@@ -3201,6 +3292,12 @@ function Brainstorm.readPoolAttachment(markerPath)
 		return nil, "invalid attachment role"
 	end
 	if marker.signature_schema ~= "1" then return nil, "unsupported attachment signature" end
+	local expectedSignatureHash = Brainstorm.poolAttachmentSignatureHash(
+		marker.signature_schema, marker.predicates)
+	if not marker.signature_hash
+			or marker.signature_hash:lower() ~= expectedSignatureHash then
+		return nil, "attachment signature checksum is stale"
+	end
 	if not marker.pool_file or marker.pool_file == "" or marker.pool_file:find("[\r\n/\\]") then
 		return nil, "unsafe attached pool filename"
 	end
@@ -3217,11 +3314,14 @@ function Brainstorm.readPoolAttachment(markerPath)
 			return nil, "attachment " .. key .. " no longer matches the pool"
 		end
 	end
-	if tonumber(marker.file_size) ~= tonumber(info.size) then
+	if not tostring(marker.file_size or ""):match("^%d+$")
+			or tonumber(marker.file_size) ~= tonumber(info.size) then
 		return nil, "attached pool file size changed"
 	end
-	if info.modtime and tonumber(marker.file_mtime_ns)
-			and math.floor(tonumber(marker.file_mtime_ns) / 1000000000)
+	if not tostring(marker.file_mtime_ns or ""):match("^%d+$") then
+		return nil, "attached pool modification time is invalid"
+	end
+	if info.modtime and math.floor(tonumber(marker.file_mtime_ns) / 1000000000)
 				~= math.floor(tonumber(info.modtime)) then
 		return nil, "attached pool modification time changed"
 	end
@@ -3238,7 +3338,6 @@ function Brainstorm.readPoolAttachment(markerPath)
 		return nil, "authoritative attachment does not cover the full natural seed space"
 	end
 	local canonical = Brainstorm.poolAttachmentPredicatesFromHeader(h)
-	table.sort(marker.predicates)
 	if not sameStringList(marker.predicates, canonical) then
 		return nil, "attachment predicates no longer match the pool header"
 	end
@@ -3247,17 +3346,62 @@ function Brainstorm.readPoolAttachment(markerPath)
 	return marker
 end
 
+local ATTACHMENT_MAX_ANTE = 39
+
+local function attachmentPosition(ante, phase)
+	local order = ({ small = 0, big = 1, boss = 2 })[phase]
+	return ante and order and ((ante - 1) * 3 + order) or nil
+end
+
+local function attachmentInteger(value, minimum, maximum)
+	local number = tonumber(value)
+	if not number or number ~= math.floor(number)
+			or number < minimum or number > maximum then return nil end
+	return number
+end
+
+local function attachmentTagWindowCount(minAnte, minPhase, maxAnte, maxPhase)
+	local first, last = attachmentPosition(minAnte, minPhase),
+		attachmentPosition(maxAnte, maxPhase)
+	if not first or not last or first > last then return 0 end
+	local count = 0
+	for ante = minAnte, maxAnte do
+		for _, phase in ipairs({ "small", "big" }) do
+			local position = attachmentPosition(ante, phase)
+			if position >= first and position <= last then count = count + 1 end
+		end
+	end
+	return count
+end
+
 local function attachmentPredicate(value)
 	local p = attachmentWords(value)
 	if p[1] == "tag" and #p == 8 then
-		return { kind = "tag", mode = p[2], key = p[3], minAnte = tonumber(p[4]),
-			minPhase = p[5], maxAnte = tonumber(p[6]), maxPhase = p[7],
-			count = tonumber(p[8]) }
+		local minAnte = attachmentInteger(p[4], 1, ATTACHMENT_MAX_ANTE)
+		local maxAnte = attachmentInteger(p[6], 1, ATTACHMENT_MAX_ANTE)
+		local count = attachmentInteger(p[8], 1, ATTACHMENT_MAX_ANTE * 2)
+		if (p[2] ~= "collect" and p[2] ~= "observe") or not minAnte or not maxAnte
+				or (p[5] ~= "small" and p[5] ~= "big")
+				or (p[7] ~= "small" and p[7] ~= "big") or not count
+				or count > attachmentTagWindowCount(minAnte, p[5], maxAnte, p[7]) then
+			return nil
+		end
+		return { kind = "tag", mode = p[2], key = p[3], minAnte = minAnte,
+			minPhase = p[5], maxAnte = maxAnte, maxPhase = p[7], count = count }
 	elseif p[1] == "legendary" and #p == 10 then
-		return { kind = "legendary", key = p[2], minAnte = tonumber(p[3]),
-			minPhase = p[4], maxAnte = tonumber(p[5]), maxPhase = p[6],
-			negative = p[7] == "1", source = p[8], depth = tonumber(p[9]),
-			routes = p[10] }
+		local minAnte = attachmentInteger(p[3], 1, ATTACHMENT_MAX_ANTE)
+		local maxAnte = attachmentInteger(p[5], 1, ATTACHMENT_MAX_ANTE)
+		local depth = attachmentInteger(p[9], 0, 2)
+		local validPhase = { small = true, big = true, boss = true }
+		local validSource = { any = true, shop = true, charm = true, ethereal = true }
+		if not minAnte or not maxAnte or not validPhase[p[4]] or not validPhase[p[6]]
+				or not attachmentPosition(minAnte, p[4])
+				or attachmentPosition(minAnte, p[4]) > attachmentPosition(maxAnte, p[6])
+				or (p[7] ~= "0" and p[7] ~= "1") or not validSource[p[8]] or not depth
+				or (p[10] ~= "full" and p[10] ~= "canonical_charm") then return nil end
+		return { kind = "legendary", key = p[2], minAnte = minAnte,
+			minPhase = p[4], maxAnte = maxAnte, maxPhase = p[6],
+			negative = p[7] == "1", source = p[8], depth = depth, routes = p[10] }
 	elseif p[1] == "voucher" or p[1] == "voucher_exclude" then
 		return { kind = p[1], unsupported = true }
 	end
@@ -3280,11 +3424,6 @@ function Brainstorm.activeAttachmentPredicates()
 			source = "charm", depth = 1, routes = "canonical_charm" }
 	end
 	return active
-end
-
-local function attachmentPosition(ante, phase)
-	local order = ({ small = 0, big = 1, boss = 2 })[phase]
-	return ante and order and ((ante - 1) * 3 + order) or nil
 end
 
 local function activeImpliesPoolPredicate(active, pool)

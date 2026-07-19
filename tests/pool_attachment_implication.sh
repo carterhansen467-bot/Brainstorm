@@ -1,8 +1,9 @@
 #!/bin/sh
-# Bounded differential check for the initial automatic-attachment route
-# widening used by the classic Perkeo/Charm request: every observed Fast Exact
-# member must also exist in the exhaustive/full pool built from otherwise
-# identical criteria. This is regression evidence, not an all-space proof.
+# Native differential evidence for each containment dimension accepted by the
+# classic Perkeo/Charm automatic-attachment matcher. The exhaustive finite
+# policy proof lives in pool_attachment_matrix.lua; this bounded seed sample
+# independently checks that the native evaluator follows the same containment
+# relationships without treating sampling as the logical proof itself.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
@@ -16,35 +17,50 @@ if [ ! -x "$SCANNER" ]; then
 fi
 
 mkdir -p "$OUT"
-sed "s/__COUNT__/$COUNT/; s/__ROUTES__/full/; s/__TAG_MAX_ANTE__/2/; s/__TAG_MAX_PHASE__/big/; s/__LEG_MAX_ANTE__/2/; s/__LEG_MAX_PHASE__/big/; s/__NEG__/0/; s/__SOUL_DEPTH__/any/" \
-  "$ROOT/tests/fixtures/pool_attachment_template.cfg" > "$OUT/full.cfg"
-sed "s/__COUNT__/$COUNT/; s/__ROUTES__/canonical_charm/; s/__TAG_MAX_ANTE__/1/; s/__TAG_MAX_PHASE__/small/; s/__LEG_MAX_ANTE__/1/; s/__LEG_MAX_PHASE__/small/; s/__NEG__/0/; s/__SOUL_DEPTH__/1/" \
-  "$ROOT/tests/fixtures/pool_attachment_template.cfg" > "$OUT/fast.cfg"
-sed "s/__COUNT__/$COUNT/; s/__ROUTES__/canonical_charm/; s/__TAG_MAX_ANTE__/1/; s/__TAG_MAX_PHASE__/small/; s/__LEG_MAX_ANTE__/1/; s/__LEG_MAX_PHASE__/small/; s/__NEG__/1/; s/__SOUL_DEPTH__/1/" \
-  "$ROOT/tests/fixtures/pool_attachment_template.cfg" > "$OUT/fast-negative.cfg"
 
-"$SCANNER" scan "$SNAPSHOT" "$OUT/full.cfg" "$OUT/full.bspool"
-"$SCANNER" scan "$SNAPSHOT" "$OUT/fast.cfg" "$OUT/fast.bspool"
-"$SCANNER" scan "$SNAPSHOT" "$OUT/fast-negative.cfg" "$OUT/fast-negative.bspool"
-"$SCANNER" export "$OUT/full.bspool" "$OUT/full.txt"
-"$SCANNER" export "$OUT/fast.bspool" "$OUT/fast.txt"
-"$SCANNER" export "$OUT/fast-negative.bspool" "$OUT/fast-negative.txt"
-LC_ALL=C sort "$OUT/full.txt" > "$OUT/full.sorted.txt"
-LC_ALL=C sort "$OUT/fast.txt" > "$OUT/fast.sorted.txt"
-LC_ALL=C sort "$OUT/fast-negative.txt" > "$OUT/fast-negative.sorted.txt"
+make_config() {
+  name=$1 routes=$2 tag_ante=$3 tag_phase=$4 leg_ante=$5 leg_phase=$6 neg=$7 depth=$8
+  sed "s/__COUNT__/$COUNT/; s/__ROUTES__/$routes/; s/__TAG_MAX_ANTE__/$tag_ante/; s/__TAG_MAX_PHASE__/$tag_phase/; s/__LEG_MAX_ANTE__/$leg_ante/; s/__LEG_MAX_PHASE__/$leg_phase/; s/__NEG__/$neg/; s/__SOUL_DEPTH__/$depth/" \
+    "$ROOT/tests/fixtures/pool_attachment_template.cfg" > "$OUT/$name.cfg"
+}
+
+scan_export() {
+  name=$1
+  "$SCANNER" scan "$SNAPSHOT" "$OUT/$name.cfg" "$OUT/$name.bspool"
+  "$SCANNER" export "$OUT/$name.bspool" "$OUT/$name.txt"
+  LC_ALL=C sort "$OUT/$name.txt" > "$OUT/$name.sorted.txt"
+}
+
+assert_subset() {
+  subset=$1 superset=$2 relationship=$3
+  if comm -23 "$OUT/$subset.sorted.txt" "$OUT/$superset.sorted.txt" | grep -q .; then
+    echo "FAIL: $relationship" >&2
+    exit 1
+  fi
+}
+
+# Baseline UI request and one isolated superset per accepted implication rule.
+make_config fast canonical_charm 1 small 1 small 0 1
+make_config fast-negative canonical_charm 1 small 1 small 1 1
+make_config wider-window canonical_charm 2 big 2 big 0 1
+make_config full-routes full 1 small 1 small 0 1
+make_config either-soul canonical_charm 1 small 1 small 0 any
+make_config all-widened full 2 big 2 big 0 any
+
+for name in fast fast-negative wider-window full-routes either-soul all-widened; do
+  scan_export "$name"
+done
 
 if [ ! -s "$OUT/fast-negative.sorted.txt" ]; then
   echo "FAIL: bounded sample contained no Negative Fast Exact member; increase COUNT" >&2
   exit 1
 fi
 
-if comm -23 "$OUT/fast.sorted.txt" "$OUT/full.sorted.txt" | grep -q .; then
-  echo "FAIL: exhaustive attachment pool omitted a Fast Exact Perkeo/Charm member" >&2
-  exit 1
-fi
-if comm -23 "$OUT/fast-negative.sorted.txt" "$OUT/full.sorted.txt" | grep -q .; then
-  echo "FAIL: broader non-Negative attachment pool omitted a Negative active member" >&2
-  exit 1
-fi
+assert_subset fast wider-window "wider route window omitted an exact-window member"
+assert_subset fast full-routes "Full Exhaustive routes omitted a Fast Exact member"
+assert_subset fast either-soul "either-Soul pool omitted a first-Soul member"
+assert_subset fast all-widened "combined widening omitted a Fast Exact member"
+assert_subset fast-negative fast "non-Negative pool omitted a Negative active member"
+assert_subset fast-negative all-widened "combined widening omitted a Negative active member"
 
-echo "PASS: bounded differential found full Perkeo/Charm contains Fast Exact and Negative subsets across $COUNT ranks"
+echo "PASS: native attachment differentials preserve window, route, Soul-depth, and Negative implications across $COUNT ranks"

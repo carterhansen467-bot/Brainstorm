@@ -12,30 +12,6 @@ and Lua models.
 
 ## Priority 0 — correctness and release readiness
 
-### 1. Prove automatic attachment through one real end-to-end path
-
-The current tests separately exercise Lua attachment selection/status
-transitions and native pool hit/exhaustion behavior. Add one harness that starts
-with real `.attached` discovery, launches the real native child, consumes its
-status protocol, and observes the final Lua continuation decision.
-
-Cover on both macOS and Windows:
-
-- a compatible accelerator that finds a seed;
-- smallest-pool exhaustion followed by the next compatible attachment;
-- final accelerator exhaustion followed by unrestricted generation;
-- a compatible authoritative pool whose exhaustion is definitive;
-- missing, unreadable, corrupt, changed, stale-ID, stale-catalog, and
-  stale-profile pools;
-- marker or pool mutation immediately before authoritative exhaustion is
-  accepted;
-- manual selection taking precedence and retaining hard-error behavior;
-- a fallback search finding a valid result outside the accelerator.
-
-Acceptance requires no false exhaustion, no silent broadening of a manual
-search, stable user-visible telemetry, and the same result when the path is
-replayed on Windows and macOS.
-
 ### 2. Complete the attachment implication proof matrix
 
 Differentially compare automatic-pool and unrestricted membership for every
@@ -108,7 +84,8 @@ Record the Balatro, Lovely, Steamodded, Windows, and package versions used.
 ### 6. Publish a current Windows release
 
 The newest Windows tag predates the attachment and audited vector-gate work.
-After priorities 1–5 are either complete or explicitly accepted as nonblocking:
+After the preceding Priority 0 items are either complete or explicitly accepted
+as nonblocking:
 
 - create a new `win-v*` tag from the intended release commit;
 - let CI build the full and incremental packages;

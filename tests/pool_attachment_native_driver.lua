@@ -94,6 +94,23 @@ Brainstorm.SETTINGS.multiAnteSearch = {
   ante4Slots = 12, ante4Packs = true,
 }
 
+if scenario == "layered-pack" then
+  Brainstorm.SETTINGS.autoreroll.searchLegendary = ""
+  Brainstorm.SETTINGS.autoreroll.searchVoucher = ""
+  Brainstorm.SETTINGS.autoreroll.searchPack = { "p_spectral_mega_1" }
+  Brainstorm.SETTINGS.autoreroll.jokerSlotData = {
+    { key = "", requireNegative = false },
+    { key = "", requireNegative = false },
+    { key = "", requireNegative = false },
+  }
+  Brainstorm.SETTINGS.multiAnteSearch = {
+    ante1Slots = 0, ante1Packs = false,
+    ante2Slots = 0, ante2Packs = false,
+    ante3Slots = 0, ante3Packs = false,
+    ante4Slots = 0, ante4Packs = false,
+  }
+end
+
 local estimateModes = {}
 Brainstorm.setAttachedPoolEstimateMode = function(attached)
   estimateModes[#estimateModes + 1] = attached and true or false
@@ -182,6 +199,17 @@ elseif scenario == "chain" then
   result, selected = runNative()
   assert(result and selected == "02-large.bspool")
   print("PASS real native child chains smallest exhausted accelerator to a compatible hit")
+
+elseif scenario == "layered-pack" then
+  local result, selected = runNative()
+  assert(result and selected == "01-tag.bspool")
+  print("PASS active pack predicate is evaluated safely over a broader attached tag pool")
+
+elseif scenario == "incompatible" then
+  assert(Brainstorm.findAutomaticSeedPool() == nil)
+  local result, selected = runNative()
+  assert(result and selected == nil)
+  print("PASS unproved attachment relationship is refused before unrestricted fallback")
 
 elseif scenario == "fallback" then
   local result, selected = runNative()

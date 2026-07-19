@@ -38,8 +38,9 @@ def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(command, check=True, **kwargs)
 
 
-def write_criteria(path: Path, count: int) -> None:
-    path.write_text("\n".join([
+def write_criteria(path: Path, count: int, include_legendary: bool = True,
+                   tag_key: str = "tag_charm") -> None:
+    lines = [
         "poolver 1",
         "threads 4",
         "start 0",
@@ -49,13 +50,16 @@ def write_criteria(path: Path, count: int) -> None:
         "resume 0",
         "format binary",
         "tag_route collect",
-        "tag tag_charm 1 small 1 small 1",
-        "legendary_routes full",
-        "legendary j_perkeo 1 small 1 small 0 charm",
-        "soul_depth 1",
-        "end",
-        "",
-    ]), encoding="utf-8")
+        f"tag {tag_key} 1 small 1 small 1",
+    ]
+    if include_legendary:
+        lines.extend([
+            "legendary_routes full",
+            "legendary j_perkeo 1 small 1 small 0 charm",
+            "soul_depth 1",
+        ])
+    lines.extend(["end", ""])
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def attach(path: Path, role: str) -> None:
@@ -144,7 +148,8 @@ def make_invalid_directory(base: Path, small_pool: Path) -> Path:
 def main() -> int:
     snapshot = Path(sys.argv[1] if len(sys.argv) > 1 else "native_search.cfg").resolve()
     template = snapshot.with_name("case15.cfg")
-    if not snapshot.is_file() or not template.is_file():
+    pack_template = snapshot.with_name("case33.cfg")
+    if not snapshot.is_file() or not template.is_file() or not pack_template.is_file():
         raise SystemExit(
             "usage: pool_attachment_native_e2e.py <fixture case1.cfg>; "
             "run tests/native_equivalence.sh first")
@@ -171,11 +176,21 @@ def main() -> int:
         large_criteria = pools / "large.cfg"
         small_pool = pools / "small.bspool"
         large_pool = pools / "large.bspool"
+        tag_criteria = pools / "tag.cfg"
+        tag_pool = pools / "tag.bspool"
+        incompatible_criteria = pools / "incompatible.cfg"
+        incompatible_pool = pools / "incompatible.bspool"
         small_seeds = pools / "small.txt"
         write_criteria(small_criteria, SMALL_COUNT)
         write_criteria(large_criteria, LARGE_COUNT)
+        write_criteria(tag_criteria, SMALL_COUNT, include_legendary=False)
+        write_criteria(incompatible_criteria, SMALL_COUNT,
+                       include_legendary=False, tag_key="tag_1")
         run([str(scanner), "scan", str(aligned), str(small_criteria), str(small_pool)])
         run([str(scanner), "scan", str(aligned), str(large_criteria), str(large_pool)])
+        run([str(scanner), "scan", str(aligned), str(tag_criteria), str(tag_pool)])
+        run([str(scanner), "scan", str(aligned), str(incompatible_criteria),
+             str(incompatible_pool)])
         run([str(scanner), "export", str(small_pool), str(small_seeds)])
 
         small_records = pool_core.PoolInfo(str(small_pool)).as_dict()["records"]
@@ -193,6 +208,12 @@ def main() -> int:
         ])
         fallback = scenario_dir(base, "fallback", [
             (small_pool, "01-small.bspool", "accelerator"),
+        ])
+        layered_pack = scenario_dir(base, "layered-pack", [
+            (tag_pool, "01-tag.bspool", "accelerator"),
+        ])
+        incompatible = scenario_dir(base, "incompatible", [
+            (incompatible_pool, "01-incompatible.bspool", "accelerator"),
         ])
         manual = scenario_dir(base, "manual", [
             (small_pool, "01-small.bspool", "accelerator"),
@@ -223,23 +244,25 @@ def main() -> int:
         invalid = make_invalid_directory(base, small_pool)
 
         scenarios = {
-            "hit": hit,
-            "chain": chain,
-            "fallback": fallback,
-            "authoritative": authoritative,
-            "authoritative-mutated": authoritative_mutated,
-            "authoritative-pool-mutated": authoritative_pool_mutated,
-            "manual": manual,
-            "invalid-discovery": invalid,
-            "stale-profile": stale,
-            "missing-after-selection": missing,
-            "corrupt-after-selection": corrupt,
+            "hit": (hit, template),
+            "chain": (chain, template),
+            "fallback": (fallback, template),
+            "layered-pack": (layered_pack, pack_template),
+            "incompatible": (incompatible, template),
+            "authoritative": (authoritative, template),
+            "authoritative-mutated": (authoritative_mutated, template),
+            "authoritative-pool-mutated": (authoritative_pool_mutated, template),
+            "manual": (manual, template),
+            "invalid-discovery": (invalid, template),
+            "stale-profile": (stale, template),
+            "missing-after-selection": (missing, template),
+            "corrupt-after-selection": (corrupt, template),
         }
         driver = ROOT / "tests" / "pool_attachment_native_driver.lua"
-        for name, directory in scenarios.items():
+        for name, (directory, scenario_template) in scenarios.items():
             run(lua + [
                 str(driver), str(ROOT / "Brainstorm_reroll.lua"), str(ROOT),
-                str(directory), str(binary), str(template),
+                str(directory), str(binary), str(scenario_template),
                 str(directory / "items.txt"), str(small_seeds), name,
             ], cwd=ROOT)
 
