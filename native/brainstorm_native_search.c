@@ -51,29 +51,68 @@
 #define MAX_SLOTS 64      /* shop slots per ante */
 #define MAX_RESAMPLE 64   /* persistent resample streams per base key */
 #define MAX_SEQ 80        /* per-ante joker sequence entries */
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
+#define BOOST_SOUL_RUN_CAP (MAX_BOOST * 2 + 1)
+#define BOOST_SOUL_LUT_BITS 10
+#define BOOST_SOUL_LUT_SIZE (1 << BOOST_SOUL_LUT_BITS)
+#define BOOST_SOUL_LUT_MIXED UINT16_MAX
+#endif
 
 static const double LUA_PI = 3.14159265358979323846; /* == math.pi bits */
+typedef union { uint64_t u64; double d; } U64double;
 
 /* Lua 5.1 `x % 1` == x - floor(x/1)*1; exact for our non-negative x. */
 static inline double lua_mod1(double x) { return x - floor(x); }
 
 /* ------------------------------------------------------------- round13 --
  * Port of the mod's round13 (Brainstorm_reroll.lua): bit-identical stand-in
- * for math.abs(tonumber(string.format("%.13f", x))), x in [0,1). The rare
- * ambiguous band falls back to the exact decimal path; snprintf/strtod here
- * and LuaJIT's lj_strfmt/lj_strscan are both correctly rounded, so they
- * agree everywhere (also enforced by check_r13 parity lines). */
-static double round13(double x) {
-	double q = x * 1e13;
-	double n = floor(q);
-	double f = q - n;
-	if (f > 0.5015) {
-		n += 1.0;
-	} else if (f > 0.4985) {
+ * for math.abs(tonumber(string.format("%.13f", x))), x in [0,1).
+ *
+ * A floating x*1e13 cannot reliably decide values within about 0.001 of a
+ * decimal half-way point.  Keep that very cheap arithmetic test for the
+ * common 99.7%, but replace the former snprintf+strtod slow path with an
+ * exact binary64 calculation.  For x = mantissa / 2^shift, the 97-bit
+ * product mantissa*10^13 fits in unsigned __int128, so its remainder decides
+ * decimal rounding without floating error.  Only a genuine exact tie retains
+ * the string fallback (and therefore the runtime's tie rule).  The final
+ * integer and 10^13 are exact doubles; IEEE division returns the same nearest
+ * binary64 value as parsing the emitted 13-place decimal. */
+static double round13_exact(double x) {
+	uint64_t bits;
+	memcpy(&bits, &x, sizeof bits);
+	uint64_t fraction = bits & UINT64_C(0x000fffffffffffff);
+	unsigned exponent = (unsigned)((bits >> 52) & 0x7ffu);
+	/* The search hot paths pass only finite non-negative values below one.
+	 * Preserve the old routine's behavior defensively for any other caller. */
+	if ((bits >> 63) || exponent >= 1023u) goto decimal_fallback;
+	if (exponent == 0) return 0.0; /* zero/subnormal: far below 0.5e-13 */
+	unsigned shift = 1075u - exponent;
+	unsigned __int128 scaled = (unsigned __int128)
+			(fraction | UINT64_C(0x0010000000000000))
+			* UINT64_C(10000000000000);
+	/* scaled < 2^97, so a denominator of 2^98 or larger rounds to zero. */
+	if (shift >= 98u) return 0.0;
+	unsigned __int128 rounded = scaled >> shift;
+	unsigned __int128 remainder = scaled
+			& (((unsigned __int128)1u << shift) - 1u);
+	unsigned __int128 halfway = (unsigned __int128)1u << (shift - 1u);
+	if (remainder > halfway) rounded++;
+	else if (remainder == halfway) goto decimal_fallback;
+	return (double)(uint64_t)rounded / 1e13;
+
+decimal_fallback: {
 		char buf[48];
 		snprintf(buf, sizeof buf, "%.13f", x);
 		return fabs(strtod(buf, NULL));
 	}
+}
+
+static inline double round13(double x) {
+	double q = x * 1e13;
+	double n = floor(q);
+	double f = q - n;
+	if (f > 0.5015) n += 1.0;
+	else if (f > 0.4985) return round13_exact(x);
 	return n / 1e13;
 }
 
@@ -95,8 +134,6 @@ static inline uint64_t prng_step(PRNG *rs) {
 	TW223_GEN(rs, z, r, 3, 47, 21, 8)
 	return r;
 }
-
-typedef union { uint64_t u64; double d; } U64double;
 
 /* g_seed_fma: how the game's LuaJIT binary rounded d*pi+e in random_seed.
  * 1 = fused (single rounding), 0 = separate mul+add. Decided at startup by
@@ -134,6 +171,265 @@ static inline int lj_random_n(PRNG *rs, int n) {
 	double d = floor(lj_random(rs) * (double)n) + 1.0;
 	if (!(d >= 1.0 && d <= (double)n)) return -1; /* NaN guard (Lua would error too) */
 	return (int)d;
+}
+
+/* Every Balatro pseudorandom draw reseeds TW223 and consumes exactly its first
+ * output.  The component recurrences are linear over GF(2); composing their
+ * eleven steps (ten discarded warm-ups plus the returned draw) yields these
+ * exact shift/mask forms.  Only the low 52 output bits are materialized.
+ * Keeping the canonical stateful functions above makes parity calibration and
+ * differential tests independent of this one-shot hot path. */
+static inline uint64_t prng_first_0(uint64_t x) {
+	return ((x & UINT64_C(0xfe00000000000000)) >> 57)
+			^ ((x & UINT64_C(0xff00000000000000)) >> 56)
+			^ ((x & UINT64_C(0xffc0000000000000)) >> 54)
+			^ ((x & UINT64_C(0x00000001fc000000)) >> 26)
+			^ ((x & UINT64_C(0xfffffffe00000000)) >> 25)
+			^ ((x & UINT64_C(0xfffffffe00000000)) >> 23)
+			^ ((x & UINT64_C(0x00000001fffffffe)) << 6)
+			^ ((x & UINT64_C(0x00001ffffffffffe)) << 7)
+			^ ((x & UINT64_C(0x00000ffe00000000)) << 8)
+			^ ((x & UINT64_C(0x000007fffffffffe)) << 9)
+			^ ((x & UINT64_C(0x0000000000003ffe)) << 38)
+			^ ((x & UINT64_C(0x0000000000000ffe)) << 40);
+}
+
+static inline uint64_t prng_first_1(uint64_t x) {
+	return ((x & UINT64_C(0xc000000000000000)) >> 62)
+			^ ((x & UINT64_C(0xe000000000000000)) >> 61)
+			^ ((x & UINT64_C(0xf000000000000000)) >> 60)
+			^ ((x & UINT64_C(0x0000180000000000)) >> 43)
+			^ ((x & UINT64_C(0xffffe00000000000)) >> 42)
+			^ ((x & UINT64_C(0x00001e0000000000)) >> 41)
+			^ ((x & UINT64_C(0xffffff0000000000)) >> 40)
+			^ ((x & UINT64_C(0xffffe00000000000)) >> 23)
+			^ ((x & UINT64_C(0xffffffffffc00000)) >> 22)
+			^ ((x & UINT64_C(0xffffe00000000000)) >> 21)
+			^ ((x & UINT64_C(0x00001fffffffffc0)) >> 4)
+			^ ((x & UINT64_C(0x00001fffffffffc0)) >> 3)
+			^ ((x & UINT64_C(0x00001fffffffffc0)) >> 2)
+			^ ((x & UINT64_C(0x0000000fffffffc0)) << 16)
+			^ ((x & UINT64_C(0x00000003ffffffc0)) << 18)
+			^ ((x & UINT64_C(0x000000000001ffc0)) << 35)
+			^ ((x & UINT64_C(0x000000000000ffc0)) << 36)
+			^ ((x & UINT64_C(0x0000000000007fc0)) << 37);
+}
+
+static inline uint64_t prng_first_2(uint64_t x) {
+	return ((x & UINT64_C(0xffffff0000000000)) >> 40)
+			^ ((x & UINT64_C(0xfffffffe00000000)) >> 33)
+			^ ((x & UINT64_C(0x000000ffffff0000)) >> 16)
+			^ ((x & UINT64_C(0x1fffff0000000000)) >> 9)
+			^ ((x & UINT64_C(0x0000001ffffffe00)) << 15)
+			^ ((x & UINT64_C(0x000000003ffffe00)) << 22);
+}
+
+static inline uint64_t prng_first_3(uint64_t x) {
+	return ((x & UINT64_C(0x8000000000000000)) >> 63)
+			^ ((x & UINT64_C(0xfc00000000000000)) >> 58)
+			^ ((x & UINT64_C(0xffe0000000000000)) >> 53)
+			^ ((x & UINT64_C(0x0000040000000000)) >> 42)
+			^ ((x & UINT64_C(0xfffff80000000000)) >> 37)
+			^ ((x & UINT64_C(0x000007ff00000000)) >> 32)
+			^ ((x & UINT64_C(0x000007fffffe0000)) >> 16)
+			^ ((x & UINT64_C(0x7ffffffffffe0000)) >> 11)
+			^ ((x & UINT64_C(0x03fffffffffe0000)) >> 6)
+			^ ((x & UINT64_C(0x000003fffffe0000)) << 10);
+}
+
+/* Bits 44..51 alone decide 255/256 comparisons against both hot thresholds
+ * (0.997 for Soul/Negative/Black Hole and 0.8 for Omen conversion). */
+static inline uint64_t prng_first_hi_0(uint64_t x) {
+	return ((x & UINT64_C(0x00001fe000000000)) << 7)
+			^ ((x & UINT64_C(0x00000ff000000000)) << 8)
+			^ ((x & UINT64_C(0x000007f800000000)) << 9)
+			^ ((x & UINT64_C(0x0000000000003fc0)) << 38)
+			^ ((x & UINT64_C(0x0000000000000ff0)) << 40);
+}
+
+static inline uint64_t prng_first_hi_1(uint64_t x) {
+	return ((x & UINT64_C(0x0000000ff0000000)) << 16)
+			^ ((x & UINT64_C(0x00000003fc000000)) << 18)
+			^ ((x & UINT64_C(0x000000000001fe00)) << 35)
+			^ ((x & UINT64_C(0x000000000000ff00)) << 36)
+			^ ((x & UINT64_C(0x0000000000007f80)) << 37);
+}
+
+static inline uint64_t prng_first_hi_2(uint64_t x) {
+	return ((x & UINT64_C(0x1fe0000000000000)) >> 9)
+			^ ((x & UINT64_C(0x0000001fe0000000)) << 15)
+			^ ((x & UINT64_C(0x000000003fc00000)) << 22);
+}
+
+static inline uint64_t prng_first_hi_3(uint64_t x) {
+	return ((x & UINT64_C(0x7f80000000000000)) >> 11)
+			^ ((x & UINT64_C(0x03fc000000000000)) >> 6)
+			^ ((x & UINT64_C(0x000003fc00000000)) << 10);
+}
+
+static inline double lj_random_seed_one(double d) {
+	uint32_t masks = UINT32_C(0x11090601);
+	uint64_t result = 0;
+	for (int i = 0; i < 4; i++) {
+		U64double u;
+		uint32_t minimum = 1u << (masks & 255u);
+		masks >>= 8;
+		d = seed_step(d);
+		u.d = d;
+		if (u.u64 < minimum) u.u64 += minimum;
+		if (i == 0) result ^= prng_first_0(u.u64);
+		else if (i == 1) result ^= prng_first_1(u.u64);
+		else if (i == 2) result ^= prng_first_2(u.u64);
+		else result ^= prng_first_3(u.u64);
+	}
+	U64double out;
+	out.u64 = (result & UINT64_C(0x000fffffffffffff))
+			| UINT64_C(0x3ff0000000000000);
+	return out.d - 1.0;
+}
+
+/* The stock voucher catalog has exactly 32 entries.  math.random(32) only
+ * observes output bits 47..51 of the 52-bit fraction, all of which are already
+ * produced by the much smaller threshold transform above. */
+static inline int lj_random_seed_one_n32(double d) {
+	uint32_t masks = UINT32_C(0x11090601);
+	uint64_t high = 0;
+	for (int i = 0; i < 4; i++) {
+		U64double u;
+		uint32_t minimum = 1u << (masks & 255u);
+		masks >>= 8;
+		d = seed_step(d);
+		u.d = d;
+		if (u.u64 < minimum) u.u64 += minimum;
+		if (i == 0) high ^= prng_first_hi_0(u.u64);
+		else if (i == 1) high ^= prng_first_hi_1(u.u64);
+		else if (i == 2) high ^= prng_first_hi_2(u.u64);
+		else high ^= prng_first_hi_3(u.u64);
+	}
+	return (int)((high >> 47) & UINT64_C(31)) + 1;
+}
+
+static inline int lj_random_seed_one_n(double seed, int n) {
+	if (n == 32) return lj_random_seed_one_n32(seed);
+	double d = floor(lj_random_seed_one(seed) * (double)n) + 1.0;
+	if (!(d >= 1.0 && d <= (double)n)) return -1;
+	return (int)d;
+}
+
+static inline int lj_random_seed_gt(double d, uint8_t thresholdHi,
+		uint64_t thresholdFloor) {
+	uint32_t masks = UINT32_C(0x11090601);
+	uint64_t word[4], high = 0;
+	for (int i = 0; i < 4; i++) {
+		U64double u;
+		uint32_t minimum = 1u << (masks & 255u);
+		masks >>= 8;
+		d = seed_step(d);
+		u.d = d;
+		if (u.u64 < minimum) u.u64 += minimum;
+		word[i] = u.u64;
+		if (i == 0) high ^= prng_first_hi_0(u.u64);
+		else if (i == 1) high ^= prng_first_hi_1(u.u64);
+		else if (i == 2) high ^= prng_first_hi_2(u.u64);
+		else high ^= prng_first_hi_3(u.u64);
+	}
+	uint8_t outputHi = (uint8_t)(high >> 44);
+	if (outputHi != thresholdHi) return outputHi > thresholdHi;
+	uint64_t result = prng_first_0(word[0]) ^ prng_first_1(word[1])
+			^ prng_first_2(word[2]) ^ prng_first_3(word[3]);
+	return (result & UINT64_C(0x000fffffffffffff)) > thresholdFloor;
+}
+
+static inline int lj_random_seed_gt_997(double seed) {
+	return lj_random_seed_gt(seed, UINT8_C(0xff),
+			UINT64_C(0x000ff3b645a1cac0));
+}
+
+static inline int lj_random_seed_gt_08(double seed) {
+	return lj_random_seed_gt(seed, UINT8_C(0xcc),
+			UINT64_C(0x000ccccccccccccd));
+}
+
+#define PRNG_BATCH_MAX 8
+static void lj_random_seed_components_batch(const double *seed, int count,
+		uint64_t word[4][PRNG_BATCH_MAX]) {
+	double d[PRNG_BATCH_MAX];
+	if (count < 1 || count > PRNG_BATCH_MAX) return;
+	for (int lane = 0; lane < count; lane++) d[lane] = seed[lane];
+	uint32_t masks = UINT32_C(0x11090601);
+	for (int component = 0; component < 4; component++) {
+		if (g_seed_fma) {
+#pragma clang loop vectorize(enable)
+			for (int lane = 0; lane < count; lane++)
+				d[lane] = fma(d[lane], 3.14159265358979323846,
+						2.7182818284590452354);
+		} else {
+#pragma clang loop vectorize(enable)
+			for (int lane = 0; lane < count; lane++)
+				d[lane] = d[lane] * 3.14159265358979323846
+						+ 2.7182818284590452354;
+		}
+		uint32_t minimum = 1u << (masks & 255u);
+		masks >>= 8;
+		for (int lane = 0; lane < count; lane++) {
+			U64double u = { .d = d[lane] };
+			if (u.u64 < minimum) u.u64 += minimum;
+			word[component][lane] = u.u64;
+		}
+	}
+}
+
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
+static void lj_random_seed_word_batch(const double *seed, int count,
+		uint64_t *result) {
+	uint64_t word[4][PRNG_BATCH_MAX];
+	lj_random_seed_components_batch(seed, count, word);
+	for (int lane = 0; lane < count; lane++) {
+		result[lane] = prng_first_0(word[0][lane])
+				^ prng_first_1(word[1][lane])
+				^ prng_first_2(word[2][lane])
+				^ prng_first_3(word[3][lane]);
+	}
+}
+
+static void lj_random_seed_one_batch(const double *seed, int count,
+		double *output) {
+	uint64_t result[PRNG_BATCH_MAX];
+	lj_random_seed_word_batch(seed, count, result);
+	for (int lane = 0; lane < count; lane++) {
+		U64double u;
+		u.u64 = (result[lane] & UINT64_C(0x000fffffffffffff))
+				| UINT64_C(0x3ff0000000000000);
+		output[lane] = u.d - 1.0;
+	}
+}
+#endif
+
+static void lj_random_seed_one_n_batch(const double *seed, int count,
+		int n, int *output) {
+	uint64_t word[4][PRNG_BATCH_MAX];
+	lj_random_seed_components_batch(seed, count, word);
+	if (n == 32) {
+		for (int lane = 0; lane < count; lane++) {
+			uint64_t high = prng_first_hi_0(word[0][lane])
+					^ prng_first_hi_1(word[1][lane])
+					^ prng_first_hi_2(word[2][lane])
+					^ prng_first_hi_3(word[3][lane]);
+			output[lane] = (int)((high >> 47) & UINT64_C(31)) + 1;
+		}
+		return;
+	}
+	for (int lane = 0; lane < count; lane++) {
+		uint64_t result = prng_first_0(word[0][lane])
+				^ prng_first_1(word[1][lane])
+				^ prng_first_2(word[2][lane])
+				^ prng_first_3(word[3][lane]);
+		U64double u;
+		u.u64 = (result & UINT64_C(0x000fffffffffffff))
+				| UINT64_C(0x3ff0000000000000);
+		double value = floor((u.d - 1.0) * (double)n) + 1.0;
+		output[lane] = value >= 1.0 && value <= (double)n ? (int)value : -1;
+	}
 }
 
 /* ------------------------------------------------------------ pseudohash --
@@ -215,7 +511,21 @@ typedef struct {
 	uint8_t boostBuf[MAX_BOOST], boostAvail[MAX_BOOST]; int boostCards[MAX_BOOST];
 	uint8_t boostSoul[MAX_BOOST]; /* 0 none, 1 Arcana(Tarot), 2 Spectral */
 	int tagRewardCards[3]; /* indexed by boostSoul kind: Charm=1, Ethereal=2 */
-	double boostCume;
+	/* Available boosters in source order with the exact running sums used by
+	 * Lua's weighted poll.  The compact table removes an availability branch
+	 * and permits a lower-bound search in every simulated shop-pack slot. */
+	int nboostAvailable, boostAvailableIndex[MAX_BOOST];
+	double boostAvailableLower[MAX_BOOST], boostAvailableCume[MAX_BOOST], boostCume;
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
+	/* Exact projection of weighted booster picks onto the only fields observed
+	 * by seed-pool Soul walks: (content kind, card count). Runs are expressed
+	 * in the PRNG's 52-bit fraction domain; the high-bit LUT resolves every
+	 * bucket except the few containing a weighted-catalog boundary. */
+	int nboostSoulRuns;
+	uint64_t boostSoulRunEnd[BOOST_SOUL_RUN_CAP];
+	uint16_t boostSoulRunClass[BOOST_SOUL_RUN_CAP];
+	uint16_t boostSoulLut[BOOST_SOUL_LUT_SIZE];
+#endif
 	int soulAllowed, blackHoleAllowed, forceBuffoon, sawSpecialDef;
 	/* joker-search derived */
 	int ntargets; int wanted[4]; int needNeg; int anyAnteActive;
@@ -232,6 +542,7 @@ typedef struct {
 		poolRouteRules[MAX_POOL_ROUTE_RULES];
 	int npoolLegendRules;
 	int poolLegendaryRoutes;
+	int poolLegendNeedsEdition; /* derived: any cumulative pool rule requires Negative */
 	struct {
 		int poolIndex, minAnte, minPhase, maxAnte, maxPhase;
 		int neg, source, humanLocation, soulDepth;
@@ -248,6 +559,7 @@ typedef struct {
 	 * keys (config_finalize_catalog). */
 	int omenVoucherIdx;   /* v_omen_globe, -1 if absent */
 	int charmTagIdx;      /* tag_charm, -1 if absent */
+	int activeLegendaryIdx; /* active legendary key in joker rarity-4 pool */
 	int activeTagReward;  /* tag_reward_kind of the active tag filter */
 	uint8_t vouchIsReducer[MAX_VOUCH]; /* v_hieroglyph / v_petroglyph */
 	uint8_t tagRewardKindOf[MAX_TAGS]; /* 0 none, 1 Charm, 2 Ethereal */
@@ -255,11 +567,14 @@ typedef struct {
 	 * which the route DFS already requires): bit i of vouchUnlocksMask[p] is
 	 * set when voucher i's prerequisite is voucher p. */
 	uint64_t vouchRouteEligibleMask, vouchNoPrereqMask;
+	uint64_t vouchInitiallyOwnedMask, vouchInitialAvailMask, vouchReducerMask;
+	uint64_t omenPrereqMask;
 	uint64_t vouchUnlocksMask[MAX_VOUCH];
 } Config;
 
 enum { CK_PH = 1, CK_R13, CK_PR, CK_PRN };
-enum { FS_NONE = 0, FS_SOUL, FS_TAG, FS_PACK, FS_VOUCH, FS_JCDT, FS_JPACK };
+enum { FS_NONE = 0, FS_SOUL, FS_TAG, FS_PACK, FS_VOUCH, FS_JCDT, FS_JPACK,
+	FS_LEGEND };
 
 /* ------------------------------------------------------------ candidates --
  * Charset matches the game's random_string output (no 0/O). Sequential
@@ -350,7 +665,18 @@ static uint64_t splitmix64(uint64_t x) {
 }
 
 /* ------------------------------------------------------- per-thread state */
-typedef struct { double state; uint32_t gen; } Stream;
+typedef struct { double state; uint64_t gen; } Stream;
+
+#define CTX_SOUL_EVENTS_PER_ANTE 8
+#define CTX_SOUL_CARDS_PER_EVENT 64
+#define CTX_SOUL_CARDS_PER_ANTE \
+	(CTX_SOUL_EVENTS_PER_ANTE * CTX_SOUL_CARDS_PER_EVENT)
+#define CTX_TAROT_TAPE_WORDS ((CTX_SOUL_CARDS_PER_ANTE + 63) / 64)
+#define CTX_SPECTRAL_TAPE_WORDS ((CTX_SOUL_CARDS_PER_ANTE * 2 + 63) / 64)
+#define CTX_OMEN_TAPE_BITS ((MAX_SEARCH_ANTE + 1) * CTX_SOUL_CARDS_PER_ANTE)
+#define CTX_OMEN_TAPE_WORDS ((CTX_OMEN_TAPE_BITS + 63) / 64)
+
+typedef struct CtxOmenTrace CtxOmenTrace;
 
 /* Persistent resample streams: same "_resample<it>" key can be advanced more
  * than once per candidate (two UNAVAILABLE picks in the same ante+rarity), so
@@ -370,7 +696,7 @@ typedef struct {
 	const Config *g;
 	char seed[9];
 	double hashed_seed;
-	uint32_t gen;
+	uint64_t gen;
 	PRNG prng;
 	Stream joker4;
 	Stream tagS[MAX_SEARCH_ANTE + 1], soulT[MAX_SEARCH_ANTE + 1];
@@ -383,13 +709,24 @@ typedef struct {
 	Stream tagResample[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE];
 	Stream poolVoucherResample[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE];
 	uint8_t poolVoucherVisits[MAX_SEARCH_ANTE + 1];
+	/* Reducer-free Omen routes read each VoucherN stream once. Cache its raw
+	 * catalog draws so DFS/frontier siblings and Charm variants only redo the
+	 * cheap availability-mask selection. */
+	uint64_t voucherRawGen[MAX_SEARCH_ANTE + 1];
+	uint8_t voucherRawN[MAX_SEARCH_ANTE + 1];
+	uint8_t voucherRaw[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE + 1];
 	uint64_t poolVoucherPurchased;
 	uint8_t poolVoucherPurchaseAnte[MAX_VOUCH];
 	uint8_t poolVoucherPurchaseVisit[MAX_VOUCH];
 	int tagRoll[MAX_SEARCH_ANTE + 1][2];
 	uint8_t tagRollDone[MAX_SEARCH_ANTE + 1][2];
-	uint32_t packs_gen[MAX_SEARCH_ANTE + 1];
+	uint64_t packs_gen[MAX_SEARCH_ANTE + 1];
 	int packs_n[MAX_SEARCH_ANTE + 1], pack_idx[MAX_SEARCH_ANTE + 1][6];
+	/* Raw shop-pack draws are route-independent; a skipped blind merely uses a
+	 * shorter prefix. Alternate Charm/Omen routes therefore share this cache. */
+	uint64_t shopPackRawGen[MAX_SEARCH_ANTE + 1];
+	uint8_t shopPackRawN[MAX_SEARCH_ANTE + 1];
+	int16_t shopPackRaw[MAX_SEARCH_ANTE + 1][6];
 	/* per-candidate blind-skip assumption (mirrors skipsFromFilters /
 	 * setPackSkipAssumption): a skipped blind's shop never opens, so its two
 	 * get_pack picks never roll. forcedAnte = first ante that still opens a
@@ -398,6 +735,20 @@ typedef struct {
 	/* Soul-capable pack opened immediately in place of a collected blind's shop:
 	 * 1 = Charm/Mega Arcana, 2 = Ethereal/Spectral. A plain skipped blind is 0. */
 	uint8_t rewardSm[MAX_SEARCH_ANTE + 1], rewardBig[MAX_SEARCH_ANTE + 1];
+	/* Threshold-only random tape shared by every Soul replay for this seed. */
+	uint64_t soulTapeGen;
+	Stream tapeTarot[MAX_SEARCH_ANTE + 1], tapeSpectral[MAX_SEARCH_ANTE + 1];
+	Stream tapeEdition[MAX_SEARCH_ANTE + 1], tapeOmen;
+	uint16_t tarotFilled[MAX_SEARCH_ANTE + 1], spectralFilled[MAX_SEARCH_ANTE + 1];
+	uint8_t editionFilled[MAX_SEARCH_ANTE + 1];
+	uint32_t omenFilled;
+	uint64_t tarotHit[MAX_SEARCH_ANTE + 1][CTX_TAROT_TAPE_WORDS];
+	uint64_t spectralHit[MAX_SEARCH_ANTE + 1][CTX_SPECTRAL_TAPE_WORDS];
+	uint64_t editionNegative[MAX_SEARCH_ANTE + 1];
+	uint64_t omenConvert[CTX_OMEN_TAPE_WORDS];
+	/* Reachability result from the no-extra-Charm Omen probe. */
+	int omenRoutePossible;
+	CtxOmenTrace *omenTrace;
 	char label[64];
 	char legloc[24];
 } Ctx;
@@ -441,8 +792,6 @@ static const char *RBASE_KEY[RBASES] = {
 static const char *K_TAG[9] = { 0, "Tag1", "Tag2", "Tag3", "Tag4", "Tag5", "Tag6", "Tag7", "Tag8" };
 static const char *K_SOULT[9] = { 0, "soul_Tarot1", "soul_Tarot2", "soul_Tarot3", "soul_Tarot4",
 	"soul_Tarot5", "soul_Tarot6", "soul_Tarot7", "soul_Tarot8" };
-static const char *K_SOULS[9] = { 0, "soul_Spectral1", "soul_Spectral2", "soul_Spectral3", "soul_Spectral4",
-	"soul_Spectral5", "soul_Spectral6", "soul_Spectral7", "soul_Spectral8" };
 static const char *K_EDISOUA[9] = { 0, "edisou1", "edisou2", "edisou3", "edisou4",
 	"edisou5", "edisou6", "edisou7", "edisou8" };
 
@@ -459,25 +808,37 @@ static char KT_EDISOU[MAX_SEARCH_ANTE + 1][12];
 static char RS_RBASE[RBASES][MAX_RESAMPLE][24];
 static char RS_TAG[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE][24];
 static char RS_VOUCHER[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE][24];
+static uint8_t KL_TAG[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_VOUCHER[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_SHOPPACK[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_SOULT[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_SOULS[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_EDISOU[MAX_SEARCH_ANTE + 1];
+static uint8_t KL_RS_RBASE[RBASES][MAX_RESAMPLE];
+static uint8_t KL_RS_TAG[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE];
+static uint8_t KL_RS_VOUCHER[MAX_SEARCH_ANTE + 1][MAX_RESAMPLE];
 
 static void init_key_tables(void) {
 	for (int a = 1; a <= MAX_SEARCH_ANTE; a++) {
-		snprintf(KT_TAG[a], sizeof KT_TAG[a], "Tag%d", a);
-		snprintf(KT_VOUCHER[a], sizeof KT_VOUCHER[a], "Voucher%d", a);
-		snprintf(KT_SHOPPACK[a], sizeof KT_SHOPPACK[a], "shop_pack%d", a);
-		snprintf(KT_SOULT[a], sizeof KT_SOULT[a], "soul_Tarot%d", a);
-		snprintf(KT_SOULS[a], sizeof KT_SOULS[a], "soul_Spectral%d", a);
-		snprintf(KT_EDISOU[a], sizeof KT_EDISOU[a], "edisou%d", a);
+		KL_TAG[a] = (uint8_t)snprintf(KT_TAG[a], sizeof KT_TAG[a], "Tag%d", a);
+		KL_VOUCHER[a] = (uint8_t)snprintf(KT_VOUCHER[a], sizeof KT_VOUCHER[a], "Voucher%d", a);
+		KL_SHOPPACK[a] = (uint8_t)snprintf(KT_SHOPPACK[a], sizeof KT_SHOPPACK[a], "shop_pack%d", a);
+		KL_SOULT[a] = (uint8_t)snprintf(KT_SOULT[a], sizeof KT_SOULT[a], "soul_Tarot%d", a);
+		KL_SOULS[a] = (uint8_t)snprintf(KT_SOULS[a], sizeof KT_SOULS[a], "soul_Spectral%d", a);
+		KL_EDISOU[a] = (uint8_t)snprintf(KT_EDISOU[a], sizeof KT_EDISOU[a], "edisou%d", a);
 		for (int it = 2; it < MAX_RESAMPLE + 2; it++) {
-			snprintf(RS_TAG[a][it - 2], sizeof RS_TAG[a][it - 2],
+			KL_RS_TAG[a][it - 2] = (uint8_t)snprintf(
+					RS_TAG[a][it - 2], sizeof RS_TAG[a][it - 2],
 					"Tag%d_resample%d", a, it);
-			snprintf(RS_VOUCHER[a][it - 2], sizeof RS_VOUCHER[a][it - 2],
+			KL_RS_VOUCHER[a][it - 2] = (uint8_t)snprintf(
+					RS_VOUCHER[a][it - 2], sizeof RS_VOUCHER[a][it - 2],
 					"Voucher%d_resample%d", a, it);
 		}
 	}
 	for (int b = 0; b < RBASES; b++) {
 		for (int it = 2; it < MAX_RESAMPLE + 2; it++) {
-			snprintf(RS_RBASE[b][it - 2], sizeof RS_RBASE[b][it - 2],
+			KL_RS_RBASE[b][it - 2] = (uint8_t)snprintf(
+					RS_RBASE[b][it - 2], sizeof RS_RBASE[b][it - 2],
 					"%s_resample%d", RBASE_KEY[b], it);
 		}
 	}
@@ -508,12 +869,114 @@ static inline double resample_next(Ctx *c, int base, int it /* >=2 */) {
 
 /* pseudorandom(seed) / pseudorandom_element index (worker fast path). */
 static inline double psr(Ctx *c, double seedval) {
-	lj_random_seed(&c->prng, seedval);
-	return lj_random(&c->prng);
+	(void)c;
+	return lj_random_seed_one(seedval);
 }
 static inline int psr_n(Ctx *c, double seedval, int n) {
-	lj_random_seed(&c->prng, seedval);
-	return lj_random_n(&c->prng, n);
+	(void)c;
+	return lj_random_seed_one_n(seedval, n);
+}
+static inline int psr_gt_997(Ctx *c, double seedval) {
+	(void)c;
+	return lj_random_seed_gt_997(seedval);
+}
+static inline int psr_gt_08(Ctx *c, double seedval) {
+	(void)c;
+	return lj_random_seed_gt_08(seedval);
+}
+
+static inline void ctx_tape_store(uint64_t *bits, uint32_t at, int value) {
+	uint64_t mask = UINT64_C(1) << (at & 63u);
+	if (value) bits[at >> 6] |= mask;
+	else bits[at >> 6] &= ~mask;
+}
+
+static inline int ctx_tape_load(const uint64_t *bits, uint32_t at) {
+	return (int)((bits[at >> 6] >> (at & 63u)) & 1u);
+}
+
+static void ctx_soul_tape_prepare(Ctx *c) {
+	if (c->soulTapeGen == c->gen) return;
+	c->soulTapeGen = c->gen;
+	memset(c->tarotFilled, 0, sizeof c->tarotFilled);
+	memset(c->spectralFilled, 0, sizeof c->spectralFilled);
+	memset(c->editionFilled, 0, sizeof c->editionFilled);
+	c->omenFilled = 0;
+}
+
+#ifdef BRAINSTORM_VERIFY_INTERACTIVE_SOUL_TAPE
+static int ctx_soul_tape_reference(Ctx *c, const char *key,
+		uint32_t at, double threshold) {
+	Stream state = { 0 };
+	double value = 0.0;
+	for (uint32_t i = 0; i <= at; i++)
+		value = psr(c, stream_next(c, &state, key));
+	return value > threshold;
+}
+#define CTX_VERIFY_TAPE(c_, key_, at_, threshold_, got_) do { \
+	int reference_ = ctx_soul_tape_reference((c_), (key_), (at_), (threshold_)); \
+	if ((got_) != reference_) { \
+		fprintf(stderr, "interactive Soul tape mismatch seed=%s key=%s at=%u cached=%d reference=%d\n", \
+				(c_)->seed, (key_), (unsigned)(at_), (got_), reference_); \
+		abort(); \
+	} \
+} while (0)
+#else
+#define CTX_VERIFY_TAPE(c_, key_, at_, threshold_, got_) ((void)0)
+#endif
+
+static int ctx_soul_tape_tarot(Ctx *c, int ante, uint16_t at) {
+	ctx_soul_tape_prepare(c);
+	if (ante < 1 || ante > MAX_SEARCH_ANTE || at >= CTX_SOUL_CARDS_PER_ANTE)
+		return 0;
+	while (c->tarotFilled[ante] <= at) {
+		uint16_t pos = c->tarotFilled[ante]++;
+		int hit = psr_gt_997(c, stream_next(c,
+				&c->tapeTarot[ante], KT_SOULT[ante]));
+		ctx_tape_store(c->tarotHit[ante], pos, hit);
+		CTX_VERIFY_TAPE(c, KT_SOULT[ante], pos, 0.997, hit);
+	}
+	return ctx_tape_load(c->tarotHit[ante], at);
+}
+
+static int ctx_soul_tape_spectral(Ctx *c, int ante, uint16_t at) {
+	ctx_soul_tape_prepare(c);
+	if (ante < 1 || ante > MAX_SEARCH_ANTE
+			|| at >= CTX_SOUL_CARDS_PER_ANTE * 2) return 0;
+	while (c->spectralFilled[ante] <= at) {
+		uint16_t pos = c->spectralFilled[ante]++;
+		int hit = psr_gt_997(c, stream_next(c,
+				&c->tapeSpectral[ante], KT_SOULS[ante]));
+		ctx_tape_store(c->spectralHit[ante], pos, hit);
+		CTX_VERIFY_TAPE(c, KT_SOULS[ante], pos, 0.997, hit);
+	}
+	return ctx_tape_load(c->spectralHit[ante], at);
+}
+
+static int ctx_soul_tape_edition(Ctx *c, int ante, uint8_t at) {
+	ctx_soul_tape_prepare(c);
+	if (ante < 1 || ante > MAX_SEARCH_ANTE || at >= 64) return 0;
+	while (c->editionFilled[ante] <= at) {
+		uint8_t pos = c->editionFilled[ante]++;
+		int negative = psr_gt_997(c, stream_next(c,
+				&c->tapeEdition[ante], KT_EDISOU[ante]));
+		ctx_tape_store(&c->editionNegative[ante], pos, negative);
+		CTX_VERIFY_TAPE(c, KT_EDISOU[ante], pos, 0.997, negative);
+	}
+	return ctx_tape_load(&c->editionNegative[ante], at);
+}
+
+static int ctx_soul_tape_omen(Ctx *c, uint32_t at) {
+	ctx_soul_tape_prepare(c);
+	if (at >= CTX_OMEN_TAPE_BITS) return 0;
+	while (c->omenFilled <= at) {
+		uint32_t pos = c->omenFilled++;
+		int convert = psr_gt_08(c,
+				stream_next(c, &c->tapeOmen, "omen_globe"));
+		ctx_tape_store(c->omenConvert, pos, convert);
+		CTX_VERIFY_TAPE(c, "omen_globe", pos, 0.8, convert);
+	}
+	return ctx_tape_load(c->omenConvert, at);
 }
 
 /* Pick from an index-preserving culled pool with the resample loop. Returns
@@ -546,6 +1009,158 @@ static int pack_max_slots(const Ctx *c, int a) {
 	return 2 * shops;
 }
 
+/* Exact get_pack weighted choice over the compact available catalog. The
+ * lower test looks redundant in real arithmetic, but Lua's source loop
+ * recomputes `running_sum - weight` after a rounded addition. Retain it so
+ * even a rounding gap/overlap at a weight boundary selects the same entry. */
+static inline int boost_pick_index(const Config *g, double poll) {
+	int lo = 0, hi = g->nboostAvailable;
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+		if (g->boostAvailableCume[mid] >= poll) hi = mid;
+		else lo = mid + 1;
+	}
+	while (lo < g->nboostAvailable && g->boostAvailableLower[lo] > poll) lo++;
+	return lo < g->nboostAvailable ? g->boostAvailableIndex[lo] : -1;
+}
+
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
+static inline double boost_poll_from_fraction(const Config *g,
+		uint64_t fraction) {
+	U64double u = { .u64 = (fraction & UINT64_C(0x000fffffffffffff))
+			| UINT64_C(0x3ff0000000000000) };
+	return (u.d - 1.0) * g->boostCume;
+}
+
+/* First 52-bit PRNG fraction whose rounded weighted poll is >=/> boundary. */
+static uint64_t boost_fraction_lower_bound(const Config *g, double boundary,
+		int strict) {
+	const uint64_t limit = UINT64_C(1) << 52;
+	uint64_t lo = 0, hi = limit;
+	while (lo < hi) {
+		uint64_t mid = lo + ((hi - lo) >> 1);
+		double poll = boost_poll_from_fraction(g, mid);
+		if (strict ? poll > boundary : poll >= boundary) hi = mid;
+		else lo = mid + 1;
+	}
+	return lo;
+}
+
+static void boost_add_soul_run(Config *g, uint64_t end, uint16_t cls) {
+	int n = g->nboostSoulRuns;
+	if (n && g->boostSoulRunClass[n - 1] == cls) {
+		g->boostSoulRunEnd[n - 1] = end;
+		return;
+	}
+	if (n >= BOOST_SOUL_RUN_CAP) return;
+	g->boostSoulRunEnd[n] = end;
+	g->boostSoulRunClass[n] = cls;
+	g->nboostSoulRuns = n + 1;
+}
+
+static int boost_soul_run_index(const Config *g, uint64_t fraction) {
+	int lo = 0, hi = g->nboostSoulRuns;
+	while (lo < hi) {
+		int mid = lo + ((hi - lo) >> 1);
+		if (g->boostSoulRunEnd[mid] >= fraction) hi = mid;
+		else lo = mid + 1;
+	}
+	return lo;
+}
+
+static inline uint16_t boost_pick_soul_fraction(const Config *g,
+		uint64_t fraction) {
+	fraction &= UINT64_C(0x000fffffffffffff);
+	uint16_t cls = g->boostSoulLut[fraction >> (52 - BOOST_SOUL_LUT_BITS)];
+	if (cls == BOOST_SOUL_LUT_MIXED) {
+		int run = boost_soul_run_index(g, fraction);
+		cls = run < g->nboostSoulRuns ? g->boostSoulRunClass[run] : 0;
+	}
+#ifdef BRAINSTORM_VERIFY_BOOST_SOUL_FRACTION
+	int reference = boost_pick_index(g, boost_poll_from_fraction(g, fraction));
+	uint16_t referenceClass = reference >= 0 && g->boostSoul[reference]
+			? (uint16_t)((g->boostSoul[reference] << 8)
+					| g->boostCards[reference]) : 0;
+	if (cls != referenceClass) {
+		fprintf(stderr,
+				"booster Soul fraction mismatch fraction=%llu got=%u reference=%u\n",
+				(unsigned long long)fraction, cls, referenceClass);
+		abort();
+	}
+#endif
+	return cls;
+}
+
+static int boost_fraction_boundary_compare(const void *a, const void *b) {
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+static void boost_build_soul_fraction_index(Config *g) {
+	const uint64_t limit = UINT64_C(1) << 52;
+	uint64_t boundary[MAX_BOOST * 2 + 2];
+	int nboundary = 0;
+	boundary[nboundary++] = 0;
+	boundary[nboundary++] = limit;
+	/* Every comparison in boost_pick_index is invariant between these exact
+	 * integer-domain change points.  Sweeping them handles even pathological
+	 * rounded gaps, overlaps, or non-monotone lower bounds from tiny weights. */
+	for (int at = 0; at < g->nboostAvailable; at++) {
+		boundary[nboundary++] = boost_fraction_lower_bound(g,
+				g->boostAvailableCume[at], 1);
+		boundary[nboundary++] = boost_fraction_lower_bound(g,
+				g->boostAvailableLower[at], 0);
+	}
+	qsort(boundary, (size_t)nboundary, sizeof boundary[0],
+			boost_fraction_boundary_compare);
+	g->nboostSoulRuns = 0;
+	for (int at = 0; at + 1 < nboundary;) {
+		uint64_t start = boundary[at];
+		int nextAt = at + 1;
+		while (nextAt < nboundary && boundary[nextAt] == start) nextAt++;
+		if (start >= limit || nextAt >= nboundary) break;
+		uint64_t next = boundary[nextAt];
+		int pick = boost_pick_index(g, boost_poll_from_fraction(g, start));
+		uint16_t cls = pick >= 0 && g->boostSoul[pick]
+				? (uint16_t)((g->boostSoul[pick] << 8) | g->boostCards[pick]) : 0;
+		boost_add_soul_run(g, next - 1, cls);
+		at = nextAt;
+	}
+	for (unsigned bucket = 0; bucket < BOOST_SOUL_LUT_SIZE; bucket++) {
+		uint64_t low = (uint64_t)bucket << (52 - BOOST_SOUL_LUT_BITS);
+		uint64_t high = (((uint64_t)bucket + 1u)
+				<< (52 - BOOST_SOUL_LUT_BITS)) - 1u;
+		int first = boost_soul_run_index(g, low);
+		int last = boost_soul_run_index(g, high);
+		g->boostSoulLut[bucket] = first == last
+				? g->boostSoulRunClass[first] : BOOST_SOUL_LUT_MIXED;
+	}
+#ifdef BRAINSTORM_VERIFY_BOOST_SOUL_FRACTION
+	for (int run = 0; run < g->nboostSoulRuns; run++) {
+		uint64_t edge = g->boostSoulRunEnd[run];
+		uint64_t lo = edge > 3 ? edge - 3 : 0;
+		uint64_t hi = edge + 3 < limit ? edge + 3 : limit - 1;
+		for (uint64_t fraction = lo; fraction <= hi; fraction++)
+			(void)boost_pick_soul_fraction(g, fraction);
+	}
+	for (unsigned bucket = 0; bucket < BOOST_SOUL_LUT_SIZE; bucket++) {
+		uint64_t lo = (uint64_t)bucket << (52 - BOOST_SOUL_LUT_BITS);
+		uint64_t hi = (((uint64_t)bucket + 1u)
+				<< (52 - BOOST_SOUL_LUT_BITS)) - 1u;
+		(void)boost_pick_soul_fraction(g, lo);
+		(void)boost_pick_soul_fraction(g, lo + ((hi - lo) >> 1));
+		(void)boost_pick_soul_fraction(g, hi);
+	}
+	uint64_t sample = UINT64_C(0x243f6a8885a308d3);
+	for (int i = 0; i < 1000000; i++) {
+		sample = splitmix64(sample);
+		(void)boost_pick_soul_fraction(g,
+				sample & UINT64_C(0x000fffffffffffff));
+	}
+#endif
+}
+#endif
+
 static void resolve_forced_pack_ante(Ctx *c) {
 	c->forcedAnte = 1;
 	for (int a = 1; a <= MAX_SEARCH_ANTE; a++) {
@@ -556,10 +1171,15 @@ static void resolve_forced_pack_ante(Ctx *c) {
 static void sim_packs(Ctx *c, int a, int count) {
 	const Config *g = c->g;
 	if (a < 1 || a > MAX_SEARCH_ANTE) return;
+	if (c->shopPackRawGen[a] != c->gen) {
+		c->shopPackRawGen[a] = c->gen;
+		c->shopPackRawN[a] = 0;
+	}
+	int forced = g->forceBuffoon && a == c->forcedAnte;
 	if (c->packs_gen[a] != c->gen) {
 		c->packs_gen[a] = c->gen;
 		c->packs_n[a] = 0;
-		if (g->forceBuffoon && a == c->forcedAnte) {
+		if (forced) {
 			c->pack_idx[a][0] = PACK_FORCED;
 			c->packs_n[a] = 1;
 		}
@@ -567,16 +1187,15 @@ static void sim_packs(Ctx *c, int a, int count) {
 	int max = pack_max_slots(c, a);
 	if (count > max) count = max;
 	const char *packKey = KT_SHOPPACK[a];
-	while (c->packs_n[a] < count) {
+	int rawNeeded = count - forced;
+	while (c->shopPackRawN[a] < rawNeeded) {
 		double poll = psr(c, stream_next(c, &c->shop_pack[a], packKey)) * g->boostCume;
-		double it = 0.0;
-		int pick = -1;
-		for (int i = 0; i < g->nboost; i++) {
-			if (!g->boostAvail[i]) continue;
-			it += g->boostW[i];
-			if (it >= poll && it - g->boostW[i] <= poll) { pick = i; break; }
-		}
-		c->pack_idx[a][c->packs_n[a]++] = pick;
+		int pick = boost_pick_index(g, poll);
+		c->shopPackRaw[a][c->shopPackRawN[a]++] = (int16_t)pick;
+	}
+	while (c->packs_n[a] < count) {
+		int rawAt = c->packs_n[a] - forced;
+		c->pack_idx[a][c->packs_n[a]++] = c->shopPackRaw[a][rawAt];
 	}
 }
 
@@ -595,13 +1214,24 @@ static int tag_reward_kind_key(const char *key) {
 }
 
 typedef struct {
-	int soulKind, cards;
-	int shopSlot; /* 1-based flattened physical shop-pack slot; 0 for tag reward */
-	int blind;    /* -1 shop, 0 Small reward, 1 Big reward */
-	int humanAnte; /* displayed route position, distinct from the RNG Ante key */
-	int phase;     /* 0 Boss, 1 Small, 2 Big */
-	int source;    /* 1 shop, 2 Charm reward, 3 Ethereal reward */
+	uint8_t soulKind, cards;
+	uint8_t humanAnte; /* displayed route position, distinct from the RNG Ante key */
+	uint8_t phase;     /* 0 Boss, 1 Small, 2 Big */
+	uint8_t source;    /* 1 shop, 2 Charm reward, 3 Ethereal reward */
 } SoulPackEvent;
+
+/* Omen timing variants share one physical pack timeline for the current
+ * skip/reward route. Random Soul/Omen/edition decisions live in Ctx's tape. */
+struct CtxOmenTrace {
+	uint64_t routeGen;
+	int routeMaxAnte, forcedAnte;
+	uint8_t routeSkipSm[MAX_SEARCH_ANTE + 1];
+	uint8_t routeSkipBig[MAX_SEARCH_ANTE + 1];
+	uint8_t routeRewardSm[MAX_SEARCH_ANTE + 1];
+	uint8_t routeRewardBig[MAX_SEARCH_ANTE + 1];
+	uint8_t eventCount[MAX_SEARCH_ANTE + 1];
+	SoulPackEvent event[MAX_SEARCH_ANTE + 1][CTX_SOUL_EVENTS_PER_ANTE];
+};
 
 enum { SOUL_PHASE_BOSS = 0, SOUL_PHASE_SMALL = 1, SOUL_PHASE_BIG = 2 };
 enum { SOUL_SOURCE_SHOP = 1, SOUL_SOURCE_CHARM = 2, SOUL_SOURCE_ETHEREAL = 3 };
@@ -627,13 +1257,13 @@ static void append_shop_pair(const Ctx *c, int ante, int humanAnte, int phase, i
 	for (int i = 0; i < 2 && *cursor < c->packs_n[ante]; i++) {
 		int slot = (*cursor)++;
 		int pi = c->pack_idx[ante][slot];
+		int soulKind = pi >= 0 ? g->boostSoul[pi] : 0;
+		if (!soulKind) continue;
 		SoulPackEvent *e = &events[(*n)++];
-		e->soulKind = pi >= 0 ? g->boostSoul[pi] : 0;
-		e->cards = pi >= 0 ? g->boostCards[pi] : 0;
-		e->shopSlot = slot + 1;
-		e->blind = -1;
-		e->humanAnte = humanAnte;
-		e->phase = phase;
+		e->soulKind = (uint8_t)soulKind;
+		e->cards = (uint8_t)g->boostCards[pi];
+		e->humanAnte = (uint8_t)humanAnte;
+		e->phase = (uint8_t)phase;
 		e->source = SOUL_SOURCE_SHOP;
 	}
 }
@@ -642,13 +1272,11 @@ static void append_tag_reward(const Ctx *c, int ante, int kind, int blind,
 		SoulPackEvent events[8], int *n) {
 	if (!kind) return;
 	SoulPackEvent *e = &events[(*n)++];
-	e->soulKind = kind;
-	e->cards = c->g->tagRewardCards[kind];
-	e->shopSlot = 0;
-	e->blind = blind;
-	e->humanAnte = ante;
-	e->phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
-	e->source = kind == 1 ? SOUL_SOURCE_CHARM : SOUL_SOURCE_ETHEREAL;
+	e->soulKind = (uint8_t)kind;
+	e->cards = (uint8_t)c->g->tagRewardCards[kind];
+	e->humanAnte = (uint8_t)ante;
+	e->phase = (uint8_t)(blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG);
+	e->source = (uint8_t)(kind == 1 ? SOUL_SOURCE_CHARM : SOUL_SOURCE_ETHEREAL);
 }
 
 /* Build one Ante's opened-pack timeline. Antes 2+ begin with the previous
@@ -714,7 +1342,8 @@ static int sim_shop(Ctx *c, int a, int nslots, SeqEnt *seq) {
 				chosen = g->jokerKey[rarity][idx];
 			}
 			bool neg = false;
-			if (g->needNeg) neg = psr(c, stream_next(c, &c->edisho[a], K_EDISHO[a])) > 0.997;
+			if (g->needNeg) neg = psr_gt_997(c,
+					stream_next(c, &c->edisho[a], K_EDISHO[a]));
 			seq[m].key = chosen; seq[m].neg = neg; seq[m].rarity = rarity; m++;
 		}
 	}
@@ -746,7 +1375,8 @@ static int sim_pack_jokers(Ctx *c, int a, SeqEnt *seq) {
 				chosen = g->jokerKey[rarity][idx];
 			}
 			bool neg = false;
-			if (g->needNeg) neg = psr(c, stream_next(c, &c->edibuf[a], K_EDIBUF[a])) > 0.997;
+			if (g->needNeg) neg = psr_gt_997(c,
+					stream_next(c, &c->edibuf[a], K_EDIBUF[a]));
 			seq[m].key = chosen; seq[m].neg = neg; seq[m].rarity = rarity; m++;
 		}
 	}
@@ -860,6 +1490,7 @@ typedef struct {
 typedef struct {
 	int found, purchases;
 	int maxAnte, requireOmen, requirePoolLegends, requireActiveLegend, omenIndex;
+	int forbidAnteReducers;
 	uint64_t purchased;
 	uint8_t purchaseAnte[MAX_VOUCH], purchaseVisit[MAX_VOUCH];
 } CtxVoucherBest;
@@ -867,6 +1498,8 @@ typedef struct {
 static void reset_pool_legend_streams(Ctx *c);
 static bool check_pool_legend_rules(Ctx *c);
 static bool check_legendary_anywhere(Ctx *c, const char **locOut);
+static uint16_t active_omen_activation_mask(Ctx *c, int omenIndex,
+		int routeMaxAnte, uint16_t candidates);
 
 static bool pool_voucher_excluded(const Config *g, int index) {
 	for (int i = 0; i < g->npoolVoucherExclusions; i++)
@@ -874,11 +1507,254 @@ static bool pool_voucher_excluded(const Config *g, int index) {
 	return false;
 }
 
-static int roll_pool_voucher(Ctx *c, int ante, uint64_t purchased,
-		CtxVoucherUndo *undo) {
-	const Config *g = c->g;
-	if (ante < 1 || ante > MAX_SEARCH_ANTE || g->nvouch < 1 || g->nvouch > 64)
+/* Return the first draw from VoucherN or one independent resample key. This
+ * is valid for reducer-free routes: each displayed Ante is visited once, so
+ * purchased state only selects which immutable raw catalog value survives. */
+static int route_raw_voucher(Ctx *c, int ante, int position) {
+	if (ante < 1 || ante > 8 || position < 0 || position > MAX_RESAMPLE)
 		return -1;
+	if (c->voucherRawGen[ante] != c->gen) {
+		c->voucherRawGen[ante] = c->gen;
+		c->voucherRawN[ante] = 0;
+	}
+	while (c->voucherRawN[ante] <= position) {
+		int at = c->voucherRawN[ante];
+		const char *key = at == 0 ? KT_VOUCHER[ante]
+				: RS_VOUCHER[ante][at - 1];
+		double state = pseudohash_ks(key, c->seed);
+		state = round13(lua_mod1(2.134453429141 + state * 1.72431234));
+		int index = psr_n(c, (state + c->hashed_seed) / 2.0, c->g->nvouch);
+		if (index < 1 || index > c->g->nvouch) return -1;
+		c->voucherRaw[ante][at] = (uint8_t)index;
+		c->voucherRawN[ante]++;
+#ifdef BRAINSTORM_VERIFY_INTERACTIVE_VOUCHER_RAW
+		Stream referenceState = { 0 };
+		int reference = psr_n(c, stream_next(c, &referenceState, key), c->g->nvouch);
+		if (index != reference) {
+			fprintf(stderr,
+					"interactive voucher raw mismatch seed=%s ante=%d position=%d cached=%d reference=%d\n",
+					c->seed, ante, at, index, reference);
+			abort();
+		}
+#endif
+	}
+	return c->voucherRaw[ante][position];
+}
+
+static bool prefill_omen_voucher_raw(Ctx *c, int maxAnte) {
+	double seedval[PRNG_BATCH_MAX];
+	int result[PRNG_BATCH_MAX], anteOf[PRNG_BATCH_MAX];
+	int count = 0;
+	for (int ante = 1; ante <= maxAnte; ante++) {
+		if (c->voucherRawGen[ante] != c->gen) {
+			c->voucherRawGen[ante] = c->gen;
+			c->voucherRawN[ante] = 0;
+		}
+		if (!c->voucherRawN[ante]) anteOf[count++] = ante;
+	}
+	if (!count) return true;
+	for (int lane = 0; lane < count; lane++) {
+		int ante = anteOf[lane];
+		double state = pseudohash_ks(KT_VOUCHER[ante], c->seed);
+		state = round13(lua_mod1(2.134453429141 + state * 1.72431234));
+		seedval[lane] = (state + c->hashed_seed) / 2.0;
+	}
+	lj_random_seed_one_n_batch(seedval, count, c->g->nvouch, result);
+	for (int lane = 0; lane < count; lane++) {
+		if (result[lane] < 1 || result[lane] > c->g->nvouch) return false;
+		int ante = anteOf[lane];
+		c->voucherRaw[ante][0] = (uint8_t)result[lane];
+		c->voucherRawN[ante] = 1;
+#ifdef BRAINSTORM_VERIFY_INTERACTIVE_VOUCHER_RAW
+		int reference = psr_n(c, seedval[lane], c->g->nvouch);
+		if (result[lane] != reference) {
+			fprintf(stderr,
+					"interactive voucher raw batch mismatch seed=%s ante=%d cached=%d reference=%d\n",
+					c->seed, ante, result[lane], reference);
+			abort();
+		}
+#endif
+	}
+	return true;
+}
+
+static int route_raw_offer(Ctx *c, int ante, uint64_t availMask) {
+	if (!availMask) return -1;
+	for (int position = 0; position <= MAX_RESAMPLE; position++) {
+		int raw = route_raw_voucher(c, ante, position);
+		if (raw < 1 || raw > c->g->nvouch) return -1;
+		int index = raw - 1;
+		if (availMask & (UINT64_C(1) << index)) return index;
+	}
+	return -1;
+}
+
+typedef struct {
+	uint64_t purchased, availMask;
+	uint16_t buyMask, order;
+	uint8_t purchases, omenAnte;
+} CtxOmenRouteState;
+
+typedef struct {
+	uint16_t feasibleMask;
+	uint8_t found[9];
+	CtxOmenRouteState best[9];
+} CtxOmenRoutes;
+
+static int omen_state_better(const CtxOmenRouteState *a,
+		const CtxOmenRouteState *b) {
+	return a->purchases < b->purchases
+			|| (a->purchases == b->purchases && a->order < b->order);
+}
+
+static uint64_t pool_voucher_exclusion_mask(const Config *g) {
+	uint64_t mask = 0;
+	for (int i = 0; i < g->npoolVoucherExclusions; i++) {
+		int index = g->poolVoucherExclusions[i];
+		if (index >= 0 && index < 64) mask |= UINT64_C(1) << index;
+	}
+	return mask;
+}
+
+/* Exact skip/buy frontier for the common no-predicate Omen fallback. It
+ * retains the generic DFS's minimum-purchase, skip-first winner separately
+ * for every possible Omen purchase Ante. */
+static bool collect_omen_routes(Ctx *c, int maxAnte, CtxOmenRoutes *routes) {
+	const Config *g = c->g;
+	memset(routes, 0, sizeof *routes);
+	if (maxAnte < 1 || maxAnte > 8 || g->omenVoucherIdx < 0
+			|| g->omenVoucherIdx >= g->nvouch || g->nvouch > 64) return false;
+	uint64_t omenBit = UINT64_C(1) << g->omenVoucherIdx;
+	if (g->vouchInitiallyOwnedMask & omenBit) return false;
+	uint64_t forbidden = pool_voucher_exclusion_mask(g) | g->vouchReducerMask;
+	if (g->omenPrereqMask & (forbidden | ~g->vouchRouteEligibleMask)) return false;
+	if (!prefill_omen_voucher_raw(c, maxAnte)) return false;
+
+	enum { FRONTIER_CAP = 1 << 8 };
+	uint64_t purchasedA[FRONTIER_CAP], purchasedB[FRONTIER_CAP];
+	uint64_t availA[FRONTIER_CAP], availB[FRONTIER_CAP];
+	uint16_t buyA[FRONTIER_CAP], buyB[FRONTIER_CAP];
+	uint16_t orderA[FRONTIER_CAP], orderB[FRONTIER_CAP];
+	uint64_t *curPurchased = purchasedA, *nextPurchased = purchasedB;
+	uint64_t *curAvail = availA, *nextAvail = availB;
+	uint16_t *curBuy = buyA, *nextBuy = buyB;
+	uint16_t *curOrder = orderA, *nextOrder = orderB;
+	int ncur = 1;
+	curPurchased[0] = g->vouchInitiallyOwnedMask;
+	curAvail[0] = g->vouchInitialAvailMask;
+	curBuy[0] = 0;
+	curOrder[0] = 0;
+	for (int ante = 1; ante <= maxAnte && ncur; ante++) {
+		int nnext = 0;
+		int visible = ante != 1 || !c->skipSm[1] || !c->skipBig[1];
+		for (int si = 0; si < ncur; si++) {
+			uint64_t purchased = curPurchased[si];
+			uint64_t availMask = curAvail[si];
+			uint16_t buyMask = curBuy[si];
+			uint16_t order = curOrder[si];
+			int missing = __builtin_popcountll(g->omenPrereqMask & ~purchased);
+			if (missing > maxAnte - ante + 1) continue;
+			int index = route_raw_offer(c, ante, availMask);
+			if (index < 0) continue;
+			nextPurchased[nnext] = purchased;
+			nextAvail[nnext] = availMask;
+			nextBuy[nnext] = buyMask;
+			nextOrder[nnext] = (uint16_t)(order << 1);
+			nnext++;
+			uint64_t bit = UINT64_C(1) << index;
+			if (!visible || (forbidden & bit)) continue;
+			uint64_t bought = purchased | bit;
+			uint64_t boughtAvail = (availMask & ~bit)
+					| (g->vouchUnlocksMask[index]
+							& g->vouchRouteEligibleMask & ~bought);
+			uint16_t boughtMask = buyMask | (UINT16_C(1) << (ante - 1));
+			uint16_t boughtOrder = (uint16_t)((order << 1) | 1u);
+			if (index == g->omenVoucherIdx) {
+				int valid = 1;
+				for (int later = ante + 1; later <= maxAnte; later++) {
+					if (route_raw_offer(c, later, boughtAvail) < 0) {
+						valid = 0;
+						break;
+					}
+				}
+				if (!valid) continue;
+				CtxOmenRouteState state = {
+					.purchased = bought, .availMask = boughtAvail,
+					.buyMask = boughtMask,
+					.order = (uint16_t)(boughtOrder << (maxAnte - ante)),
+					.purchases = (uint8_t)__builtin_popcount((unsigned)boughtMask),
+					.omenAnte = (uint8_t)ante,
+				};
+				if (!routes->found[ante]
+						|| omen_state_better(&state, &routes->best[ante])) {
+					routes->found[ante] = 1;
+					routes->best[ante] = state;
+					routes->feasibleMask |= UINT16_C(1) << (ante - 1);
+				}
+				continue;
+			}
+			nextPurchased[nnext] = bought;
+			nextAvail[nnext] = boughtAvail;
+			nextBuy[nnext] = boughtMask;
+			nextOrder[nnext] = boughtOrder;
+			nnext++;
+		}
+		uint64_t *tmp64 = curPurchased;
+		curPurchased = nextPurchased; nextPurchased = tmp64;
+		tmp64 = curAvail; curAvail = nextAvail; nextAvail = tmp64;
+		uint16_t *tmp16 = curBuy;
+		curBuy = nextBuy; nextBuy = tmp16;
+		tmp16 = curOrder; curOrder = nextOrder; nextOrder = tmp16;
+		ncur = nnext;
+	}
+	return routes->feasibleMask != 0;
+}
+
+static const CtxOmenRouteState *best_omen_route(
+		const CtxOmenRoutes *routes, uint16_t timings) {
+	const CtxOmenRouteState *best = NULL;
+	for (int ante = 1; ante <= 8; ante++) {
+		if (!(timings & (UINT16_C(1) << (ante - 1))) || !routes->found[ante])
+			continue;
+		const CtxOmenRouteState *candidate = &routes->best[ante];
+		if (!best || omen_state_better(candidate, best)) best = candidate;
+	}
+	return best;
+}
+
+static bool materialize_omen_route(Ctx *c, const CtxOmenRouteState *state,
+		int maxAnte, CtxVoucherBest *best) {
+	const Config *g = c->g;
+	uint64_t purchased = g->vouchInitiallyOwnedMask;
+	uint64_t availMask = g->vouchInitialAvailMask;
+	memset(best->purchaseAnte, 0, sizeof best->purchaseAnte);
+	memset(best->purchaseVisit, 0, sizeof best->purchaseVisit);
+	for (int ante = 1; ante <= maxAnte; ante++) {
+		int index = route_raw_offer(c, ante, availMask);
+		if (index < 0) return false;
+		if (!(state->buyMask & (UINT16_C(1) << (ante - 1)))) continue;
+		best->purchaseAnte[index] = (uint8_t)ante;
+		best->purchaseVisit[index] = 1;
+		uint64_t bit = UINT64_C(1) << index;
+		purchased |= bit;
+		availMask = (availMask & ~bit)
+				| (g->vouchUnlocksMask[index]
+						& g->vouchRouteEligibleMask & ~purchased);
+	}
+	if (purchased != state->purchased) return false;
+	best->found = 1;
+	best->purchases = state->purchases;
+	best->purchased = purchased;
+	return true;
+}
+
+static int roll_pool_voucher(Ctx *c, int ante, uint64_t purchased,
+		CtxVoucherUndo *undo, int firstVisitOnly) {
+	const Config *g = c->g;
+	if (ante < 1 || ante > MAX_SEARCH_ANTE || g->nvouch < 1 || g->nvouch > 64) {
+		*undo = (CtxVoucherUndo){0};
+		return -1;
+	}
 	const char *key = KT_VOUCHER[ante];
 	undo->main = c->voucher[ante];
 	undo->nresample = 0;
@@ -895,14 +1771,19 @@ static int roll_pool_voucher(Ctx *c, int ante, uint64_t purchased,
 			& (g->vouchNoPrereqMask | unlocked);
 	if (!availMask) return -1;
 
-	int idx = psr_n(c, stream_next(c, &c->voucher[ante], key), g->nvouch);
+	int idx = firstVisitOnly ? route_raw_voucher(c, ante, 0)
+			: psr_n(c, stream_next(c, &c->voucher[ante], key), g->nvouch);
 	int it = 1;
 	while (idx > 0 && !(availMask >> (idx - 1) & 1)) {
 		it++;
 		if (it - 2 >= MAX_RESAMPLE) return -1;
-		undo->resample[undo->nresample++] = c->poolVoucherResample[ante][it - 2];
-		idx = psr_n(c, stream_next(c, &c->poolVoucherResample[ante][it - 2],
-				RS_VOUCHER[ante][it - 2]), g->nvouch);
+		if (firstVisitOnly) {
+			idx = route_raw_voucher(c, ante, it - 1);
+		} else {
+			undo->resample[undo->nresample++] = c->poolVoucherResample[ante][it - 2];
+			idx = psr_n(c, stream_next(c, &c->poolVoucherResample[ante][it - 2],
+					RS_VOUCHER[ante][it - 2]), g->nvouch);
+		}
 	}
 	return idx > 0 ? idx - 1 : -1;
 }
@@ -917,6 +1798,12 @@ static void undo_pool_voucher(Ctx *c, int ante, const CtxVoucherUndo *undo) {
 static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 		uint32_t matched, int purchases, CtxVoucherBest *best) {
 	const Config *g = c->g;
+	if (best->requireOmen && best->forbidAnteReducers
+			&& best->omenIndex >= 0
+			&& !(purchased & (UINT64_C(1) << best->omenIndex))) {
+		int missing = __builtin_popcountll(g->omenPrereqMask & ~purchased);
+		if (missing > best->maxAnte - ante + 1) return;
+	}
 	uint32_t all = (UINT32_C(1) << g->npoolVoucherRules) - 1u;
 	if (best->found && purchases > best->purchases) return;
 	for (int i = 0; i < g->npoolVoucherRules; i++)
@@ -953,7 +1840,8 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 	}
 
 	CtxVoucherUndo undo;
-	int index = roll_pool_voucher(c, ante, purchased, &undo);
+	int index = roll_pool_voucher(c, ante, purchased, &undo,
+			best->forbidAnteReducers);
 	if (index < 0) {
 		undo_pool_voucher(c, ante, &undo);
 		return;
@@ -976,9 +1864,7 @@ static void search_pool_voucher_route(Ctx *c, int ante, uint64_t purchased,
 	if (visible && needMore
 			&& (!best->found || purchases + 1 <= best->purchases)
 			&& !pool_voucher_excluded(g, index)) {
-		if ((best->requirePoolLegends || best->requireActiveLegend
-				|| g->npoolRouteRules)
-				&& g->vouchIsReducer[index])
+		if (best->forbidAnteReducers && g->vouchIsReducer[index])
 			goto skip_pool_voucher_buy;
 		uint8_t oldAnte = c->poolVoucherPurchaseAnte[index];
 		uint8_t oldVisit = c->poolVoucherPurchaseVisit[index];
@@ -1048,17 +1934,81 @@ static bool check_pool_voucher_route_mode(Ctx *c, int requireOmen,
 		.requirePoolLegends = requirePoolLegends,
 		.requireActiveLegend = requireActiveLegend,
 		.omenIndex = g->omenVoucherIdx,
+		.forbidAnteReducers = requirePoolLegends || requireActiveLegend
+				|| g->npoolRouteRules,
 	};
 	if (best.maxAnte < g->poolVoucherMaxAnte) best.maxAnte = g->poolVoucherMaxAnte;
 	if (best.maxAnte < 1 || best.maxAnte > 8) return false;
 	if (requireOmen && best.omenIndex < 0) return false;
-	if (requireOmen && (requirePoolLegends || requireActiveLegend)
-			&& !omen_timing_possible(c, best.omenIndex, best.maxAnte,
-					requirePoolLegends, requireActiveLegend)) return false;
-	uint64_t initialPurchased = 0;
-	for (int i = 0; i < g->nvouch; i++)
-		if (g->vouchInitiallyOwned[i]) initialPurchased |= UINT64_C(1) << i;
-	search_pool_voucher_route(c, 1, initialPurchased, 0, 0, &best);
+	if (requireOmen && (requirePoolLegends || requireActiveLegend))
+		c->omenRoutePossible = -1;
+	uint64_t initialPurchased = g->vouchInitiallyOwnedMask;
+	int haveBest = 0;
+	/* Active legAnywhere without embedded voucher predicates is the common
+	 * in-game fallback. Establish exact route reachability first, then test
+	 * only those Omen timings against the shared Soul trace. */
+	if (requireOmen && requireActiveLegend && !requirePoolLegends
+			&& !g->npoolVoucherRules && best.forbidAnteReducers) {
+		CtxOmenRoutes routes;
+		if (!collect_omen_routes(c, best.maxAnte, &routes)) {
+			/* Adding a Charm skip can only hide the initial A1 voucher; it cannot
+			 * reveal an offer or buy edge. */
+			c->omenRoutePossible = 0;
+			return false;
+		}
+		c->omenRoutePossible = 1;
+		uint16_t validTimings = active_omen_activation_mask(c,
+				best.omenIndex, best.maxAnte, routes.feasibleMask);
+		if (!validTimings) return false;
+		const CtxOmenRouteState *chosen = best_omen_route(&routes, validTimings);
+		if (!chosen || !materialize_omen_route(c, chosen, best.maxAnte, &best))
+			return false;
+#ifdef BRAINSTORM_VERIFY_INTERACTIVE_OMEN_FRONTIER
+		/* Differentially prove both reachability and the minimum-purchase,
+		 * skip-first winner against the original recursive route engine. */
+		CtxVoucherBest fastBest = best;
+		memset(c->voucher, 0, sizeof c->voucher);
+		memset(c->poolVoucherResample, 0, sizeof c->poolVoucherResample);
+		memset(c->poolVoucherVisits, 0, sizeof c->poolVoucherVisits);
+		memset(c->poolVoucherPurchaseAnte, 0,
+				sizeof c->poolVoucherPurchaseAnte);
+		memset(c->poolVoucherPurchaseVisit, 0,
+				sizeof c->poolVoucherPurchaseVisit);
+		c->poolVoucherPurchased = 0;
+		CtxVoucherBest referenceBest = {
+			.purchases = INT_MAX,
+			.maxAnte = best.maxAnte,
+			.requireOmen = requireOmen,
+			.requirePoolLegends = requirePoolLegends,
+			.requireActiveLegend = requireActiveLegend,
+			.omenIndex = best.omenIndex,
+			.forbidAnteReducers = best.forbidAnteReducers,
+		};
+		search_pool_voucher_route(c, 1, initialPurchased, 0, 0,
+				&referenceBest);
+		if (!referenceBest.found
+				|| referenceBest.purchases != fastBest.purchases
+				|| referenceBest.purchased != fastBest.purchased
+				|| memcmp(referenceBest.purchaseAnte, fastBest.purchaseAnte,
+					sizeof fastBest.purchaseAnte)
+				|| memcmp(referenceBest.purchaseVisit, fastBest.purchaseVisit,
+					sizeof fastBest.purchaseVisit)) {
+			fprintf(stderr,
+					"interactive Omen frontier mismatch seed=%s fast_purchases=%d reference_found=%d reference_purchases=%d\n",
+					c->seed, fastBest.purchases, referenceBest.found,
+					referenceBest.purchases);
+			abort();
+		}
+		best = fastBest;
+#endif
+		haveBest = 1;
+	}
+	if (!haveBest) {
+		if (requireOmen && (requirePoolLegends || requireActiveLegend)
+				&& !omen_timing_possible(c, best.omenIndex, best.maxAnte,
+						requirePoolLegends, requireActiveLegend)) return false;
+		search_pool_voucher_route(c, 1, initialPurchased, 0, 0, &best);
+	}
 	memset(c->voucher, 0, sizeof c->voucher);
 	memset(c->poolVoucherResample, 0, sizeof c->poolVoucherResample);
 	memset(c->poolVoucherVisits, 0, sizeof c->poolVoucherVisits);
@@ -1083,7 +2033,6 @@ static bool check_pool_voucher_route(Ctx *c) {
 static void reset_pool_legend_streams(Ctx *c) {
 	memset(&c->joker4, 0, sizeof c->joker4);
 	memset(c->resample[RB_JOKER4], 0, sizeof c->resample[RB_JOKER4]);
-	memset(c->shop_pack, 0, sizeof c->shop_pack);
 	memset(c->soulT, 0, sizeof c->soulT);
 	memset(c->soulS, 0, sizeof c->soulS);
 	memset(c->edisouA, 0, sizeof c->edisouA);
@@ -1132,6 +2081,11 @@ static bool check_pool_legend_rules(Ctx *c) {
 	int found = 0, eventAnte[3] = { 0 };
 	SoulPackEvent eventPack[3] = { 0 };
 	double eventEdition[3] = { 0.0 };
+	ctx_soul_tape_prepare(c);
+	uint16_t tarotAt[MAX_SEARCH_ANTE + 1] = { 0 };
+	uint16_t spectralAt[MAX_SEARCH_ANTE + 1] = { 0 };
+	uint8_t editionAt[MAX_SEARCH_ANTE + 1] = { 0 };
+	uint32_t omenAt = 0;
 	int omenIndex = g->omenVoucherIdx;
 	for (int ante = 1; ante <= maxAnte && found < needDepth; ante++) {
 		SoulPackEvent packs[8];
@@ -1144,15 +2098,18 @@ static bool check_pool_legend_rules(Ctx *c) {
 			for (int card = 0; card < cards && found < needDepth; card++) {
 				int contentKind = kind;
 				if (kind == 1 && omenOwned
-						&& psr(c, stream_next(c, &c->omen, "omen_globe")) > 0.8)
+						&& ctx_soul_tape_omen(c, omenAt++))
 					contentKind = 2;
-				Stream *stream = contentKind == 1 ? &c->soulT[ante] : &c->soulS[ante];
-				const char *soulKey = contentKind == 1 ? KT_SOULT[ante] : KT_SOULS[ante];
 				bool soul = false;
-				if (!soulInPack)
-					soul = psr(c, stream_next(c, stream, soulKey)) > 0.997;
+				if (!soulInPack) {
+					if (contentKind == 1)
+						soul = ctx_soul_tape_tarot(c, ante, tarotAt[ante]++);
+					else
+						soul = ctx_soul_tape_spectral(c, ante, spectralAt[ante]++);
+				}
 				if (contentKind == 2 && !blackHoleInPack) {
-					bool blackHole = psr(c, stream_next(c, stream, soulKey)) > 0.997;
+					bool blackHole = ctx_soul_tape_spectral(c, ante,
+							spectralAt[ante]++);
 					if (blackHole) {
 						if (g->blackHoleAllowed) blackHoleInPack = true;
 						soul = false;
@@ -1163,8 +2120,9 @@ static bool check_pool_legend_rules(Ctx *c) {
 				found++;
 				eventAnte[found] = ante;
 				eventPack[found] = packs[slot];
-				eventEdition[found] = psr(c,
-						stream_next(c, &c->edisouA[ante], KT_EDISOU[ante]));
+				if (g->poolLegendNeedsEdition)
+					eventEdition[found] = ctx_soul_tape_edition(c, ante,
+							editionAt[ante]++);
 			}
 		}
 	}
@@ -1180,7 +2138,7 @@ static bool check_pool_legend_rules(Ctx *c) {
 						&& eventPack[depth].source != g->poolLegendRules[i].source)) return false;
 		} else if (eventAnte[depth] < g->poolLegendRules[i].minAnte
 				|| eventAnte[depth] > g->poolLegendRules[i].maxAnte) return false;
-		if (g->poolLegendRules[i].neg && eventEdition[depth] <= 0.997) return false;
+		if (g->poolLegendRules[i].neg && !eventEdition[depth]) return false;
 	}
 	return true;
 }
@@ -1188,6 +2146,9 @@ static bool check_pool_legend_rules(Ctx *c) {
 static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte,
 		int requireOmen) {
 	const Config *g = c->g;
+	/* Buying Charm cannot create an Omen route: the voucher frontier is
+	 * independent of every tag reward and physical pack draw. */
+	if (requireOmen && c->omenRoutePossible == 0) return false;
 	int charmIndex = g->charmTagIdx;
 	if (charmIndex < 0) return false;
 	if (tagMaxAnte > MAX_SEARCH_ANTE) tagMaxAnte = MAX_SEARCH_ANTE;
@@ -1224,6 +2185,10 @@ static bool try_pool_targeted_charm(Ctx *c, int soulMaxAnte, int tagMaxAnte,
 static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	const Config *g = c->g;
 	if (!g->soulAllowed) return false;
+	ctx_soul_tape_prepare(c);
+	uint16_t tarotAt[9] = { 0 }, spectralAt[9] = { 0 };
+	uint8_t editionAt[9] = { 0 };
+	uint32_t omenAt = 0;
 	int omenIndex = g->omenVoucherIdx;
 	for (int a = 1; a <= 8; a++) {
 		SoulPackEvent packs[8];
@@ -1237,15 +2202,17 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 			for (int card = 0; card < ncards; card++) {
 				int contentKind = sk;
 				if (sk == 1 && omenOwned
-						&& psr(c, stream_next(c, &c->omen, "omen_globe")) > 0.8)
+						&& ctx_soul_tape_omen(c, omenAt++))
 					contentKind = 2;
-				Stream *ss = contentKind == 1 ? &c->soulT[a] : &c->soulS[a];
-				const char *skey = contentKind == 1 ? K_SOULT[a] : K_SOULS[a];
 				bool soul = false;
-				if (!soul_in_pack)
-					soul = psr(c, stream_next(c, ss, skey)) > 0.997;
+				if (!soul_in_pack) {
+					if (contentKind == 1)
+						soul = ctx_soul_tape_tarot(c, a, tarotAt[a]++);
+					else
+						soul = ctx_soul_tape_spectral(c, a, spectralAt[a]++);
+				}
 				if (contentKind == 2 && !bh_in_pack) {
-					bool bh = psr(c, stream_next(c, ss, skey)) > 0.997;
+					bool bh = ctx_soul_tape_spectral(c, a, spectralAt[a]++);
 					if (bh) {
 						/* A banned Black Hole still consumes its roll and
 						 * overwrites a same-card Soul, but it never enters the
@@ -1255,12 +2222,9 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 					}
 				}
 				if (soul) {
-					int idx = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
-							g->jokerAvail[4], g->njoker[4], -1);
-					if (idx < 0) return false;
-					if (strcmp(g->jokerKey[4][idx], g->legendary)) return false;
+					if (g->activeLegendaryIdx < 0) return false;
 					if (g->negLegendary
-							&& psr(c, stream_next(c, &c->edisouA[a], K_EDISOUA[a])) <= 0.997) {
+							&& !ctx_soul_tape_edition(c, a, editionAt[a]++)) {
 						return false;
 					}
 					soul_event_location(c->legloc, sizeof c->legloc, &packs[slot]);
@@ -1273,9 +2237,170 @@ static bool check_legendary_anywhere(Ctx *c, const char **locOut) {
 	return false;
 }
 
+static bool omen_trace_same_route(const Ctx *c, const CtxOmenTrace *t,
+		int maxAnte) {
+	size_t bytes = (size_t)(maxAnte + 1) * sizeof(uint8_t);
+	return t->routeGen == c->gen && t->routeMaxAnte == maxAnte
+			&& t->forcedAnte == c->forcedAnte
+			&& !memcmp(t->routeSkipSm, c->skipSm, bytes)
+			&& !memcmp(t->routeSkipBig, c->skipBig, bytes)
+			&& !memcmp(t->routeRewardSm, c->rewardSm, bytes)
+			&& !memcmp(t->routeRewardBig, c->rewardBig, bytes);
+}
+
+static bool omen_trace_prepare(Ctx *c, int maxAnte) {
+	if (maxAnte < 1 || maxAnte > MAX_SEARCH_ANTE) return false;
+	if (!c->omenTrace) c->omenTrace = calloc(1, sizeof *c->omenTrace);
+	CtxOmenTrace *t = c->omenTrace;
+	if (!t) return false;
+	ctx_soul_tape_prepare(c);
+	if (omen_trace_same_route(c, t, maxAnte)) return true;
+	memset(c->packs_gen, 0, sizeof c->packs_gen);
+	memset(c->packs_n, 0, sizeof c->packs_n);
+	for (int ante = 1; ante <= maxAnte; ante++) {
+		int n = soul_pack_events(c, ante, t->event[ante]);
+		if (n < 0 || n > CTX_SOUL_EVENTS_PER_ANTE) return false;
+		t->eventCount[ante] = (uint8_t)n;
+		for (int i = 0; i < n; i++)
+			if (t->event[ante][i].cards > CTX_SOUL_CARDS_PER_EVENT) return false;
+	}
+	t->routeMaxAnte = maxAnte;
+	t->forcedAnte = c->forcedAnte;
+	size_t bytes = (size_t)(maxAnte + 1) * sizeof(uint8_t);
+	memcpy(t->routeSkipSm, c->skipSm, bytes);
+	memcpy(t->routeSkipBig, c->skipBig, bytes);
+	memcpy(t->routeRewardSm, c->rewardSm, bytes);
+	memcpy(t->routeRewardBig, c->rewardBig, bytes);
+	t->routeGen = c->gen;
+	memset(c->packs_gen, 0, sizeof c->packs_gen);
+	memset(c->packs_n, 0, sizeof c->packs_n);
+	return true;
+}
+
+static bool omen_trace_owned_at(const Ctx *c, int purchaseAnte,
+		const SoulPackEvent *event) {
+	int omenIndex = c->g->omenVoucherIdx;
+	if (omenIndex >= 0 && omenIndex < c->g->nvouch
+			&& c->g->vouchInitiallyOwned[omenIndex]) return true;
+	int humanAnte, phase;
+	if (purchaseAnte == 1) {
+		humanAnte = 1;
+		phase = c->skipSm[1] ? SOUL_PHASE_BIG : SOUL_PHASE_SMALL;
+	} else {
+		humanAnte = purchaseAnte - 1;
+		phase = SOUL_PHASE_BOSS;
+	}
+	return bspool_route_position(event->humanAnte, event->phase)
+			>= bspool_route_position(humanAnte, phase);
+}
+
+static bool omen_trace_active_matches(Ctx *c, const CtxOmenTrace *t,
+		int purchaseAnte, const char **locOut) {
+	const Config *g = c->g;
+	uint16_t tarotAt[9] = { 0 }, spectralAt[9] = { 0 };
+	uint8_t editionAt[9] = { 0 };
+	uint32_t omenAt = 0;
+	for (int ante = 1; ante <= 8; ante++) {
+		for (int slot = 0; slot < t->eventCount[ante]; slot++) {
+			const SoulPackEvent *event = &t->event[ante][slot];
+			int soulKind = event->soulKind;
+			if (!soulKind) continue;
+			bool omenOwned = omen_trace_owned_at(c, purchaseAnte, event);
+			bool soulInPack = false, blackHoleInPack = false;
+			for (int card = 0; card < event->cards; card++) {
+				int contentKind = soulKind;
+				if (soulKind == 1 && omenOwned
+						&& ctx_soul_tape_omen(c, omenAt++)) contentKind = 2;
+				bool soul = false;
+				if (!soulInPack) {
+					if (contentKind == 1)
+						soul = ctx_soul_tape_tarot(c, ante, tarotAt[ante]++);
+					else
+						soul = ctx_soul_tape_spectral(c, ante, spectralAt[ante]++);
+				}
+				if (contentKind == 2 && !blackHoleInPack) {
+					bool blackHole = ctx_soul_tape_spectral(c, ante,
+							spectralAt[ante]++);
+					if (blackHole) {
+						if (g->blackHoleAllowed) blackHoleInPack = true;
+						soul = false;
+					}
+				}
+				if (!soul) continue;
+				soulInPack = true;
+				if (g->negLegendary
+						&& !ctx_soul_tape_edition(c, ante, editionAt[ante]++))
+					return false;
+				if (locOut) {
+					soul_event_location(c->legloc, sizeof c->legloc, event);
+					*locOut = c->legloc;
+				}
+				return g->activeLegendaryIdx >= 0;
+			}
+		}
+	}
+	return false;
+}
+
+static uint16_t active_omen_activation_mask_reference(Ctx *c, int omenIndex,
+		int routeMaxAnte, uint16_t candidates) {
+	uint64_t oldPurchased = c->poolVoucherPurchased;
+	uint8_t oldAnte = c->poolVoucherPurchaseAnte[omenIndex];
+	uint8_t oldVisit = c->poolVoucherPurchaseVisit[omenIndex];
+	uint16_t mask = 0;
+	for (int ante = 1; ante <= routeMaxAnte; ante++) {
+		uint16_t bit = UINT16_C(1) << (ante - 1);
+		if (!(candidates & bit)) continue;
+		c->poolVoucherPurchased = oldPurchased | (UINT64_C(1) << omenIndex);
+		c->poolVoucherPurchaseAnte[omenIndex] = (uint8_t)ante;
+		c->poolVoucherPurchaseVisit[omenIndex] = 1;
+		const char *unusedLocation = NULL;
+		reset_pool_legend_streams(c);
+		if (check_legendary_anywhere(c, &unusedLocation)) mask |= bit;
+	}
+	c->poolVoucherPurchased = oldPurchased;
+	c->poolVoucherPurchaseAnte[omenIndex] = oldAnte;
+	c->poolVoucherPurchaseVisit[omenIndex] = oldVisit;
+	reset_pool_legend_streams(c);
+	return mask;
+}
+
+static uint16_t active_omen_activation_mask(Ctx *c, int omenIndex,
+		int routeMaxAnte, uint16_t candidates) {
+	if (omenIndex < 0 || omenIndex >= c->g->nvouch) return 0;
+	if (__builtin_popcount((unsigned)candidates) <= 1)
+		return active_omen_activation_mask_reference(c, omenIndex,
+				routeMaxAnte, candidates);
+	if (!omen_trace_prepare(c, 8))
+		return active_omen_activation_mask_reference(c, omenIndex,
+				routeMaxAnte, candidates);
+	uint16_t mask = 0;
+	for (int ante = 1; ante <= routeMaxAnte; ante++) {
+		uint16_t bit = UINT16_C(1) << (ante - 1);
+		if ((candidates & bit)
+				&& omen_trace_active_matches(c, c->omenTrace, ante, NULL))
+			mask |= bit;
+	}
+#ifdef BRAINSTORM_VERIFY_INTERACTIVE_OMEN_TRACE
+	uint16_t reference = active_omen_activation_mask_reference(c, omenIndex,
+			routeMaxAnte, candidates);
+	if (mask != reference) {
+		fprintf(stderr,
+				"interactive Omen trace mismatch seed=%s candidates=%04x trace=%04x reference=%04x\n",
+				c->seed, candidates, mask, reference);
+		abort();
+	}
+#endif
+	return mask;
+}
+
 static bool try_active_targeted_charm(Ctx *c, const char **locOut,
 		int requireOmen) {
 	const Config *g = c->g;
+	/* The no-Charm route search already proved this candidate has no legal
+	 * Omen route. Charm only inserts a forced pack, so repeating the full
+	 * voucher search for each of 16 tag positions cannot change that proof. */
+	if (requireOmen && c->omenRoutePossible == 0) return false;
 	int charmIndex = g->charmTagIdx;
 	if (charmIndex < 0) return false;
 	/* The zero-purchase branch must evaluate with no route purchases owned,
@@ -1388,6 +2513,7 @@ done:;
 static bool passes_prepared(Ctx *c) {
 	const Config *g = c->g;
 	c->label[0] = 0;
+	c->omenRoutePossible = -1;
 	memset(c->tagRollDone, 0, sizeof c->tagRollDone);
 	/* Voucher routes are candidate-local. A purchased-Omen fallback found for
 	 * one seed must never remain owned while the next fixture/search candidate
@@ -1398,6 +2524,14 @@ static bool passes_prepared(Ctx *c) {
 	bool legAnywhere = g->legAnywhere && g->legendary[0];
 	const char *tagLoc = NULL, *legLoc = NULL;
 	char tagLocBuf[12];
+	/* Legendary identity is independent of every pack, Charm, and Omen route.
+	 * Reject the other rarity-4 picks before paying for a physical Soul walk. */
+	if (legAnywhere) {
+		if (!g->soulAllowed) return false;
+		int first = pick_culled(c, &c->joker4, "Joker4", RB_JOKER4,
+				g->jokerAvail[4], g->njoker[4], -1);
+		if (first < 0 || first != g->activeLegendaryIdx) return false;
+	}
 
 	/* 1) soul / legendary, ante-1 charm-tag convention (replaced by the
 	 * anywhere pack-scan below when the toggle is on) */
@@ -1408,7 +2542,8 @@ static bool passes_prepared(Ctx *c) {
 		for (int i = 0; i < needed; i++) {
 			bool found = false;
 			for (int j = 0; j < g->tagRewardCards[1]; j++) {
-				if (psr(c, stream_next(c, &c->soulT[1], K_SOULT[1])) > 0.997) found = true;
+				if (psr_gt_997(c,
+						stream_next(c, &c->soulT[1], K_SOULT[1]))) found = true;
 			}
 			last = found;
 			if (!found) return false;
@@ -1419,7 +2554,8 @@ static bool passes_prepared(Ctx *c) {
 					g->jokerAvail[4], g->njoker[4], -1);
 			if (idx < 0) return false;
 			if (strcmp(g->jokerKey[4][idx], g->legendary)) return false;
-			if (g->negLegendary && psr(c, stream_next(c, &c->edisouA[1], K_EDISOUA[1])) <= 0.997) return false;
+			if (g->negLegendary && !psr_gt_997(c,
+					stream_next(c, &c->edisouA[1], K_EDISOUA[1]))) return false;
 		}
 	}
 	/* 2) tag: source-verified culled roll; anywhere = both blinds, antes 1-8
@@ -1797,6 +2933,7 @@ static Stream *first_stream(Ctx *c) {
 	case FS_VOUCH: return &c->voucher[1];
 	case FS_JCDT: return &c->cdt[g->fsAnte];
 	case FS_JPACK: return &c->shop_pack[g->fsAnte];
+	case FS_LEGEND: return &c->joker4;
 	}
 	return NULL;
 }
@@ -1977,10 +3114,16 @@ static uint64_t config_single_bit(const char *d) {
 static void config_finalize_catalog(Config *g) {
 	g->omenVoucherIdx = -1;
 	g->charmTagIdx = -1;
+	g->activeLegendaryIdx = -1;
 	memset(g->vouchIsReducer, 0, sizeof g->vouchIsReducer);
 	memset(g->tagRewardKindOf, 0, sizeof g->tagRewardKindOf);
 	g->vouchRouteEligibleMask = 0;
 	g->vouchNoPrereqMask = 0;
+	g->vouchInitiallyOwnedMask = 0;
+	g->vouchInitialAvailMask = 0;
+	g->vouchReducerMask = 0;
+	g->omenPrereqMask = 0;
+	g->poolLegendNeedsEdition = 0;
 	memset(g->vouchUnlocksMask, 0, sizeof g->vouchUnlocksMask);
 	for (int i = 0; i < g->nvouch; i++) {
 		if (!strcmp(g->vouchKey[i], "v_omen_globe")) g->omenVoucherIdx = i;
@@ -1991,10 +3134,23 @@ static void config_finalize_catalog(Config *g) {
 	if (g->nvouch <= 64) {
 		for (int i = 0; i < g->nvouch; i++) {
 			if (g->vouchRouteAvail[i]) g->vouchRouteEligibleMask |= UINT64_C(1) << i;
+			if (g->vouchInitiallyOwned[i]) g->vouchInitiallyOwnedMask |= UINT64_C(1) << i;
+			if (g->vouchIsReducer[i]) g->vouchReducerMask |= UINT64_C(1) << i;
 			int prerequisite = g->vouchPrereq[i];
 			if (prerequisite < 0) g->vouchNoPrereqMask |= UINT64_C(1) << i;
 			else if (prerequisite < g->nvouch)
 				g->vouchUnlocksMask[prerequisite] |= UINT64_C(1) << i;
+		}
+		uint64_t unlocked = 0;
+		for (uint64_t owned = g->vouchInitiallyOwnedMask; owned; owned &= owned - 1)
+			unlocked |= g->vouchUnlocksMask[__builtin_ctzll(owned)];
+		g->vouchInitialAvailMask = g->vouchRouteEligibleMask
+				& ~g->vouchInitiallyOwnedMask & (g->vouchNoPrereqMask | unlocked);
+		int index = g->omenVoucherIdx;
+		while (index >= 0 && index < g->nvouch
+				&& !(g->omenPrereqMask & (UINT64_C(1) << index))) {
+			g->omenPrereqMask |= UINT64_C(1) << index;
+			index = g->vouchPrereq[index];
 		}
 	}
 	for (int i = 0; i < g->ntags; i++) {
@@ -2005,6 +3161,16 @@ static void config_finalize_catalog(Config *g) {
 			g->tagRewardKindOf[i] = 2;
 		}
 	}
+	if (g->legendary[0]) {
+		for (int i = 0; i < g->njoker[4]; i++) {
+			if (!strcmp(g->jokerKey[4][i], g->legendary)) {
+				g->activeLegendaryIdx = i;
+				break;
+			}
+		}
+	}
+	for (int i = 0; i < g->npoolLegendRules; i++)
+		if (g->poolLegendRules[i].neg) g->poolLegendNeedsEdition = 1;
 	g->activeTagReward = tag_reward_kind_key(g->tag[0] ? g->tag : NULL);
 }
 
@@ -2271,6 +3437,7 @@ bad_value:
 	/* booster cume (array order, matches the Lua float sum); card counts come
 	 * from config.extra via the config -- name fallback is source-corrected
 	 * (mega/jumbo are 4-card packs for Buffoon/Spectral, never 6). */
+	g->nboostAvailable = 0;
 	g->boostCume = 0.0;
 	for (int i = 0; i < g->nboost; i++) {
 		if (!isfinite(g->boostW[i]) || g->boostW[i] <= 0.0) {
@@ -2279,7 +3446,13 @@ bad_value:
 		if (g->boostCards[i] < 0 || g->boostCards[i] > 64) {
 			snprintf(err, errsz, "config has an invalid booster card count"); return false;
 		}
-		if (g->boostAvail[i]) g->boostCume += g->boostW[i];
+		if (g->boostAvail[i]) {
+			g->boostCume += g->boostW[i];
+			int at = g->nboostAvailable++;
+			g->boostAvailableIndex[at] = i;
+			g->boostAvailableLower[at] = g->boostCume - g->boostW[i];
+			g->boostAvailableCume[at] = g->boostCume;
+		}
 		if (g->boostCards[i] <= 0) {
 			g->boostCards[i] = strstr(g->boostKey[i], "mega") ? 4 : (strstr(g->boostKey[i], "jumbo") ? 4 : 2);
 		}
@@ -2292,10 +3465,13 @@ bad_value:
 		if (!strcmp(g->boostKey[i], "p_buffoon_normal_1") && g->boostAvail[i])
 			g->forceBuffoon = 1;
 	}
-	if (g->nboost == 0 || g->boostCume <= 0.0) {
+	if (g->nboost == 0 || !isfinite(g->boostCume) || g->boostCume <= 0.0) {
 		snprintf(err, errsz, "config has no available booster packs");
 		return false;
 	}
+#ifdef BRAINSTORM_NATIVE_CORE_ONLY
+	boost_build_soul_fraction_index(g);
+#endif
 	if (g->tagRewardCards[1] <= 0 || g->tagRewardCards[2] <= 0) {
 		snprintf(err, errsz, "config is missing Charm/Ethereal reward-pack metadata");
 		return false;
@@ -2344,7 +3520,7 @@ bad_value:
 	int legAny = g->legAnywhere && g->legendary[0];
 	if (!legAny && (g->soulCount > 0 || g->legendary[0])) { g->fsId = FS_SOUL; g->fsKey = K_SOULT[1]; }
 	else if (g->tag[0]) { g->fsId = FS_TAG; g->fsKey = K_TAG[1]; }
-	else if (legAny) { g->fsId = FS_PACK; g->fsAnte = 1; g->fsKey = K_SHOPPACK[1]; }
+	else if (legAny) { g->fsId = FS_LEGEND; g->fsKey = "Joker4"; }
 	else if (g->npack > 0) { g->fsId = FS_PACK; g->fsAnte = 1; g->fsKey = K_SHOPPACK[1]; }
 	else if (g->voucher[0]) { g->fsId = FS_VOUCH; g->fsAnte = 1; g->fsKey = K_VOUCHER[1]; }
 	else if (g->ntargets > 0 && g->anyAnteActive) {
@@ -3846,6 +5022,7 @@ static void *pool_worker(void *vp) {
 	}
 	bspool_scratch_destroy(&scratch);
 	free(ranks);
+	free(c->omenTrace);
 	free(c);
 	atomic_fetch_sub(&g_pool.live, 1);
 	return NULL;
@@ -3901,18 +5078,28 @@ static void *worker(void *vp) {
 		}
 		atomic_fetch_add_explicit(&g_tried, (unsigned long long)done, memory_order_relaxed);
 	}
+	free(c->omenTrace);
 	free(c);
 	return NULL;
 }
 
 /* "wb": the mod parses this file as exact bytes (LF only, all platforms). */
 static void write_status(const char *path, const char *tmp, bool done, const char *emsg) {
+	bool found;
+	char foundSeed[sizeof g_found_seed], foundLabel[sizeof g_found_label];
+	bs_mutex_lock(&g_found_mtx);
+	found = g_found;
+	if (found) {
+		memcpy(foundSeed, g_found_seed, sizeof foundSeed);
+		memcpy(foundLabel, g_found_label, sizeof foundLabel);
+	}
+	bs_mutex_unlock(&g_found_mtx);
 	FILE *f = fopen(tmp, "wb");
 	if (!f) return;
 	fprintf(f, "P %llu\n", (unsigned long long)atomic_load(&g_tried));
 	if (g_warn[0]) fprintf(f, "W %s\n", g_warn);
 	if (emsg) fprintf(f, "E %s\n", emsg);
-	if (g_found) fprintf(f, "R %s %s\n", g_found_seed, g_found_label[0] ? g_found_label : "-");
+	if (found) fprintf(f, "R %s %s\n", foundSeed, foundLabel[0] ? foundLabel : "-");
 	if (done) fprintf(f, "D\n");
 	fclose(f);
 	bs_rename_overwrite(tmp, path);
@@ -3985,6 +5172,7 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		g->poolRouteRules[j].collect = 1;
 	}
 	g->npoolLegendRules = 0;
+	g->poolLegendNeedsEdition = 0;
 	g->poolLegendaryRoutes = h.legendaryRoutesExplicit
 		? h.legendaryRoutes : h.routeLegendaryRoutes;
 	for (int r = 0; r < h.nrouteLegendRules; r++) {
@@ -4008,6 +5196,7 @@ static bool pool_open(Config *g, const char *cfgPath, char *err, size_t errsz) {
 		g->poolLegendRules[j].source = h.routeLegendRules[r].source;
 		g->poolLegendRules[j].humanLocation = h.routeLegendRules[r].humanLocation;
 		g->poolLegendRules[j].soulDepth = h.routeLegendRules[r].soulDepth;
+		if (g->poolLegendRules[j].neg) g->poolLegendNeedsEdition = 1;
 	}
 	g->npoolVoucherRules = 0;
 	g->npoolVoucherExclusions = 0;
@@ -4256,6 +5445,7 @@ static int mode_fixture(const Config *g, const char *seedfile) {
 		}
 		if (!more) break;
 	}
+	free(c->omenTrace);
 	free(c);
 	fclose(f);
 	return 0;

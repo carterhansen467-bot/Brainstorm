@@ -891,6 +891,64 @@ time the tab re-renders, even though the underlying saved value is untouched.
       End-to-end tests build, export, refilter, and restricted-search a
       settable pool while asserting that no decoded seed contains `0`.
 
+28. **Exact native seed-filter performance pass**
+    (`seed-pool-integrity-audit`, 2026-07-18):
+    - The comparison workload is one-thread, count-only Perkeo as the first
+      Soul through Antes 1-6. The older canonical-only route implementation
+      ran at 752,643 seeds/s but omitted targeted Charm and automatic
+      Omen/Charm+Omen recovery. On its stored 2M-seed comparison slice it
+      found 45,224 of the exact-full result's 47,183 members, missing 4.152%.
+      The exact implementation before this pass ran at about 310-319K
+      seeds/s.
+    - Final clean-workspace exact throughput on that same stored 2M-seed
+      slice was about 857.7K seeds/s for the portable build and 926.7K
+      seeds/s with the optional matching PGO profile. Every run returned the
+      same 47,183 exact members. PGO was 8.0% faster than portable and 23.1%
+      faster than the older 752,643 seeds/s canonical-only implementation.
+      A separate 50M-seed run returned the same 1,176,353 members in every
+      configuration: portable one-thread 58.8796s, PGO one-thread 54.5100s,
+      and PGO ten-thread 7.0804s (7.062M seeds/s, 7.70x one-thread scaling).
+    - Exact hot paths now use an integer-assisted `round13` slow path, composed
+      one-shot TW223 first-draw transforms and high-bit shortcuts, batched and
+      shared-suffix seed/key hashing, deferred route-state initialization, Soul
+      event tapes, raw shop-pack/voucher replay caches, and decision-first
+      binary-result replay. Voucher recovery uses prerequisite/exclusion
+      bounds, reducer-free Omen frontiers, dominance/memo pruning, and one
+      shared activation-timing trace; all keep Balatro's reseed-per-draw model
+      and result membership unchanged.
+    - The same exact Omen machinery is now in
+      `native/brainstorm_native_search.c`. On the 1M-seed active Omen fixture it
+      reduced wall time from 94.64s to 2.79s (33.9x) while retaining 31,346
+      accepts and byte-identical output. Its legacy/reference implementations
+      remain available behind verifier macros and run in the regression suite.
+    - Cache generations are 64-bit in both native engines, preventing stale
+      cache aliases after a 32-bit epoch wrap on long, high-throughput scans.
+      Scanner defaults use all detected logical CPUs (capped at 64) and smaller
+      work chunks to reduce tail imbalance on voucher-heavy workloads.
+    - Exact-workload profile-guided builds are an optional local optimization,
+      not the portable default. The final macOS profiles improved the pool
+      workload by 8.0%, the unrestricted exact interactive workload by 5.6%,
+      and its ordinary early-rejection workload by 8.6%. Search and pool use
+      separate profiles; the package records the exact sanitized training
+      input plus source, driver, compiler, target, flags, and merge recipe, and
+      stale/incomplete profiles are rejected before replacing either binary.
+      Profiles are regenerated and validated rather than committed. Windows
+      adoption still requires a target-native Windows train/measure/parity run
+      because a macOS profile is neither portable nor evidence of a Windows
+      speedup.
+    - The final audit also fixed two correctness/safety defects outside the hot
+      path: embedded pool headers now recompute the Negative-legendary flag
+      after loading their legendary rules, and status snapshots synchronize
+      access to the winning seed/label instead of racing worker publication.
+    - The second audit prototyped and rejected changes that were slower,
+      neutral, below the 1% keep threshold, or semantics-heavy for their gain:
+      explicit NEON, wider LUTs, alternative TW223 jumps, Soul wave/batch
+      evaluation, eager/interleaved voucher hashing, recursive or hash-deduped
+      Omen search, static tag-first ordering, FMA/cold `round13` variants,
+      split fast/general paths, alternate compiler/LTO flags, persistent worker
+      barriers, QoS/affinity changes, larger refilter buffers, and the separate
+      metadata-free reachability precheck.
+
 ## Not yet built (next steps)
 
 1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per

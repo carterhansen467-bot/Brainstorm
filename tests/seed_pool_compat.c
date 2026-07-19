@@ -6,9 +6,14 @@
 #undef main
 
 int main(int argc, char **argv) {
-	if (argc != 4) {
-		fprintf(stderr, "usage: %s <native-snapshot.cfg> <criteria.cfg> <seed-count>\n", argv[0]);
+	if (argc != 4 && argc != 5) {
+		fprintf(stderr, "usage: %s <native-snapshot.cfg> <criteria.cfg> <seed-count> [expected-seeds]\n", argv[0]);
 		return 2;
+	}
+	FILE *expected = NULL;
+	if (argc == 5 && !(expected = fopen(argv[4], "wb"))) {
+		fprintf(stderr, "cannot write expected membership %s\n", argv[4]);
+		return 1;
 	}
 	Config catalog, legacy;
 	PoolPlan plan;
@@ -42,6 +47,10 @@ int main(int argc, char **argv) {
 	legacy.npack = 0;
 	legacy.ntargets = 0;
 	legacy.anyAnteActive = 0;
+	/* The optimized evaluators cache catalog identities used by their hot
+	 * paths. This harness mutates a loaded Config into its legacy filter shape,
+	 * so rebuild those derived indices exactly as load_config normally does. */
+	config_finalize_catalog(&legacy);
 
 	Ctx oldctx = { 0 };
 	oldctx.g = &legacy;
@@ -59,6 +68,7 @@ int main(int argc, char **argv) {
 		bool newok = pool_evaluate_pre(&newctx, seed,
 				pseudohash_ks("", seed), pseudohash_ks(plan.firstKey, seed),
 				label, sizeof label, NULL);
+		if (newok && expected) fprintf(expected, "%s\n", seed);
 		if (oldok != newok) {
 			/* The standalone builder now deliberately extends Model-3 with
 			 * targeted Charm and minimum-purchase Omen branches. A positive
@@ -79,6 +89,8 @@ int main(int argc, char **argv) {
 		printf("PASS: pool/Model-3 compatibility across %" PRIu64
 				" seeds (+%" PRIu64 " labeled Charm/Omen extensions)\n",
 				count, intentionalExtensions);
+	free(newctx.soulTape);
 	free(newctx.omenTrace);
+	if (expected && fclose(expected) != 0) result = 1;
 	return result;
 }

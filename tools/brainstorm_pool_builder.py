@@ -406,7 +406,7 @@ class Criteria:
                  "start %d" % start,
                  "count %s" % count_text,
                  "checkpoint %d" % checkpoint,
-                 "chunk 16384",
+                 "chunk 2048",
                  "resume 1",
                  "format %s" % fmt,
                  "tag_route %s" % ("collect" if self.route_collect else "observe")]
@@ -1028,7 +1028,7 @@ class App:
                        [os.path.basename(p) for p in self.input_pools[1:]],
                        idx=self.input_idx, set=self._set_input))
         f.append(Field("cycle", "Threads",
-                       options=["Auto (cores-1)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
+                       options=["Auto (all cores)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
                        idx=c.threads, set=self._set_threads))
         f.append(Field("cycle", "Seed space", options=[s[1] for s in SPACES],
                        idx=[s[0] for s in SPACES].index(c.space), set=self._set_space))

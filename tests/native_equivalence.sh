@@ -13,7 +13,7 @@ case "$(uname -s)" in
 	MINGW*|MSYS*|CYGWIN*) EXE=.exe; BUILD=native/build_windows.sh ;;
 	*) EXE=; BUILD=native/build.sh ;;
 esac
-sh "$BUILD"
+if [ "${SKIP_BUILD:-0}" != "1" ]; then sh "$BUILD"; fi
 "$LUAJIT" tests/dump_native_fixtures.lua Brainstorm_reroll.lua "$OUT" "${NSEEDS:-30000}"
 fail=0
 for cfg in "$OUT"/case*.cfg; do

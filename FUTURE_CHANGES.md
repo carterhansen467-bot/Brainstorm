@@ -12,12 +12,6 @@ Seed Pool Tools overhaul.
 
 ## Search performance follow-up
 
-- Mirror the standalone Builder's exact Omen overhaul into
-  `native/brainstorm_native_search.c` for active in-game Legendary searches:
-  voucher reachability first, the no-route Charm proof, reducer-free raw-draw
-  caching and prerequisite bounds, then a shared timing mask that supports
-  both embedded pool rules and active Legendary filters. Keep an independently
-  compiled reference path in regression tests while porting it.
 - Do not add the separate metadata-free Builder reachability precheck unless a
   later profile changes the tradeoff. Its exact prototype improved tested
   workloads by only about 0.7-3.5% while duplicating voucher-route semantics.

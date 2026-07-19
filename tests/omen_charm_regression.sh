@@ -330,6 +330,28 @@ PY
 		|| fail "active in-game Legendary filter missed its purchased-Omen route"
 	echo "PASS active Legendary overlay searches the purchased-Omen route"
 
+	# Keep each optimized interactive primitive wired to its independent
+	# reference implementation in CI.  This targeted seed takes the raw
+	# voucher/frontier path, buys Omen, and then exercises the cached physical
+	# Soul timeline, so all three verifier families execute in one bounded run.
+	case "$(uname -s)" in
+		MINGW*|MSYS*|CYGWIN*) verify_exe=.exe ;;
+		*) verify_exe= ;;
+	esac
+	verify_native="$tmpdir/brainstorm_native_search_verify$verify_exe"
+	${CC:-clang} -O2 -Wall -Wno-unused-function -ffp-contract=off -pthread \
+		-DBRAINSTORM_VERIFY_INTERACTIVE_SOUL_TAPE \
+		-DBRAINSTORM_VERIFY_INTERACTIVE_VOUCHER_RAW \
+		-DBRAINSTORM_VERIFY_INTERACTIVE_OMEN_FRONTIER \
+		-DBRAINSTORM_VERIFY_INTERACTIVE_OMEN_TRACE \
+		-o "$verify_native" "$ROOT/native/brainstorm_native_search.c" -lm
+	"$verify_native" fixture "$tmpdir/active-purchased-overlay.cfg" \
+		"$tmpdir/purchased.seed" > "$tmpdir/active-purchased-verify.out"
+	cmp "$tmpdir/active-purchased-overlay.out" \
+		"$tmpdir/active-purchased-verify.out" \
+		|| fail "interactive optimized verifier changed purchased-Omen output"
+	echo "PASS interactive Soul/voucher/frontier/Omen fast paths match their references"
+
 	luajit_text "$ROOT/tests/pool_lua_oracle.lua" "$ROOT/Brainstorm_reroll.lua" \
 		"$tmpdir/omen.cfg" "$tmpdir/charm.bspool" "$tmpdir/seeds" \
 		> "$tmpdir/charm-lua.out"

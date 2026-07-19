@@ -68,6 +68,7 @@ write_criteria "$OUT/boss.cfg" \
 	"legendary $LEGENDARY 1 boss 1 boss 0 shop"
 write_criteria "$OUT/legacy-a1.cfg" "legendary $LEGENDARY 1 1 0"
 write_criteria "$OUT/legacy-a2.cfg" "legendary $LEGENDARY 2 2 0"
+write_criteria "$OUT/negative.cfg" "legendary $LEGENDARY 1 8 1"
 
 for name in tag-small tag-big charm boss; do
 	"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
@@ -78,6 +79,18 @@ for name in tag-small tag-big charm boss; do
 		echo "FAIL: $name sample is empty; raise COUNT (currently $COUNT)"; exit 1;
 	}
 done
+
+# Negative is a derived replay requirement in the interactive pool loader:
+# its rules arrive from the .bspool header after native_search.cfg has already
+# been finalized. Keep a broad window so the fixture remains dense while
+# proving that late-loaded rules still consume and test the edition stream.
+"./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+	"$OUT/negative.cfg" "$OUT/negative.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/negative.bspool" \
+	"$OUT/negative.txt"
+[ -s "$OUT/negative.txt" ] || {
+	echo "FAIL: Negative Legendary sample is empty; raise COUNT (currently $COUNT)"; exit 1;
+}
 
 # The targeted Charm/Omen branches intentionally let one seed expose its first
 # Soul at different locations on different valid routes.  Legacy coordinate
@@ -241,20 +254,28 @@ grep -a -q "^route_legendary $LEGENDARY 1 boss 1 boss 0 shop 1$" \
 grep -a -q "^legendary $LEGENDARY 2 2 0$" "$OUT/boss-roundtrip.bspool"
 check_metadata "$OUT/boss-roundtrip.bspool" 2 "$LEGENDARY" 1 0 1
 
-# Exercise the same cumulative exact-location route through the in-game native
-# pool loader. No overlay filter is active, so every committed member must
-# remain valid under the route inherited from the pool header.
-{
+# Exercise cumulative routes through the in-game native pool loader. No
+# overlay filter is active, so every committed member must remain valid under
+# the route inherited from the pool header.
+write_overlay_cfg() {
+	pool="$1"
+	out="$2"
+	snapshot="$3"
+	{
 	echo "session 1"; echo "threads 4"; echo "modelver 6"; echo "entropy 1"
 	echo "soul 0"; echo "legendary -"; echo "neglegendary 0"; echo "tag -"
 	echo "voucher -"; echo "voucherante 1"; echo "taganywhere 0"; echo "leganywhere 0"
 	echo "matchany 0"; echo "jslot 1 - 0"; echo "jslot 2 - 0"; echo "jslot 3 - 0"
 	echo "maslots 0 0 0 0 0 0 0 0"; echo "mapacks 0 0 0 0 0 0 0 0"; echo "packslots 2"
-	echo "poolfile $(native_path "$OUT/boss-roundtrip.bspool")"
+	echo "poolfile $(native_path "$pool")"
 	grep -E '^(tagdef|vouchdef|vouchroute|vouchowned|jokerdef|boostdef|specialdef|check_[a-z0-9]+) ' \
-		"$OUT/legacy-snapshot.cfg"
+		"$snapshot"
 	echo "end"
-} > "$OUT/overlay.cfg"
+	} > "$out"
+}
+
+write_overlay_cfg "$OUT/boss-roundtrip.bspool" "$OUT/overlay.cfg" \
+	"$OUT/legacy-snapshot.cfg"
 sed -n '1,500p' "$OUT/boss-roundtrip.txt" > "$OUT/overlay.seeds"
 "./native/brainstorm_native_search$EXE" fixture "$OUT/overlay.cfg" \
 	"$OUT/overlay.seeds" > "$OUT/overlay.fixture"
@@ -262,8 +283,27 @@ if awk '$2 != 1 { bad=1 } END { exit !bad }' "$OUT/overlay.fixture"; then
 	echo "FAIL: in-game pool loader rejected an exact-location member"; exit 1
 fi
 
+# The production Lua replay is an independent oracle for these members; the
+# native fixture must accept the same late-loaded Negative route. This catches
+# a stale derived `poolLegendNeedsEdition` flag as an all-member false negative.
+sed -n '1,500p' "$OUT/negative.txt" > "$OUT/negative-overlay.seeds"
+"$LUAJIT_BIN" tests/pool_lua_oracle.lua Brainstorm_reroll.lua \
+	"$OUT/snapshot.cfg" "$OUT/negative.bspool" "$OUT/negative-overlay.seeds" \
+	> "$OUT/negative-lua.fixture"
+if awk '$2 != 1 { bad=1 } END { exit !bad }' "$OUT/negative-lua.fixture"; then
+	echo "FAIL: production Lua rejected a Negative Legendary pool member"; exit 1
+fi
+write_overlay_cfg "$OUT/negative.bspool" "$OUT/negative-overlay.cfg" \
+	"$OUT/snapshot.cfg"
+"./native/brainstorm_native_search$EXE" fixture "$OUT/negative-overlay.cfg" \
+	"$OUT/negative-overlay.seeds" > "$OUT/negative-overlay.fixture"
+if awk '$2 != 1 { bad=1 } END { exit !bad }' "$OUT/negative-overlay.fixture"; then
+	echo "FAIL: in-game pool loader rejected a Negative Legendary member"; exit 1
+fi
+
 SMALL_RECORDS=$(wc -l < "$OUT/tag-small.txt" | tr -d ' ')
 BIG_RECORDS=$(wc -l < "$OUT/tag-big.txt" | tr -d ' ')
 CHARM_RECORDS=$(wc -l < "$OUT/charm.txt" | tr -d ' ')
 BOSS_RECORDS=$(wc -l < "$OUT/boss.txt" | tr -d ' ')
-echo "PASS: exact tag phases, Legendary phases/sources, metadata, legacy RNG Antes, and header round trips agree (small=$SMALL_RECORDS big=$BIG_RECORDS charm=$CHARM_RECORDS boss=$BOSS_RECORDS)"
+NEGATIVE_RECORDS=$(wc -l < "$OUT/negative.txt" | tr -d ' ')
+echo "PASS: exact tag phases, Legendary phases/sources/Negative editions, metadata, legacy RNG Antes, and header round trips agree (small=$SMALL_RECORDS big=$BIG_RECORDS charm=$CHARM_RECORDS boss=$BOSS_RECORDS negative=$NEGATIVE_RECORDS)"

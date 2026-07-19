@@ -16,6 +16,7 @@ debug_predict.txt
 # Native search helper: locally built binary + its runtime handshake files
 native/brainstorm_native_search
 native/brainstorm_seed_pool
+native/.brainstorm-pgo.*
 native_search.cfg
 native_search.status
 native_search.status.tmp

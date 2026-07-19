@@ -15,6 +15,7 @@ SNAPSHOT="${1:-native_search.cfg}"
 COUNT="${2:-1000000}"
 TAG="${TAG:-tag_rare}"
 OUT="${TMPDIR:-/tmp}/brainstorm_seed_pool_equivalence"
+rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # Windows CI runs this same harness under Git Bash against the .exe builds.
@@ -23,10 +24,9 @@ case "$(uname -s)" in
 	*) EXE=; BUILD=native/build.sh ;;
 esac
 
-sh "$BUILD"
+if [ "${SKIP_BUILD:-0}" != "1" ]; then sh "$BUILD"; fi
 
-# The snapshot on disk may predate the current config protocol; the catalog
-# data (pools/checks) is version-independent, so rewrite only the handshake.
+# Work on an isolated snapshot copy so this harness never mutates its fixture.
 cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 SNAPSHOT="$OUT/snapshot.cfg"
 ${CC:-clang} -O3 -DBRAINSTORM_VERIFY_OMEN_TRACE \
@@ -42,11 +42,31 @@ ${CC:-clang} -O3 -DBRAINSTORM_VERIFY_OMEN_TRACE \
 	echo "checkpoint $COUNT"
 	echo "chunk 16384"
 	echo "resume 0"
-	echo "format count"
+	echo "format binary"
 	echo "tag_route collect"
 	echo "tag $TAG 1 8 1"
 	echo "legendary j_perkeo 1 8"
 	echo "end"
 } > "$OUT/criteria.cfg"
 
-"$OUT/seed_pool_compat$EXE" "$SNAPSHOT" "$OUT/criteria.cfg" "$COUNT"
+"$OUT/seed_pool_compat$EXE" "$SNAPSHOT" "$OUT/criteria.cfg" "$COUNT" \
+	"$OUT/reference.seeds"
+"./native/brainstorm_seed_pool$EXE" scan "$SNAPSHOT" "$OUT/criteria.cfg" \
+	"$OUT/actual.bspool"
+"./native/brainstorm_seed_pool$EXE" export "$OUT/actual.bspool" \
+	"$OUT/actual.rows"
+awk '{ print $1 }' "$OUT/actual.rows" > "$OUT/actual.seeds"
+cmp "$OUT/reference.seeds" "$OUT/actual.seeds"
+
+awk '$1 == "format" { print "format count"; next } { print }' \
+	"$OUT/criteria.cfg" > "$OUT/count-criteria.cfg"
+"./native/brainstorm_seed_pool$EXE" scan "$SNAPSHOT" \
+	"$OUT/count-criteria.cfg" "$OUT/actual.count"
+reference_count=$(wc -l < "$OUT/reference.seeds" | tr -d ' ')
+actual_count=$(awk '$1 == "matched" { if (seen++) exit 2; value=$2 }
+	END { if (seen != 1) exit 2; print value }' "$OUT/actual.count.state")
+[ "$reference_count" = "$actual_count" ] || {
+	echo "FAIL: pool count $actual_count != exact reference $reference_count" >&2
+	exit 1
+}
+echo "PASS: helper membership/count matches exact reference ($actual_count records)"
