@@ -633,22 +633,7 @@ the scalar evaluator.
   bucket interval for catalog sizes 1 through 256; duplicate modded target
   keys conservatively disable index-specific tag/voucher gates.
 
-### Evaluated and rejected
+### Future work
 
-Any-window voucher gates and the anywhere-tag gate measured as net losses
-(0.88-0.93x): with roughly half the voucher catalog culled early-run,
-"every roll decided-missed" is too rare to pay for the per-Ante hashes.
-Removed per the keep-only-measured-gains rule in `FUTURE_CHANGES.md`.
-
-### Remaining
-
-- Searcher-side survivor rebatching (e.g. Soul-gate survivors through a
-  batched legendary pick). The direct FS_LEGEND pick/state handoff is complete;
-  Soul survivors are only 1.93% in the bounded fixture, so a second staging
-  layer remains contingent on a measured gain that justifies its complexity.
-- Cost/selectivity planner for multi-filter ordering (deferred in
-  FUTURE_CHANGES.md).
-- Known pre-existing issue to revisit for pool attachment: multi-thread
-  Builder runs emit the same seed set in nondeterministic record order,
-  so membership_digest differs between identical runs; single-thread
-  output is deterministic.
+All unfinished testing, improvements, additions, and measured rejected ideas
+are maintained in one place: [`BLUEPRINT.md`](BLUEPRINT.md).

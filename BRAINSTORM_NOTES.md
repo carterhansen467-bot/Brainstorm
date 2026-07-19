@@ -595,7 +595,7 @@ time the tab re-renders, even though the underlying saved value is untouched.
       pause at rank 33,554,432 and resume from that exact rank.
 
 17. **Windows port, Tier 3** (2026-07-11, `windows-port` branch off
-    `joker-search-experiment`; plan in WINDOWS_PORT_PLAN.md): full
+    `joker-search-experiment`): full
     experience parity — native fast search, in-game seed pools, and the
     Seed Pool Builder — on Windows, one codebase, no filter/RNG changes.
     - `native/platform.h` is the ONLY file that knows the OS: bs_* wrappers
@@ -639,11 +639,8 @@ time the tab re-renders, even though the underlying saved value is untouched.
       `gh release create`, preventing mixed Lua/native model installations.
     - All three harnesses re-verified locally on macOS after the port, plus
       a manual SIGINT pause (rc 130) -> resume-from-checkpoint run.
-    - Still open (the one thing CI can't prove): a human Windows smoke test
-      inside Balatro itself — Ctrl+A on/off writes native_search.cfg and
-      the status file appears, then a pool search against a shared .bspool.
-      Watch for SmartScreen blocking the unsigned exes (README has the
-      unblock steps).
+    - CI covers the platform mechanics; unfinished release validation is
+      tracked only in `BLUEPRINT.md`.
 
 18. **Total seed space + pool identity** (2026-07-12, `total-seed-space`
     branch): the pool scanner can now cover every seed the game ACCEPTS, not
@@ -932,10 +929,8 @@ time the tab re-renders, even though the underlying saved value is untouched.
       separate profiles; the package records the exact sanitized training
       input plus source, driver, compiler, target, flags, and merge recipe, and
       stale/incomplete profiles are rejected before replacing either binary.
-      Profiles are regenerated and validated rather than committed. Windows
-      adoption still requires a target-native Windows train/measure/parity run
-      because a macOS profile is neither portable nor evidence of a Windows
-      speedup.
+      Profiles are regenerated and validated rather than committed. Profiles
+      are target-specific; a macOS profile cannot be reused on Windows.
     - The final audit also fixed two correctness/safety defects outside the hot
       path: embedded pool headers now recompute the Negative-legendary flag
       after loading their legendary rules, and status snapshots synchronize
@@ -949,18 +944,10 @@ time the tab re-renders, even though the underlying saved value is untouched.
       barriers, QoS/affinity changes, larger refilter buffers, and the separate
       metadata-free reachability precheck.
 
-## Not yet built (next steps)
+## Future work
 
-1. **Multi-ante search tab** ("Brainstorm: Ante Search") — independent depth settings per
-   ante (e.g. Ante 1 Depth, Ante 2 Depth, Ante 3 Depth, Ante 4 Depth, each 0-8, 0 = skip
-   that ante). Loop `checkShopJokerSearch`/`checkPackJokerSearch` over each ante with
-   its own depth instead of hardcoding ante=1.
-2. **Shop-vs-Pack match indicator** — use the mod's existing `Brainstorm.attention_text()`
-   helper to flash "Found in Shop!" or "Found in Pack!" when `auto_reroll` succeeds,
-   instead of silently starting the run.
-3. **Multi-joker OR search** (discussed, deprioritized) — currently only one joker can be
-   searched at a time since all 3 rarity dropdowns write to the same single
-   `Brainstorm.SETTINGS.autoreroll.searchJoker` field. Would need to become a list.
+The sole forward-looking task list is [`BLUEPRINT.md`](BLUEPRINT.md). This
+historical session record intentionally does not duplicate that backlog.
 
 ## Workflow notes
 

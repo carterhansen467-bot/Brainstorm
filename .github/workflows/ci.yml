@@ -50,6 +50,8 @@ jobs:
         run: sh tests/seed_pool_soul_depth.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 5000000
       - name: Pool build -> restricted search -> exhaustion e2e
         run: TAG=tag_charm sh tests/pool_search_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: Automatic attachment -> real native child -> continuation e2e
+        run: python3 tests/pool_attachment_native_e2e.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool -> refiltered pool intersection e2e
         run: TAG=tag_charm sh tests/pool_refilter_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Exact locations, voucher routes, Omen, and organizer
@@ -112,6 +114,8 @@ jobs:
         run: sh tests/seed_pool_soul_depth.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 5000000
       - name: Pool build -> restricted search -> exhaustion e2e
         run: TAG=tag_charm sh tests/pool_search_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: Automatic attachment -> real native child -> continuation e2e
+        run: python tests/pool_attachment_native_e2e.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool -> refiltered pool intersection e2e
         run: TAG=tag_charm sh tests/pool_refilter_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Exact locations, voucher routes, Omen, and organizer
