@@ -560,3 +560,59 @@ end-to-end (member hit + definitive exhaustion):
 tests/seed_pool_equivalence.sh native_search.cfg 1000000
 tests/pool_search_equivalence.sh native_search.cfg 3000000
 ```
+
+## Vectorized first gates (2026-07-18)
+
+Lane-parallel "first gates" now reject most candidates from the first RNG
+draw(s) of an eight-seed hashed group before the scalar filter chain runs,
+in both the in-game searcher and the Seed Pool Builder. A gate may only
+reject on evidence the scalar chain must also reject on (decided
+`math.random(n)` buckets or certain sub-threshold rolls from output bits
+44..51); anything undecided — bucket boundaries, culled resamples — reruns
+the unchanged scalar path, which remains the single membership authority.
+`BRAINSTORM_VECTOR_GATE=0` disables every gate at runtime, and building
+with `-DBRAINSTORM_VERIFY_VECTOR_GATE` re-checks each rejection against
+the scalar evaluator.
+
+### Completed
+
+- **Builder** (`brainstorm_seed_pool`): Joker4 first-draw gate for
+  all-depth-1 legendary plans; survivor rebatching that batch-hashes Tag1
+  once eight legendary-gate survivors accumulate and gates the ante-1
+  Small tag pick (rules pinned to that window, natural space); decided
+  first picks hand their post-draw stream state to the evaluator instead
+  of recomputing the draw. Measured on M1 Max: Perkeo+Charm build **1.70x**
+  single-thread / **1.83x** all-core, legendary-only 1.10x, pinned
+  tag-only 1.27x.
+- **Searcher** (`brainstorm_native_search`, both full-space and poolfile
+  workers): FS_SOUL ante-1 reward-pack roll chain (**1.94x** on the
+  classic Soul/legendary search), FS_LEGEND legendary-anywhere (1.33x),
+  ante-1 FS_TAG (1.28x), and exact-Ante FS_VOUCH (**1.68x**).
+- **Verification**: 14M-seed gate-vs-scalar differential harness across
+  every gate kind (zero drops over 300k+ passing seeds), 200M-rank
+  handoff divergence checks, byte-identical single-thread scan and
+  refilter pools with gates on/off, and the Lua-oracle, soul-depth,
+  fastpath, search/refilter/partial/lineage/shard, voucher-route, and
+  Omen/Charm suites.
+
+### Evaluated and rejected
+
+Any-window voucher gates and the anywhere-tag gate measured as net losses
+(0.88-0.93x): with roughly half the voucher catalog culled early-run,
+"every roll decided-missed" is too rare to pay for the per-Ante hashes.
+Removed per the keep-only-measured-gains rule in `FUTURE_CHANGES.md`.
+
+### Remaining
+
+- FS_PACK first-stream gate (route-dependent weighted pack simulation;
+  deliberately skipped, see FUTURE_CHANGES.md guidance on
+  state-sharing predicates).
+- Searcher-side survivor rebatching (e.g. Soul-gate survivors through a
+  batched legendary pick) and a searcher pick handoff mirroring the
+  Builder's.
+- Cost/selectivity planner for multi-filter ordering (deferred in
+  FUTURE_CHANGES.md).
+- Known pre-existing issue to revisit for pool attachment: multi-thread
+  Builder runs emit the same seed set in nondeterministic record order,
+  so membership_digest differs between identical runs; single-thread
+  output is deterministic.
