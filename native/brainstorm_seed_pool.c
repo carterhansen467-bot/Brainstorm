@@ -3714,7 +3714,7 @@ static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, u
 static bool pool_write_state(const char *path, const PoolPlan *p, const PoolState *s,
 		char *err, size_t errsz) {
 	char tmp[1024];
-	if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+	if (snprintf(tmp, sizeof tmp, "%s.tmp.%lu", path, bs_process_id()) >= (int)sizeof tmp) {
 		snprintf(err, errsz, "state path is too long"); return false;
 	}
 	FILE *f = fopen(tmp, "w");
@@ -3976,6 +3976,29 @@ static bool pool_write_manifest(const char *path, const PoolPlan *p,
 
 static double pool_now(void) {
 	return bs_monotonic_seconds();
+}
+
+static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output);
+
+static int pool_mode_scan_locked(const Config *g, PoolPlan *p, const char *output) {
+	char lockPath[1024];
+	if (snprintf(lockPath, sizeof lockPath, "%s.writer.lock", output)
+			>= (int)sizeof lockPath) {
+		fprintf(stderr, "output path is too long for its writer lock\n");
+		return 1;
+	}
+	bool busy = false;
+	bs_file_lock_t lock = bs_file_lock_acquire(lockPath, &busy);
+	if (lock == BS_FILE_LOCK_INVALID) {
+		if (busy)
+			fprintf(stderr, "output is already being written by another scanner\n");
+		else
+			fprintf(stderr, "cannot acquire output writer lock: %s\n", strerror(errno));
+		return 1;
+	}
+	int rc = pool_mode_scan(g, p, output);
+	bs_file_lock_release(lock);
+	return rc;
 }
 
 static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
@@ -5219,9 +5242,9 @@ int main(int argc, char **argv) {
 	pool_finalize_hot_plan(&catalog, &plan);
 	plan.criteriaHash = pool_hash_plan(&plan);
 	pool_set_identity(&plan);
-	if (!strcmp(argv[1], "scan")) return pool_mode_scan(&catalog, &plan, argv[4]);
+	if (!strcmp(argv[1], "scan")) return pool_mode_scan_locked(&catalog, &plan, argv[4]);
 	if (refilter) {
-		int rc = pool_mode_scan(&catalog, &plan, argv[5]);
+		int rc = pool_mode_scan_locked(&catalog, &plan, argv[5]);
 		bspool_reader_destroy(&plan.inputReader);
 		fclose(inputFile);
 		return rc;

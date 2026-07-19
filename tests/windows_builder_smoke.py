@@ -44,6 +44,14 @@ def main():
     r = core.Runner(snap.current_model_copy(), text, out)
     assert wait(r, 120, until=lambda r: r.scanned > 0), \
         "scanner never reported progress: %r" % list(r.lines)
+
+    duplicate = core.Runner(snap.current_model_copy(), text, out)
+    assert wait(duplicate, 30), "duplicate scanner did not reject the active output"
+    assert duplicate.returncode() == 1, \
+        "duplicate scanner unexpectedly opened the active output: %r" % list(duplicate.lines)
+    assert any("already being written by another scanner" in line
+               for line in duplicate.lines), list(duplicate.lines)
+
     r.stop()  # Windows: CTRL_BREAK_EVENT -> checkpointed pause
     assert wait(r, 120), "scanner did not stop after CTRL_BREAK"
     rc = r.returncode()

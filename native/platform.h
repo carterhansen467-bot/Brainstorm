@@ -100,6 +100,28 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 
 static inline int bs_dup(int fd) { return _dup(fd); }
 static inline int bs_close(int fd) { return _close(fd); }
+static inline unsigned long bs_process_id(void) { return (unsigned long)GetCurrentProcessId(); }
+
+static inline void bs_set_errno_from_win32(DWORD code);
+
+typedef HANDLE bs_file_lock_t;
+#define BS_FILE_LOCK_INVALID INVALID_HANDLE_VALUE
+
+static inline bs_file_lock_t bs_file_lock_acquire(const char *path, bool *busy) {
+	if (busy) *busy = false;
+	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+			OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h != INVALID_HANDLE_VALUE) return h;
+	DWORD saved = GetLastError();
+	if (busy) *busy = saved == ERROR_SHARING_VIOLATION
+			|| saved == ERROR_LOCK_VIOLATION;
+	bs_set_errno_from_win32(saved);
+	return INVALID_HANDLE_VALUE;
+}
+
+static inline void bs_file_lock_release(bs_file_lock_t lock) {
+	if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+}
 
 static inline void bs_set_errno_from_win32(DWORD code) {
 	switch (code) {
@@ -273,6 +295,7 @@ static inline char *strsep(char **stringp, const char *delim) {
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 
 static inline void bs_platform_init(void) {}
 
@@ -297,6 +320,26 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 
 static inline int bs_dup(int fd) { return dup(fd); }
 static inline int bs_close(int fd) { return close(fd); }
+static inline unsigned long bs_process_id(void) { return (unsigned long)getpid(); }
+
+typedef int bs_file_lock_t;
+#define BS_FILE_LOCK_INVALID (-1)
+
+static inline bs_file_lock_t bs_file_lock_acquire(const char *path, bool *busy) {
+	if (busy) *busy = false;
+	int fd = open(path, O_CREAT | O_RDWR, 0600);
+	if (fd < 0) return -1;
+	if (flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
+	int saved = errno;
+	if (busy) *busy = saved == EWOULDBLOCK || saved == EAGAIN;
+	close(fd);
+	errno = saved;
+	return -1;
+}
+
+static inline void bs_file_lock_release(bs_file_lock_t lock) {
+	if (lock >= 0) close(lock);
+}
 
 static inline int bs_fsync_file(FILE *f) { return fsync(fileno(f)); }
 

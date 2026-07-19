@@ -951,7 +951,9 @@ def read_pool_library(pool_dir=POOL_DIR):
 # to the shareable pool.  An attached-pool marker is reserved for the automatic
 # in-game pool-selection work; deleting a pool must not leave that marker
 # pointing at a file that no longer exists.
-POOL_DELETE_SUFFIXES = ("", ".state", ".manifest", ".criteria.cfg", ".attached")
+POOL_DELETE_SUFFIXES = (
+    "", ".state", ".manifest", ".criteria.cfg", ".attached", ".writer.lock",
+)
 
 
 def _safe_pool_path(name, pool_dir):

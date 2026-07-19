@@ -44,7 +44,8 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     name = "finished.bspool"
     path = os.path.join(pool_dir, name)
     write_pool(path)
-    for suffix in (".state", ".manifest", ".criteria.cfg", ".attached"):
+    for suffix in (".state", ".manifest", ".criteria.cfg", ".attached",
+                   ".writer.lock"):
         with open(path + suffix, "w", encoding="utf-8") as handle:
             handle.write("sidecar %s\n" % suffix)
     unrelated = os.path.join(pool_dir, "keep.txt")
@@ -54,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     plan = core.pool_delete_plan(name, pool_dir)
     assert [item["name"] for item in plan["files"]] == [
         name, name + ".state", name + ".manifest",
-        name + ".criteria.cfg", name + ".attached",
+        name + ".criteria.cfg", name + ".attached", name + ".writer.lock",
     ]
     assert all(os.path.isabs(item["path"]) for item in plan["files"])
     complete_info = core.PoolInfo(path).as_dict()
