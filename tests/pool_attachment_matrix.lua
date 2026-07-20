@@ -272,4 +272,15 @@ end
 setActive("tag_charm", "j_perkeo", false, 0)
 permute(1)
 
+-- An authoritative pool outranks every accelerator even when it is larger:
+-- its exhaustion is definitive, so a miss never falls back to a full
+-- unrestricted scan (ATTACHED_SEED_POOLS.md runtime selection rule 3).
+local bigAuthoritative = marker("big-authoritative.bspool", 500, "authoritative", "50")
+names[#names + 1] = bigAuthoritative.pool_file .. ".attached"
+directoryItems = { unpack(names) }
+Brainstorm.AUTOREROLL.autoPoolTried = { [tiedRole.path] = true }
+assert(Brainstorm.findAutomaticSeedPool().pool_file == "big-authoritative.bspool",
+  "large authoritative pool must outrank smaller accelerators")
+Brainstorm.AUTOREROLL.autoPoolTried = nil
+
 print("POOL ATTACHMENT IMPLICATION MATRIX: ALL PASS")

@@ -3504,10 +3504,12 @@ function Brainstorm.findAutomaticSeedPool()
 		end
 	end
 	table.sort(choices, function(a, b)
-		if a.records ~= b.records then return a.records < b.records end
-		-- Either role is a sound first pass. Prefer fewer candidates; retain
-		-- authority only as a tie-break because it can terminate a miss.
+		-- ATTACHED_SEED_POOLS.md: a compatible authoritative pool wins. Its
+		-- exhaustion is definitive, so a miss ends at the pool instead of
+		-- falling back to a full unrestricted scan; an accelerator's smaller
+		-- time-to-first-hit can never repay that worst case.
 		if a.role ~= b.role then return a.role == "authoritative" end
+		if a.records ~= b.records then return a.records < b.records end
 		if a.pool_id ~= b.pool_id then return tostring(a.pool_id) < tostring(b.pool_id) end
 		return a.pool_file < b.pool_file
 	end)
