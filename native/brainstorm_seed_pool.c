@@ -54,6 +54,8 @@ _Static_assert(POOL_OUTPUT_BUFFER / 8 == BSPOOL_BLOCK_MAX_RECORDS,
 
 typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
 
+typedef struct PoolEventHit PoolEventHit;
+
 typedef struct {
 	char key[MAX_KEY];
 	int poolIndex;
@@ -741,6 +743,18 @@ bad_value:
 	p->chunk -= p->chunk % ILV;
 	if (!p->checkpoint) { snprintf(err, errsz, "checkpoint must be positive"); return false; }
 	if (p->checkpoint < p->chunk) p->checkpoint = p->chunk;
+	/* A checkpoint may end only between publication chunks. This makes a
+	 * paused/resumed run use the same physical block boundaries as one that
+	 * runs straight through, even when the requested checkpoint was not an
+	 * exact multiple of the chunk size. */
+	uint64_t checkpointRemainder = p->checkpoint % p->chunk;
+	if (checkpointRemainder) {
+		uint64_t add = p->chunk - checkpointRemainder;
+		if (p->checkpoint > UINT64_MAX - add) {
+			snprintf(err, errsz, "checkpoint is too large"); return false;
+		}
+		p->checkpoint += add;
+	}
 	p->resume = !!p->resume;
 	p->collectTags = !!p->collectTags;
 	if (p->ntagRules == 0 && !p->nlegendary && !p->nvoucherRules) {
@@ -3059,9 +3073,72 @@ typedef struct {
 	_Atomic bool ioError;
 	FILE *out;
 	bs_mutex_t outMutex;
+	bs_cond_t outReady[64];
+	uint64_t writeNext, epochStart;
+	unsigned char *pending, *pendingEncoded;
+	size_t pendingUsed;
+	PoolEventHit *pendingEvents;
+	size_t pendingEventUsed;
 	uint64_t *membershipDigest;
 	uint64_t *metadataDigest;
 } PoolScanShared;
+
+/* Workers may evaluate chunks in any order, but only the next contiguous
+ * chunk may publish.  A worker claims that turn lazily when its local block
+ * first fills (or at chunk completion), then retains it through the rest of
+ * the chunk.  This keeps evaluation parallel, bounds buffering exactly as
+ * before, and makes the physical record stream independent of scheduling. */
+typedef struct {
+	PoolScanShared *shared;
+	uint64_t begin, end;
+	bool ownsTurn;
+} PoolChunkWriter;
+
+static size_t pool_chunk_writer_slot(const PoolScanShared *s, uint64_t begin) {
+	return (size_t)(((begin - s->epochStart) / s->p->chunk) % 64u);
+}
+
+static void pool_scan_fail(PoolScanShared *s, bool outputLocked) {
+	if (!outputLocked) bs_mutex_lock(&s->outMutex);
+	atomic_store(&s->ioError, true);
+	for (size_t i = 0; i < 64; i++) bs_cond_broadcast(&s->outReady[i]);
+	if (!outputLocked) bs_mutex_unlock(&s->outMutex);
+}
+
+static bool pool_chunk_writer_begin(PoolChunkWriter *w) {
+	if (w->ownsTurn) return true;
+	PoolScanShared *s = w->shared;
+	bs_mutex_lock(&s->outMutex);
+	while (s->writeNext != w->begin && !atomic_load(&s->ioError))
+		bs_cond_wait(&s->outReady[pool_chunk_writer_slot(s, w->begin)],
+				&s->outMutex);
+	if (atomic_load(&s->ioError)) {
+		bs_mutex_unlock(&s->outMutex);
+		return false;
+	}
+	w->ownsTurn = true;
+	return true;
+}
+
+static void pool_chunk_writer_abort(PoolChunkWriter *w) {
+	if (w->ownsTurn) {
+		pool_scan_fail(w->shared, true);
+		bs_mutex_unlock(&w->shared->outMutex);
+		w->ownsTurn = false;
+	} else {
+		pool_scan_fail(w->shared, false);
+	}
+}
+
+static bool pool_chunk_writer_finish(PoolChunkWriter *w) {
+	if (!pool_chunk_writer_begin(w)) return false;
+	w->shared->writeNext = w->end;
+	bs_cond_signal(&w->shared->outReady[
+			pool_chunk_writer_slot(w->shared, w->end)]);
+	bs_mutex_unlock(&w->shared->outMutex);
+	w->ownsTurn = false;
+	return true;
+}
 
 static bool pool_read_input_batch(const PoolScanShared *s, uint64_t first,
 		uint64_t count, uint64_t ranks[ILV], BspoolScratch *scratch) {
@@ -3146,10 +3223,10 @@ static size_t pool_encode_rank_block(unsigned char *buf, uint32_t count,
 	return out;
 }
 
-typedef struct {
+struct PoolEventHit {
 	uint64_t rank;
 	PoolMetadata metadata;
-} PoolEventHit;
+};
 
 typedef struct {
 	uint8_t len;
@@ -3253,7 +3330,9 @@ static void pool_meta_descriptors_free(PoolMetaDescriptor *d, size_t n) {
 	free(d);
 }
 
-static bool pool_flush_event_hits(PoolScanShared *s, PoolEventHit *hits,
+/* Encode and write one globally assembled event block. The output mutex is
+ * held by the caller so digest updates remain atomic with the bytes. */
+static bool pool_write_event_block_locked(PoolScanShared *s, PoolEventHit *hits,
 		size_t *used) {
 	if (!*used) return true;
 	qsort(hits, *used, sizeof *hits, pool_event_hit_compare);
@@ -3325,7 +3404,6 @@ static bool pool_flush_event_hits(PoolScanShared *s, PoolEventHit *hits,
 	crc = bspool_crc64_update(crc, rankPayload, rankBytes);
 	crc = bspool_crc64_update(crc, metadata.data, metadata.size);
 	bspool_put_u64le(header + 40, crc);
-	bs_mutex_lock(&s->outMutex);
 	size_t wh = fwrite(header, 1, sizeof header, s->out);
 	size_t wr = rankBytes ? fwrite(rankPayload, 1, rankBytes, s->out) : 0;
 	size_t wm = fwrite(metadata.data, 1, metadata.size, s->out);
@@ -3335,10 +3413,12 @@ static bool pool_flush_event_hits(PoolScanShared *s, PoolEventHit *hits,
 		*s->membershipDigest = pool_hash_update(*s->membershipDigest, metadata.data, metadata.size);
 		*s->metadataDigest = pool_hash_update(*s->metadataDigest, metadata.data, metadata.size);
 	}
-	bs_mutex_unlock(&s->outMutex);
 	free(metadata.data);
 	pool_meta_descriptors_free(descriptors, ndescriptors);
-	if (wh != sizeof header || wr != rankBytes || wm != metadata.size) goto fail;
+	if (wh != sizeof header || wr != rankBytes || wm != metadata.size) {
+		pool_scan_fail(s, true);
+		return false;
+	}
 	*used = 0;
 	return true;
 fail_meta:
@@ -3346,20 +3426,48 @@ fail_meta:
 fail_desc:
 	pool_meta_descriptors_free(descriptors, ndescriptors);
 fail:
-	atomic_store(&s->ioError, true);
+	pool_scan_fail(s, true);
 	return false;
 }
 
-static bool pool_buffer_event_hit(PoolScanShared *s, PoolEventHit *hits,
+/* Append a worker-local, rank-ascending run to the shared canonical block
+ * assembler. Full BSP3 blocks therefore depend only on logical record order,
+ * never on which worker happened to finish first. */
+static bool pool_flush_event_hits(PoolChunkWriter *writer, PoolEventHit *hits,
+		size_t *used) {
+	if (!*used) return true;
+	PoolScanShared *s = writer->shared;
+	if (!pool_chunk_writer_begin(writer)) return false;
+	size_t at = 0;
+	while (at < *used) {
+		size_t room = POOL_EVENT_BLOCK_RECORDS - s->pendingEventUsed;
+		size_t n = *used - at < room ? *used - at : room;
+		memcpy(s->pendingEvents + s->pendingEventUsed, hits + at,
+				n * sizeof *hits);
+		s->pendingEventUsed += n;
+		at += n;
+		if (s->pendingEventUsed == POOL_EVENT_BLOCK_RECORDS
+				&& !pool_write_event_block_locked(s, s->pendingEvents,
+						&s->pendingEventUsed)) {
+			pool_chunk_writer_abort(writer);
+			return false;
+		}
+	}
+	*used = 0;
+	return true;
+}
+
+static bool pool_buffer_event_hit(PoolChunkWriter *writer, PoolEventHit *hits,
 		size_t *used, uint64_t rank, const PoolMetadata *metadata) {
-	if (*used == POOL_EVENT_BLOCK_RECORDS && !pool_flush_event_hits(s, hits, used)) return false;
+	if (*used == POOL_EVENT_BLOCK_RECORDS
+			&& !pool_flush_event_hits(writer, hits, used)) return false;
 	hits[*used].rank = rank;
 	hits[*used].metadata = *metadata;
 	(*used)++;
 	return true;
 }
 
-static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
+static bool pool_write_block_locked(PoolScanShared *s, unsigned char *buf,
 		unsigned char *encoded, size_t *used) {
 	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
 	const unsigned char *writeBuf = buf;
@@ -3372,7 +3480,6 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
 		size_t out = pool_encode_rank_block(buf, count, encoded, header);
 		writeBuf = encoded; writeBytes = out;
 	}
-	bs_mutex_lock(&s->outMutex);
 	size_t wroteHeader = s->p->format == POOL_BINARY
 			? fwrite(header, 1, headerBytes, s->out) : headerBytes;
 	size_t wrote = fwrite(writeBuf, 1, writeBytes, s->out);
@@ -3382,20 +3489,45 @@ static bool pool_flush_hits(PoolScanShared *s, unsigned char *buf,
 		h = pool_hash_update(h, writeBuf, writeBytes);
 		*s->membershipDigest = h;
 	}
-	bs_mutex_unlock(&s->outMutex);
 	if (wroteHeader != headerBytes || wrote != writeBytes) {
-		atomic_store(&s->ioError, true);
+		pool_scan_fail(s, true);
 		return false;
 	}
 	*used = 0;
 	return true;
 }
 
-static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf,
+static bool pool_flush_hits(PoolChunkWriter *writer, unsigned char *buf,
+		unsigned char *encoded, size_t *used) {
+	(void)encoded;
+	PoolScanShared *s = writer->shared;
+	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
+	if (!pool_chunk_writer_begin(writer)) return false;
+	size_t at = 0;
+	while (at < *used) {
+		size_t room = POOL_OUTPUT_BUFFER - s->pendingUsed;
+		size_t n = *used - at < room ? *used - at : room;
+		memcpy(s->pending + s->pendingUsed, buf + at, n);
+		s->pendingUsed += n;
+		at += n;
+		if (s->pendingUsed == POOL_OUTPUT_BUFFER
+				&& !pool_write_block_locked(s, s->pending, s->pendingEncoded,
+						&s->pendingUsed)) {
+			pool_chunk_writer_abort(writer);
+			return false;
+		}
+	}
+	*used = 0;
+	return true;
+}
+
+static bool pool_buffer_hit(PoolChunkWriter *writer, unsigned char *buf,
 		unsigned char *encoded, size_t *used, uint64_t rank, const char seed[9]) {
+	PoolScanShared *s = writer->shared;
 	size_t slen = strlen(seed); /* 8 natural, 1..8 in expanded spaces */
 	size_t record = s->p->format == POOL_BINARY ? 8u : slen + 1;
-	if (*used + record > POOL_OUTPUT_BUFFER && !pool_flush_hits(s, buf, encoded, used)) return false;
+	if (*used + record > POOL_OUTPUT_BUFFER
+			&& !pool_flush_hits(writer, buf, encoded, used)) return false;
 	if (s->p->format == POOL_BINARY) {
 		memcpy(buf + *used, &rank, 8); *used += 8;
 	} else if (s->p->format == POOL_TEXT) {
@@ -3412,6 +3544,7 @@ static bool pool_buffer_hit(PoolScanShared *s, unsigned char *buf,
  * inline code answered with goto done. */
 typedef struct {
 	PoolScanShared *s;
+	PoolChunkWriter *writer;
 	PoolCtx *c;
 	bool eventMode, decisionReplay;
 	PoolEventHit *eventHits;
@@ -3445,16 +3578,16 @@ static bool pool_eval_emit(PoolEvalSink *k, uint64_t rank, const char seed[9],
 		if (!passed) {
 			fprintf(stderr, "internal decision/metadata replay mismatch for seed %s\n",
 					seed);
-			atomic_store(&k->s->ioError, true);
+			pool_chunk_writer_abort(k->writer);
 			return false;
 		}
 	}
 	if (passed) {
 		(*k->chunkMatched)++;
 		if (k->eventMode) {
-			if (!pool_buffer_event_hit(k->s, k->eventHits, k->eventUsed,
+			if (!pool_buffer_event_hit(k->writer, k->eventHits, k->eventUsed,
 					rank, k->metadata)) return false;
-		} else if (!pool_buffer_hit(k->s, k->outbuf, k->encoded, k->outUsed,
+		} else if (!pool_buffer_hit(k->writer, k->outbuf, k->encoded, k->outUsed,
 				rank, seed)) return false;
 	}
 	return true;
@@ -3513,7 +3646,7 @@ static void *pool_scan_worker(void *arg) {
 	if (!c || !c->soulTape || !outbuf || !encoded || (eventMode && !eventHits)) {
 		if (c) free(c->soulTape);
 		free(c); free(outbuf); free(encoded); free(eventHits);
-		atomic_store(&s->ioError, true);
+		pool_scan_fail(s, false);
 		return NULL;
 	}
 	c->g = s->g;
@@ -3532,8 +3665,10 @@ static void *pool_scan_worker(void *arg) {
 	double stFState[POOL_STAGE_CAP];
 	int nStaged = 0;
 	uint64_t chunkMatched = 0;
+	PoolChunkWriter writer = { .shared = s };
 	PoolEvalSink sink = {
-		.s = s, .c = c, .eventMode = eventMode, .decisionReplay = decisionReplay,
+		.s = s, .writer = &writer, .c = c,
+		.eventMode = eventMode, .decisionReplay = decisionReplay,
 		.eventHits = eventHits, .eventUsed = &eventUsed,
 		.outbuf = outbuf, .encoded = encoded, .outUsed = &outUsed,
 		.metadata = &metadata, .chunkMatched = &chunkMatched,
@@ -3541,8 +3676,11 @@ static void *pool_scan_worker(void *arg) {
 	while (!atomic_load(&s->ioError)) {
 		uint64_t begin = atomic_fetch_add(&s->next, s->p->chunk);
 		if (begin >= s->end) break;
-		uint64_t end = begin + s->p->chunk;
-		if (end > s->end) end = s->end;
+		uint64_t end = s->p->chunk < s->end - begin
+				? begin + s->p->chunk : s->end;
+		writer.begin = begin;
+		writer.end = end;
+		writer.ownsTurn = false;
 		uint64_t rank = begin;
 		chunkMatched = 0;
 		int space = s->p->space;
@@ -3561,7 +3699,7 @@ static void *pool_scan_worker(void *arg) {
 		for (; rank + ILV <= end; rank += ILV) {
 			if (s->p->refilter) {
 				if (!pool_read_input_batch(s, rank, ILV, ranks, &inputScratch)) {
-					atomic_store(&s->ioError, true); goto done;
+					pool_chunk_writer_abort(&writer); goto done;
 				}
 				int l0 = 0, uniform = 1;
 				for (int i = 0; i < ILV; i++) {
@@ -3647,7 +3785,7 @@ static void *pool_scan_worker(void *arg) {
 		nStaged = 0;
 		for (; rank < end; rank++) {
 			if (s->p->refilter && !pool_read_input_batch(s, rank, 1, ranks, &inputScratch)) {
-				atomic_store(&s->ioError, true); goto done;
+				pool_chunk_writer_abort(&writer); goto done;
 			}
 			uint64_t candidate = s->p->refilter ? ranks[0] : rank;
 			make_seed_in(space, candidate, seeds[0]);
@@ -3660,25 +3798,37 @@ static void *pool_scan_worker(void *arg) {
 				if (!passed) {
 					fprintf(stderr, "internal decision/metadata replay mismatch for seed %s\n",
 							seeds[0]);
-					atomic_store(&s->ioError, true);
+					pool_chunk_writer_abort(&writer);
 					goto done;
 				}
 			}
 			if (passed) {
 				chunkMatched++;
 				if (eventMode) {
-					if (!pool_buffer_event_hit(s, eventHits, &eventUsed,
+					if (!pool_buffer_event_hit(&writer, eventHits, &eventUsed,
 							candidate, &metadata)) goto done;
-				} else if (!pool_buffer_hit(s, outbuf, encoded, &outUsed,
+				} else if (!pool_buffer_hit(&writer, outbuf, encoded, &outUsed,
 						candidate, seeds[0])) goto done;
 			}
+		}
+		/* A chunk is the publication unit. Flush even a partial local block,
+		 * then advance the ordered writer turn; empty chunks take the same turn
+		 * so a later matching chunk can never overtake them. */
+		if (s->p->format != POOL_COUNT) {
+			if (eventMode) {
+				if (!pool_flush_event_hits(&writer, eventHits, &eventUsed)) goto done;
+			} else if (!pool_flush_hits(&writer, outbuf, encoded, &outUsed)) goto done;
+			if (!pool_chunk_writer_finish(&writer)) goto done;
 		}
 		atomic_fetch_add(&s->matched, chunkMatched);
 		atomic_fetch_add(&s->scanned, end - begin);
 	}
 done:
-	if (eventMode) (void)pool_flush_event_hits(s, eventHits, &eventUsed);
-	else (void)pool_flush_hits(s, outbuf, encoded, &outUsed);
+	if (writer.ownsTurn) {
+		pool_scan_fail(s, true);
+		bs_mutex_unlock(&s->outMutex);
+		writer.ownsTurn = false;
+	}
 	bspool_scratch_destroy(&inputScratch);
 	free(eventHits);
 	free(encoded);
@@ -4120,11 +4270,12 @@ static bool pool_write_manifest(const char *path, const PoolPlan *p,
 	int coverageComplete = s->done && (!p->refilter || p->sourceCoverageComplete);
 	fprintf(f, "scanned %" PRIu64 "\nmatched %" PRIu64 "\ncomplete %d\ncoverage_complete %d\n",
 			s->scanned, s->matched, s->done, coverageComplete);
-	fprintf(f, "format %s\nrecord_order block-sorted\ntag_route %s\n",
+	fprintf(f, "format %s\nrecord_order %s\ntag_route %s\n",
 			p->format == POOL_BINARY
 					? (p->outputSchema == BSPOOL_SCHEMA_EVENTS
 							? "delta-varint-events-v1" : "delta-varint-blocks-v1")
 					: p->format == POOL_TEXT ? "seed-text" : "count-only",
+			p->refilter ? "source-stable-block-sorted" : "rank-ascending",
 			p->collectTags ? "collect-first-required" : "observe");
 	int hasLegendaryRoute = p->nbaseLegendaryRules || p->nlegendary;
 	if (hasLegendaryRoute
@@ -4481,6 +4632,7 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		PoolScanShared shared;
 		memset(&shared, 0, sizeof shared);
 		shared.g = g; shared.p = p; shared.end = epochEnd; shared.out = out;
+		shared.writeNext = shared.epochStart = state.cursor;
 		shared.membershipDigest = &state.membershipDigest;
 		shared.metadataDigest = &state.metadataDigest;
 		atomic_init(&shared.next, state.cursor);
@@ -4488,16 +4640,48 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		atomic_init(&shared.matched, 0);
 		atomic_init(&shared.ioError, false);
 		bs_mutex_init(&shared.outMutex);
+		for (size_t i = 0; i < 64; i++) bs_cond_init(&shared.outReady[i]);
+		bool sharedEventMode = p->format == POOL_BINARY
+				&& p->outputSchema == BSPOOL_SCHEMA_EVENTS;
+		if (sharedEventMode)
+			shared.pendingEvents = malloc(POOL_EVENT_BLOCK_RECORDS
+					* sizeof *shared.pendingEvents);
+		else if (p->format != POOL_COUNT) {
+			shared.pending = malloc(POOL_OUTPUT_BUFFER);
+			shared.pendingEncoded = malloc(POOL_OUTPUT_BUFFER);
+		}
+		if ((sharedEventMode && !shared.pendingEvents)
+				|| (p->format != POOL_COUNT && !sharedEventMode
+					&& (!shared.pending || !shared.pendingEncoded))) {
+			fprintf(stderr, "cannot allocate ordered output buffers\n");
+			free(shared.pendingEvents); free(shared.pending); free(shared.pendingEncoded);
+			for (size_t i = 0; i < 64; i++) bs_cond_destroy(&shared.outReady[i]);
+			bs_mutex_destroy(&shared.outMutex);
+			if (out) fclose(out);
+			return 1;
+		}
 		bs_thread_t threads[64];
 		int made = 0;
 		for (int i = 0; i < p->threads; i++) {
 			if (bs_thread_create(&threads[i], pool_scan_worker, &shared) != 0) {
-				atomic_store(&shared.ioError, true);
+				pool_scan_fail(&shared, false);
 				break;
 			}
 			made++;
 		}
 		for (int i = 0; i < made; i++) bs_thread_join(threads[i]);
+		if (!atomic_load(&shared.ioError)) {
+			bs_mutex_lock(&shared.outMutex);
+			bool flushed = sharedEventMode
+					? pool_write_event_block_locked(&shared, shared.pendingEvents,
+							&shared.pendingEventUsed)
+					: pool_write_block_locked(&shared, shared.pending,
+							shared.pendingEncoded, &shared.pendingUsed);
+			bs_mutex_unlock(&shared.outMutex);
+			if (!flushed) atomic_store(&shared.ioError, true);
+		}
+		free(shared.pendingEvents); free(shared.pending); free(shared.pendingEncoded);
+		for (size_t i = 0; i < 64; i++) bs_cond_destroy(&shared.outReady[i]);
 		bs_mutex_destroy(&shared.outMutex);
 		if (atomic_load(&shared.ioError)) {
 			fprintf(stderr, "scan aborted because a worker or output write failed\n");
@@ -5173,10 +5357,265 @@ typedef struct {
 	uint64_t fileBytes;
 } PoolMergePart;
 
+typedef struct {
+	uint64_t ranks[POOL_EVENT_BLOCK_RECORDS];
+	size_t used;
+	PoolMetaDescriptor *descriptors;
+	size_t ndescriptors, descriptorCap;
+	uint32_t associations;
+	uint64_t priorRank;
+	bool hasPriorRank;
+} PoolMergeEventBlock;
+
+typedef struct {
+	uint64_t ranks[BSPOOL_BLOCK_MAX_RECORDS];
+	size_t used;
+	uint64_t priorRank;
+	bool hasPriorRank;
+} PoolMergeRankBlock;
+
+static bool pool_raw_descriptor_record(PoolMetaDescriptor **descriptors,
+		size_t *ndescriptors, size_t *descriptorCap, uint32_t *associations,
+		const unsigned char *bytes, size_t len, uint16_t record) {
+	if (!len || len > sizeof (*descriptors)[0].bytes) return false;
+	size_t d = 0;
+	for (; d < *ndescriptors; d++)
+		if ((*descriptors)[d].len == len
+				&& !memcmp((*descriptors)[d].bytes, bytes, len)) break;
+	if (d == *ndescriptors) {
+		if (*ndescriptors == *descriptorCap) {
+			size_t cap = *descriptorCap ? *descriptorCap * 2 : 16;
+			if (cap < *descriptorCap || cap > SIZE_MAX / sizeof **descriptors)
+				return false;
+			PoolMetaDescriptor *p = realloc(*descriptors, cap * sizeof *p);
+			if (!p) return false;
+			*descriptors = p; *descriptorCap = cap;
+		}
+		memset(&(*descriptors)[d], 0, sizeof (*descriptors)[d]);
+		(*descriptors)[d].len = (uint8_t)len;
+		memcpy((*descriptors)[d].bytes, bytes, len);
+		(*ndescriptors)++;
+	}
+	if (*associations == UINT32_MAX
+			|| !pool_meta_record(&(*descriptors)[d], record)) return false;
+	(*associations)++;
+	return true;
+}
+
+static void pool_merge_event_reset(PoolMergeEventBlock *block) {
+	uint64_t priorRank = block->priorRank;
+	bool hasPriorRank = block->hasPriorRank;
+	pool_meta_descriptors_free(block->descriptors, block->ndescriptors);
+	memset(block, 0, sizeof *block);
+	block->priorRank = priorRank;
+	block->hasPriorRank = hasPriorRank;
+}
+
+static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
+		uint64_t *membershipDigest, uint64_t *metadataDigest,
+		char *err, size_t errsz) {
+	if (!block->used) return true;
+	unsigned char rankPayload[(POOL_EVENT_BLOCK_RECORDS - 1) * 6];
+	size_t rankBytes = 0;
+	for (size_t i = 1; i < block->used; i++) {
+		uint64_t delta = block->ranks[i] - block->ranks[i - 1];
+		if (!delta) {
+			snprintf(err, errsz, "merged event ranks are not strictly ascending");
+			return false;
+		}
+		do {
+			unsigned char byte = (unsigned char)(delta & 0x7f);
+			delta >>= 7;
+			if (delta) byte |= 0x80;
+			rankPayload[rankBytes++] = byte;
+		} while (delta);
+	}
+	qsort(block->descriptors, block->ndescriptors,
+			sizeof *block->descriptors, pool_meta_descriptor_compare);
+	PoolByteBuffer metadata = { 0 };
+	if (!pool_byte_varint(&metadata, block->ndescriptors)) goto memory;
+	for (size_t d = 0; d < block->ndescriptors; d++) {
+		PoolMetaDescriptor *entry = &block->descriptors[d];
+		if (!pool_byte_varint(&metadata, entry->len)
+				|| !pool_byte_append(&metadata, entry->bytes, entry->len)
+				|| !pool_byte_varint(&metadata, entry->count)
+				|| !entry->count
+				|| !pool_byte_varint(&metadata, entry->records[0])) goto memory;
+		for (uint32_t i = 1; i < entry->count; i++) {
+			uint16_t delta = (uint16_t)(entry->records[i] - entry->records[i - 1]);
+			if (!delta || !pool_byte_varint(&metadata, delta)) goto memory;
+		}
+	}
+	unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE] = { 0 };
+	memcpy(header, "BSP3", 4); header[4] = BSPOOL3_BLOCK_HEADER_SIZE;
+	bspool_put_u32le(header + 8, (uint32_t)block->used);
+	bspool_put_u32le(header + 12, (uint32_t)rankBytes);
+	bspool_put_u32le(header + 16, (uint32_t)metadata.size);
+	bspool_put_u32le(header + 20, block->associations);
+	bspool_put_u64le(header + 24, block->ranks[0]);
+	bspool_put_u64le(header + 32, block->ranks[block->used - 1]);
+	uint64_t crc = bspool_crc64_update(0, header + 4, 36);
+	crc = bspool_crc64_update(crc, rankPayload, rankBytes);
+	crc = bspool_crc64_update(crc, metadata.data, metadata.size);
+	bspool_put_u64le(header + 40, crc);
+	if (fwrite(header, 1, sizeof header, out) != sizeof header
+			|| (rankBytes && fwrite(rankPayload, 1, rankBytes, out) != rankBytes)
+			|| fwrite(metadata.data, 1, metadata.size, out) != metadata.size) {
+		free(metadata.data);
+		snprintf(err, errsz, "cannot write canonical merged event block");
+		return false;
+	}
+	*membershipDigest = pool_hash_update(*membershipDigest, header, sizeof header);
+	*membershipDigest = pool_hash_update(*membershipDigest, rankPayload, rankBytes);
+	*membershipDigest = pool_hash_update(*membershipDigest, metadata.data, metadata.size);
+	*metadataDigest = pool_hash_update(*metadataDigest, metadata.data, metadata.size);
+	free(metadata.data);
+	pool_merge_event_reset(block);
+	return true;
+memory:
+	free(metadata.data);
+	snprintf(err, errsz, "cannot assemble canonical merged event metadata");
+	return false;
+}
+
+/* Append one verified BSP3 source block, splitting its inverted metadata at
+ * the canonical 1,024-record output boundary when a shard edge falls inside
+ * the next block. */
+static bool pool_merge_append_event_block(FILE *out, PoolMergeEventBlock *block,
+		const uint64_t *ranks, uint32_t count,
+		const unsigned char *metadata, size_t metadataBytes,
+		uint64_t *membershipDigest, uint64_t *metadataDigest,
+		char *err, size_t errsz) {
+	size_t first = count;
+	if (first > POOL_EVENT_BLOCK_RECORDS - block->used)
+		first = POOL_EVENT_BLOCK_RECORDS - block->used;
+	size_t second = count - first;
+	size_t oldUsed = block->used;
+	for (uint32_t i = 0; i < count; i++) {
+		if (block->hasPriorRank && ranks[i] <= block->priorRank) {
+			snprintf(err, errsz, "merged event ranks are not globally ascending");
+			return false;
+		}
+		block->priorRank = ranks[i]; block->hasPriorRank = true;
+	}
+	memcpy(block->ranks + oldUsed, ranks, first * sizeof *ranks);
+	PoolMetaDescriptor *nextDescriptors = NULL;
+	size_t nextCount = 0, nextCap = 0;
+	uint32_t nextAssociations = 0;
+	size_t at = 0;
+	uint64_t descriptors = 0;
+	if (!bspool_varint_read(metadata, metadataBytes, &at, &descriptors)) goto malformed;
+	for (uint64_t d = 0; d < descriptors; d++) {
+		uint64_t len = 0, matches = 0, record = 0;
+		if (!bspool_varint_read(metadata, metadataBytes, &at, &len)
+				|| !len || len > metadataBytes - at) goto malformed;
+		const unsigned char *raw = metadata + at;
+		at += (size_t)len;
+		if (!bspool_varint_read(metadata, metadataBytes, &at, &matches)
+				|| !matches || matches > count) goto malformed;
+		for (uint64_t i = 0; i < matches; i++) {
+			uint64_t value = 0;
+			if (!bspool_varint_read(metadata, metadataBytes, &at, &value)) goto malformed;
+			if (!i) record = value;
+			else {
+				if (!value || record > UINT64_MAX - value) goto malformed;
+				record += value;
+			}
+			if (record >= count) goto malformed;
+			bool ok = record < first
+					? pool_raw_descriptor_record(&block->descriptors,
+							&block->ndescriptors, &block->descriptorCap,
+							&block->associations, raw, (size_t)len,
+							(uint16_t)(oldUsed + record))
+					: pool_raw_descriptor_record(&nextDescriptors, &nextCount,
+							&nextCap, &nextAssociations, raw, (size_t)len,
+							(uint16_t)(record - first));
+			if (!ok) goto memory;
+		}
+	}
+	if (at != metadataBytes) goto malformed;
+	block->used += first;
+	if (block->used == POOL_EVENT_BLOCK_RECORDS
+			&& !pool_merge_write_event_block(out, block, membershipDigest,
+					metadataDigest, err, errsz)) goto fail;
+	if (second) {
+		memcpy(block->ranks, ranks + first, second * sizeof *ranks);
+		block->used = second;
+		block->descriptors = nextDescriptors;
+		block->ndescriptors = nextCount;
+		block->descriptorCap = nextCap;
+		block->associations = nextAssociations;
+		nextDescriptors = NULL; nextCount = 0;
+	}
+	pool_meta_descriptors_free(nextDescriptors, nextCount);
+	return true;
+malformed:
+	snprintf(err, errsz, "cannot decode verified event metadata while merging");
+	goto fail;
+memory:
+	snprintf(err, errsz, "cannot allocate canonical merged event metadata");
+fail:
+	pool_meta_descriptors_free(nextDescriptors, nextCount);
+	return false;
+}
+
+static bool pool_merge_write_rank_block(FILE *out, PoolMergeRankBlock *block,
+		uint64_t *membershipDigest, char *err, size_t errsz) {
+	if (!block->used) return true;
+	unsigned char encoded[POOL_OUTPUT_BUFFER], header[BSPOOL_BLOCK_HEADER_SIZE];
+	size_t payload = pool_encode_rank_block((unsigned char *)block->ranks,
+			(uint32_t)block->used, encoded, header);
+	if (fwrite(header, 1, sizeof header, out) != sizeof header
+			|| fwrite(encoded, 1, payload, out) != payload) {
+		snprintf(err, errsz, "cannot write canonical merged rank block");
+		return false;
+	}
+	*membershipDigest = pool_hash_update(*membershipDigest, header, sizeof header);
+	*membershipDigest = pool_hash_update(*membershipDigest, encoded, payload);
+	block->used = 0;
+	return true;
+}
+
+static bool pool_merge_append_ranks(FILE *out, PoolMergeRankBlock *block,
+		const uint64_t *ranks, size_t count, uint64_t *membershipDigest,
+		char *err, size_t errsz) {
+	size_t at = 0;
+	while (at < count) {
+		size_t room = BSPOOL_BLOCK_MAX_RECORDS - block->used;
+		size_t n = count - at < room ? count - at : room;
+		for (size_t i = 0; i < n; i++) {
+			if (block->hasPriorRank && ranks[at + i] <= block->priorRank) {
+				snprintf(err, errsz, "merged ranks are not globally ascending");
+				return false;
+			}
+			block->priorRank = ranks[at + i]; block->hasPriorRank = true;
+		}
+		memcpy(block->ranks + block->used, ranks + at, n * sizeof *ranks);
+		block->used += n; at += n;
+		if (block->used == BSPOOL_BLOCK_MAX_RECORDS
+				&& !pool_merge_write_rank_block(out, block, membershipDigest,
+						err, errsz)) return false;
+	}
+	return true;
+}
+
 static int pool_merge_part_compare(const void *a, const void *b) {
 	const PoolMergePart *x = a, *y = b;
 	return x->header.rangeStart < y->header.rangeStart ? -1
 			: x->header.rangeStart > y->header.rangeStart;
+}
+
+static bool pool_reader_blocks_ascending(const BspoolReader *reader) {
+	if (reader->encoding == BSPOOL_ENCODING_U64) return false;
+	uint64_t prior = 0;
+	for (uint64_t b = 0; b < reader->nblocks; b++) {
+		BspoolBlockInfo info;
+		if (!bspool_block_header(reader->fd, reader->blocks[b].offset,
+				reader->encoding, &info)) return false;
+		if (b && info.first <= prior) return false;
+		prior = info.last;
+	}
+	return true;
 }
 
 static void pool_compute_merged_id(const BspoolHeader *h, uint64_t rangeStart,
@@ -5204,6 +5643,8 @@ static void pool_output_label(const char *path, char out[136]) {
 }
 
 static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
+		PoolMergeEventBlock *eventBlock, PoolMergeRankBlock *rankBlock,
+		bool canonical,
 		uint64_t *written, uint64_t *membershipDigest, uint64_t *metadataDigest,
 		char *err, size_t errsz) {
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
@@ -5218,19 +5659,36 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					|| scratch.ranks[i] >= part->header.rangeEnd) {
 				snprintf(err, errsz, "%s contains a rank outside its declared shard range", part->path); goto fail;
 			}
-			unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE];
-			size_t headerBytes = part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
-					? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
-			if (bs_pread(part->reader.fd, header, headerBytes, (int64_t)e->offset) != (int64_t)headerBytes
-					|| fwrite(header, 1, headerBytes, out) != headerBytes
-					|| (e->payloadBytes && fwrite(scratch.bytes, 1, e->payloadBytes, out) != e->payloadBytes)) {
-				snprintf(err, errsz, "cannot copy verified block from %s", part->path); goto fail;
+			if (!canonical) {
+				unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE];
+				size_t headerBytes = part->header.encoding
+						== BSPOOL_ENCODING_DELTA_EVENTS
+						? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
+				if (bs_pread(part->reader.fd, header, headerBytes,
+						(int64_t)e->offset) != (int64_t)headerBytes
+						|| fwrite(header, 1, headerBytes, out) != headerBytes
+						|| (e->payloadBytes && fwrite(scratch.bytes, 1,
+							e->payloadBytes, out) != e->payloadBytes)) {
+					snprintf(err, errsz, "cannot copy verified block from %s",
+							part->path); goto fail;
+				}
+				*membershipDigest = pool_hash_update(*membershipDigest,
+						header, headerBytes);
+				*membershipDigest = pool_hash_update(*membershipDigest,
+						scratch.bytes, e->payloadBytes);
+				if (part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS)
+					*metadataDigest = pool_hash_update(*metadataDigest,
+							scratch.bytes + e->rankBytes, e->metadataBytes);
+				*written += e->count;
+				continue;
 			}
-			*membershipDigest = pool_hash_update(*membershipDigest, header, headerBytes);
-			*membershipDigest = pool_hash_update(*membershipDigest, scratch.bytes, e->payloadBytes);
-			if (part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS)
-				*metadataDigest = pool_hash_update(*metadataDigest,
-						scratch.bytes + e->rankBytes, e->metadataBytes);
+			bool appended = part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
+					? pool_merge_append_event_block(out, eventBlock, scratch.ranks,
+							e->count, scratch.bytes + e->rankBytes, e->metadataBytes,
+							membershipDigest, metadataDigest, err, errsz)
+					: pool_merge_append_ranks(out, rankBlock, scratch.ranks, e->count,
+							membershipDigest, err, errsz);
+			if (!appended) goto fail;
 			*written += e->count;
 		}
 	} else {
@@ -5246,13 +5704,21 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					|| ranks[i] >= part->header.rangeEnd) {
 				snprintf(err, errsz, "%s contains a rank outside its declared shard range", part->path); goto fail;
 			}
-			size_t payload = pool_encode_rank_block((unsigned char *)ranks, (uint32_t)n, encoded, header);
-			if (fwrite(header, 1, sizeof header, out) != sizeof header
-					|| fwrite(encoded, 1, payload, out) != payload) {
-				snprintf(err, errsz, "cannot write merged output"); goto fail;
+			if (canonical) {
+				if (!pool_merge_append_ranks(out, rankBlock, ranks, (size_t)n,
+						membershipDigest, err, errsz)) goto fail;
+			} else {
+				size_t payload = pool_encode_rank_block((unsigned char *)ranks,
+						(uint32_t)n, encoded, header);
+				if (fwrite(header, 1, sizeof header, out) != sizeof header
+						|| fwrite(encoded, 1, payload, out) != payload) {
+					snprintf(err, errsz, "cannot write merged output"); goto fail;
+				}
+				*membershipDigest = pool_hash_update(*membershipDigest,
+						header, sizeof header);
+				*membershipDigest = pool_hash_update(*membershipDigest,
+						encoded, payload);
 			}
-			*membershipDigest = pool_hash_update(*membershipDigest, header, sizeof header);
-			*membershipDigest = pool_hash_update(*membershipDigest, encoded, payload);
 			record += n; *written += n;
 		}
 	}
@@ -5322,6 +5788,11 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 		totalRecords += p->header.records;
 	}
 	qsort(parts, (size_t)ninputs, sizeof *parts, pool_merge_part_compare);
+	bool canonicalMerge = true;
+	for (int i = 0; i < ninputs; i++)
+		if (!pool_reader_blocks_ascending(&parts[i].reader)) canonicalMerge = false;
+	if (!canonicalMerge)
+		fprintf(stderr, "merge: preserving legacy block order because an input is not globally rank-ascending\n");
 	int outputSchema = parts[0].header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
 			? BSPOOL_SCHEMA_EVENTS : BSPOOL_SCHEMA_BLOCKS;
 	int outputHeaderBytes = outputSchema == BSPOOL_SCHEMA_EVENTS
@@ -5403,14 +5874,25 @@ static int pool_mode_merge(const char *output, int ninputs, char **inputs) {
 	uint64_t written = 0;
 	uint64_t membershipDigest = POOL_HASH_INIT;
 	uint64_t metadataDigest = outputSchema == BSPOOL_SCHEMA_EVENTS ? POOL_HASH_INIT : 0;
+	PoolMergeEventBlock eventBlock = { 0 };
+	PoolMergeRankBlock rankBlock = { 0 };
 	for (int i = 0; i < ninputs; i++) {
-		if (!pool_merge_write_part(out, &parts[i], &written,
+		if (!pool_merge_write_part(out, &parts[i], &eventBlock, &rankBlock,
+				canonicalMerge, &written,
 				&membershipDigest, &metadataDigest, err, sizeof err)) {
+			pool_merge_event_reset(&eventBlock);
 			fclose(out); remove(output); goto done;
 		}
 		fprintf(stderr, "merged=%d/%d records=%" PRIu64 "/%" PRIu64 "\n",
 				i + 1, ninputs, written, totalRecords);
 	}
+	bool tailOk = outputSchema == BSPOOL_SCHEMA_EVENTS
+			? pool_merge_write_event_block(out, &eventBlock, &membershipDigest,
+					&metadataDigest, err, sizeof err)
+			: pool_merge_write_rank_block(out, &rankBlock, &membershipDigest,
+					err, sizeof err);
+	pool_merge_event_reset(&eventBlock);
+	if (!tailOk) { fclose(out); remove(output); goto done; }
 	int64_t dataEnd = bs_ftello(out);
 	uint64_t finalBytes = 0;
 	uint64_t mergedDataBytes = dataEnd >= outputHeaderBytes

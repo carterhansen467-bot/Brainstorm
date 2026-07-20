@@ -62,6 +62,29 @@ header "$OUT/nested.bspool" | grep -q '^merged_parts 4$'
 NESTED_ID=$(header "$OUT/nested.bspool" | sed -n 's/^pool_id //p')
 [ "$NESTED_ID" = "$MONO_ID" ]
 
+# Canonical reblocking crosses shard and nested-merge edges. The physical data
+# stream and every content-derived identity must therefore equal the one-shot
+# monolithic scan, not merely export the same set after sorting.
+for field in data_bytes snapshot_id membership_digest metadata_digest; do
+  mono=$(header "$OUT/mono.bspool" | sed -n "s/^$field //p")
+  merged=$(header "$OUT/merged.bspool" | sed -n "s/^$field //p")
+  nested=$(header "$OUT/nested.bspool" | sed -n "s/^$field //p")
+  [ -n "$mono" ] && [ "$mono" = "$merged" ] && [ "$mono" = "$nested" ] || {
+    echo "FAIL: $field differs across monolithic, direct, or nested merge"; exit 1;
+  }
+done
+python3 - "$OUT/mono.bspool" "$OUT/merged.bspool" "$OUT/nested.bspool" <<'PY'
+import re, sys
+
+payloads = []
+for path in sys.argv[1:]:
+    raw = open(path, "rb").read()
+    header = int(re.search(br"(?m)^header_bytes (\d+)$", raw[:1024]).group(1))
+    data = int(re.search(br"(?m)^data_bytes (\d+)$", raw[:header]).group(1))
+    payloads.append(raw[header:header + data])
+assert payloads[0] == payloads[1] == payloads[2]
+PY
+
 # Gaps and overlaps must fail without leaving an output that looks usable.
 if "./native/brainstorm_seed_pool$EXE" merge "$OUT/gap.bspool" \
     "$OUT/part-1.bspool" "$OUT/part-3.bspool" 2>/dev/null; then

@@ -12,23 +12,7 @@ and Lua models.
 
 ## Priority 0 — correctness and release readiness
 
-### 1. Make multithreaded pool artifacts deterministic
-
-Identical multithreaded scans currently contain the same seed set but can emit
-records in different orders, producing different `membership_digest` values.
-Choose and benchmark one exact solution:
-
-- publish completed chunks in rank order;
-- perform an ordered final merge; or
-- define an order-independent canonical membership identity while preserving a
-  separate integrity check for the physical record stream.
-
-Verify identical membership and metadata identities across thread counts,
-pause/resume, checkpoint boundaries, refiltering, compression, distributed
-shards, and merged outputs. Do not trade away enough throughput to make the
-identity improvement more costly than its reproducibility value.
-
-### 2. Redesign Organize / Combine
+### 1. Redesign Organize / Combine
 
 Treat this as a workflow and semantic redesign, not a cosmetic pass. The final
 interface must make source pools, compatibility, ambiguity, unmatched seeds,
@@ -47,7 +31,7 @@ Re-test end to end:
 - writer locking, cancellation, and atomic output publication;
 - the embedded Builder view and standalone Organizer on both platforms.
 
-### 3. Perform a human in-game Windows smoke test
+### 2. Perform a human in-game Windows smoke test
 
 CI proves Windows Lua/native parity, CreateProcess quoting, status files,
 CTRL_BREAK pause/resume, Builder headless behavior, and package layout. A real
@@ -62,7 +46,7 @@ Balatro session still needs to verify what CI cannot:
 
 Record the Balatro, Lovely, Steamodded, Windows, and package versions used.
 
-### 4. Publish a current Windows release
+### 3. Publish a current Windows release
 
 The newest Windows tag predates the attachment and audited vector-gate work.
 After the preceding Priority 0 items are either complete or explicitly accepted
@@ -82,13 +66,13 @@ Add one predicate family at a time. Each item requires an independent proof of
 `active predicate => pool predicate`; similar names or overlapping samples are
 not sufficient.
 
-### 5. Voucher attachment matching
+### 4. Voucher attachment matching
 
 Model target windows, owned vouchers, purchase prerequisites, exclusions,
 Ante reducers, and the difference between observing and purchasing a voucher.
 Prove exact-Ante and ranged implications independently, including Omen routes.
 
-### 6. Anywhere and broader-source attachment matching
+### 5. Anywhere and broader-source attachment matching
 
 Add dedicated semantics and differentials for:
 
@@ -102,14 +86,14 @@ Add dedicated semantics and differentials for:
 Chronological route state must remain authoritative. Do not infer compatibility
 from item identity alone.
 
-### 7. Composite Boolean attachment matching
+### 6. Composite Boolean attachment matching
 
 Represent union, intersection, and difference provenance as Boolean predicates
 and prove implication against that expression. Do not flatten a composite into
 a single conjunction. Refuse automatic use whenever the expression or lineage
 cannot be translated exactly.
 
-### 8. Generate canonical predicates from one schema
+### 7. Generate canonical predicates from one schema
 
 The Builder and Lua runtime currently reconstruct compatible representations
 in different languages. Define one versioned predicate-field specification for
@@ -117,14 +101,14 @@ item, count, location, source, Negative/edition, Soul depth, route coverage,
 voucher ownership/purchase, exclusions, and Boolean composition. Generate or
 validate both implementations from it so new fields cannot silently drift.
 
-### 9. Measure and improve pool choice
+### 8. Measure and improve pool choice
 
 The current deterministic choice favors the fewest records. Benchmark real
 time-to-result using record count, coverage, density, decode cost, active-filter
 acceptance, and storage behavior. Change the heuristic only if those
 measurements beat the simpler rule while preserving deterministic tie-breaks.
 
-### 10. Measure accelerator revisit cost
+### 9. Measure accelerator revisit cost
 
 Unrestricted fallback may revisit ranks that were already members of an
 accelerator. This is correct. Add native exclusion state only if measured
@@ -133,7 +117,7 @@ changing checkpoint/resume semantics.
 
 ## Priority 2 — performance research
 
-### 11. Reprofile the final pipeline before changing it
+### 10. Reprofile the final pipeline before changing it
 
 The recent exact-route, vector-gate, pack-gate, and handoff work changed the
 hotspots. Capture representative profiles for:
@@ -152,7 +136,7 @@ checkpoint tail time, and thermal variance. Use the corrected family-specific
 benchmark path and keep result membership nonempty so measurements are not
 vacuous.
 
-### 12. Evaluate target-native Windows PGO
+### 11. Evaluate target-native Windows PGO
 
 Train Windows search and Builder profiles on Windows, rebuild with matching
 identity metadata, run full Lua/native parity, and compare ordinary plus PGO
@@ -160,7 +144,7 @@ rates. macOS profiles are neither portable nor evidence of a Windows gain.
 Adopt Windows PGO only if the packaged complexity produces a repeatable
 improvement on representative hardware.
 
-### 13. Benchmark searcher survivor rebatching only on a suitable workload
+### 12. Benchmark searcher survivor rebatching only on a suitable workload
 
 The current Soul gate leaves about 1.93% of the bounded fixture for scalar
 evaluation, so a second staged Legendary gate has little room to help. Revisit
@@ -169,7 +153,7 @@ very selective independent predicate. Carry rank, seed, hashed seed, first
 stream result/state, and cached hash-prefix state; preserve FIFO order and flush
 partial batches explicitly.
 
-### 14. Add a cost/selectivity planner only when it has a real choice
+### 13. Add a cost/selectivity planner only when it has a real choice
 
 A planner should choose only among predicates proven independent, using static
 RNG probability plus measured rejection cost. The selected plan must remain
@@ -177,7 +161,7 @@ deterministic and observable in telemetry/pool identity where relevant. Current
 common-case ordering is already close to measured selectivity, so this waits
 for another profitable independent stage.
 
-### 15. Revisit portable SIMD only after profiling
+### 14. Revisit portable SIMD only after profiling
 
 If profiles expose a new lane-parallel hotspot, compare portable ILV code,
 compiler vectorization, Apple NEON, and Windows AVX2/AVX-512 separately. Retain
@@ -187,33 +171,33 @@ project's fixed `Vector512` code literally.
 
 ## Priority 3 — product and UX additions
 
-### 16. Show where a found joker was located
+### 15. Show where a found joker was located
 
 The search already records locations. Add a concise result notification such
 as “Found in Shop,” “Found in Pack,” or the exact route label, including when a
 seed is banked rather than immediately applied. Avoid overlapping the existing
 seed-slot and search-progress messages.
 
-### 17. Optional scoring and ranked results
+### 16. Optional scoring and ranked results
 
 Add `should`-style criteria only as a separate result-ranking feature. It must
 not weaken mandatory predicates or be presented as a generation-speed gain.
 Define deterministic scoring, tie-breaking, retention limits, and export.
 
-### 18. Richer native survivor metadata
+### 17. Richer native survivor metadata
 
 Consider returning route/location metadata with survivors to avoid a second
 native analysis pass. Main-thread Lua verification remains the final authority
 before a seed is applied.
 
-### 19. Managed remote search
+### 18. Managed remote search
 
 Consider a remote worker abstraction only after local shards, checkpoints,
 merge publication, and Organizer workflows are dependable. Preserve explicit
 ranges, identities, resumability, provenance, and independent result
 verification.
 
-### 20. General typed filter authoring
+### 19. General typed filter authoring
 
 A JAML-style must/should/must-not and Boolean editor could expand the product,
 but it risks duplicating route semantics. Do not begin it before canonical
@@ -221,7 +205,7 @@ attachment predicates and composite pool semantics are stable.
 
 ## Priority 4 — repository maintenance
 
-### 21. Remove obsolete workspace artifacts
+### 20. Remove obsolete workspace artifacts
 
 After confirming they contain no unique user work, remove the old `.bak` files
 and prune the stale distributed-worktree registration. Keep this separate from

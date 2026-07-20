@@ -54,6 +54,8 @@ jobs:
         run: python3 tests/pool_attachment_native_e2e.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool -> refiltered pool intersection e2e
         run: TAG=tag_charm sh tests/pool_refilter_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: Deterministic pool artifacts
+        run: sh tests/pool_deterministic_artifacts.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Exact locations, voucher routes, Omen, and organizer
         run: |
           sh tests/pool_exact_location_regression.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 1000000
@@ -120,6 +122,8 @@ jobs:
         run: python tests/pool_attachment_native_e2e.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Pool -> refiltered pool intersection e2e
         run: TAG=tag_charm sh tests/pool_refilter_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
+      - name: Deterministic pool artifacts
+        run: sh tests/pool_deterministic_artifacts.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000000
       - name: Exact locations, voucher routes, Omen, and organizer
         run: |
           sh tests/pool_exact_location_regression.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 1000000

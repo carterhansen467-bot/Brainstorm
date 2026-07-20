@@ -86,6 +86,15 @@ static inline void bs_mutex_destroy(bs_mutex_t *m) { (void)m; }
 static inline void bs_mutex_lock(bs_mutex_t *m) { AcquireSRWLockExclusive(m); }
 static inline void bs_mutex_unlock(bs_mutex_t *m) { ReleaseSRWLockExclusive(m); }
 
+typedef CONDITION_VARIABLE bs_cond_t;
+static inline void bs_cond_init(bs_cond_t *c) { InitializeConditionVariable(c); }
+static inline void bs_cond_destroy(bs_cond_t *c) { (void)c; }
+static inline void bs_cond_wait(bs_cond_t *c, bs_mutex_t *m) {
+	SleepConditionVariableSRW(c, m, INFINITE, 0);
+}
+static inline void bs_cond_signal(bs_cond_t *c) { WakeConditionVariable(c); }
+static inline void bs_cond_broadcast(bs_cond_t *c) { WakeAllConditionVariable(c); }
+
 static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) {
 	HANDLE h = (HANDLE)_get_osfhandle(fd);
 	if (h == INVALID_HANDLE_VALUE) return -1;
@@ -313,6 +322,13 @@ static inline void bs_mutex_init(bs_mutex_t *m) { pthread_mutex_init(m, NULL); }
 static inline void bs_mutex_destroy(bs_mutex_t *m) { pthread_mutex_destroy(m); }
 static inline void bs_mutex_lock(bs_mutex_t *m) { pthread_mutex_lock(m); }
 static inline void bs_mutex_unlock(bs_mutex_t *m) { pthread_mutex_unlock(m); }
+
+typedef pthread_cond_t bs_cond_t;
+static inline void bs_cond_init(bs_cond_t *c) { pthread_cond_init(c, NULL); }
+static inline void bs_cond_destroy(bs_cond_t *c) { pthread_cond_destroy(c); }
+static inline void bs_cond_wait(bs_cond_t *c, bs_mutex_t *m) { pthread_cond_wait(c, m); }
+static inline void bs_cond_signal(bs_cond_t *c) { pthread_cond_signal(c); }
+static inline void bs_cond_broadcast(bs_cond_t *c) { pthread_cond_broadcast(c); }
 
 static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) {
 	return (int64_t)pread(fd, buf, count, (off_t)offset);
