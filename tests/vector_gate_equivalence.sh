@@ -216,9 +216,15 @@ echo "PASS source-implied Charm gate preserves duplicate-catalog output"
 # Starting Omen changes the contents and call order inside the Charm reward,
 # but not the fact that the required A1-Small source has exactly one route.
 awk '
+	{
+		for (i = 2; i <= NF; i++) {
+			if ($i == "v_base_5") $i = "v_crystal_ball"
+			else if ($i == "v_upg_5") $i = "v_omen_globe"
+		}
+	}
 	$1 == "end" { print "vouchowned v_crystal_ball"; print "vouchowned v_omen_globe" }
 	{ print }
-' "$ROOT/native_search.cfg" > "$OUT/starting-omen.cfg"
+' "$FIXTURES/case1.cfg" > "$OUT/starting-omen.cfg"
 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
 	"$OUT/starting-omen.cfg" "$OUT/inferred-charm.cfg" \
 	"$OUT/inferred-omen-on.bspool" 2> "$OUT/inferred-omen-on.log"
