@@ -162,20 +162,6 @@ checkpoint tail time, and thermal variance. Use the corrected family-specific
 benchmark path and keep result membership nonempty so measurements are not
 vacuous.
 
-Test one high-value derived gate first: an exact A1-Small Legendary rule whose
-source is the Charm reward can succeed only when that blind physically rolls a
-Charm Tag. Reuse the existing survivor tag gate from that source constraint
-without adding a tag criterion or changing the pool identity, route metadata,
-or attachment signature. On an M1 Max portable build, the source-only
-Perkeo/Charm workload measured about 29.5M seeds/s while the otherwise
-equivalent explicit-tag plan measured 93.3M seeds/s; both produced the same
-9,900 ranks over a 50M-rank comparison. That bounded result identifies the
-opportunity but is not the proof. Differentially cover randomized ranges,
-Small/Big locations, Charm/Ethereal sources, route modes, Soul depths,
-Negative requirements, starting Omen state, duplicate/modded tag catalogs,
-expanded seed spaces, metadata, resume, and gate-disabled output before
-enabling the inference.
-
 ### 11. Evaluate target-native Windows PGO
 
 Train Windows search and Builder profiles on Windows, rebuild with matching
@@ -300,6 +286,8 @@ the keep threshold, or too semantics-heavy for the gain:
 - eager or interleaved voucher hashing;
 - recursive or hash-deduplicated Omen search variants;
 - static tag-first ordering;
+- exact culled-tag resample replay in the derived Charm gate (54.4M seeds/s
+  versus 56.0M/s for the simpler conservative gate on the M1 Max workload);
 - alternate FMA/cold `round13` variants;
 - split fast/general evaluator paths;
 - tested alternate compiler/LTO flag combinations;

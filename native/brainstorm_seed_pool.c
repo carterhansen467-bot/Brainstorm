@@ -2238,7 +2238,6 @@ static const PoolLegendaryRule *pool_legend_rule_at(const PoolPlan *p, int i) {
 }
 
 static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
-	(void)g;
 	p->voucherExclusionMask = 0;
 	for (int i = 0; i < p->nbaseVoucherExclusions; i++)
 		if (p->baseVoucherExclusions[i] >= 0 && p->baseVoucherExclusions[i] < 64)
@@ -2277,13 +2276,18 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 					p->vectorGateTarget = -2; /* contradictory rules: no lane passes */
 		}
 	}
-	/* The ante-1 Small tag roll is the Tag1 stream's first draw, and a rule
+	/* The ante-1 Small tag roll is the Tag1 stream's first draw. A tag rule
 	 * pinned to exactly that window makes a decided miss there a certain
 	 * scalar rejection (pool_check_tags fails the rule at its window end).
-	 * Natural space only: the staged rebatch hashes Tag1 at fixed length 8. */
+	 * The same implication follows from an exact A1-Small Charm-source Soul:
+	 * pool_try_targeted_charm can emit that source only after the physical
+	 * A1-Small roll selected g->charmTagIdx. This is a derived execution fact,
+	 * not an added criterion, so pool identity, metadata, and resume state stay
+	 * unchanged. Natural space only: the staged rebatch hashes Tag1 at fixed
+	 * length 8. */
 	p->vectorTagGate = 0;
 	p->vectorTagTarget = -2;
-	if (p->space == SPACE_NATURAL && p->ntagRules) {
+	if (p->space == SPACE_NATURAL) {
 		int found = 0;
 		for (int r = 0; r < p->ntagRules; r++) {
 			const PoolTagRule *rule = &p->tagRules[r];
@@ -2294,6 +2298,23 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 				if (!found) { p->vectorTagTarget = rule->poolIndex; found = 1; }
 				else if (rule->poolIndex != p->vectorTagTarget)
 					p->vectorTagTarget = -2; /* contradictory: no lane passes */
+			}
+		}
+		if (p->vectorFirstGate && g->charmTagIdx >= 0) {
+			for (int i = 0; i < pool_legend_rule_count(p); i++) {
+				const PoolLegendaryRule *rule = pool_legend_rule_at(p, i);
+				if (rule->humanLocation && rule->minAnte == 1 && rule->maxAnte == 1
+						&& rule->minPhase == SOUL_PHASE_SMALL
+						&& rule->maxPhase == SOUL_PHASE_SMALL
+						&& rule->source == SOUL_SOURCE_CHARM) {
+					if (!found) {
+						p->vectorTagTarget = g->charmTagIdx;
+						found = 1;
+					} else if (p->vectorTagTarget != g->charmTagIdx) {
+						/* One physical roll cannot satisfy different exact tags. */
+						p->vectorTagTarget = -2;
+					}
+				}
 			}
 		}
 		if (found) {
@@ -6195,6 +6216,10 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	pool_finalize_hot_plan(&catalog, &plan);
+#ifdef BRAINSTORM_VERIFY_VECTOR_GATE
+	fprintf(stderr, "vector-gate-plan first=%d tag=%d target=%d\n",
+			plan.vectorFirstGate, plan.vectorTagGate, plan.vectorTagTarget);
+#endif
 	plan.criteriaHash = pool_hash_plan(&plan);
 	pool_set_identity(&plan);
 	if (!strcmp(argv[1], "scan")) return pool_mode_scan_locked(&catalog, &plan, argv[4]);

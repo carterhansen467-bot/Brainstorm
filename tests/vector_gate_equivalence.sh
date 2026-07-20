@@ -83,6 +83,7 @@ $CC_BIN -O3 -Wall -Wno-unused-function -ffp-contract=off $THREAD_FLAG \
 write_criteria() {
 	name=$1
 	legendary=$2
+	routes=${3:-canonical_charm}
 	{
 		echo "poolver 1"
 		echo "threads 1"
@@ -95,7 +96,7 @@ write_criteria() {
 		echo "tag_route collect"
 		echo "tag tag_charm 1 small 1 small 1"
 		if test "$legendary" = 1; then
-			echo "legendary_routes canonical_charm"
+			echo "legendary_routes $routes"
 			echo "legendary j_perkeo 1 small 1 small 0 charm"
 			echo "soul_depth 1"
 		fi
@@ -103,15 +104,83 @@ write_criteria() {
 	} > "$OUT/$name.cfg"
 }
 
+write_inferred_charm_criteria() {
+	{
+		echo "poolver 1"
+		echo "threads 1"
+		echo "start 0"
+		echo "count $POOL_COUNT"
+		echo "checkpoint $POOL_COUNT"
+		echo "chunk 16384"
+		echo "resume 0"
+		echo "format binary"
+		echo "tag_route collect"
+		echo "legendary_routes full"
+		echo "legendary j_perkeo 1 small 1 small 0 charm"
+		echo "soul_depth 1"
+		echo "end"
+	} > "$OUT/inferred-charm.cfg"
+}
+
 write_criteria tag-only 0
 write_criteria rebatch 1
-for name in tag-only rebatch; do
+write_criteria rebatch-full 1 full
+write_inferred_charm_criteria
+for name in tag-only rebatch rebatch-full inferred-charm; do
 	"$OUT/brainstorm_seed_pool_verify$EXE" scan \
-		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-on.bspool"
+		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-on.bspool" \
+		2> "$OUT/$name-on.log"
 	BRAINSTORM_VECTOR_GATE=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
-		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-off.bspool"
+		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-off.bspool" \
+		2> "$OUT/$name-off.log"
 	cmp "$OUT/$name-on.bspool" "$OUT/$name-off.bspool"
+	python3 - "$OUT/$name-on.bspool" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as handle:
+    header = handle.read(8192).split(b"\0", 1)[0].decode("ascii")
+records = int(next(line.split()[1] for line in header.splitlines()
+                   if line.startswith("records ")))
+if records <= 0:
+    raise SystemExit("gate differential produced no accepted records: %s" % path)
+PY
 	echo "PASS Builder $name gate-on/off output is byte-identical"
 done
+
+grep -q '^vector-gate-plan first=1 tag=2 target=[0-9][0-9]*$' \
+	"$OUT/inferred-charm-on.log" || {
+	echo "FAIL source-implied Charm predicate did not enable the staged tag gate" >&2
+	exit 1
+}
+grep -q '^vector-gate-plan first=0 tag=0 target=' \
+	"$OUT/inferred-charm-off.log" || {
+	echo "FAIL BRAINSTORM_VECTOR_GATE=0 did not disable the inferred gate" >&2
+	exit 1
+}
+
+# The inferred predicate changes execution only. Its bounded membership must
+# equal the physically equivalent explicit A1-Small Charm rule, while keeping
+# the source-only pool's own criteria/header identity.
+"$OUT/brainstorm_seed_pool_verify$EXE" export \
+	"$OUT/inferred-charm-on.bspool" "$OUT/inferred-charm.txt"
+"$OUT/brainstorm_seed_pool_verify$EXE" export \
+	"$OUT/rebatch-full-on.bspool" "$OUT/explicit-charm.txt"
+awk '{ print $1 }' "$OUT/inferred-charm.txt" > "$OUT/inferred-charm.seeds"
+awk '{ print $1 }' "$OUT/explicit-charm.txt" > "$OUT/explicit-charm.seeds"
+cmp "$OUT/inferred-charm.seeds" "$OUT/explicit-charm.seeds"
+echo "PASS source-implied and explicit A1-Small Charm membership agree"
+
+# Duplicate modded Charm keys select one physical catalog index in the scalar
+# targeted-Charm walk. The derived gate must follow that resolved index and
+# may never reject a scalar member.
+"$OUT/brainstorm_seed_pool_verify$EXE" scan \
+	"$OUT/duplicate-tag.cfg" "$OUT/inferred-charm.cfg" \
+	"$OUT/inferred-duplicate-on.bspool" 2> "$OUT/inferred-duplicate-on.log"
+BRAINSTORM_VECTOR_GATE=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
+	"$OUT/duplicate-tag.cfg" "$OUT/inferred-charm.cfg" \
+	"$OUT/inferred-duplicate-off.bspool" 2> "$OUT/inferred-duplicate-off.log"
+cmp "$OUT/inferred-duplicate-on.bspool" "$OUT/inferred-duplicate-off.bspool"
+echo "PASS source-implied Charm gate preserves duplicate-catalog output"
 
 echo "PASS vector gate searcher/Builder equivalence"

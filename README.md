@@ -618,7 +618,12 @@ the scalar evaluator.
   once eight legendary-gate survivors accumulate and gates the ante-1
   Small tag pick (rules pinned to that window, natural space); decided
   first picks hand their post-draw stream state to the evaluator instead
-  of recomputing the draw. Measured on M1 Max: Perkeo+Charm build **1.70x**
+  of recomputing the draw. An exact ante-1 Small Charm-source Legendary
+  rule now derives that same physical Tag1 prerequisite internally, without
+  adding a tag criterion or changing pool identity/resume compatibility.
+  The user's exhaustive Perkeo/Charm plan measured **29.0M to 56.0M
+  seeds/s (1.93x)** over a byte-identical 500M-rank comparison. Earlier
+  measured M1 Max results: Perkeo+Charm build **1.70x**
   single-thread / **1.83x** all-core, legendary-only 1.10x, pinned
   tag-only 1.27x.
 - **Searcher** (`brainstorm_native_search`, both full-space and poolfile
