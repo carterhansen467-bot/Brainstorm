@@ -10,6 +10,32 @@ pool shortcut may change execution order, but it must not change the seeds,
 routes, metadata, or exhaustion semantics accepted by the established scalar
 and Lua models.
 
+## Review notes applied 2026-07-20
+
+Two behaviors changed after the post-attachment review; future work should
+build on these semantics rather than the ones they replaced.
+
+1. **Deterministic Builder publication now parks finished chunks instead of
+   blocking.** The in-order chunk protocol had workers idle in a publication
+   convoy, measured at 6–14% on multi-thread builds. A finished chunk out of
+   cursor order now deposits its worker-local run (capped ring, buffer
+   recycling, `pool_chunk_publish_or_deposit`) and the worker continues
+   scanning; whichever thread advances the cursor drains parked chunks in
+   order. Byte output is unchanged — deposits publish in exactly the cursor
+   order — and multi-thread pools remain byte-identical to single-thread.
+   Measured: dense-build overhead cut from +14% to +7%, sparse builds back to
+   the pre-determinism baseline; TSan-clean. Slot collisions beyond the
+   64-entry ring are possible now that spans exceed worker count, so every
+   writer wake is a broadcast; keep it that way.
+2. **Automatic pool selection prefers an authoritative pool over a smaller
+   accelerator**, matching ATTACHED_SEED_POOLS.md runtime selection rule 3.
+   The prior smallest-first order optimized time-to-first-hit but let a
+   definitive miss fall back from an exhausted accelerator into a full
+   unrestricted scan; authoritative exhaustion ends the search instead.
+   Records, pool id, and filename remain the tie-breaks, and
+   `pool_attachment_matrix.lua` now pins the large-authoritative-over-small-
+   accelerator case.
+
 ## Priority 0 — correctness and release readiness
 
 ### 1. Redesign Organize / Combine
