@@ -162,6 +162,20 @@ checkpoint tail time, and thermal variance. Use the corrected family-specific
 benchmark path and keep result membership nonempty so measurements are not
 vacuous.
 
+Test one high-value derived gate first: an exact A1-Small Legendary rule whose
+source is the Charm reward can succeed only when that blind physically rolls a
+Charm Tag. Reuse the existing survivor tag gate from that source constraint
+without adding a tag criterion or changing the pool identity, route metadata,
+or attachment signature. On an M1 Max portable build, the source-only
+Perkeo/Charm workload measured about 29.5M seeds/s while the otherwise
+equivalent explicit-tag plan measured 93.3M seeds/s; both produced the same
+9,900 ranks over a 50M-rank comparison. That bounded result identifies the
+opportunity but is not the proof. Differentially cover randomized ranges,
+Small/Big locations, Charm/Ethereal sources, route modes, Soul depths,
+Negative requirements, starting Omen state, duplicate/modded tag catalogs,
+expanded seed spaces, metadata, resume, and gate-disabled output before
+enabling the inference.
+
 ### 11. Evaluate target-native Windows PGO
 
 Train Windows search and Builder profiles on Windows, rebuild with matching
@@ -197,33 +211,47 @@ project's fixed `Vector512` code literally.
 
 ## Priority 3 — product and UX additions
 
-### 15. Show where a found joker was located
+### 15. Delete paused and incomplete pools safely
+
+Extend the Builder's completed-pool deletion workflow to paused, resumable,
+and non-resumable incomplete pools. Refuse deletion while any Builder,
+Organizer, refilter, merge, or native writer has the pool open as an input or
+output. Bind confirmation to the pool identity plus its current checkpoint and
+file identities so a stale browser action cannot delete a scan that resumed in
+the meantime. Clearly distinguish deleting recoverable scan progress from
+removing an unusable partial artifact; enumerate the `.bspool`, `.state`,
+`.manifest`, `.criteria.cfg`, and applicable temporary/attachment sidecars,
+remove the main pool last, and preserve the reusable writer-lock inode. Test
+paused fresh scans, refilters, distributed parts, missing or damaged sidecars,
+stale confirmations, concurrent writers, and Windows file-lock behavior.
+
+### 16. Show where a found joker was located
 
 The search already records locations. Add a concise result notification such
 as “Found in Shop,” “Found in Pack,” or the exact route label, including when a
 seed is banked rather than immediately applied. Avoid overlapping the existing
 seed-slot and search-progress messages.
 
-### 16. Optional scoring and ranked results
+### 17. Optional scoring and ranked results
 
 Add `should`-style criteria only as a separate result-ranking feature. It must
 not weaken mandatory predicates or be presented as a generation-speed gain.
 Define deterministic scoring, tie-breaking, retention limits, and export.
 
-### 17. Richer native survivor metadata
+### 18. Richer native survivor metadata
 
 Consider returning route/location metadata with survivors to avoid a second
 native analysis pass. Main-thread Lua verification remains the final authority
 before a seed is applied.
 
-### 18. Managed remote search
+### 19. Managed remote search
 
 Consider a remote worker abstraction only after local shards, checkpoints,
 merge publication, and Organizer workflows are dependable. Preserve explicit
 ranges, identities, resumability, provenance, and independent result
 verification.
 
-### 19. General typed filter authoring
+### 20. General typed filter authoring
 
 A JAML-style must/should/must-not and Boolean editor could expand the product,
 but it risks duplicating route semantics. Do not begin it before canonical
@@ -231,7 +259,7 @@ attachment predicates and composite pool semantics are stable.
 
 ## Priority 4 — repository maintenance
 
-### 20. Remove obsolete workspace artifacts
+### 21. Remove obsolete workspace artifacts
 
 After confirming they contain no unique user work, remove the old `.bak` files
 and prune the stale distributed-worktree registration. Keep this separate from
