@@ -36,6 +36,7 @@ from __future__ import print_function
 import argparse
 import base64
 import collections
+import functools
 import heapq
 import json
 import os
@@ -320,7 +321,7 @@ class Occurrence:
     def is_operand(self) -> bool:
         return self.operand_id is not None
 
-    @property
+    @functools.cached_property
     def category_id(self) -> Optional[str]:
         if not self.known:
             return None
@@ -1170,19 +1171,38 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
     operand_counts = collections.Counter()
     records_without_provenance = 0
     records_without_operands = 0
+    # Descriptor text is block-local but normally repeats for hundreds of
+    # thousands (or millions) of records.  Resolve each raw descriptor once.
+    # Besides avoiding repeated formatting, do not use
+    # ``details.setdefault(key, item.as_dict())`` here: Python evaluates the
+    # default eagerly, which previously rebuilt the full label/dictionary for
+    # every occurrence even after the category was already known.
+    category_ids = {}
     for record in reader.iter_records():
-        categories = record_categories(record, selected)
+        categories_set = set()
         record_provenance = set()
         record_operands = set()
         for item in record.occurrences:
-            if item.known and item.category_id in categories:
-                details.setdefault(item.category_id, item.as_dict())
-            elif item.is_provenance:
-                record_provenance.add(item.provenance_id)
-            elif item.is_operand:
-                record_operands.add(item.operand_id)
-            elif not item.known:
+            if item.known:
+                category = category_ids.get(item.raw)
+                if category is None:
+                    category = item.category_id
+                    category_ids[item.raw] = category
+                if selected is None or category in selected:
+                    categories_set.add(category)
+                    if category not in details:
+                        details[category] = item.as_dict()
+                continue
+            provenance_id = item.provenance_id
+            if provenance_id is not None:
+                record_provenance.add(provenance_id)
+                continue
+            operand_id = item.operand_id
+            if operand_id is not None:
+                record_operands.add(operand_id)
+            else:
                 opaque_associations += 1
+        categories = sorted(categories_set)
         for branch_id in record_provenance:
             provenance_counts[branch_id] += 1
         if reader.is_composite and not record_provenance:

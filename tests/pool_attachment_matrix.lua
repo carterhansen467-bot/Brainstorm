@@ -17,6 +17,35 @@ G = { FUNCS = {} }
 Brainstorm = { SETTINGS = { autoreroll = {}, multiAnteSearch = {} }, AUTOREROLL = {} }
 assert(loadfile(reroll))()
 
+-- The in-game selector stores exact filenames but must never render an
+-- unbounded filename into Balatro's fixed-width settings layout.  Automatic
+-- is the default behavior, duplicate labels remain distinguishable, and a
+-- temporarily missing manual selection is preserved safely.
+do
+  local headers = {
+    ["a-very-long-file-name-that-used-to-break-the-settings-layout.bspool"] =
+      {label = "A very long shared display label that is also unsafe", pool_id = "aaaabbbb"},
+    ["second.bspool"] = {label = "Duplicate", pool_id = "11112222"},
+    ["third.bspool"] = {label = "Duplicate", pool_id = "33334444"},
+  }
+  local options, files, current = Brainstorm.buildSeedPoolOptions({
+    "ignored.attached", "third.bspool",
+    "a-very-long-file-name-that-used-to-break-the-settings-layout.bspool",
+    "second.bspool",
+  }, "missing-selected-pool-with-a-long-name.bspool", function(name)
+    return headers[name]
+  end)
+  assert(options[1] == "Automatic" and files.Automatic == "" and current == #options)
+  local seen = {}
+  for _, label in ipairs(options) do
+    assert(#label <= 24, "pool option exceeded its bounded display width")
+    assert(not seen[label], "pool option labels collided")
+    seen[label] = true
+  end
+  assert(files[options[current]] == "missing-selected-pool-with-a-long-name.bspool")
+  assert(Brainstorm.poolInfoString(""):match("^Automatic:"))
+end
+
 local function setActive(tag, legendary, negative, soul, tagAnywhere, legAnywhere)
   Brainstorm.SETTINGS.autoreroll = {
     seedPoolFile = "",

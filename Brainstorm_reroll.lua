@@ -3514,10 +3514,74 @@ function Brainstorm.findAutomaticSeedPool()
 	return choices[1]
 end
 
+-- The settings cycler must store the exact filename, but rendering that raw
+-- filename lets a long shared-pool name widen Balatro's option-cycle node and
+-- push the whole settings tab off-screen.  Keep display labels bounded and
+-- return an explicit label -> filename map.  Empty filename is the normal
+-- automatic mode: compatible attached accelerators are tried first, then the
+-- unrestricted search continues when they are exhausted.
+local SEED_POOL_OPTION_MAX = 24
+
+function Brainstorm.seedPoolOptionLabel(name, header, suffix)
+	local value = header and header.label or ""
+	if not value or value == "" then
+		value = tostring(name or ""):gsub("%.bspool$", "")
+	end
+	value = value:gsub("[%c]", " "):gsub("^%s+", ""):gsub("%s+$", "")
+	if value == "" then value = "Unnamed pool" end
+	suffix = suffix and tostring(suffix):sub(1, 8) or ""
+	local tail = suffix ~= "" and (" [" .. suffix .. "]") or ""
+	local room = math.max(4, SEED_POOL_OPTION_MAX - #tail)
+	if #value > room then value = value:sub(1, room - 3) .. "..." end
+	return value .. tail
+end
+
+function Brainstorm.buildSeedPoolOptions(items, saved, readHeader)
+	local filenames = {}
+	for _, name in ipairs(items or {}) do
+		if type(name) == "string" and name:match("%.bspool$") then
+			filenames[#filenames + 1] = name
+		end
+	end
+	table.sort(filenames)
+	local options = {"Automatic"}
+	local files = {["Automatic"] = ""}
+	local current, seenSaved = 1, false
+	local function append(name, missing)
+		local header
+		if readHeader and not missing then
+			local ok, value = pcall(readHeader, name)
+			if ok then header = value end
+		end
+		local label = Brainstorm.seedPoolOptionLabel(name, header)
+		if files[label] ~= nil then
+			local identity = header and header.pool_id or ""
+			identity = identity and identity:sub(1, 4) or ""
+			if identity == "" then identity = tostring(#options) end
+			label = Brainstorm.seedPoolOptionLabel(name, header, identity)
+			local collision = 2
+			while files[label] ~= nil do
+				label = Brainstorm.seedPoolOptionLabel(name, header,
+					identity .. "-" .. tostring(collision))
+				collision = collision + 1
+			end
+		end
+		options[#options + 1] = label
+		files[label] = name
+		if name == saved then current, seenSaved = #options, true end
+	end
+	for _, name in ipairs(filenames) do append(name, false) end
+	-- Preserve an explicitly selected file that is temporarily missing.  This
+	-- retains the existing safety rule: disappearance must not silently broaden
+	-- a manual pool search into an unrestricted one.
+	if saved and saved ~= "" and not seenSaved then append(saved, true) end
+	return options, files, current
+end
+
 -- One-line description shown under the in-game Seed Pool selector; the
 -- pool_id prefix is the shareable identity mark (same file => same id).
 function Brainstorm.poolInfoString(name)
-	if not name or name == "" then return "" end
+	if not name or name == "" then return "Automatic: compatible attached pools first" end
 	local h = Brainstorm.readPoolHeader(Brainstorm.seedPoolDir() .. "/" .. name)
 	if not h then return "(pool file missing or unreadable)" end
 	local bits = {}

@@ -512,11 +512,14 @@ again without losing their snapshot expression or source-filter map.
 
 Drop the finished `.bspool` into `Mods/Brainstorm/seed_pools/` (the folder is
 created the first time the Brainstorm settings tab opens). A **Seed Pool**
-selector appears in the Brainstorm tab listing every pool in that folder;
-pick one and start an auto-reroll as usual. While a pool is selected, the
-native helper only considers seeds recorded in the pool -- your other active
-Brainstorm filters still apply on top of it, and each search starts at a
-random position in the pool so repeat searches surface different seeds.
+selector appears in the Brainstorm tab. Leave it on **Automatic** for normal
+use; choose one of its bounded display labels only when you deliberately want
+to force a particular file. The exact filename remains stored internally and
+the pool id below the selector disambiguates repeated labels. While a pool is
+manually selected, the native helper only considers seeds recorded in that
+pool -- your other active Brainstorm filters still apply on top of it, and each
+search starts at a random position in the pool so repeat searches surface
+different seeds.
 
 For a pool with complete source coverage, a search that covers every record
 without a hit is a definitive verdict: the mod stops and reports that no seed
@@ -528,7 +531,8 @@ refilter finishes. Pool searches never fall back to the full-space Lua thread
 search -- that could return a seed outside the selected pool. They require the
 native helper (macOS: built by `native/build.sh`; Windows: release-zip exes).
 
-An attached pool is different from a manual selection. With **Seed Pool: None**,
+An attached pool is different from a manual selection. With **Seed Pool:
+Automatic** (the default),
 Brainstorm may automatically choose a compatible `.attached` pool whose
 embedded predicate is proven broader than the active request. Manual selection
 always wins. Automatic records still pass the native filters and the independent
@@ -542,7 +546,12 @@ optional Negative, first-or-second Soul breadth, and full versus Fast Exact
 coverage. Voucher, Legendary-anywhere, composite, tag-anywhere, and ambiguous
 route/source relationships are ignored for automatic selection until their
 implication rules have separate differential proofs; they remain available via
-the manual selector.
+the manual selector. The one-time **Attach to Brainstorm** action in the Builder
+creates this persistent local policy; it is not an in-game setting that must be
+enabled for each search. Automatic attachment currently accepts only the
+natural eight-character seed space, preventing an automatic search from
+silently introducing short, `O`, or `0` seeds that the game would not naturally
+deal.
 
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
 their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model

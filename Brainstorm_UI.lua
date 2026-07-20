@@ -313,7 +313,13 @@ end
 -- freshly copied-in pool shows up without a restart. The setting stores the
 -- FILENAME (not the index): the list can change between sessions.
 G.FUNCS.change_seed_pool = function(x)
-	Brainstorm.SETTINGS.autoreroll.seedPoolFile = (x.to_val ~= "None") and x.to_val or ""
+	local mapped = Brainstorm.seedPoolFileByOption
+		and Brainstorm.seedPoolFileByOption[x.to_val]
+	if mapped == nil then
+		-- Compatibility with an already-open tab from an older script revision.
+		mapped = (x.to_val ~= "None" and x.to_val ~= "Automatic") and x.to_val or ""
+	end
+	Brainstorm.SETTINGS.autoreroll.seedPoolFile = mapped
 	Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(Brainstorm.SETTINGS.autoreroll.seedPoolFile)
 	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
@@ -714,27 +720,13 @@ function create_tabs(args)
 				local poolDir = Brainstorm.seedPoolDir and Brainstorm.seedPoolDir()
 					or (Brainstorm.modPath() .. "/seed_pools")
 				nativefs.createDirectory(poolDir)
-				local poolNames = {"None"}
 				local poolItems = nativefs.getDirectoryItems(poolDir) or {}
-				table.sort(poolItems)
-				for _, fn in ipairs(poolItems) do
-					if fn:match("%.bspool$") then poolNames[#poolNames + 1] = fn end
-				end
 				local savedPool = Brainstorm.SETTINGS.autoreroll.seedPoolFile
-				local poolCurrent = 1
-				if savedPool and savedPool ~= "" then
-					local seen = false
-					for i, n in ipairs(poolNames) do
-						if i > 1 and n == savedPool then poolCurrent = i; seen = true; break end
-					end
-					-- Selected pool no longer on disk: still show (and keep) the
-					-- selection so a temporarily missing drive doesn't silently
-					-- turn a pool search into a full-space search.
-					if not seen then
-						poolNames[#poolNames + 1] = savedPool
-						poolCurrent = #poolNames
-					end
-				end
+				local poolNames, poolFiles, poolCurrent = Brainstorm.buildSeedPoolOptions(
+					poolItems, savedPool, function(fn)
+						return Brainstorm.readPoolHeader(poolDir .. "/" .. fn)
+					end)
+				Brainstorm.seedPoolFileByOption = poolFiles
 				Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(savedPool or "")
 				if Brainstorm.refreshSearchEstimateDisplay then
 					Brainstorm.refreshSearchEstimateDisplay(true)

@@ -99,6 +99,7 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertTrue(os.path.isfile(result["report_path"]))
         self.assertTrue(all(os.path.dirname(row["path"]) == self.temp.name
                             for row in result["outputs"]))
+
         self.assertTrue(all(row["name"].startswith("paused-test--")
                             for row in result["outputs"]))
         self.assertFalse(any(name.startswith(".organizer-stage-")
@@ -112,6 +113,12 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertEqual(derived.header.one("parent_snapshot_id"),
                          self.identity["snapshot"])
         self.assertEqual(derived.family_id, int(self.identity["family"], 16))
+
+    def test_large_inspection_has_visible_busy_feedback(self):
+        page = web.PAGE
+        self.assertIn("Inspecting ${fmt(row.records)} seeds…", page)
+        self.assertIn("button.disabled=true", page)
+        self.assertIn('button.textContent="Inspect pool"', page)
 
     def test_stale_plan_traversal_and_unresolved_split_are_safe(self):
         with self.assertRaisesRegex(organizer.PoolError, "choose a pool"):
