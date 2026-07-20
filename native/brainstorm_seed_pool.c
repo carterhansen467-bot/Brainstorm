@@ -56,6 +56,20 @@ typedef enum { POOL_BINARY = 0, POOL_TEXT = 1, POOL_COUNT = 2 } PoolFormat;
 
 typedef struct PoolEventHit PoolEventHit;
 
+/* One finished chunk's worker-local hit run, parked until the ordered
+ * publication cursor reaches it. Depositing lets a worker move on to the
+ * next chunk instead of idling in the publication convoy; capacity below
+ * bounds the parked memory and keeps chunk spans finite. */
+#define POOL_DEPOSIT_CAP 16
+typedef struct {
+	bool ready;
+	uint64_t begin, end;
+	unsigned char *buf;
+	size_t used;
+	PoolEventHit *events;
+	size_t eventUsed;
+} PoolChunkDeposit;
+
 typedef struct {
 	char key[MAX_KEY];
 	int poolIndex;
@@ -3079,6 +3093,13 @@ typedef struct {
 	size_t pendingUsed;
 	PoolEventHit *pendingEvents;
 	size_t pendingEventUsed;
+	PoolChunkDeposit deposit[64];
+	int depositReady;
+	bs_cond_t depositRoom;
+	unsigned char *freeRankBufs[POOL_DEPOSIT_CAP];
+	int nfreeRankBufs;
+	PoolEventHit *freeEventBufs[4];
+	int nfreeEventBufs;
 	uint64_t *membershipDigest;
 	uint64_t *metadataDigest;
 } PoolScanShared;
@@ -3102,6 +3123,7 @@ static void pool_scan_fail(PoolScanShared *s, bool outputLocked) {
 	if (!outputLocked) bs_mutex_lock(&s->outMutex);
 	atomic_store(&s->ioError, true);
 	for (size_t i = 0; i < 64; i++) bs_cond_broadcast(&s->outReady[i]);
+	bs_cond_broadcast(&s->depositRoom);
 	if (!outputLocked) bs_mutex_unlock(&s->outMutex);
 }
 
@@ -3130,14 +3152,19 @@ static void pool_chunk_writer_abort(PoolChunkWriter *w) {
 	}
 }
 
+static void pool_drain_deposits_locked(PoolScanShared *s);
+
 static bool pool_chunk_writer_finish(PoolChunkWriter *w) {
 	if (!pool_chunk_writer_begin(w)) return false;
 	w->shared->writeNext = w->end;
-	bs_cond_signal(&w->shared->outReady[
-			pool_chunk_writer_slot(w->shared, w->end)]);
+	/* Parked successor chunks may already be waiting on this cursor; publish
+	 * them now, then wake whichever waiter class the new cursor unblocks.
+	 * Deposits stretch in-flight chunk spans past the 64-slot ring, so slot
+	 * collisions are possible and every wake must be a broadcast. */
+	pool_drain_deposits_locked(w->shared);
 	bs_mutex_unlock(&w->shared->outMutex);
 	w->ownsTurn = false;
-	return true;
+	return !atomic_load(&w->shared->ioError);
 }
 
 static bool pool_read_input_batch(const PoolScanShared *s, uint64_t first,
@@ -3432,12 +3459,9 @@ fail:
 
 /* Append a worker-local, rank-ascending run to the shared canonical block
  * assembler. Full BSP3 blocks therefore depend only on logical record order,
- * never on which worker happened to finish first. */
-static bool pool_flush_event_hits(PoolChunkWriter *writer, PoolEventHit *hits,
+ * never on which worker happened to finish first. Callers hold outMutex. */
+static bool pool_append_events_locked(PoolScanShared *s, PoolEventHit *hits,
 		size_t *used) {
-	if (!*used) return true;
-	PoolScanShared *s = writer->shared;
-	if (!pool_chunk_writer_begin(writer)) return false;
 	size_t at = 0;
 	while (at < *used) {
 		size_t room = POOL_EVENT_BLOCK_RECORDS - s->pendingEventUsed;
@@ -3448,12 +3472,21 @@ static bool pool_flush_event_hits(PoolChunkWriter *writer, PoolEventHit *hits,
 		at += n;
 		if (s->pendingEventUsed == POOL_EVENT_BLOCK_RECORDS
 				&& !pool_write_event_block_locked(s, s->pendingEvents,
-						&s->pendingEventUsed)) {
-			pool_chunk_writer_abort(writer);
+						&s->pendingEventUsed))
 			return false;
-		}
 	}
 	*used = 0;
+	return true;
+}
+
+static bool pool_flush_event_hits(PoolChunkWriter *writer, PoolEventHit *hits,
+		size_t *used) {
+	if (!*used) return true;
+	if (!pool_chunk_writer_begin(writer)) return false;
+	if (!pool_append_events_locked(writer->shared, hits, used)) {
+		pool_chunk_writer_abort(writer);
+		return false;
+	}
 	return true;
 }
 
@@ -3497,12 +3530,8 @@ static bool pool_write_block_locked(PoolScanShared *s, unsigned char *buf,
 	return true;
 }
 
-static bool pool_flush_hits(PoolChunkWriter *writer, unsigned char *buf,
-		unsigned char *encoded, size_t *used) {
-	(void)encoded;
-	PoolScanShared *s = writer->shared;
-	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
-	if (!pool_chunk_writer_begin(writer)) return false;
+static bool pool_append_run_locked(PoolScanShared *s, const unsigned char *buf,
+		size_t *used) {
 	size_t at = 0;
 	while (at < *used) {
 		size_t room = POOL_OUTPUT_BUFFER - s->pendingUsed;
@@ -3512,13 +3541,160 @@ static bool pool_flush_hits(PoolChunkWriter *writer, unsigned char *buf,
 		at += n;
 		if (s->pendingUsed == POOL_OUTPUT_BUFFER
 				&& !pool_write_block_locked(s, s->pending, s->pendingEncoded,
-						&s->pendingUsed)) {
-			pool_chunk_writer_abort(writer);
+						&s->pendingUsed))
 			return false;
-		}
 	}
 	*used = 0;
 	return true;
+}
+
+static bool pool_flush_hits(PoolChunkWriter *writer, unsigned char *buf,
+		unsigned char *encoded, size_t *used) {
+	(void)encoded;
+	PoolScanShared *s = writer->shared;
+	if (!*used || s->p->format == POOL_COUNT) { *used = 0; return true; }
+	if (!pool_chunk_writer_begin(writer)) return false;
+	if (!pool_append_run_locked(s, buf, used)) {
+		pool_chunk_writer_abort(writer);
+		return false;
+	}
+	return true;
+}
+
+/* Publish one parked chunk into the assembler and recycle its buffer. */
+static bool pool_publish_deposit_locked(PoolScanShared *s, PoolChunkDeposit *d) {
+	bool ok = true;
+	if (d->events) {
+		ok = pool_append_events_locked(s, d->events, &d->eventUsed);
+		if (s->nfreeEventBufs < (int)(sizeof s->freeEventBufs
+				/ sizeof s->freeEventBufs[0]))
+			s->freeEventBufs[s->nfreeEventBufs++] = d->events;
+		else free(d->events);
+	} else if (d->buf) {
+		ok = pool_append_run_locked(s, d->buf, &d->used);
+		if (s->nfreeRankBufs < POOL_DEPOSIT_CAP)
+			s->freeRankBufs[s->nfreeRankBufs++] = d->buf;
+		else free(d->buf);
+	}
+	d->buf = NULL;
+	d->events = NULL;
+	d->ready = false;
+	s->depositReady--;
+	return ok;
+}
+
+static void pool_drain_deposits_locked(PoolScanShared *s) {
+	while (!atomic_load(&s->ioError)) {
+		PoolChunkDeposit *d = &s->deposit[pool_chunk_writer_slot(s, s->writeNext)];
+		if (!d->ready || d->begin != s->writeNext) break;
+		uint64_t end = d->end;
+		if (!pool_publish_deposit_locked(s, d)) {
+			pool_scan_fail(s, true);
+			break;
+		}
+		s->writeNext = end;
+	}
+	/* Unconditionally: a depositRoom waiter whose chunk just became the
+	 * cursor position publishes inline rather than parking, and it can be
+	 * the only thread able to advance the cursor. */
+	bs_cond_broadcast(&s->depositRoom);
+	bs_cond_broadcast(&s->outReady[pool_chunk_writer_slot(s, s->writeNext)]);
+}
+
+/* Chunk-end publication. A worker that already owns the turn (its local
+ * block filled mid-chunk) keeps the original blocking path. Otherwise it
+ * publishes inline when it holds the next cursor position, or parks the
+ * chunk's local buffer and swaps in a fresh one so scanning continues
+ * instead of idling in the publication convoy. Byte output is unchanged:
+ * deposits are published in exactly the cursor order. */
+static bool pool_chunk_publish_or_deposit(PoolChunkWriter *w, bool eventMode,
+		PoolEventHit **eventHits, size_t *eventUsed,
+		unsigned char **outbuf, size_t *outUsed) {
+	PoolScanShared *s = w->shared;
+	if (w->ownsTurn) {
+		if (eventMode) {
+			if (!pool_flush_event_hits(w, *eventHits, eventUsed)) return false;
+		} else if (!pool_flush_hits(w, *outbuf, NULL, outUsed)) return false;
+		return pool_chunk_writer_finish(w);
+	}
+	bs_mutex_lock(&s->outMutex);
+	size_t slot = pool_chunk_writer_slot(s, w->begin);
+	for (;;) {
+		if (atomic_load(&s->ioError)) {
+			bs_mutex_unlock(&s->outMutex);
+			return false;
+		}
+		if (s->writeNext == w->begin) break; /* publish inline */
+		if (!s->deposit[slot].ready && s->depositReady < POOL_DEPOSIT_CAP) {
+			/* Park the local run. An empty chunk needs no buffer swap. */
+			unsigned char *replBuf = NULL;
+			PoolEventHit *replEvents = NULL;
+			bool empty = eventMode ? *eventUsed == 0 : *outUsed == 0;
+			if (!empty && eventMode) {
+				replEvents = s->nfreeEventBufs
+						? s->freeEventBufs[--s->nfreeEventBufs]
+						: malloc(POOL_EVENT_BLOCK_RECORDS * sizeof *replEvents);
+				if (!replEvents) goto blocking; /* fall back, stay exact */
+			} else if (!empty) {
+				replBuf = s->nfreeRankBufs
+						? s->freeRankBufs[--s->nfreeRankBufs]
+						: malloc(POOL_OUTPUT_BUFFER);
+				if (!replBuf) goto blocking;
+			}
+			PoolChunkDeposit *d = &s->deposit[slot];
+			d->ready = true;
+			d->begin = w->begin;
+			d->end = w->end;
+			d->buf = NULL; d->used = 0;
+			d->events = NULL; d->eventUsed = 0;
+			if (!empty && eventMode) {
+				d->events = *eventHits; d->eventUsed = *eventUsed;
+				*eventHits = replEvents; *eventUsed = 0;
+			} else if (!empty) {
+				d->buf = *outbuf; d->used = *outUsed;
+				*outbuf = replBuf; *outUsed = 0;
+			}
+			s->depositReady++;
+			bs_mutex_unlock(&s->outMutex);
+			return true;
+		}
+		bs_cond_wait(&s->depositRoom, &s->outMutex);
+	}
+	{
+		bool ok = eventMode ? pool_append_events_locked(s, *eventHits, eventUsed)
+				: pool_append_run_locked(s, *outbuf, outUsed);
+		if (!ok) {
+			pool_scan_fail(s, true);
+			bs_mutex_unlock(&s->outMutex);
+			return false;
+		}
+		s->writeNext = w->end;
+		pool_drain_deposits_locked(s);
+		bool failed = atomic_load(&s->ioError);
+		bs_mutex_unlock(&s->outMutex);
+		return !failed;
+	}
+blocking:
+	while (s->writeNext != w->begin && !atomic_load(&s->ioError))
+		bs_cond_wait(&s->outReady[slot], &s->outMutex);
+	if (atomic_load(&s->ioError)) {
+		bs_mutex_unlock(&s->outMutex);
+		return false;
+	}
+	{
+		bool ok = eventMode ? pool_append_events_locked(s, *eventHits, eventUsed)
+				: pool_append_run_locked(s, *outbuf, outUsed);
+		if (!ok) {
+			pool_scan_fail(s, true);
+			bs_mutex_unlock(&s->outMutex);
+			return false;
+		}
+		s->writeNext = w->end;
+		pool_drain_deposits_locked(s);
+		bool failed = atomic_load(&s->ioError);
+		bs_mutex_unlock(&s->outMutex);
+		return !failed;
+	}
 }
 
 static bool pool_buffer_hit(PoolChunkWriter *writer, unsigned char *buf,
@@ -3811,14 +3987,16 @@ static void *pool_scan_worker(void *arg) {
 						candidate, seeds[0])) goto done;
 			}
 		}
-		/* A chunk is the publication unit. Flush even a partial local block,
-		 * then advance the ordered writer turn; empty chunks take the same turn
-		 * so a later matching chunk can never overtake them. */
+		/* A chunk is the publication unit. Publish in cursor order when it is
+		 * this chunk's turn; otherwise park the local run and keep scanning.
+		 * Empty chunks take the same ordered step so a later matching chunk
+		 * can never overtake them. A deposit swaps the local buffer, so the
+		 * sink's cached pointers must follow it. */
 		if (s->p->format != POOL_COUNT) {
-			if (eventMode) {
-				if (!pool_flush_event_hits(&writer, eventHits, &eventUsed)) goto done;
-			} else if (!pool_flush_hits(&writer, outbuf, encoded, &outUsed)) goto done;
-			if (!pool_chunk_writer_finish(&writer)) goto done;
+			if (!pool_chunk_publish_or_deposit(&writer, eventMode,
+					&eventHits, &eventUsed, &outbuf, &outUsed)) goto done;
+			sink.eventHits = eventHits;
+			sink.outbuf = outbuf;
 		}
 		atomic_fetch_add(&s->matched, chunkMatched);
 		atomic_fetch_add(&s->scanned, end - begin);
@@ -4641,6 +4819,7 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 		atomic_init(&shared.ioError, false);
 		bs_mutex_init(&shared.outMutex);
 		for (size_t i = 0; i < 64; i++) bs_cond_init(&shared.outReady[i]);
+		bs_cond_init(&shared.depositRoom);
 		bool sharedEventMode = p->format == POOL_BINARY
 				&& p->outputSchema == BSPOOL_SCHEMA_EVENTS;
 		if (sharedEventMode)
@@ -4656,6 +4835,7 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			fprintf(stderr, "cannot allocate ordered output buffers\n");
 			free(shared.pendingEvents); free(shared.pending); free(shared.pendingEncoded);
 			for (size_t i = 0; i < 64; i++) bs_cond_destroy(&shared.outReady[i]);
+			bs_cond_destroy(&shared.depositRoom);
 			bs_mutex_destroy(&shared.outMutex);
 			if (out) fclose(out);
 			return 1;
@@ -4680,8 +4860,19 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 			bs_mutex_unlock(&shared.outMutex);
 			if (!flushed) atomic_store(&shared.ioError, true);
 		}
+		/* On success every deposit has drained (the cursor reached epochEnd);
+		 * after an abort, parked runs and recycled buffers may remain. */
+		for (size_t i = 0; i < 64; i++) {
+			free(shared.deposit[i].buf);
+			free(shared.deposit[i].events);
+		}
+		while (shared.nfreeRankBufs)
+			free(shared.freeRankBufs[--shared.nfreeRankBufs]);
+		while (shared.nfreeEventBufs)
+			free(shared.freeEventBufs[--shared.nfreeEventBufs]);
 		free(shared.pendingEvents); free(shared.pending); free(shared.pendingEncoded);
 		for (size_t i = 0; i < 64; i++) bs_cond_destroy(&shared.outReady[i]);
+		bs_cond_destroy(&shared.depositRoom);
 		bs_mutex_destroy(&shared.outMutex);
 		if (atomic_load(&shared.ioError)) {
 			fprintf(stderr, "scan aborted because a worker or output write failed\n");
