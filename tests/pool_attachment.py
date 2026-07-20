@@ -223,7 +223,10 @@ assert(Brainstorm.attachmentMatchesActiveFilters({predicates={
 assert(not Brainstorm.attachmentMatchesActiveFilters({predicates={
   "voucher v_overstock_norm 1 2"}}))
 local selected = assert(Brainstorm.findAutomaticSeedPool())
-assert(selected.pool_file == "accelerator-small.bspool")
+-- The compatible authoritative pool outranks both smaller accelerators
+-- (ATTACHED_SEED_POOLS.md runtime selection rule 3): its exhaustion is
+-- definitive, so a miss never falls back to a full unrestricted scan.
+assert(selected.pool_file == "full.bspool")
 require("nativefs").getDirectoryItems = function()
   return {"full.bspool.attached"}
 end
