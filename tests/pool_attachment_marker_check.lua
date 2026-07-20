@@ -14,11 +14,16 @@ local function read(path, bytes)
   return value
 end
 
+local function normalized(path)
+  path = tostring(path):gsub("\\", "/")
+  return package.config:sub(1, 1) == "\\" and path:lower() or path
+end
+
 package.loaded.nativefs = {
   read = read,
   write = function() end,
   getInfo = function(path)
-    if path ~= poolPath then return nil end
+    if normalized(path) ~= normalized(poolPath) then return nil end
     return { type = "file", size = assert(tonumber(size)),
       modtime = assert(tonumber(modtime)) }
   end,
