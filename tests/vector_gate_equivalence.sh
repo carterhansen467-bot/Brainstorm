@@ -6,7 +6,9 @@
 #     unrestricted Ante-1 physical packs;
 #   - prove duplicate modded tag/voucher keys disable index-specific shortcuts;
 #   - compile the Builder's internal rejection/handoff verifier and require
-#     gate-on/off BSP3 bytes to match for direct and survivor-rebatched tags.
+#     gate-on/off BSP3 bytes to match for direct and survivor-rebatched tags;
+#   - compare the source-implied direct Charm route byte-for-byte with the
+#     generic evaluator across full/fast, Negative, duplicate, and Omen plans.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -105,28 +107,34 @@ write_criteria() {
 }
 
 write_inferred_charm_criteria() {
+	name=$1
+	routes=$2
+	negative=$3
+	start=${4:-0}
 	{
 		echo "poolver 1"
 		echo "threads 1"
-		echo "start 0"
+		echo "start $start"
 		echo "count $POOL_COUNT"
 		echo "checkpoint $POOL_COUNT"
 		echo "chunk 16384"
 		echo "resume 0"
 		echo "format binary"
 		echo "tag_route collect"
-		echo "legendary_routes full"
-		echo "legendary j_perkeo 1 small 1 small 0 charm"
+		echo "legendary_routes $routes"
+		echo "legendary j_perkeo 1 small 1 small $negative charm"
 		echo "soul_depth 1"
 		echo "end"
-	} > "$OUT/inferred-charm.cfg"
+	} > "$OUT/$name.cfg"
 }
 
 write_criteria tag-only 0
 write_criteria rebatch 1
 write_criteria rebatch-full 1 full
-write_inferred_charm_criteria
-for name in tag-only rebatch rebatch-full inferred-charm; do
+write_inferred_charm_criteria inferred-charm full 0
+write_inferred_charm_criteria inferred-charm-fast canonical_charm 0
+write_inferred_charm_criteria inferred-charm-negative full 1 8000000
+for name in tag-only rebatch rebatch-full inferred-charm inferred-charm-fast inferred-charm-negative; do
 	"$OUT/brainstorm_seed_pool_verify$EXE" scan \
 		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-on.bspool" \
 		2> "$OUT/$name-on.log"
@@ -148,14 +156,32 @@ PY
 	echo "PASS Builder $name gate-on/off output is byte-identical"
 done
 
-grep -q '^vector-gate-plan first=1 tag=2 target=[0-9][0-9]*$' \
+for name in inferred-charm inferred-charm-fast inferred-charm-negative; do
+	BRAINSTORM_DIRECT_CHARM=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
+		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-reference.bspool" \
+		2> "$OUT/$name-reference.log"
+	BRAINSTORM_VECTOR_GATE=0 BRAINSTORM_DIRECT_CHARM=0 \
+		"$OUT/brainstorm_seed_pool_verify$EXE" scan \
+		"$FIXTURES/case1.cfg" "$OUT/$name.cfg" "$OUT/$name-scalar.bspool" \
+		2> "$OUT/$name-scalar.log"
+	cmp "$OUT/$name-on.bspool" "$OUT/$name-reference.bspool"
+	cmp "$OUT/$name-on.bspool" "$OUT/$name-scalar.bspool"
+	echo "PASS Builder $name direct-Charm/reference output is byte-identical"
+done
+
+grep -q '^vector-gate-plan first=1 tag=2 target=[0-9][0-9]* direct_charm=1$' \
 	"$OUT/inferred-charm-on.log" || {
-	echo "FAIL source-implied Charm predicate did not enable the staged tag gate" >&2
+	echo "FAIL source-implied Charm plan did not enable its staged gate and direct route" >&2
 	exit 1
 }
-grep -q '^vector-gate-plan first=0 tag=0 target=' \
+grep -q '^vector-gate-plan first=0 tag=0 target=.* direct_charm=1$' \
 	"$OUT/inferred-charm-off.log" || {
 	echo "FAIL BRAINSTORM_VECTOR_GATE=0 did not disable the inferred gate" >&2
+	exit 1
+}
+grep -q '^vector-gate-plan first=1 tag=2 target=.* direct_charm=0$' \
+	"$OUT/inferred-charm-reference.log" || {
+	echo "FAIL BRAINSTORM_DIRECT_CHARM=0 did not restore the generic route" >&2
 	exit 1
 }
 
@@ -180,7 +206,26 @@ echo "PASS source-implied and explicit A1-Small Charm membership agree"
 BRAINSTORM_VECTOR_GATE=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
 	"$OUT/duplicate-tag.cfg" "$OUT/inferred-charm.cfg" \
 	"$OUT/inferred-duplicate-off.bspool" 2> "$OUT/inferred-duplicate-off.log"
+BRAINSTORM_DIRECT_CHARM=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
+	"$OUT/duplicate-tag.cfg" "$OUT/inferred-charm.cfg" \
+	"$OUT/inferred-duplicate-reference.bspool" 2> "$OUT/inferred-duplicate-reference.log"
 cmp "$OUT/inferred-duplicate-on.bspool" "$OUT/inferred-duplicate-off.bspool"
+cmp "$OUT/inferred-duplicate-on.bspool" "$OUT/inferred-duplicate-reference.bspool"
 echo "PASS source-implied Charm gate preserves duplicate-catalog output"
+
+# Starting Omen changes the contents and call order inside the Charm reward,
+# but not the fact that the required A1-Small source has exactly one route.
+awk '
+	$1 == "end" { print "vouchowned v_crystal_ball"; print "vouchowned v_omen_globe" }
+	{ print }
+' "$ROOT/native_search.cfg" > "$OUT/starting-omen.cfg"
+"$OUT/brainstorm_seed_pool_verify$EXE" scan \
+	"$OUT/starting-omen.cfg" "$OUT/inferred-charm.cfg" \
+	"$OUT/inferred-omen-on.bspool" 2> "$OUT/inferred-omen-on.log"
+BRAINSTORM_DIRECT_CHARM=0 "$OUT/brainstorm_seed_pool_verify$EXE" scan \
+	"$OUT/starting-omen.cfg" "$OUT/inferred-charm.cfg" \
+	"$OUT/inferred-omen-reference.bspool" 2> "$OUT/inferred-omen-reference.log"
+cmp "$OUT/inferred-omen-on.bspool" "$OUT/inferred-omen-reference.bspool"
+echo "PASS direct Charm route preserves starting-Omen output"
 
 echo "PASS vector gate searcher/Builder equivalence"

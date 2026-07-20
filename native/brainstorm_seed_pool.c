@@ -136,6 +136,7 @@ typedef struct {
 	int simpleFirstSoul, simpleSoulMinAnte, simpleSoulMaxAnte; /* derived hot path */
 	int vectorFirstGate, vectorGateTarget; /* derived hot path */
 	int vectorTagGate, vectorTagTarget; /* derived: 1 first-stream, 2 staged */
+	int directCharmRoute; /* derived exact A1-Small Charm-only evaluator */
 	uint64_t catalogHash, criteriaHash, stageHash;
 	uint64_t familyId, segmentId, lineageId, derivationId;
 	int refilter, refilterDepth;
@@ -2287,6 +2288,7 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 	 * length 8. */
 	p->vectorTagGate = 0;
 	p->vectorTagTarget = -2;
+	p->directCharmRoute = 0;
 	if (p->space == SPACE_NATURAL) {
 		int found = 0;
 		for (int r = 0; r < p->ntagRules; r++) {
@@ -2324,11 +2326,30 @@ static void pool_finalize_hot_plan(const Config *g, PoolPlan *p) {
 				p->vectorTagGate = 2; /* rebatch legendary-gate survivors */
 		}
 	}
+	/* A fresh, single exact A1-Small Charm-source rule has only one physical
+	 * route that can satisfy it. With no other route predicates to compose,
+	 * evaluating the canonical route first is provably redundant. Keep this
+	 * execution-only specialization narrow; it is not part of pool identity. */
+	if (!p->refilter && p->space == SPACE_NATURAL
+			&& !p->nbaseTagRules && !p->ntagRules
+			&& !p->nbaseLegendaryRules && p->nlegendary == 1
+			&& !pool_voucher_rule_count(p) && !p->nvoucherExclusions
+			&& g->charmTagIdx >= 0) {
+		const PoolLegendaryRule *rule = &p->legendary[0];
+		if (rule->soulDepth == 1 && rule->humanLocation
+				&& rule->minAnte == 1 && rule->maxAnte == 1
+				&& rule->minPhase == SOUL_PHASE_SMALL
+				&& rule->maxPhase == SOUL_PHASE_SMALL
+				&& rule->source == SOUL_SOURCE_CHARM)
+			p->directCharmRoute = 1;
+	}
 	const char *gateEnv = getenv("BRAINSTORM_VECTOR_GATE");
 	if (gateEnv && !strcmp(gateEnv, "0")) {
 		p->vectorFirstGate = 0;
 		p->vectorTagGate = 0;
 	}
+	const char *directEnv = getenv("BRAINSTORM_DIRECT_CHARM");
+	if (directEnv && !strcmp(directEnv, "0")) p->directCharmRoute = 0;
 }
 
 /* All refilter stages constrain one cumulative Soul sequence. Resolve the
@@ -2823,6 +2844,61 @@ static uint16_t pool_omen_activation_mask(PoolCtx *c, int omenIndex,
 	return mask;
 }
 
+/* Materialize and validate one already-rolled Charm skip. Both the general
+ * alternate-route search and the exact-location direct path share this body,
+ * so route state, metadata, Omen timing, and Soul evaluation cannot drift. */
+static bool pool_evaluate_charm_route_at(PoolCtx *c,
+		char *label, size_t labelCap, PoolMetadata *metadata,
+		int baseMetadataCount, size_t baseLabelLength,
+		int ante, int blind, int requireOmen, int routeMaxAnte) {
+	const PoolPlan *p = c->p;
+	int charmIndex = c->g->charmTagIdx;
+	uint8_t *skip = blind == 0 ? &c->skipSm[ante] : &c->skipBig[ante];
+	uint8_t *reward = blind == 0 ? &c->rewardSm[ante] : &c->rewardBig[ante];
+	if (charmIndex < 0 || *skip) return false;
+	uint8_t oldSkip = *skip, oldReward = *reward, oldCharm = c->charmRequired;
+	int oldForced = c->forcedAnte;
+	*skip = 1;
+	*reward = 1;
+	c->charmRequired = 1;
+	pool_resolve_forced_ante(c);
+
+	do {
+		if (metadata) metadata->count = (uint8_t)baseMetadataCount;
+		if (label) label[baseLabelLength] = 0;
+		int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
+		if (!pool_metadata_add(metadata, (PoolOccurrence) {
+				.kind = POOL_META_TAG, .keyIndex = (uint16_t)charmIndex,
+				.ante = (uint8_t)ante, .phase = (uint8_t)phase,
+				.flags = POOL_META_CHARM_REQUIRED,
+		})) break;
+		if (!requireOmen && !pool_voucher_rule_count(p)) {
+			/* No voucher state can change this Charm route. The old helper
+			 * validated Souls internally and the success path replayed them
+			 * solely to recover metadata; perform the final walk once. */
+			pool_reset_soul_walk(c);
+			if (!pool_check_all_souls(c, label, labelCap, metadata)) break;
+		} else {
+			if (!pool_check_vouchers_mode(c, label, labelCap, metadata,
+					requireOmen, 1, routeMaxAnte)) break;
+			pool_reset_soul_walk(c);
+			if (!pool_check_all_souls(c, label, labelCap, metadata)) break;
+		}
+		pool_label_add(label, labelCap, "%sCharmRequired=A%d%s",
+				label && label[0] ? " " : "", ante,
+				blind == 0 ? "Sm" : "Big");
+		return true;
+	} while (0);
+
+	*skip = oldSkip;
+	*reward = oldReward;
+	c->charmRequired = oldCharm;
+	c->forcedAnte = oldForced;
+	if (metadata) metadata->count = (uint8_t)baseMetadataCount;
+	if (label) label[baseLabelLength] = 0;
+	return false;
+}
+
 static bool pool_try_targeted_charm(PoolCtx *c, char *label, size_t labelCap,
 		PoolMetadata *metadata, int baseMetadataCount, size_t baseLabelLength,
 		int soulMaxAnte, int tagMaxAnte, int requireOmen) {
@@ -2841,52 +2917,24 @@ static bool pool_try_targeted_charm(PoolCtx *c, char *label, size_t labelCap,
 		for (int blind = 0; blind < 2; blind++) {
 			int idx = pool_roll_tag_at(c, ante, blind);
 			if (idx < 0) return false;
-			uint8_t *skip = blind == 0 ? &c->skipSm[ante] : &c->skipBig[ante];
-			uint8_t *reward = blind == 0 ? &c->rewardSm[ante] : &c->rewardBig[ante];
-			if (idx != charmIndex || *skip) continue;
-			uint8_t oldSkip = *skip, oldReward = *reward, oldCharm = c->charmRequired;
-			int oldForced = c->forcedAnte;
-			*skip = 1;
-			*reward = 1;
-			c->charmRequired = 1;
-			pool_resolve_forced_ante(c);
-
-			do {
-				if (metadata) metadata->count = (uint8_t)baseMetadataCount;
-				if (label) label[baseLabelLength] = 0;
-				int phase = blind == 0 ? SOUL_PHASE_SMALL : SOUL_PHASE_BIG;
-				if (!pool_metadata_add(metadata, (PoolOccurrence) {
-						.kind = POOL_META_TAG, .keyIndex = (uint16_t)charmIndex,
-						.ante = (uint8_t)ante, .phase = (uint8_t)phase,
-						.flags = POOL_META_CHARM_REQUIRED,
-				})) break;
-				if (!requireOmen && !pool_voucher_rule_count(p)) {
-					/* No voucher state can change this Charm route. The old helper
-					 * validated Souls internally and the success path replayed them
-					 * solely to recover metadata; perform the final walk once. */
-					pool_reset_soul_walk(c);
-					if (!pool_check_all_souls(c, label, labelCap, metadata)) break;
-				} else {
-					if (!pool_check_vouchers_mode(c, label, labelCap, metadata,
-							requireOmen, 1, routeMaxAnte)) break;
-					pool_reset_soul_walk(c);
-					if (!pool_check_all_souls(c, label, labelCap, metadata)) break;
-				}
-				pool_label_add(label, labelCap, "%sCharmRequired=A%d%s",
-						label && label[0] ? " " : "", ante,
-						blind == 0 ? "Sm" : "Big");
-				return true;
-			} while (0);
-
-			*skip = oldSkip;
-			*reward = oldReward;
-			c->charmRequired = oldCharm;
-			c->forcedAnte = oldForced;
+			if (idx != charmIndex) continue;
+			if (pool_evaluate_charm_route_at(c, label, labelCap, metadata,
+					baseMetadataCount, baseLabelLength, ante, blind,
+					requireOmen, routeMaxAnte)) return true;
 		}
 	}
 	if (metadata) metadata->count = (uint8_t)baseMetadataCount;
 	if (label) label[baseLabelLength] = 0;
 	return false;
+}
+
+static bool pool_check_required_charm_small(PoolCtx *c, char *label,
+		size_t labelCap, PoolMetadata *metadata) {
+	int charmIndex = c->g->charmTagIdx;
+	int idx = pool_roll_tag_at(c, 1, 0);
+	if (idx < 0 || idx != charmIndex) return false;
+	return pool_evaluate_charm_route_at(c, label, labelCap, metadata,
+			0, 0, 1, 0, 0, 1);
 }
 
 static void pool_reset_route_state(PoolCtx *c, char *label, size_t labelCap,
@@ -2935,6 +2983,8 @@ static bool pool_evaluate_pre_first(PoolCtx *c, const char seed[9], double hseed
 			return false;
 	} else if (!pool_precheck_all_legendaries(c)) return false;
 	pool_reset_route_state(c, label, labelCap, metadata);
+	if (p->directCharmRoute)
+		return pool_check_required_charm_small(c, label, labelCap, metadata);
 	if (p->nbaseTagRules && !pool_apply_base_route(c, metadata)) return false;
 	if (p->ntagRules && !pool_check_tags(c, label, labelCap, metadata)) return false;
 	c->forcedAnte = 1;
@@ -6217,8 +6267,9 @@ int main(int argc, char **argv) {
 	}
 	pool_finalize_hot_plan(&catalog, &plan);
 #ifdef BRAINSTORM_VERIFY_VECTOR_GATE
-	fprintf(stderr, "vector-gate-plan first=%d tag=%d target=%d\n",
-			plan.vectorFirstGate, plan.vectorTagGate, plan.vectorTagTarget);
+	fprintf(stderr, "vector-gate-plan first=%d tag=%d target=%d direct_charm=%d\n",
+			plan.vectorFirstGate, plan.vectorTagGate, plan.vectorTagTarget,
+			plan.directCharmRoute);
 #endif
 	plan.criteriaHash = pool_hash_plan(&plan);
 	pool_set_identity(&plan);

@@ -609,7 +609,8 @@ reject on evidence the scalar chain must also reject on (decided
 the unchanged scalar path, which remains the single membership authority.
 `BRAINSTORM_VECTOR_GATE=0` disables every gate at runtime, and building
 with `-DBRAINSTORM_VERIFY_VECTOR_GATE` re-checks each rejection against
-the scalar evaluator.
+the scalar evaluator. `BRAINSTORM_DIRECT_CHARM=0` separately restores the
+generic canonical-then-Charm route evaluator for differential testing.
 
 ### Completed
 
@@ -619,10 +620,13 @@ the scalar evaluator.
   Small tag pick (rules pinned to that window, natural space); decided
   first picks hand their post-draw stream state to the evaluator instead
   of recomputing the draw. An exact ante-1 Small Charm-source Legendary
-  rule now derives that same physical Tag1 prerequisite internally, without
-  adding a tag criterion or changing pool identity/resume compatibility.
-  The user's exhaustive Perkeo/Charm plan measured **29.0M to 56.0M
-  seeds/s (1.93x)** over a byte-identical 500M-rank comparison. Earlier
+  rule now derives that same physical Tag1 prerequisite internally and sends
+  survivors directly through the only route that can satisfy the source,
+  without adding a tag criterion or changing pool identity/resume
+  compatibility. The user's exhaustive Perkeo/Charm plan measured **29.0M
+  to 107.3M seeds/s (3.70x)**; on the same 500M-rank comparison, the former
+  gate-only path reached 55.9M/s and the explicit-tag plan reached 99.8M/s.
+  The direct and generic inferred pools were byte-identical. Earlier
   measured M1 Max results: Perkeo+Charm build **1.70x**
   single-thread / **1.83x** all-core, legendary-only 1.10x, pinned
   tag-only 1.27x.
