@@ -191,7 +191,9 @@ def normalized_summary(scanner, pool, path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scanner", default=os.path.join(
-        ROOT, "native", "brainstorm_seed_pool"))
+        ROOT, "native",
+        "brainstorm_seed_pool.exe" if os.name == "nt"
+        else "brainstorm_seed_pool"))
     parser.add_argument("--snapshot", default=os.path.join(
         ROOT, "native_search.cfg"))
     parser.add_argument("--count", type=int, default=8192)
