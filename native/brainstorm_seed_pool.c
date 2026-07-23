@@ -4998,8 +4998,8 @@ static bool pool_append_adaptive_index(FILE *f, int headerBytes,
 		unsigned char header[BSPOOL4_BLOCK_HEADER_SIZE];
 		if (offset > (uint64_t)INT64_MAX
 				|| BSPOOL4_BLOCK_HEADER_SIZE > indexOff - offset
-				|| bs_pread(fileno(f), header, sizeof header,
-					(int64_t)offset) != (int64_t)sizeof header) {
+				|| bs_fseeko(f, (int64_t)offset, SEEK_SET) != 0
+				|| fread(header, 1, sizeof header, f) != sizeof header) {
 			snprintf(err, errsz, "adaptive pool has a truncated block header");
 			return false;
 		}
@@ -5043,10 +5043,9 @@ static bool pool_append_adaptive_index(FILE *f, int headerBytes,
 		entry[48] = header[5];
 		entry[49] = header[6];
 		entry[50] = header[7];
-		/* ReadFile may advance the underlying Windows handle even though
-		 * bs_pread supplies an explicit offset. Reassert the append position
-		 * before every stdio write so the CRT stream and OS handle cannot
-		 * disagree after the positional header read. */
+		/* Keep reads and writes on this update stream inside stdio. Mixing the
+		 * CRT stream with ReadFile positional reads can desynchronize their
+		 * file positions on Windows and overwrite a later block payload. */
 		if (blocks > (UINT64_MAX - indexOff)
 					/ BSPOOL4_INDEX_ENTRY_SIZE) {
 			snprintf(err, errsz, "adaptive pool index offset overflows");
