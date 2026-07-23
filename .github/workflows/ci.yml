@@ -30,10 +30,32 @@ jobs:
         run: LUAJIT=luajit sh tests/native_equivalence.sh
       - name: Analytical search telemetry
         run: luajit tests/search_estimate.lua
+      - name: Native status polling cadence
+        run: luajit tests/native_search_polling.lua
+      - name: Lua worker progress protocol
+        run: luajit tests/lua_search_progress.lua
+      - name: Bounded native filesystem reads
+        run: luajit tests/nativefs_bounded_read.lua nativefs.lua
+      - name: Native filesystem module isolation
+        run: luajit tests/nativefs_module_isolation.lua
+      - name: Bounded variable pool headers
+        run: python3 tests/pool_variable_header.py
+      - name: Representative disposable BSP4 Builder estimate
+        run: python3 tests/pool_builder_estimate_pipeline.py
+      - name: Adaptive BSP4 codec and corruption contract
+        run: python3 tests/pool_bsp4.py
+      - name: Native BSP4 reader and logical-digest contract
+        run: python3 tests/bsp4_native_reader.py
       - name: Exact native arithmetic fast paths
         run: FASTPATH_CASES=1000000 sh tests/native_fastpath_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Vector first-gate differential
         run: sh tests/vector_gate_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures"
+      - name: Joker-heavy eight-lane stream-prime differential
+        run: BRAINSTORM_FIXTURES_DIR="${TMPDIR:-/tmp}/brainstorm_native_fixtures" sh tests/joker_lane_prime_equivalence.sh
+      - name: Native BSP4 writer, resume, merge, and upgrade
+        run: python3 tests/pool_native_bsp4.py --snapshot "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Ordered pool event allocation failure
+        run: python3 tests/pool_event_failure.py
       - name: Fresh profile-guided native helper builds
         run: BRAINSTORM_NATIVE_SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" sh native/build_pgo.sh train
       - name: PGO search oracle equivalence (no rebuild)
@@ -106,10 +128,36 @@ jobs:
       - name: Analytical search telemetry
         run: |
           "$LUAJIT" tests/search_estimate.lua
+      - name: Native status polling cadence
+        run: |
+          "$LUAJIT" tests/native_search_polling.lua
+      - name: Lua worker progress protocol
+        run: |
+          "$LUAJIT" tests/lua_search_progress.lua
+      - name: Bounded native filesystem reads
+        run: |
+          "$LUAJIT" tests/nativefs_bounded_read.lua nativefs.lua
+      - name: Native filesystem module isolation
+        run: |
+          "$LUAJIT" tests/nativefs_module_isolation.lua
+      - name: Bounded variable pool headers
+        run: python tests/pool_variable_header.py
+      - name: Representative disposable BSP4 Builder estimate
+        run: python tests/pool_builder_estimate_pipeline.py
+      - name: Adaptive BSP4 codec and corruption contract
+        run: python tests/pool_bsp4.py
+      - name: Native BSP4 reader and logical-digest contract
+        run: python tests/bsp4_native_reader.py
       - name: Exact native arithmetic fast paths
         run: FASTPATH_CASES=1000000 sh tests/native_fastpath_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Vector first-gate differential
         run: sh tests/vector_gate_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures"
+      - name: Joker-heavy eight-lane stream-prime differential
+        run: BRAINSTORM_FIXTURES_DIR="${TMPDIR:-/tmp}/brainstorm_native_fixtures" sh tests/joker_lane_prime_equivalence.sh
+      - name: Native BSP4 writer, resume, merge, and upgrade
+        run: python tests/pool_native_bsp4.py --snapshot "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Ordered pool event allocation failure
+        run: python tests/pool_event_failure.py
       - name: Hash/odometer generation equivalence
         run: sh tests/hash_generation_equivalence.sh
       - name: Pool engine vs established reference equivalence
@@ -188,4 +236,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             out/brainstorm-windows-full.zip \
             --title "Brainstorm Windows $GITHUB_REF_NAME" \
-            --notes "One tested Windows x64 package for both fresh installs and updates. Extract it and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. The standalone builder and organizer are grouped in their own folder while SMODS-required files stay in place. Built from $GITHUB_SHA after the full Lua/native, pool-route, Soul-depth, compression, shard/merge, pause/resume, and corruption suites passed on windows-latest and macos-latest."
+            --notes "Brainstorm 1.2.0-alpha for Windows x64. This release adds safe automatic accelerator/authoritative pool attachment, vectorized first gates, direct Charm-source evaluation, deterministic parallel publication, adaptive BSP4 pools, lower-memory pipelined Builder output, faster Joker-heavy and multi-Ante searches, bounded in-game telemetry, and the redesigned Organizer split/combine workflow. Extract the full ZIP and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. Existing BSP3 pools remain readable, but BSP4 pools require this release or newer. Built from $GITHUB_SHA after the full Lua/native, pool-route, Soul-depth, attachment, BSP4 corruption, deterministic publication, Organizer, shard/merge, pause/resume, installer, and Windows/macOS equivalence suites passed."

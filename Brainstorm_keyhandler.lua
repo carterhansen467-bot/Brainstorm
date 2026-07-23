@@ -1,5 +1,5 @@
 local lovely = require("lovely")
-local nativefs = require("nativefs")
+local nativefs = require("brainstorm_nativefs")
 
 Brainstorm.AUTOREROLL = {}
 

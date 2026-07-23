@@ -7,6 +7,8 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 SNAPSHOT=${1:-"$ROOT/native_search.cfg"}
 COUNT=${2:-2000000}
+DENSE_COUNT=$COUNT
+if [ "$DENSE_COUNT" -gt 131072 ]; then DENSE_COUNT=131072; fi
 OUT=${TMPDIR:-/tmp}/brainstorm_pool_deterministic_artifacts
 
 case "$(uname -s 2>/dev/null || echo Windows)" in
@@ -38,7 +40,20 @@ write_refilter_criteria() {
 		echo "poolver 1"; echo "threads $threads"; echo "start 0"
 		echo "count $COUNT"; echo "checkpoint 1000003"; echo "chunk 2048"
 		echo "resume 0"; echo "format binary"; echo "tag_route collect"
-		echo "tag tag_3 1 8 1"; echo "end"
+		# The fixture snapshot is intentionally allowed to contain only the
+		# active Charm tag. Refilter on that stable key instead of an obsolete
+		# synthetic tag_3 entry that current snapshots correctly reject.
+		echo "tag tag_charm 1 small 1 small 1"; echo "end"
+	} > "$file"
+}
+
+write_dense_criteria() {
+	file=$1 threads=$2
+	{
+		echo "poolver 1"; echo "threads $threads"; echo "start 0"
+		echo "count $DENSE_COUNT"; echo "checkpoint $DENSE_COUNT"; echo "chunk 16384"
+		echo "resume 0"; echo "format binary"; echo "tag_route collect"
+		echo "tag tag_charm 1 39 1"; echo "end"
 	} > "$file"
 }
 
@@ -53,6 +68,18 @@ write_scan_criteria "$OUT/many-repeat.cfg" 8 1000003
 "$SCANNER" scan "$SNAPSHOT" "$OUT/many-repeat.cfg" "$OUT/many-repeat.bspool"
 cmp "$OUT/one.bspool" "$OUT/many.bspool"
 cmp "$OUT/many.bspool" "$OUT/many-repeat.bspool"
+
+# Dense output fills enough canonical blocks to exercise concurrent encoding,
+# out-of-order encoder completion, and the bounded ready/commit pipeline.
+write_dense_criteria "$OUT/dense-one.cfg" 1
+write_dense_criteria "$OUT/dense-many.cfg" 8
+write_dense_criteria "$OUT/dense-many-repeat.cfg" 8
+"$SCANNER" scan "$SNAPSHOT" "$OUT/dense-one.cfg" "$OUT/dense-one.bspool"
+"$SCANNER" scan "$SNAPSHOT" "$OUT/dense-many.cfg" "$OUT/dense-many.bspool"
+"$SCANNER" scan "$SNAPSHOT" "$OUT/dense-many-repeat.cfg" \
+	"$OUT/dense-many-repeat.bspool"
+cmp "$OUT/dense-one.bspool" "$OUT/dense-many.bspool"
+cmp "$OUT/dense-many.bspool" "$OUT/dense-many-repeat.bspool"
 
 # Refilter workers claim compressed input-record chunks rather than numeric
 # rank chunks, so cover that independent scheduler as well.
@@ -83,4 +110,4 @@ for index, path in enumerate(paths):
     assert expected in manifest
 PY
 
-echo "PASS: BSP3 scan and refilter artifacts are byte-identical across one/eight workers and repeated scheduling"
+echo "PASS: sparse/dense BSP3 scan and refilter artifacts are byte-identical across one/eight workers and repeated scheduling"

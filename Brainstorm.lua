@@ -35,7 +35,7 @@ end
 
 function initBrainstorm()
 	local lovely = require("lovely")
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	Brainstorm.MOD_PATH = Brainstorm.locateModDir(lovely.mod_dir, nativefs)
 	if not Brainstorm.MOD_PATH then
 		error("[Brainstorm] could not find Brainstorm_main.lua anywhere under\n"
@@ -149,4 +149,3 @@ function initBrainstorm()
 	end
   _RELEASE_MODE = not Brainstorm.SETTINGS.debug_mode
 end
-

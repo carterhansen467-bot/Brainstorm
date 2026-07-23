@@ -3,7 +3,7 @@
 -- closed-form and independent of a player's profile/unlock state.
 
 package.loaded.lovely = {mod_dir = ""}
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
 	read = function() return nil end,
 	write = function() return true end,
 	getInfo = function() return nil end,
@@ -222,12 +222,21 @@ now = 102
 Brainstorm.updateSearchStats()
 close(Brainstorm.AUTOREROLL.searchTotalTried, 40, "native progress total")
 close(Brainstorm.AUTOREROLL.searchLiveRate, 20, "measured wall-clock rate")
+Brainstorm.AUTOREROLL.searchTried = 41
+now = 102.05
+Brainstorm.updateSearchStats()
+close(Brainstorm.AUTOREROLL.searchTotalTried, 40,
+	"per-frame progress formatting is throttled")
+now = 102.11
+Brainstorm.updateSearchStats()
+close(Brainstorm.AUTOREROLL.searchTotalTried, 41,
+	"throttled progress refreshes at 10 Hz")
 Brainstorm.startSearchBackendCounter("lua-2")
 Brainstorm.AUTOREROLL.searchTried = 10
 now = 103
 Brainstorm.updateSearchStats()
-close(Brainstorm.AUTOREROLL.searchTotalTried, 50, "backend handoff total")
-close(Brainstorm.AUTOREROLL.searchLikelihood, 1 - (3 / 4) ^ 50,
+close(Brainstorm.AUTOREROLL.searchTotalTried, 51, "backend handoff total")
+close(Brainstorm.AUTOREROLL.searchLikelihood, 1 - (3 / 4) ^ 51,
 	"live likelihood uses total progress", 1e-9)
 
 -- Attached-pool candidates are enriched, not random full-space samples. The
@@ -247,7 +256,7 @@ Brainstorm.startSearchBackendCounter("native-2")
 Brainstorm.AUTOREROLL.searchTried = 4
 now = 105
 Brainstorm.updateSearchStats()
-close(Brainstorm.AUTOREROLL.searchTotalTried, 74,
+close(Brainstorm.AUTOREROLL.searchTotalTried, 75,
 	"attached fallback retains total progress")
 close(Brainstorm.AUTOREROLL.searchLikelihood, 1 - (3 / 4) ^ 4,
 	"attached fallback likelihood is rebased", 1e-9)

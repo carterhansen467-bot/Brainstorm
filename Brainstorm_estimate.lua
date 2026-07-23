@@ -663,6 +663,7 @@ function Brainstorm.beginSearchStats()
 	local est = Brainstorm.estimateSearch()
 	A.searchStatsActive = true
 	A.searchStartedAt = bs_monotonic_time()
+	A.searchLastStatsAt = nil
 	A.searchProbability = est.probability
 	A.searchExpectedSeeds = est.expectedSeeds
 	A.searchPoolRecords = est.poolRecords
@@ -724,10 +725,19 @@ function Brainstorm.setAttachedPoolEstimateMode(attached)
 	A.searchLikelihood = 0
 end
 
-function Brainstorm.updateSearchStats()
+function Brainstorm.updateSearchStats(force)
 	local A = Brainstorm.AUTOREROLL
 	if not A.searchStatsActive then return end
 	local now = bs_monotonic_time()
+	-- The search loop runs once per rendered frame, but the visible counter and
+	-- likelihood do not benefit from 60-240 string rebuilds per second. Keep
+	-- numeric/UI telemetry aligned with the native status cadence and force the
+	-- final sample when a search ends.
+	if not force and A.searchLastStatsAt and now >= A.searchLastStatsAt
+			and now - A.searchLastStatsAt < 0.1 then
+		return
+	end
+	A.searchLastStatsAt = now
 	local elapsed = math.max(0, now - (A.searchStartedAt or now))
 	local tried = (A.searchBackendBase or 0) + (A.searchTried or 0)
 	A.searchTotalTried = tried
@@ -768,7 +778,7 @@ end
 function Brainstorm.finishSearchStats()
 	local A = Brainstorm.AUTOREROLL
 	if not A.searchStatsActive then return end
-	Brainstorm.updateSearchStats()
+	Brainstorm.updateSearchStats(true)
 	local elapsed = A.searchWallElapsed or 0
 	local tried = A.searchTotalTried or 0
 	local backend = A.searchCounterBackend
@@ -786,7 +796,7 @@ function Brainstorm.finishSearchStats()
 		Brainstorm.SETTINGS.searchRateFallback[backend] = entry
 		bs_trim_rate_history(Brainstorm.SETTINGS.searchRateHistory, 24)
 		pcall(function()
-			local nativefs = require("nativefs")
+			local nativefs = require("brainstorm_nativefs")
 			nativefs.write(Brainstorm.modPath() .. "/settings.lua",
 				STR_PACK(Brainstorm.SETTINGS))
 		end)

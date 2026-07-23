@@ -43,11 +43,12 @@ local nativefs = {
   end,
 }
 
-package.loaded.nativefs = nativefs
+package.loaded.brainstorm_nativefs = nativefs
 package.loaded.lovely = { mod_dir = root }
 local windows = package.config:sub(1, 1) == "\\"
+local testNow = 0
 love = {
-  timer = { getTime = os.clock },
+  timer = { getTime = function() return testNow end },
   system = { getOS = function() return windows and "Windows" or "OS X" end },
 }
 G = { FUNCS = {} }
@@ -172,6 +173,7 @@ local function runNative(afterStart, beforeTerminalPoll)
     end
     if not Brainstorm.AUTOREROLL.nativeActive then return nil, selectedName end
     sleepMs(10)
+    testNow = testNow + 0.01
   end
   Brainstorm.stopNativeSearch()
   error("native child did not finish within 10 seconds")

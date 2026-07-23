@@ -299,9 +299,12 @@ def write_custom_bsp3(path, ranks, per_record, criteria_hash,
     }
 
 
-def write_out_of_order_bsp3(path):
-    """Write two sorted, overlapping blocks in deliberately wrong order."""
-    specs = [([1, 5], [[TAG], [TAG]]), ([2, 4], [[TAG], [TAG]])]
+def write_out_of_order_bsp3(path, overlapping=True):
+    """Write two sorted blocks in deliberately wrong physical order."""
+    specs = (
+        [([1, 5], [[TAG], [TAG]]), ([2, 4], [[TAG], [TAG]])]
+        if overlapping else
+        [([4, 5], [[TAG], [TAG]]), ([1, 2], [[TAG], [TAG]])])
     encoded = [event_block(ranks, occurrences)
                for ranks, occurrences in specs]
     membership = FNV64_OFFSET
@@ -468,6 +471,8 @@ class OrganizerRegression(unittest.TestCase):
         self.assertEqual(by_category[legendary_category]["records"], 1)
 
         legendary_reader = organizer.BSPoolReader(by_category[legendary_category]["path"])
+        self.assertEqual(legendary_reader.schema, 4)
+        self.assertEqual(legendary_reader.encoding, "adaptive-events-v1")
         legendary_records = list(legendary_reader.iter_records())
         self.assertEqual([item.rank for item in legendary_records], [1])
         # Selecting the Legendary category must not erase its tag/voucher
@@ -540,6 +545,42 @@ class OrganizerRegression(unittest.TestCase):
         self.assertTrue(os.path.isfile(output))
         self.assertTrue(os.path.isfile(output + ".writer.lock"))
 
+    def test_combine_reuses_decoded_descriptors_across_every_record(self):
+        first, second = self._mixed_filter_sources()
+        readers = [
+            organizer.BSPoolReader(first),
+            organizer.BSPoolReader(second),
+        ]
+        output = os.path.join(self.temp.name, "descriptor-reuse.bspool")
+        original_descriptor = organizer.Occurrence.__dict__["decode"]
+        original_decode = organizer.Occurrence.decode
+        decoded = []
+
+        def counted_decode(raw):
+            decoded.append(raw)
+            return original_decode(raw)
+
+        organizer.Occurrence.decode = staticmethod(counted_decode)
+        try:
+            result = organizer.combine_pools(
+                readers, output, "union", "Descriptor reuse")
+        finally:
+            organizer.Occurrence.decode = original_descriptor
+
+        self.assertEqual(result["records"], 5)
+        # Each source block decodes its one descriptor once. One branch and
+        # one operand descriptor per input are then synthesized once; none is
+        # decoded again for every normalized/output record.
+        self.assertEqual(len(decoded), 3 * len(readers))
+        self.assertEqual(sum(
+            organizer.provenance_branch_id(raw) is not None
+            or organizer.operand_id_from_descriptor(raw) is not None
+            for raw in decoded), 2 * len(readers))
+        combined = organizer.BSPoolReader(output)
+        self.assertEqual(
+            [record.rank for record in combined.iter_records()],
+            [1, 2, 3, 5, 6])
+
     def test_union_different_filters_deduplicates_and_preserves_provenance(self):
         first, second = self._mixed_filter_sources()
         output = os.path.join(self.temp.name, "union.bspool")
@@ -551,6 +592,8 @@ class OrganizerRegression(unittest.TestCase):
         self.assertEqual(result["branch_count"], 2)
 
         reader = organizer.BSPoolReader(output)
+        self.assertEqual(reader.schema, 4)
+        self.assertEqual(reader.encoding, "adaptive-events-v1")
         self.assertTrue(reader.is_composite)
         self.assertEqual(reader.composite_operation, "union")
         self.assertEqual(len(reader.composite_branches), 2)
@@ -804,6 +847,23 @@ class OrganizerRegression(unittest.TestCase):
         split = organizer.BSPoolReader(report["outputs"][0]["path"])
         self.assertEqual([record.rank for record in split.iter_records()],
                          [1, 2, 4, 5])
+
+        disjoint_path = os.path.join(
+            self.temp.name, "unordered-disjoint.bspool")
+        write_out_of_order_bsp3(disjoint_path, overlapping=False)
+        disjoint = organizer.BSPoolReader(disjoint_path)
+        read_order = []
+        original_read = disjoint._read_block_records
+
+        def tracked_read(handle, block):
+            read_order.append(block.first_rank)
+            return original_read(handle, block)
+
+        disjoint._read_block_records = tracked_read
+        self.assertEqual(
+            [record.rank for record in disjoint.iter_records()],
+            [1, 2, 4, 5])
+        self.assertEqual(read_order, [1, 4])
 
     def test_corruption_is_rejected_inside_committed_boundary(self):
         corrupt = os.path.join(self.temp.name, "corrupt.bspool")

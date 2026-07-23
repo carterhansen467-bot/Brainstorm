@@ -124,7 +124,16 @@ function File:read(containerOrBytes, bytes)
         error("Invalid container type: " .. container)
     end
 
-    bytes = not bytes and containerOrBytes or 'all'
+    -- With an explicit container, the second argument is the byte limit.
+    -- The old boolean expression replaced every non-nil limit with "all",
+    -- so nativefs.read(path, 8192) read and copied an entire gigabyte-scale
+    -- seed pool while trying to inspect its header.
+    if bytes == nil then
+        bytes = containerOrBytes
+    end
+    if bytes == nil then
+        bytes = 'all'
+    end
     bytes = bytes == 'all' and self:getSize() - self:tell() or math.min(self:getSize() - self:tell(), bytes)
 
     if bytes <= 0 then

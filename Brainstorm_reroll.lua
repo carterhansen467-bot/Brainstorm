@@ -1,4 +1,4 @@
-local nativefs = require("nativefs")
+local nativefs = require("brainstorm_nativefs")
 
 -- In-game this is already defined (Brainstorm.lua locates MOD_PATH before
 -- loading us); the fallback covers standalone loads -- test harnesses and
@@ -387,13 +387,24 @@ function Brainstorm.checkVoucherSearch(seed_found, target_key, ante_mode)
 	ante_mode = ante_mode or 1
 	local any_to = (ante_mode == 0 and 4) or (ante_mode == -1 and 8) or nil
 	local max_ante = any_to or ante_mode
-	local seq = Brainstorm.rollVoucherSequence(seed_found, max_ante)
 	if any_to then
+		-- Each Ante has an independent stream, so later rolls cannot change an
+		-- ANY match that has already succeeded.
+		local base = Brainstorm.getVoucherCulledPool()
 		for ante = 1, any_to do
-			if seq[ante] == target_key then return true end
+			local key = 'Voucher' .. ante
+			local chosen = pseudorandom_element(base, Brainstorm.pseudoseed(key .. seed_found))
+			local it = 1
+			while chosen == 'UNAVAILABLE' do
+				it = it + 1
+				chosen = pseudorandom_element(base,
+					Brainstorm.pseudoseed(key .. '_resample' .. it .. seed_found))
+			end
+			if chosen == target_key then return true end
 		end
 		return false
 	end
+	local seq = Brainstorm.rollVoucherSequence(seed_found, max_ante)
 	return seq[ante_mode] == target_key
 end
 
@@ -435,7 +446,7 @@ function Brainstorm.debugPredictVoucher()
 		lines[#lines + 1] = "Pool size " .. #G.P_CENTER_POOLS['Voucher'] .. ", available " .. #avail
 		lines[#lines + 1] = "Available: " .. table.concat(avail, ", ")
 	end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
@@ -501,7 +512,7 @@ function Brainstorm.debugPredictPacks()
 			lines[#lines + 1] = "Predicted A" .. a .. ": " .. table.concat(parts, " ") .. note .. mark
 		end
 	end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
@@ -670,7 +681,7 @@ end
 function Brainstorm.dumpDiagnostics()
 	local seed = G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed
 	local text = seed and Brainstorm.buildDiagnosticsText(seed) or "No active run/seed."
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.modPath() .. "/brainstorm_diagnostics.txt", text)
 end
 
@@ -685,7 +696,7 @@ function Brainstorm.logSeedMismatch(res)
 		Brainstorm.buildDiagnosticsText(seed),
 		"",
 	}
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local path = Brainstorm.modPath() .. "/brainstorm_mismatch.txt"
 	local prior = nativefs.read(path) or ""
 	nativefs.write(path, prior .. table.concat(parts, "\n") .. "\n")
@@ -944,7 +955,7 @@ function Brainstorm.debugPredictShop(seed_found, ante, num_slots)
 		end
 	end
 
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
@@ -2386,7 +2397,7 @@ function Brainstorm.debugPredictLegendary(seed_found)
 		lines[#lines+1] = "Predicted legendary: " .. chosen_key
 	end
 
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.modPath() .. "/debug_predict.txt", table.concat(lines, "\n"))
 end
 
@@ -2435,7 +2446,7 @@ Brainstorm.SEARCH_CHANNELS = {
 }
 
 function Brainstorm.getRerollSource()
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	return nativefs.read(Brainstorm.modPath() .. "/Brainstorm_reroll.lua")
 end
 
@@ -2591,15 +2602,25 @@ function Brainstorm.pollSearchThread()
 	end
 
 	local C = Brainstorm.SEARCH_CHANNELS
-	-- Progress is per-thread ({i, n}); keep the latest count for each and sum them
-	-- so A.searchTried reflects total seeds tested across all workers.
+	-- Progress is per-thread ("i:n"); keep the latest count for each and sum
+	-- them so A.searchTried reflects total seeds tested across all workers.
 	local progressChan = love.thread.getChannel(C.progress)
 	A.searchProgress = A.searchProgress or {}
 	local praw = progressChan:pop()
 	while praw ~= nil do
-		local ok, pv = pcall(function() return load("return " .. praw)() end)
-		if ok and type(pv) == "table" and pv.i ~= nil then
-			A.searchProgress[pv.i] = pv.n
+		-- Workers publish this hot-path counter as "index:count". The previous
+		-- serialized Lua table required a fresh parser/compiler invocation for
+		-- every message and could flood the main thread on simple searches.
+		local worker, count
+		if type(praw) == "string" then
+			worker, count = praw:match("^(%d+):(%d+)$")
+		end
+		if worker then
+			worker, count = tonumber(worker), tonumber(count)
+		end
+		if worker and count and worker >= 0
+				and (not A.searchThreadCount or worker < A.searchThreadCount) then
+			A.searchProgress[worker] = count
 		end
 		praw = progressChan:pop()
 	end
@@ -2895,7 +2916,7 @@ end
 -- across all cores (build once with native/build.sh). The mod writes a config
 -- snapshot (pools with eligibility RESOLVED HERE, settings, and parity checks
 -- computed with the game's own RNG functions), spawns the helper detached,
--- and polls a tiny status file each frame. SAFETY RAILS, in order:
+-- and polls a tiny status file at 10 Hz. SAFETY RAILS, in order:
 --   1. The helper re-derives nothing: pool eligibility comes from the same
 --      joker_is_pool_eligible / voucher rules on this thread.
 --   2. Before searching, the helper must reproduce the check_* lines
@@ -2936,7 +2957,7 @@ function Brainstorm.nativeAvailable()
 	if Brainstorm.SETTINGS.useNativeSearch == false then return false end
 	local N = Brainstorm.NATIVE_STATE
 	if not N then
-		local nativefs = require("nativefs")
+		local nativefs = require("brainstorm_nativefs")
 		N = { binPresent = nativefs.getInfo(Brainstorm.nativePaths().bin) ~= nil }
 		Brainstorm.NATIVE_STATE = N
 	end
@@ -2957,15 +2978,16 @@ function Brainstorm.seedPoolDir()
 end
 
 -- Identity readout for a .bspool. Schemas 1/2 have a fixed 1 KiB header;
--- schema 3 advertises a potentially larger header_bytes value in that first
--- KiB. The cap keeps this metadata read bounded even for a malformed pool.
+-- event schemas 3/4 advertise a potentially larger header_bytes value in
+-- that first KiB. The cap keeps this metadata read bounded even for a
+-- malformed pool.
 function Brainstorm.readPoolHeader(path)
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local prefixBytes, maxHeaderBytes = 1024, 256 * 1024
 	local raw = nativefs.read(path, prefixBytes)
 	if not raw or not raw:match("^BRAINSTORM_SEED_POOL ") then return nil end
 	local schema = tonumber(raw:match("^BRAINSTORM_SEED_POOL%s+(%d+)[\r\n]"))
-	if schema == 3 then
+	if schema == 3 or schema == 4 then
 		local headerBytes
 		for line in raw:gmatch("[^\r\n%z]+") do
 			headerBytes = tonumber(line:match("^header_bytes%s+(%d+)%s*$")) or headerBytes
@@ -2998,6 +3020,8 @@ function Brainstorm.readPoolHeader(path)
 		end
 	end
 	h.schema = schema
+	h.metadata_capable = schema == 3 or schema == 4
+	h.native_compatible = schema ~= nil and schema >= 1 and schema <= 4
 	for line in raw:gmatch("[^\n]+") do
 		local k, v = line:match("^(%S+)%s*(.-)%s*$")
 		if k == "end" then break end
@@ -3012,6 +3036,7 @@ function Brainstorm.readPoolHeader(path)
 				or k == "composite_metadata_complete" then h[k] = tonumber(v)
 		elseif k == "space" or k == "pool_id" or k == "label"
 				or k == "catalog_hash" or k == "criteria_hash" or k == "charset"
+				or k == "encoding"
 				or k == "tag_route" or k == "family_id"
 				or k == "segment_id" or k == "stage_hash" or k == "lineage_id"
 				or k == "derivation_id" or k == "snapshot_id"
@@ -3137,7 +3162,13 @@ function Brainstorm.readPoolHeader(path)
 	for _, key in ipairs(h.voucher_exclusions) do
 		h.pool_voucher_exclusions[#h.pool_voucher_exclusions + 1] = key
 	end
+	if schema == 4 and h.encoding ~= "adaptive-events-v1" then return nil end
 	return h
+end
+
+function Brainstorm.poolNativeCompatible(header)
+	return header ~= nil and header.schema ~= nil
+		and header.schema >= 1 and header.schema <= 4
 end
 
 local ATTACHMENT_SEEDSPACE = 1785793904896
@@ -3270,7 +3301,7 @@ local function sameStringList(a, b)
 end
 
 function Brainstorm.readPoolAttachment(markerPath)
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local raw = nativefs.read(markerPath, 256 * 1024)
 	if not raw or not raw:match("^BRAINSTORM_POOL_ATTACHMENT 1[\r\n]") then
 		return nil, "unsupported or unreadable attachment marker"
@@ -3309,6 +3340,9 @@ function Brainstorm.readPoolAttachment(markerPath)
 	local info = nativefs.getInfo(poolPath)
 	local h = info and Brainstorm.readPoolHeader(poolPath)
 	if not h then return nil, "attached pool is missing or unreadable" end
+	if not Brainstorm.poolNativeCompatible(h) then
+		return nil, "attached pool schema is not supported by this Brainstorm build"
+	end
 	for _, key in ipairs({ "pool_id", "catalog_hash", "criteria_hash", "snapshot_id" }) do
 		if not h[key] or h[key] == "" or tostring(h[key]):lower() ~= tostring(marker[key] or ""):lower() then
 			return nil, "attachment " .. key .. " no longer matches the pool"
@@ -3483,7 +3517,7 @@ end
 function Brainstorm.findAutomaticSeedPool()
 	local ar = Brainstorm.SETTINGS.autoreroll or {}
 	if ar.seedPoolFile and ar.seedPoolFile ~= "" then return nil end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local dir = Brainstorm.seedPoolDir()
 	local choices = {}
 	local tried = Brainstorm.AUTOREROLL.autoPoolTried or {}
@@ -3520,8 +3554,8 @@ end
 -- filename lets a long shared-pool name widen Balatro's option-cycle node and
 -- push the whole settings tab off-screen.  Keep display labels bounded and
 -- return an explicit label -> filename map.  Empty filename is the normal
--- automatic mode: compatible attached accelerators are tried first, then the
--- unrestricted search continues when they are exhausted.
+-- automatic mode: a compatible authoritative attachment wins; otherwise an
+-- accelerator can fall back to the next safe source and unrestricted search.
 local SEED_POOL_OPTION_MAX = 24
 
 function Brainstorm.seedPoolOptionLabel(name, header, suffix)
@@ -3587,6 +3621,9 @@ function Brainstorm.poolInfoString(name)
 	local h = Brainstorm.readPoolHeader(Brainstorm.seedPoolDir() .. "/" .. name)
 	if not h then return "(pool file missing or unreadable)" end
 	local bits = {}
+	if not Brainstorm.poolNativeCompatible(h) then
+		bits[#bits + 1] = "UNSUPPORTED POOL SCHEMA"
+	end
 	if h.label and h.label ~= "" and (h.label .. ".bspool") ~= name then
 		bits[#bits + 1] = '"' .. h.label .. '"'
 	end
@@ -3644,7 +3681,7 @@ function Brainstorm.seedPoolPath()
 	local ar = Brainstorm.SETTINGS.autoreroll
 	local name = ar and ar.seedPoolFile
 	if not name or name == "" then return nil end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local p = Brainstorm.seedPoolDir() .. "/" .. name
 	if not nativefs.getInfo(p) then return nil end
 	return p
@@ -3861,9 +3898,19 @@ function Brainstorm.buildNativeConfigText(session)
 	return table.concat(L, "\n") .. "\n"
 end
 
+local NATIVE_STATUS_POLL_INTERVAL = 0.1
+local NATIVE_HEARTBEAT_INTERVAL = 2
+
+local function nativeSearchNow()
+	if love and love.timer and love.timer.getTime then
+		return love.timer.getTime()
+	end
+	return os.clock()
+end
+
 function Brainstorm.startNativeSearch()
 	local A = Brainstorm.AUTOREROLL
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local p = Brainstorm.nativePaths()
 	local ar = Brainstorm.SETTINGS.autoreroll or {}
 	if ar.seedPoolFile and ar.seedPoolFile ~= "" then
@@ -3876,6 +3923,16 @@ function Brainstorm.startNativeSearch()
 	end
 	if Brainstorm.setAttachedPoolEstimateMode then
 		Brainstorm.setAttachedPoolEstimateMode(A.autoPoolSelection ~= nil)
+	end
+	local selectedPool = Brainstorm.effectiveSeedPoolSelection
+		and Brainstorm.effectiveSeedPoolSelection() or nil
+	if selectedPool then
+		local header = selectedPool.header
+			or Brainstorm.readPoolHeader(selectedPool.path)
+		if header and not Brainstorm.poolNativeCompatible(header) then
+			A.poolAbort = "pool: unsupported pool schema"
+			return false
+		end
 	end
 	A.searchSession = (A.searchSession or 0) + 1
 	local cfg = Brainstorm.buildNativeConfigText(A.searchSession)
@@ -3920,8 +3977,10 @@ function Brainstorm.startNativeSearch()
 		Brainstorm.startSearchBackendCounter(backend)
 	end
 	A.nativeActive = true
-	A.nativeStartedAt = love.timer and love.timer.getTime and love.timer.getTime() or os.clock()
-	A.nativeHbFrame = 0
+	local now = nativeSearchNow()
+	A.nativeStartedAt = now
+	A.nativeLastStatusPollAt = nil -- poll once immediately after launch
+	A.nativeLastHeartbeatAt = now
 	return true
 end
 
@@ -3931,15 +3990,30 @@ end
 function Brainstorm.pollNativeSearch()
 	local A = Brainstorm.AUTOREROLL
 	if not A.nativeActive then return nil end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	local p = Brainstorm.nativePaths()
-	A.nativeHbFrame = (A.nativeHbFrame or 0) + 1
-	if A.nativeHbFrame % 120 == 0 then
+	local now = nativeSearchNow()
+
+	-- These used to be frame-counted, which made both rates depend on refresh
+	-- rate and read the status file every rendered frame. The helper publishes
+	-- at a much lower rate, so a 10 Hz read keeps terminal messages responsive
+	-- while avoiding redundant filesystem work.
+	local lastHeartbeat = A.nativeLastHeartbeatAt
+	if not lastHeartbeat or now < lastHeartbeat then
+		A.nativeLastHeartbeatAt = now
+	elseif now - lastHeartbeat >= NATIVE_HEARTBEAT_INTERVAL then
 		nativefs.write(p.hb, tostring(os.time()))
+		A.nativeLastHeartbeatAt = now
 	end
+	local lastPoll = A.nativeLastStatusPollAt
+	if lastPoll and now >= lastPoll
+			and now - lastPoll < NATIVE_STATUS_POLL_INTERVAL then
+		return nil
+	end
+	A.nativeLastStatusPollAt = now
+
 	local txt = nativefs.read(p.status)
 	if not txt then
-		local now = love.timer and love.timer.getTime and love.timer.getTime() or os.clock()
 		if now - (A.nativeStartedAt or now) > 5 then
 			print("[Brainstorm] native search wrote no status in 5s; using Lua threads instead")
 			Brainstorm.stopNativeSearch()
@@ -4013,9 +4087,11 @@ end
 function Brainstorm.stopNativeSearch()
 	local A = Brainstorm.AUTOREROLL
 	if not A.nativeActive then return end
-	local nativefs = require("nativefs")
+	local nativefs = require("brainstorm_nativefs")
 	nativefs.write(Brainstorm.nativePaths().stop, "1")
 	A.nativeActive = false
+	A.nativeLastStatusPollAt = nil
+	A.nativeLastHeartbeatAt = nil
 end
 
 -- Worker thread source. Runs in its own Lua state: no G, no love modules except
@@ -4025,13 +4101,14 @@ end
 -- thread. See Brainstorm.startSearchThread for the args passed in.
 Brainstorm.SEARCH_WORKER_SRC = [==[
 require("love.thread")
+pcall(require, "love.timer")
 
 local configStr, rerollSrc, threadIndex, numThreads = ...
 threadIndex = threadIndex or 0
 numThreads = numThreads or 1
 
 package.preload["lovely"] = function() return { mod_dir = "" } end
-package.preload["nativefs"] = function()
+package.preload["brainstorm_nativefs"] = function()
 	return { write = function() end, read = function() return "" end, getInfo = function() return nil end }
 end
 
@@ -4151,6 +4228,21 @@ local entropy = config.entropy or 0
 -- reassigned; saves two global+field lookups per candidate seed.
 local passesAllFilters = Brainstorm.passesAllFilters
 local serializeValue = Brainstorm.serializeValue
+local monotonicTime = love and love.timer and love.timer.getTime or os.clock
+local progressPrefix = tostring(threadIndex) .. ":"
+local lastProgressAt = monotonicTime()
+
+-- Searching and cancellation still advance in the existing 250-seed batches.
+-- Only the observable counter is rate-limited: the renderer cannot display
+-- hundreds of updates per second, and compact strings avoid compiling a Lua
+-- table literal for every progress sample on the main thread.
+local function publishProgress(tried, force)
+	local now = monotonicTime()
+	if force or now < lastProgressAt or now - lastProgressAt >= 0.1 then
+		progressChan:push(progressPrefix .. tostring(tried))
+		lastProgressAt = now
+	end
+end
 
 -- Partition the global seed sequence across the N workers with no overlap: this
 -- thread tests global indices threadIndex, threadIndex+N, threadIndex+2N, ...
@@ -4164,10 +4256,11 @@ while sessionChan:peek() == mySession do
 			-- Serialize with the same helper the config uses (defined in reroll.lua,
 			-- loaded above) so we never rely on love channels deep-copying tables.
 			resultChan:push(serializeValue({ seed = seed, jokerFoundAt = Brainstorm.AUTOREROLL.jokerFoundAt, session = mySession }))
-			progressChan:push(serializeValue({ i = threadIndex, n = tried }))
+			publishProgress(tried, true)
 			return
 		end
 	end
-	progressChan:push(serializeValue({ i = threadIndex, n = tried }))
+	publishProgress(tried, false)
 end
+publishProgress(tried, true)
 ]==]

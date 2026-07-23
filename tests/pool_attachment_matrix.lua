@@ -6,7 +6,7 @@
 local reroll = assert(arg[1], "usage: pool_attachment_matrix.lua <Brainstorm_reroll.lua>")
 
 local directoryItems = {}
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
   read = function() return nil end,
   write = function() end,
   getInfo = function() return nil end,

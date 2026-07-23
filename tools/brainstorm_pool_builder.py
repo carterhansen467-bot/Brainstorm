@@ -3,8 +3,8 @@
 native/brainstorm_seed_pool.
 
 A keyboard-driven settings screen in the spirit of the in-game Brainstorm
-tab (cyclers + toggles) that writes the pool criteria for you, runs the
-count-only estimate, and drives the multi-day exhaustive scan with live
+tab (cyclers + toggles) that writes the pool criteria for you, runs a
+temporary BSP4 estimate, and drives the multi-day exhaustive scan with live
 progress, a clean pause (checkpointed; rerun to resume), and pools landing
 directly in seed_pools/ where the mod's Seed Pool selector finds them.
 
@@ -27,6 +27,7 @@ except ImportError:  # Windows: use tools/pool_builder_web.py instead
     curses = None
 import hashlib
 import hmac
+import math
 import os
 import re
 import signal
@@ -105,6 +106,11 @@ SNAPSHOT = os.path.join(MOD_DIR, "native_search.cfg")
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 POOL_HEADER_PREFIX_BYTES = 1024
 POOL_HEADER_MAX_BYTES = 256 * 1024
+POOL_EXTENDED_HEADER_SCHEMAS = (3, 4)
+POOL_EVENT_ENCODINGS = {
+    3: "delta-varint-events-v1",
+    4: "adaptive-events-v1",
+}
 SEEDSPACE = 1785793904896  # 34^8: seeds the game's generator can deal
 # 35^1 + ... + 35^8: every seed vanilla's seed box preserves -- adds O and
 # 1-7 character seeds, but excludes 0 because vanilla remaps it to O.
@@ -175,6 +181,9 @@ ESTIMATE_COUNT = 2_000_000
 ESTIMATE_CHECKPOINT = 262_144
 BUILD_CHECKPOINT = 16_777_216
 SHARD_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+ESTIMATE_OUTPUT_SUFFIXES = (
+    "", ".state", ".manifest", ".criteria.cfg", ".writer.lock",
+)
 
 
 def joker_name(key):
@@ -416,6 +425,11 @@ class Criteria:
                  "resume 1",
                  "format %s" % fmt,
                  "tag_route %s" % ("collect" if self.route_collect else "observe")]
+        if fmt == "binary":
+            # New Builder publications use the adaptive event layout. Direct
+            # criteria files can still request output_schema 3 explicitly,
+            # and resuming an existing pool always inherits its stored schema.
+            lines.insert(-1, "output_schema 4")
         if self.space != "natural":
             lines.append("space %s" % self.space)
         lines.append("label %s" % self.pool_name())
@@ -493,15 +507,111 @@ class Criteria:
         return out
 
 
+def estimate_criteria_text(criteria, count=ESTIMATE_COUNT):
+    """Build a representative quick-estimate configuration.
+
+    Estimates publish a disposable adaptive pool so their wall-clock rate and
+    byte density include the same event capture, sorting, encoding, checksums,
+    and final index work as a real Builder publication.
+    """
+    count = max(1, int(count))
+    return criteria.text("binary", count, apply_shard=False,
+                         checkpoint=min(ESTIMATE_CHECKPOINT, count))
+
+
+def _manifest_number(manifest, key, default=0.0):
+    try:
+        value = float(manifest.get(key, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) and value >= 0.0 else float(default)
+
+
+def estimate_projected_bytes(manifest, projected_matches, legacy_bytes=0.0):
+    """Return ``(bytes, measured)`` for a projected adaptive pool.
+
+    A completed binary estimate reports both its final file size and the
+    variable bytes per matching record. Their difference recovers the fixed
+    header cost, giving a much stronger projection than the historical
+    delta-varint heuristic. Older/count-only manifests retain that heuristic
+    as a compatibility fallback.
+    """
+    target = max(0.0, float(projected_matches or 0.0))
+    matched = _manifest_number(manifest, "matched")
+    per_record = _manifest_number(manifest, "bytes_per_record")
+    file_bytes = _manifest_number(manifest, "compressed_file_bytes")
+    if matched > 0.0 and per_record > 0.0:
+        fixed = max(0.0, file_bytes - per_record * matched) \
+            if file_bytes > 0.0 else 0.0
+        return fixed + per_record * target, True
+    if matched > 0.0 and file_bytes > 0.0:
+        return file_bytes * target / matched, True
+    return max(0.0, float(legacy_bytes or 0.0)), False
+
+
+def _cleanup_estimate_artifacts(output):
+    """Remove one explicitly temporary estimate and its scanner sidecars."""
+    removed = []
+    first_error = None
+    for suffix in ESTIMATE_OUTPUT_SUFFIXES:
+        path = output + suffix
+        for attempt in range(5):
+            try:
+                os.unlink(path)
+                removed.append(path)
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError as exc:
+                # A just-exited Windows process or antivirus reader can retain
+                # a sidecar handle very briefly. Retry without widening the
+                # deletion target beyond this exact estimate.
+                if attempt == 4:
+                    first_error = first_error or exc
+                else:
+                    time.sleep(0.01 * (2 ** attempt))
+            except OSError as exc:
+                first_error = first_error or exc
+                break
+    try:
+        os.rmdir(os.path.dirname(output))
+    except OSError:
+        # Leave a non-empty/user-modified directory intact. All known Builder
+        # estimate artifacts above have still been removed.
+        pass
+    if first_error is not None:
+        raise first_error
+    return removed
+
+
 class Runner:
     """One scanner process: criteria written to disk, stderr streamed."""
 
-    def __init__(self, snapshot_path, criteria_text, output, input_pool=None):
+    def __init__(self, snapshot_path, criteria_text, output, input_pool=None,
+                 temporary=False):
         self.output = output
         self.input_pool = input_pool
+        self.temporary = bool(temporary)
+        try:
+            if input_pool:
+                if os.path.abspath(input_pool) == os.path.abspath(output):
+                    raise ValueError("Input and output pool must be different files.")
+                native_incompatibility = pool_native_incompatibility(
+                    read_pool_header(input_pool))
+                if native_incompatibility:
+                    raise ValueError(
+                        "Native refilter cannot read %s: %s."
+                        % (os.path.basename(input_pool), native_incompatibility))
+        except Exception:
+            if self.temporary:
+                _cleanup_estimate_artifacts(self.output)
+            raise
+        self._result_lock = threading.Lock()
+        self._cached_manifest = None
+        self._temporary_cleaned = False
+        self.started_at = time.monotonic()
+        self.completed_at = None
         self.criteria_path = output + ".criteria.cfg"
-        with open(self.criteria_path, "w", encoding="utf-8") as f:
-            f.write(criteria_text)
         self.lines = deque(maxlen=200)
         # Populate the known scan total before starting the reader thread so a
         # fresh job immediately renders as 0 / N instead of appearing inert
@@ -519,25 +629,33 @@ class Runner:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
         command = [POOL_BIN, "scan", snapshot_path, self.criteria_path, output]
         if input_pool:
-            if os.path.abspath(input_pool) == os.path.abspath(output):
-                raise ValueError("Input and output pool must be different files.")
             command = [POOL_BIN, "refilter", snapshot_path, self.criteria_path,
                        input_pool, output]
-        self.proc = subprocess.Popen(
-            command,
-            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
-            creationflags=flags)
+        try:
+            with open(self.criteria_path, "w", encoding="utf-8") as f:
+                f.write(criteria_text)
+            self.proc = subprocess.Popen(
+                command,
+                stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
+                creationflags=flags)
+        except Exception:
+            if self.temporary:
+                _cleanup_estimate_artifacts(self.output)
+            raise
         self.reader = threading.Thread(target=self._pump, daemon=True)
         self.reader.start()
 
     def _pump(self):
-        for line in self.proc.stderr:
-            line = line.rstrip("\n")
-            self.lines.append(line)
-            m = re.match(r"scanned=(\d+)/(\d+) matches=(\d+) rate=(\d+)", line)
-            if m:
-                self.scanned, self.total = int(m.group(1)), int(m.group(2))
-                self.matched, self.rate = int(m.group(3)), float(m.group(4))
+        try:
+            for line in self.proc.stderr:
+                line = line.rstrip("\n")
+                self.lines.append(line)
+                m = re.match(r"scanned=(\d+)/(\d+) matches=(\d+) rate=(\d+)", line)
+                if m:
+                    self.scanned, self.total = int(m.group(1)), int(m.group(2))
+                    self.matched, self.rate = int(m.group(3)), float(m.group(4))
+        finally:
+            self.completed_at = time.monotonic()
 
     def stop(self):
         if self.proc.poll() is None:
@@ -550,11 +668,50 @@ class Runner:
     def returncode(self):
         return self.proc.poll()
 
+    def result_manifest(self, cleanup=False):
+        """Cache a finished result, optionally removing temporary artifacts.
+
+        The lock makes simultaneous browser status requests observe the same
+        cached manifest even when the first request unlinks the on-disk copy.
+        """
+        with self._result_lock:
+            if self._cached_manifest is None:
+                if self.done() and self.reader is not threading.current_thread():
+                    self.reader.join(timeout=5.0)
+                manifest = read_manifest(self.output + ".manifest")
+                finished = self.completed_at or time.monotonic()
+                elapsed = max(0.0, finished - self.started_at)
+                scanned = _manifest_number(manifest, "scanned")
+                if elapsed > 0.0 and scanned > 0.0:
+                    manifest["pipeline_elapsed_seconds"] = "%.6f" % elapsed
+                    manifest["pipeline_seeds_per_second"] = "%.3f" % (
+                        scanned / elapsed)
+                self._cached_manifest = manifest
+            if cleanup and self.temporary and not self._temporary_cleaned:
+                try:
+                    _cleanup_estimate_artifacts(self.output)
+                except OSError as exc:
+                    self.lines.append(
+                        "warning: temporary estimate cleanup failed: %s" % exc)
+                    self._temporary_cleaned = not any(
+                        os.path.lexists(self.output + suffix)
+                        for suffix in ESTIMATE_OUTPUT_SUFFIXES)
+                else:
+                    self._temporary_cleaned = True
+            return dict(self._cached_manifest)
+
 
 class MergeRunner:
     """One native merge process, shaped like Runner for the browser UI."""
 
     def __init__(self, inputs, output):
+        for path in inputs:
+            native_incompatibility = pool_native_incompatibility(
+                read_pool_header(path))
+            if native_incompatibility:
+                raise ValueError(
+                    "Native merge cannot read %s: %s."
+                    % (os.path.basename(path), native_incompatibility))
         self.output = output
         self.input_pool = None
         self.inputs = tuple(inputs)
@@ -611,9 +768,10 @@ def read_state(path):
 def read_pool_header_text(path):
     """Read a bounded .bspool text header without touching its data payload.
 
-    Schemas 1 and 2 have the historical fixed 1 KiB header.  Schema 3 keeps
-    ``header_bytes`` in that first KiB so readers can safely discover a larger
-    metadata header before issuing a second, still-bounded read.
+    Schemas 1 and 2 have the historical fixed 1 KiB header.  Event schemas 3
+    and 4 keep ``header_bytes`` in that first KiB so readers can safely
+    discover a larger metadata header before issuing a second, still-bounded
+    read.
     """
     try:
         with open(path, "rb") as f:
@@ -623,7 +781,8 @@ def read_pool_header_text(path):
                 br"^BRAINSTORM_SEED_POOL[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
                 prefix,
             )
-            if magic and int(magic.group(1)) == 3:
+            schema = int(magic.group(1)) if magic else 0
+            if schema in POOL_EXTENDED_HEADER_SCHEMAS:
                 size_line = re.search(
                     br"(?:^|\n)header_bytes[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
                     prefix,
@@ -639,7 +798,12 @@ def read_pool_header_text(path):
                         return ""
                 else:
                     raw = raw[:header_bytes]
-        return raw.split(b"\0", 1)[0].decode("latin-1")
+        text = raw.split(b"\0", 1)[0].decode("latin-1")
+        if schema == 4 and not re.search(
+                r"(?:^|\n)encoding[ \t]+adaptive-events-v1"
+                r"[ \t]*(?:\r?\n|$)", text):
+            return ""
+        return text
     except OSError:
         return ""
 
@@ -650,7 +814,10 @@ def read_pool_header(path):
     for line in raw.splitlines():
         parts = line.split(None, 1)
         if len(parts) == 2:
-            out[parts[0]] = parts[1].strip()
+            if parts[0] == "BRAINSTORM_SEED_POOL":
+                out["schema"] = parts[1].strip()
+            else:
+                out[parts[0]] = parts[1].strip()
         if parts and parts[0] == "end":
             break
     return out
@@ -681,6 +848,19 @@ def _pool_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def pool_native_incompatibility(header):
+    """Explain why the native scanner/searcher must not receive a pool."""
+    schema = _pool_int(header.get("schema"))
+    encoding = str(header.get("encoding", ""))
+    if schema not in (1, 2, 3, 4):
+        return "pool schema %s is not supported" % (schema or "(missing)")
+    if schema in POOL_EVENT_ENCODINGS \
+            and encoding != POOL_EVENT_ENCODINGS[schema]:
+        return "pool schema %d has incompatible encoding %s" % (
+            schema, encoding or "(missing)")
+    return ""
 
 
 def _pool_identity(value):
@@ -887,6 +1067,10 @@ def pool_attachment_signature(pool):
 def pool_attachment_accelerator_blockers(pool, current_catalog_hash=None):
     """Physical blockers shared by every automatic accelerator."""
     blockers = []
+    incompatibility = pool_native_incompatibility(pool)
+    if not pool.get("native_compatible", True) or incompatibility:
+        blockers.append(incompatibility or
+                        "the pool is unavailable to the native search helper")
     if not pool.get("complete"):
         blockers.append("the pool operation is not complete")
     if not pool.get("coverage_complete"):
@@ -939,9 +1123,10 @@ def pool_attachment_base_blockers(pool):
 class PoolInfo:
     """A browser/TUI-safe view of one pool's header and checkpoint state.
 
-    Older pools deliberately remain valid: fields introduced with schema 3
-    are optional, and their absence puts the file in the legacy library group
-    instead of hiding it.
+    Older pools deliberately remain valid: fields introduced with event-pool
+    schemas are optional, and their absence puts the file in the legacy
+    library group instead of hiding it. Native Builder/search operations
+    accept all four published schemas and fail closed on unknown encodings.
     """
 
     def __init__(self, path):
@@ -973,6 +1158,10 @@ class PoolInfo:
 
     def as_dict(self, include_attachment=True, current_catalog_hash=None):
         h = self.header
+        schema = _pool_int(h.get("schema"))
+        metadata_capable = schema in POOL_EXTENDED_HEADER_SCHEMAS
+        native_incompatibility = pool_native_incompatibility(h)
+        native_compatible = not native_incompatibility
         complete = h.get("complete") == "1"
         coverage_complete = h.get("coverage_complete", h.get("complete")) == "1"
         resumable = self.state.get("done") == "0"
@@ -994,6 +1183,9 @@ class PoolInfo:
             "name": os.path.basename(self.path),
             "bytes": byte_count,
             "records": _pool_int(h.get("records")),
+            "metadata_capable": metadata_capable,
+            "native_compatible": native_compatible,
+            "native_incompatibility": native_incompatibility,
             "complete": complete,
             "coverage_complete": coverage_complete,
             "resumable": resumable,
@@ -1099,8 +1291,8 @@ def _link_pool_parents(pools):
         pool["parent_name"] = parent["name"]
         pool["parent_current_records"] = parent.get("records", 0)
         pinned = pool.get("parent_records", 0)
-        # Incremental updates are safe to advertise only for schema-3 lineage:
-        # legacy pool IDs can change as a paused file grows.
+        # Incremental updates are safe to advertise only for event-pool
+        # lineage: legacy pool IDs can change as a paused file grows.
         if (family and parent_segment and "parent_records" in pool
                 and pinned < parent.get("records", 0)):
             pool["update_available"] = True
@@ -1191,6 +1383,7 @@ def read_pool_library(pool_dir=POOL_DIR, current_catalog_hash=None):
 # second scanner create and lock a different inode for the same pool.
 POOL_DELETE_SUFFIXES = (
     "", ".state", ".manifest", ".criteria.cfg", ".attached",
+    ".organizer-summary.json",
 )
 
 
@@ -1394,7 +1587,7 @@ def detach_pool(name, pool_dir=POOL_DIR, protected_paths=()):
 
 
 def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
-    """Return a snapshot-bound deletion plan for one completed pool.
+    """Return a snapshot-bound deletion plan for one seed pool.
 
     The token covers every currently existing related file and its lstat
     identity.  The caller must recompute the plan immediately before deleting;
@@ -1404,9 +1597,11 @@ def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
     path = _safe_pool_path(name, pool_dir)
     if not os.path.isfile(path):
         raise ValueError("The selected seed pool no longer exists.")
-    header = read_pool_header(path)
-    if header.get("complete") != "1":
-        raise ValueError("Only completed seed pools can be deleted from the Builder.")
+    # Paused pools are safe to remove as long as they are not an active input
+    # or output and their persistent writer lock can be acquired. Completion
+    # used to be an additional UI/backend requirement, which stranded paused
+    # scans even after the Builder had stopped.
+    read_pool_header(path)
 
     protected = {os.path.normcase(os.path.abspath(value))
                  for value in protected_paths if value}
@@ -1436,7 +1631,10 @@ def pool_delete_plan(name, pool_dir=POOL_DIR, protected_paths=()):
 
 
 def delete_completed_pool(name, token, pool_dir=POOL_DIR, protected_paths=()):
-    """Delete a still-identical completed pool plan, main file last."""
+    """Delete a still-identical pool plan, main file last.
+
+    The historical function name remains for compatibility with older callers.
+    """
     path = _safe_pool_path(name, pool_dir)
     with _pool_writer_guard(path):
         plan = pool_delete_plan(name, pool_dir, protected_paths)
@@ -1446,7 +1644,7 @@ def delete_completed_pool(name, token, pool_dir=POOL_DIR, protected_paths=()):
                 "The pool files changed after confirmation; review the deletion again.")
         paths = [item["path"] for item in plan["files"]]
         # Sidecars first keeps the usable .bspool present if an earlier unlink
-        # fails.  A completed pool does not require its sidecars to remain usable.
+        # fails. A stopped pool does not require its sidecars to remain usable.
         main = plan["path"]
         ordered = [value for value in paths if value != main] + [main]
         removed = []
@@ -1504,7 +1702,9 @@ class App:
                 # Committed blocks are independently checksummed and readable
                 # before a scan finishes. Refiltering a paused pool is a
                 # snapshot operation over only those currently recorded seeds.
-                if fn.endswith(".bspool") and int(head.get("records", "0") or 0) > 0:
+                if (fn.endswith(".bspool")
+                        and int(head.get("records", "0") or 0) > 0
+                        and not pool_native_incompatibility(head)):
                     self.input_pools.append(path)
         self.input_idx = 0
         curses.curs_set(0)
@@ -1577,8 +1777,8 @@ class App:
                        options=["Balatro's seed space"] +
                        [os.path.basename(p) for p in self.input_pools[1:]],
                        idx=self.input_idx, set=self._set_input))
-        f.append(Field("cycle", "Threads",
-                       options=["Auto (all cores)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
+        f.append(Field("cycle", "Scan threads",
+                       options=["Auto (all scan cores)"] + [str(n) for n in range(1, (os.cpu_count() or 8) + 1)],
                        idx=c.threads, set=self._set_threads))
         f.append(Field("cycle", "Seed space", options=[s[1] for s in SPACES],
                        idx=[s[0] for s in SPACES].index(c.space), set=self._set_space))
@@ -1592,7 +1792,7 @@ class App:
                            options=[str(n) for n in range(1, c.shard_total + 1)],
                            idx=c.shard_index - 1, set=self._set_shard_index))
         f.append(Field("text", "Pool name", get=c.pool_name, set=self._set_name))
-        f.append(Field("action", "[ Run quick estimate  --  sample 2M seeds, project size/time ]",
+        f.append(Field("action", "[ Run quick estimate  --  temporary BSP4 sample, project size/time ]",
                        run=self._do_estimate))
         f.append(Field("action", "[ BUILD POOL  --  write .bspool for the mod ]",
                        run=self._do_build))
@@ -1903,11 +2103,12 @@ class App:
         if err:
             self.status = err
             return
-        out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-        text = self.crit.text("count", ESTIMATE_COUNT, apply_shard=False,
-                              checkpoint=ESTIMATE_CHECKPOINT)
+        text = estimate_criteria_text(self.crit)
         input_pool = self.input_pools[self.input_idx] or None
-        self.run_screen(Runner(self.snap.current_model_copy(), text, out, input_pool),
+        snapshot_copy = self.snap.current_model_copy()
+        out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
+        self.run_screen(Runner(snapshot_copy, text, out,
+                               input_pool, temporary=True),
                         "Filtering input pool" if input_pool else "Estimating (2M-seed sample)",
                         estimate=True)
 
@@ -1958,7 +2159,9 @@ class App:
                         break
                     scr.addnstr(y, 2, line[: w - 4], w - 4, curses.A_DIM)
                     y += 1
-                foot = "s stop (checkpointed -- rerun Build with the same name to resume)"
+                foot = "s cancel estimate (temporary files will be removed)" \
+                    if estimate else \
+                    "s stop (checkpointed -- rerun Build with the same name to resume)"
                 scr.addnstr(h - 2, 2, foot[: w - 4], w - 4, curses.A_DIM)
                 scr.refresh()
                 if runner.done():
@@ -1967,10 +2170,19 @@ class App:
                 if ch in (ord("s"), ord("S"), ord("q")) and not stopped:
                     runner.stop()
                     stopped = True
+        except KeyboardInterrupt:
+            if not runner.done():
+                runner.stop()
+                deadline = time.monotonic() + 60.0
+                while not runner.done() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            if estimate and runner.done():
+                runner.result_manifest(cleanup=True)
+            raise
         finally:
             scr.timeout(-1)
         rc = runner.returncode()
-        manifest = read_manifest(runner.output + ".manifest")
+        manifest = runner.result_manifest(cleanup=estimate)
         self.result_screen(runner, rc, manifest, estimate, stopped)
 
     def result_screen(self, runner, rc, manifest, estimate, stopped):
@@ -1979,8 +2191,12 @@ class App:
         scr.erase()
         lines = []
         if stopped or rc == 130:
-            lines.append(("Stopped at a checkpoint. Run BUILD POOL again with the same "
-                          "name to resume exactly where it left off.", 2))
+            if estimate:
+                lines.append(("Estimate canceled cleanly; its temporary pool and "
+                              "checkpoint files were removed.", 2))
+            else:
+                lines.append(("Stopped at a checkpoint. Run BUILD POOL again with the same "
+                              "name to resume exactly where it left off.", 2))
         elif rc == 0:
             lines.append(("Done." if not estimate else "Estimate complete.", 3))
         else:
@@ -1990,7 +2206,9 @@ class App:
         if manifest:
             matched = int(manifest.get("matched", "0"))
             scanned = int(manifest.get("scanned", "1")) or 1
-            rate = float(manifest.get("seeds_per_second", "0") or 0)
+            rate = float(manifest.get(
+                "pipeline_seeds_per_second" if estimate
+                else "seeds_per_second", "0") or 0)
             lines.append(("Scanned %s seeds, matched %s (%.6f%%)"
                           % (f"{scanned:,}", f"{matched:,}", 100.0 * matched / scanned), 0))
             if estimate:
@@ -2000,12 +2218,21 @@ class App:
                 space_total = float(manifest.get("seedspace", "0") or 0) or SEEDSPACE
                 space_label = next(label for key, label, _limit in SPACES
                                    if key == self.crit.space)
-                scope_name, scope_limit = SCOPES[self.crit.scope]
-                scope_start, scope_end = self.crit.shard_bounds(scope_limit)
-                scope_count = scope_end - scope_start
-                if self.crit.shard_total > 1:
-                    scope_name += " -- part %d of %d" % (
-                        self.crit.shard_index, self.crit.shard_total)
+                input_estimate = bool(runner.input_pool)
+                if input_estimate:
+                    input_header = read_pool_header(runner.input_pool)
+                    scope_count = int(input_header.get("records", scanned) or scanned)
+                    scope_name = "All currently committed seeds in %s" % (
+                        os.path.basename(runner.input_pool))
+                    proj = matched * scope_count / scanned
+                    projb = 0.0
+                else:
+                    scope_name, scope_limit = SCOPES[self.crit.scope]
+                    scope_start, scope_end = self.crit.shard_bounds(scope_limit)
+                    scope_count = scope_end - scope_start
+                    if self.crit.shard_total > 1:
+                        scope_name += " -- part %d of %d" % (
+                            self.crit.shard_index, self.crit.shard_total)
                 if matched == 0:
                     lines.append(("No matches appeared in this quick sample; use a larger "
                                   "test build for a rare filter.", 2))
@@ -2013,18 +2240,30 @@ class App:
                     lines.append(("Only %d matches appeared; the size projection is rough."
                                   % matched, 2))
                 if matched:
-                    ratio = scope_count / space_total
+                    ratio = 1.0 if input_estimate else scope_count / space_total
+                    selected_matches = proj * ratio
+                    selected_bytes, measured_bytes = estimate_projected_bytes(
+                        manifest, selected_matches, projb * ratio)
                     lines.append(("Selected scope (%s; %s seeds): ~%s matches, ~%s on disk"
                                   % (scope_name, f"{scope_count:,}",
-                                     f"{int(proj * ratio):,}", human_bytes(projb * ratio)), 0))
-                    lines.append(("Complete chosen seed space (%s; %s seeds): ~%s matches, ~%s on disk"
-                                  % (space_label, f"{int(space_total):,}",
-                                     f"{int(proj):,}", human_bytes(projb)), 0))
+                                     f"{int(selected_matches):,}",
+                                     human_bytes(selected_bytes)), 0))
+                    if not input_estimate:
+                        full_bytes, _measured = estimate_projected_bytes(
+                            manifest, proj, projb)
+                        lines.append(("Complete chosen seed space (%s; %s seeds): ~%s matches, ~%s on disk"
+                                      % (space_label, f"{int(space_total):,}",
+                                         f"{int(proj):,}",
+                                         human_bytes(full_bytes)), 0))
+                    if measured_bytes:
+                        lines.append(("Disk size uses the completed adaptive sample's "
+                                      "measured bytes per record.", 0))
                 if rate > 0:
                     lines.append(("Selected-scope time at this rate: %s"
                                   % human_secs(scope_count / rate), 0))
-                    lines.append(("Complete chosen-seed-space time at this rate: %s"
-                                  % human_secs(space_total / rate), 0))
+                    if not input_estimate:
+                        lines.append(("Complete chosen-seed-space time at this rate: %s"
+                                      % human_secs(space_total / rate), 0))
             elif rc == 0:
                 lines.append(("Pool file: %s" % runner.output, 3))
                 lines.append(("It now appears in the in-game Seed Pool selector; "
@@ -2144,11 +2383,13 @@ def main():
         c = Criteria()
         c.legendary = "j_perkeo"
         c.tag_rules.append(["tag_rare", 1, 8, 1])
+        snapshot_copy = snap.current_model_copy()
+        criteria_text = estimate_criteria_text(c, 3_000_000)
         out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-        r = Runner(snap.current_model_copy(), c.text("count", 3_000_000), out)
+        r = Runner(snapshot_copy, criteria_text, out, temporary=True)
         while not r.done():
             time.sleep(0.1)
-        m = read_manifest(out + ".manifest")
+        m = r.result_manifest(cleanup=True)
         print("rc=%d matched=%s scanned=%s" % (r.returncode(),
                                                m.get("matched"), m.get("scanned")))
         return 0 if r.returncode() == 0 else 1

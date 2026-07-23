@@ -186,6 +186,38 @@ def estimate_context(criteria, data, input_name="", input_records=0):
     }
 
 
+def estimate_projection(manifest, context):
+    """Project counts/bytes from one completed adaptive estimate."""
+    scanned = core._manifest_number(manifest, "scanned") or 1.0
+    matched = core._manifest_number(manifest, "matched")
+    match_rate = matched / scanned
+    full_count = float(context.get("space_size") or
+                       core._manifest_number(manifest, "seedspace") or
+                       core.SEEDSPACE)
+    selected_count = float(context.get("scope_count") or full_count)
+    full_matches = core._manifest_number(
+        manifest, "projected_full_matches", match_rate * full_count)
+    if full_matches <= 0.0 and matched > 0.0:
+        full_matches = match_rate * full_count
+    selected_matches = match_rate * selected_count
+    legacy_full = core._manifest_number(
+        manifest, "projected_compressed_bytes",
+        core._manifest_number(manifest, "projected_u64_bytes"))
+    legacy_selected = legacy_full * selected_count / full_count \
+        if full_count > 0.0 else 0.0
+    full_bytes, full_measured = core.estimate_projected_bytes(
+        manifest, full_matches, legacy_full)
+    selected_bytes, selected_measured = core.estimate_projected_bytes(
+        manifest, selected_matches, legacy_selected)
+    return {
+        "full_matches": full_matches,
+        "selected_matches": selected_matches,
+        "full_bytes": full_bytes,
+        "selected_bytes": selected_bytes,
+        "measured_bytes": full_measured or selected_measured,
+    }
+
+
 # ---------------------------------------------------------------- pools ----
 
 def read_pool_header(path):
@@ -262,7 +294,7 @@ def detach_pool(name, pool_dir=None):
 
 # ------------------------------------------------------------------ job ----
 
-def job_state():
+def _job_state_locked():
     r = JOB["runner"]
     out = {"running": False, "kind": JOB["kind"], "summary": JOB["summary"],
            "error": JOB["error"], "closing": JOB["closing"],
@@ -278,8 +310,29 @@ def job_state():
     })
     if r.done():
         out["rc"] = r.returncode()
-        out["manifest"] = core.read_manifest(r.output + ".manifest")
+        if hasattr(r, "result_manifest"):
+            out["manifest"] = r.result_manifest(cleanup=JOB["kind"] == "estimate")
+        else:
+            out["manifest"] = core.read_manifest(r.output + ".manifest")
+        if JOB["kind"] == "estimate":
+            out["estimate_projection"] = estimate_projection(
+                out["manifest"], JOB["estimate_context"] or {})
     return out
+
+
+def job_state():
+    # ThreadingHTTPServer may issue overlapping state polls. Serialize the
+    # first completed-result cache/unlink so every response gets the same
+    # manifest after the temporary files disappear.
+    with LOCK:
+        return _job_state_locked()
+
+
+def _cleanup_replaced_estimate_locked():
+    runner = JOB["runner"]
+    if (JOB["kind"] == "estimate" and runner is not None and runner.done()
+            and hasattr(runner, "result_manifest")):
+        runner.result_manifest(cleanup=True)
 
 
 def start_job(kind, data, snap):
@@ -289,6 +342,7 @@ def start_job(kind, data, snap):
         r = JOB["runner"]
         if r is not None and not r.done():
             raise ValueError("A scan is already running -- stop it first.")
+        _cleanup_replaced_estimate_locked()
         crit = criteria_from_json(data, snap)
         input_name = os.path.basename(str(data.get("inputPool", "")))
         input_pool = None
@@ -298,6 +352,11 @@ def start_job(kind, data, snap):
             head = read_pool_header(candidate)
             if not input_name.endswith(".bspool") or not os.path.isfile(candidate):
                 raise ValueError("The selected input pool no longer exists.")
+            native_incompatibility = core.pool_native_incompatibility(head)
+            if native_incompatibility:
+                raise ValueError(
+                    "%s cannot be used as a Builder input: %s."
+                    % (input_name, native_incompatibility))
             input_records = int(head.get("records", "0") or 0)
             if input_records <= 0:
                 raise ValueError("The selected pool has no committed seeds to process yet.")
@@ -308,10 +367,9 @@ def start_job(kind, data, snap):
         if kind == "estimate":
             sample = clamp_int(data.get("sample", core.ESTIMATE_COUNT),
                                100_000, SEEDCAP)
-            out = os.path.join(tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-            text = crit.text("count", sample, apply_shard=False,
-                             checkpoint=min(core.ESTIMATE_CHECKPOINT, sample))
+            text = core.estimate_criteria_text(crit, sample)
             context = estimate_context(crit, data, input_name, input_records)
+            out = None
         else:
             os.makedirs(core.POOL_DIR, exist_ok=True)
             out = os.path.join(core.POOL_DIR, crit.pool_name() + ".bspool")
@@ -321,12 +379,22 @@ def start_job(kind, data, snap):
             count = clamp_int(data.get("count", 0), 0, SEEDCAP)
             text = crit.text("binary", count)
             context = None
-        if input_pool and os.path.abspath(input_pool) == os.path.abspath(out):
+        if (input_pool and out is not None
+                and os.path.abspath(input_pool) == os.path.abspath(out)):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
         summary = crit.summary()
         if kind == "estimate" and not input_pool:
             summary += " [%s-seed quick sample]" % format(sample, ",")
-        JOB.update(runner=core.Runner(snap.current_model_copy(), text, out, input_pool),
+        # Resolve every fallible setup input before creating the disposable
+        # directory. Runner owns exact artifact cleanup from this point on.
+        snapshot_copy = snap.current_model_copy()
+        if kind == "estimate":
+            out = os.path.join(
+                tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
+        runner = core.Runner(
+            snapshot_copy, text, out, input_pool,
+            temporary=kind == "estimate")
+        JOB.update(runner=runner,
                    kind=kind, started=time.time(), summary=summary, error="",
                    estimate_context=context)
 
@@ -338,6 +406,7 @@ def start_merge_job(data):
         r = JOB["runner"]
         if r is not None and not r.done():
             raise ValueError("A scan or merge is already running.")
+        _cleanup_replaced_estimate_locked()
         names = []
         for value in data.get("pools", []):
             name = os.path.basename(str(value))
@@ -351,6 +420,11 @@ def start_merge_job(data):
             head = read_pool_header(path)
             if not name.endswith(".bspool") or not os.path.isfile(path):
                 raise ValueError("A selected pool no longer exists: %s" % name)
+            native_incompatibility = core.pool_native_incompatibility(head)
+            if native_incompatibility:
+                raise ValueError(
+                    "%s cannot be merged by the native Builder: %s."
+                    % (name, native_incompatibility))
             if head.get("complete") != "1":
                 raise ValueError("Finish %s before merging it." % name)
             inputs.append(path)
@@ -376,6 +450,8 @@ def shutdown_when_safe(server):
         r.stop()
         while not r.done():
             time.sleep(0.1)
+    with LOCK:
+        _cleanup_replaced_estimate_locked()
     server.shutdown()
 
 
@@ -705,7 +781,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <section class="card" aria-labelledby="scanTitle">
         <div class="card-head"><span class="step">2</span><div>
           <h2 id="scanTitle">Set the search range</h2>
-          <p class="card-copy">Start with a quick estimate, then scale up when the result looks practical.</p>
+          <p class="card-copy">Quick Estimate builds and removes a representative adaptive sample, then projects the selected scope.</p>
         </div></div>
         <div class="field-grid">
           <div class="field full"><label for="inputPool">Search within</label>
@@ -724,7 +800,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
               <option value="1000000000">First 1 billion seeds</option>
               <option value="100000000" selected>First 100 million · quick test</option>
             </select></div>
-          <div class="field"><label for="threads">CPU threads</label>
+          <div class="field"><label for="threads">Scan threads</label>
             <select id="threads"><option value="0">Auto (recommended)</option></select></div>
           <div class="field"><label for="name">Pool name</label>
             <input type="text" id="name" placeholder="Generated automatically" size="22"></div>
@@ -758,7 +834,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
           <div class="summary-item"><dt>Looking for</dt><dd id="sumFilter">Choose a Legendary, tag, or voucher</dd></div>
           <div class="summary-item"><dt>Source</dt><dd id="sumSource">Balatro's natural seeds</dd></div>
           <div class="summary-item"><dt>Scope</dt><dd id="sumScope">First 100 million</dd></div>
-          <div class="summary-item"><dt>Compute</dt><dd id="sumThreads">Automatic threads</dd></div>
+          <div class="summary-item"><dt>Compute</dt><dd id="sumThreads">Automatic scan threads</dd></div>
           <div class="summary-item"><dt>Output</dt><dd id="sumOutput">Automatic name</dd></div>
         </dl>
         <div class="primary-actions">
@@ -1083,7 +1159,7 @@ function updateSummary(){
     : spaceInfo(c.space).name;
   $("sumScope").textContent = fromPool ? "Entire input pool" : selectedText("count").replace(" · quick test", "");
   if (c.shardTotal > 1) $("sumScope").textContent += ` · part ${c.shardIndex} of ${c.shardTotal}`;
-  $("sumThreads").textContent = c.threads ? `${c.threads} threads` : "Automatic threads";
+  $("sumThreads").textContent = c.threads ? `${c.threads} scan threads` : "Automatic scan threads";
   $("sumOutput").textContent = c.name.trim() || "Automatic name";
 }
 
@@ -1146,7 +1222,7 @@ async function deletePool(name){
     let plan = await r.json();
     if (plan.error) throw new Error(plan.error);
     const exact = (plan.files||[]).map(file=>`  ${file.path}`).join("\\n");
-    const message = `Permanently delete this completed seed pool and its related files?\\n\\n${exact}`
+    const message = `Permanently delete this seed pool and its related files?\\n\\n${exact}`
       + `\\n\\nThis cannot be undone.`;
     if (!confirm(message)) return;
     r = await fetch("/api/delete", {method:"POST", body:JSON.stringify({
@@ -1190,16 +1266,23 @@ function showResult(j){
   } else if (j.kind === "estimate") {
     const scanned = +m.scanned || 1, matched = +m.matched || 0;
     const estimate = j.estimate_context || {};
+    const projection = j.estimate_projection || {};
     const chosen = spaceInfo(estimate.space || "natural");
     const fullCount = +estimate.space_size || +m.seedspace || chosen.size;
     const selectedCount = +estimate.scope_count || fullCount;
     const selectedLabel = estimate.scope_label || "Entire chosen seed space";
-    const rate = +m.seeds_per_second || 0;
+    const rate = +m.pipeline_seeds_per_second || +m.seeds_per_second || 0;
     const matchRate = matched / scanned;
-    const fullMatches = +m.projected_full_matches || matchRate * fullCount;
-    const fullBytes = +(m.projected_compressed_bytes || m.projected_u64_bytes) || 0;
-    const selectedMatches = matchRate * selectedCount;
-    const selectedBytes = fullCount > 0 ? fullBytes * selectedCount / fullCount : 0;
+    const fullMatches = Number.isFinite(+projection.full_matches)
+      ? +projection.full_matches : (+m.projected_full_matches || matchRate * fullCount);
+    const legacyFullBytes = +(m.projected_compressed_bytes || m.projected_u64_bytes) || 0;
+    const fullBytes = Number.isFinite(+projection.full_bytes)
+      ? +projection.full_bytes : legacyFullBytes;
+    const selectedMatches = Number.isFinite(+projection.selected_matches)
+      ? +projection.selected_matches : matchRate * selectedCount;
+    const selectedBytes = Number.isFinite(+projection.selected_bytes)
+      ? +projection.selected_bytes
+      : (fullCount > 0 ? legacyFullBytes * selectedCount / fullCount : 0);
     out = `Sample: ${fmt(matched)} matching seeds in ${fmt(scanned)} scanned `
         + `(${(100*matched/scanned).toFixed(5)}%).`;
     if (matched > 0 && matched < 25)
@@ -1208,6 +1291,8 @@ function showResult(j){
     if (matched === 0)
       out += `\\nNo matches appeared in this quick sample. The filter may be very rare; `
           + `use a larger test build before concluding that no matching seeds exist.`;
+    if (matched > 0 && projection.measured_bytes)
+      out += `\\nFile sizes use the completed adaptive sample's measured bytes per record.`;
     let selectedProjection = "";
     if (matched > 0)
       selectedProjection += `~${fmt(Math.round(selectedMatches))} matches, ~${fmtBytes(selectedBytes)}, `;
@@ -1237,7 +1322,8 @@ function inputPoolOptions(groups){
   let html = `<option value="">Balatro's seed space</option>`;
   for (const family of (groups || [])) {
     for (const lineage of family.lineages) {
-      const available = lineage.pools.filter(p=>p.records > 0);
+      const available = lineage.pools.filter(
+        p=>p.records > 0 && p.native_compatible !== false);
       if (!available.length) continue;
       const groupLabel = family.legacy ? family.label
         : `${family.label} · ${lineage.label}`;
@@ -1268,13 +1354,15 @@ function renderPoolCard(p, mergeSelected){
     ? ` · “${esc(p.label)}”` : "";
   const src = p.refilter_depth ? ` · refilter ${p.refilter_depth}`
     + (p.source_pool_id && p.source_pool_id !== "-" ? ` from ${esc(p.source_pool_id.slice(0,8))}` : "") : "";
-  const enc = p.encoding === "u64le" ? " · legacy format" : "";
+  const enc = p.encoding === "u64le" ? " · legacy format"
+    : p.encoding === "adaptive-events-v1" ? " · adaptive BSP4"
+    : p.native_compatible === false ? " · unsupported format" : "";
   const merged = p.merged_parts ? ` · merged ${p.merged_parts} parts` : "";
   const composite = p.composite
     ? ` · ${esc((p.composite_operation || "composite").toUpperCase())} of ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
   const range = p.range_end > p.range_start
     ? ` · ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}` : "";
-  const pick = p.complete && !p.composite
+  const pick = p.complete && !p.composite && p.native_compatible !== false
     ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>`
     : "";
   const criteriaText = p.composite
@@ -1305,9 +1393,7 @@ function renderPoolCard(p, mergeSelected){
   } else if (p.complete && p.attachment_accelerator_blockers?.length) {
     attachmentState = `<div class="pool-relation">Not attachable: ${p.attachment_accelerator_blockers.map(esc).join("; ")}</div>`;
   }
-  const deleteAction = p.complete
-    ? `<button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete completed pool…</button>`
-    : "";
+  const deleteAction = `<button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete pool…</button>`;
   const actions = attachmentAction || deleteAction
     ? `<div class="pool-actions">${attachmentAction}${deleteAction}</div>` : "";
   return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
@@ -1455,8 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
     def _organizer_export(self, parsed):
         query = parse_qs(parsed.query)
         name = query.get("source", [""])[0]
-        reader = organizer_web.organizer.BSPoolReader(
-            organizer_web.resolve_source(name, self.pool_dir))
+        reader = organizer_web.verified_source_reader(name, self.pool_dir)
         expected = query.get("snapshot", [""])[0].lower()
         if expected != reader.snapshot_token:
             raise organizer_web.organizer.PoolError(
@@ -1575,38 +1660,20 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/organizer/api/"):
             try:
                 if parsed.path == "/organizer/api/inspect":
-                    value = organizer_web.inspect_source(
+                    value = organizer_web.run_inspect(
                         data.get("source", ""), self.pool_dir)
                 elif parsed.path == "/organizer/api/plan":
-                    reader = organizer_web.organizer.BSPoolReader(
-                        organizer_web.resolve_source(
-                            data.get("source", ""), self.pool_dir))
-                    expected = str(data.get("snapshot", "")).lower()
-                    if expected and expected != reader.snapshot_token:
-                        raise organizer_web.organizer.PoolError(
-                            "source changed; inspect it again")
-                    value = organizer_web.build_split_plan(
-                        reader, data.get("selectedCategories"),
-                        data.get("choicePlan"))
+                    value = organizer_web.run_split_plan(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/combine/plan":
-                    value = organizer_web.build_combine_plan(data, self.pool_dir)
+                    value = organizer_web.run_combine_plan(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/split":
-                    if not organizer_web.SPLIT_LOCK.acquire(False):
-                        raise organizer_web.organizer.PoolError(
-                            "another organizer split is still running")
-                    try:
-                        value = organizer_web.execute_split(
-                            data.get("source", ""), data, self.pool_dir)
-                    finally:
-                        organizer_web.SPLIT_LOCK.release()
+                    value = organizer_web.run_split(
+                        data.get("source", ""), data, self.pool_dir)
                 elif parsed.path == "/organizer/api/combine":
-                    if not organizer_web.COMBINE_LOCK.acquire(False):
-                        raise organizer_web.organizer.PoolError(
-                            "another pool combine is still running")
-                    try:
-                        value = organizer_web.execute_combine(data, self.pool_dir)
-                    finally:
-                        organizer_web.COMBINE_LOCK.release()
+                    value = organizer_web.run_combine(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/cancel":
+                    value = organizer_web.cancel_operation(
+                        str(data.get("operation", "")))
                 else:
                     return self._json({"error": "not found"}, 404)
                 self._json(value)
@@ -1675,6 +1742,8 @@ def main():
             r.stop()
             while not r.done():
                 time.sleep(0.1)
+        with LOCK:
+            _cleanup_replaced_estimate_locked()
         print("Bye.")
     finally:
         server.server_close()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Inspect and splice Brainstorm BSP3 seed pools without replaying game RNG.
+"""Inspect and splice Brainstorm BSP2/BSP3/BSP4 pools without replaying RNG.
 
 The organizer treats the header's ``records`` and ``data_bytes`` fields as the
 last committed checkpoint.  This means a paused pool can be inspected and
 split safely while a later, uncommitted tail is ignored.  Schema-3 occurrence
-metadata is copied with each selected seed; schema-2 pools remain inspectable,
-but cannot be split by position because they predate occurrence metadata.
+BSP3/BSP4 occurrence metadata is copied with each selected seed; schema-2
+pools remain inspectable, but cannot be split by position because they predate
+occurrence metadata. New split/combine publications use adaptive BSP4.
 
 Typical workflow::
 
@@ -44,14 +45,15 @@ import re
 import struct
 import sys
 import tempfile
+import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 try:
-    # Keep header discovery identical to the standalone builder, especially
-    # the bounded schema-3 header_bytes second read.
+    # Keep bounded extended-header discovery identical to the standalone
+    # builder for both event-pool schemas.
     from brainstorm_pool_builder import read_pool_header_text
     from pool_writer_lock import pool_writer_guard
 except ImportError:  # Imported as tools.brainstorm_pool_organizer in tests.
@@ -63,14 +65,51 @@ HEADER_PREFIX_BYTES = 1024
 HEADER_EVENTS_BYTES = 8192
 HEADER_MAX_BYTES = 256 * 1024
 BLOCK_MAX_RECORDS = 8192
-EVENT_WRITE_RECORDS = 1024
+BSP3_WRITE_RECORDS = 1024
+BSP4_WRITE_RECORDS = 4096
+# Retain the old name for callers that treated it as the BSP3 layout
+# constant. New adaptive output uses BSP4_WRITE_RECORDS.
+EVENT_WRITE_RECORDS = BSP3_WRITE_RECORDS
 BLOCK2_HEADER_BYTES = 32
 BLOCK3_HEADER_BYTES = 48
+BLOCK4_HEADER_BYTES = 64
 INDEX2_ENTRY_BYTES = 24
 INDEX3_ENTRY_BYTES = 32
+INDEX4_ENTRY_BYTES = 56
 FOOTER2_BYTES = 40
 FOOTER3_BYTES = 80
+FOOTER4_BYTES = 96
 MAX_METADATA_BYTES = 16 * 1024 * 1024
+SUPPORTED_POOL_SCHEMAS = (2, 3, 4)
+EVENT_POOL_SCHEMAS = (3, 4)
+POOL_ENCODINGS = {
+    2: "delta-varint-blocks-v1",
+    3: "delta-varint-events-v1",
+    4: "adaptive-events-v1",
+}
+
+BSP4_RANK_POSITIVE = 0
+BSP4_RANK_COMPLEMENT = 1
+BSP4_RANK_BITMAP = 2
+BSP4_RANK_RICE = 3
+BSP4_RICE_MAX_K = 41
+BSP4_METADATA_ADAPTIVE = 1
+BSP4_META_POSITIVE = 0
+BSP4_META_COMPLEMENT = 1
+BSP4_META_BITMAP = 2
+BSP4_META_RUNS = 3
+BSP4_MEMBERSHIP_DOMAIN = b"BSP4MEM1"
+BSP4_METADATA_DOMAIN = b"BSP4META1"
+
+# BSP4 codec payloads are deliberately self-delimiting from block counts:
+# rank 0 = schema-3 positive deltas after the first rank;
+# rank 1 = deltas of absent ranks in [first,last], first relative to first;
+# rank 2 = little-endian-per-byte membership bits for [first,last];
+# rank 3 = one k byte then Rice-coded (delta - 1) values, LSB-first.
+# Each metadata descriptor remains ``length, raw, match_count`` followed by:
+# 0 = positive record-index deltas; 1 = absent-index deltas; 2 = one bit per
+# block record; 3 = ``run_count`` then ``gap_from_prior_end, run_length``.
+# All integers outside bitmaps are canonical unsigned LEB128 values.
 
 FNV64_OFFSET = 1469598103934665603
 FNV64_PRIME = 1099511628211
@@ -106,6 +145,10 @@ COMPOSITE_HEADER_SIZES = (HEADER_EVENTS_BYTES, 16 * 1024, 32 * 1024,
                           64 * 1024, 128 * 1024, HEADER_MAX_BYTES)
 COMPOSITE_HEADER_SPARE_BYTES = 4 * 1024
 SORT_CACHE_BYTES = 64 * 1024 * 1024
+# Conservative decoded-cache charge for one one-occurrence record, including
+# the record object, rank integer, occurrence tuple, and container references.
+DECODED_RECORD_CACHE_BYTES = 228
+CANCEL_CHECK_RECORDS = 8192
 
 CRITERIA_DIRECTIVES = {
     "tag_route", "tag", "route_tag", "legendary", "route_legendary",
@@ -116,6 +159,30 @@ CRITERIA_DIRECTIVES = {
 
 class PoolError(ValueError):
     """Raised when a pool cannot be trusted or organized safely."""
+
+
+def _check_cancel(cancel_check: Optional[Callable[[], bool]]) -> None:
+    """Raise the organizer's stable cancellation error when requested."""
+    if cancel_check is not None and cancel_check():
+        raise PoolError("operation cancelled")
+
+
+def fsync_directory(path: str) -> None:
+    """Durably record directory-entry publication where the platform allows."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(os.path.abspath(path), flags)
+        os.fsync(descriptor)
+    except OSError:
+        # Some network/virtual filesystems reject directory fsync even though
+        # file fsync and atomic link/replace are supported.
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _header_token(value: str) -> str:
@@ -169,19 +236,42 @@ def fnv64(data: bytes, value: int = FNV64_OFFSET) -> int:
     return value
 
 
+@functools.lru_cache(maxsize=4096)
+def _ambiguity_rule_key_cached(candidates: Tuple[str, ...]) -> str:
+    payload = "\0".join(candidates).encode("utf-8")
+    return "%016x" % fnv64(b"ambiguity-rule\0" + payload)
+
+
+def ambiguity_rule_key(candidates: Iterable[str]) -> str:
+    """Stable token for one exact set of ambiguity destinations."""
+    return _ambiguity_rule_key_cached(tuple(sorted(candidates)))
+
+
 def fnv32(data: bytes, value: int = FNV32_OFFSET) -> int:
     for byte in data:
         value = ((value ^ byte) * FNV32_PRIME) & 0xFFFFFFFF
     return value
 
 
-def crc64(data: bytes, value: int = 0) -> int:
-    """CRC64-ECMA-182, matching the native schema-3 implementation."""
-    for byte in data:
-        value ^= byte << 56
+def _crc64_table() -> Tuple[int, ...]:
+    table = []
+    for byte in range(256):
+        value = byte << 56
         for _ in range(8):
             value = ((value << 1) ^ 0x42F0E1EBA9EA3693) & MASK64 \
                 if value & (1 << 63) else (value << 1) & MASK64
+        table.append(value)
+    return tuple(table)
+
+
+CRC64_TABLE = _crc64_table()
+
+
+def crc64(data: bytes, value: int = 0) -> int:
+    """Table-driven CRC64-ECMA-182, matching the native pool readers."""
+    for byte in data:
+        value = CRC64_TABLE[((value >> 56) ^ byte) & 0xFF] \
+            ^ ((value << 8) & MASK64)
     return value
 
 
@@ -380,8 +470,513 @@ class Occurrence:
 
 @dataclass(frozen=True)
 class Record:
+    __slots__ = ("rank", "occurrences")
+
     rank: int
     occurrences: Tuple[Occurrence, ...]
+
+
+def _positive_rank_payload(ranks: Sequence[int]) -> bytes:
+    """Return the schema-3 canonical positive-delta representation."""
+    return b"".join(
+        encode_varint(ranks[index] - ranks[index - 1])
+        for index in range(1, len(ranks)))
+
+
+def _complement_rank_payload(ranks: Sequence[int],
+                             byte_limit: Optional[int] = None
+                             ) -> Optional[bytes]:
+    """Encode absent ranks in the inclusive first/last block universe.
+
+    The first and last ranks are necessarily present.  Each absent rank is
+    encoded as a positive delta from the previous absent rank, with the first
+    delta measured from ``first_rank``.  ``byte_limit`` lets the adaptive
+    encoder avoid constructing a candidate that cannot beat the positive
+    representation.
+    """
+    span = ranks[-1] - ranks[0] + 1
+    missing = span - len(ranks)
+    if missing < 0:
+        raise PoolError("rank block has an invalid inclusive span")
+    if byte_limit is not None and missing >= byte_limit:
+        return None
+    output = bytearray()
+    prior_missing = ranks[0]
+    encoded_missing = 0
+    for left, right in zip(ranks, ranks[1:]):
+        for value in range(left + 1, right):
+            output.extend(encode_varint(value - prior_missing))
+            prior_missing = value
+            encoded_missing += 1
+            if byte_limit is not None and len(output) >= byte_limit:
+                return None
+    if encoded_missing != missing:
+        raise PoolError("rank complement accounting failed")
+    return bytes(output)
+
+
+def _bitmap_rank_payload(ranks: Sequence[int]) -> bytes:
+    span = ranks[-1] - ranks[0] + 1
+    output = bytearray((span + 7) // 8)
+    first = ranks[0]
+    for rank in ranks:
+        bit = rank - first
+        output[bit >> 3] |= 1 << (bit & 7)
+    return bytes(output)
+
+
+def _rice_rank_payload_bytes(ranks: Sequence[int], k: int) -> int:
+    if k < 0 or k > BSP4_RICE_MAX_K:
+        raise PoolError("BSP4 Rice parameter is outside 0..41")
+    bits = sum(
+        ((ranks[index] - ranks[index - 1] - 1) >> k) + 1 + k
+        for index in range(1, len(ranks)))
+    return 1 + (bits + 7) // 8
+
+
+def _rice_rank_payload(ranks: Sequence[int], k: int) -> bytes:
+    """Encode rank gaps with unary quotients and LSB-first remainders."""
+    size = _rice_rank_payload_bytes(ranks, k)
+    output = bytearray(size)
+    output[0] = k
+    bit_at = 0
+    remainder_mask = (1 << k) - 1
+    for index in range(1, len(ranks)):
+        value = ranks[index] - ranks[index - 1] - 1
+        quotient = value >> k
+        bit_at += quotient  # Unary quotient zero bits are already clear.
+        output[1 + (bit_at >> 3)] |= 1 << (bit_at & 7)
+        bit_at += 1
+        remainder = value & remainder_mask
+        for bit in range(k):
+            if remainder & (1 << bit):
+                output[1 + (bit_at >> 3)] |= 1 << (bit_at & 7)
+            bit_at += 1
+    return bytes(output)
+
+
+def _encode_rice_ranks(ranks: Sequence[int]) -> Tuple[int, bytes]:
+    """Choose Rice k in one gap pass, then encode the exact winning stream.
+
+    For ``S[k] = sum(x >> k)``, the recurrence
+    ``S[k + 1] = (S[k] - ones[k]) // 2`` avoids rescanning every gap for all
+    42 legal parameters. ``ones[k]`` is the count of gaps with bit ``k`` set.
+    This is the same fixed-width O(n + 42) selection used by the native writer.
+    """
+    ones = [0] * 64
+    shifted_sum = 0
+    if ranks and (ranks[0] < 0 or ranks[0] > MASK64):
+        raise PoolError("rank is outside uint64")
+    for index in range(1, len(ranks)):
+        if ranks[index] < 0 or ranks[index] > MASK64:
+            raise PoolError("rank is outside uint64")
+        value = ranks[index] - ranks[index - 1] - 1
+        if value < 0:
+            raise PoolError("rank block is not strictly ordered")
+        shifted_sum += value
+        bits = value
+        while bits:
+            lowest = bits & -bits
+            ones[lowest.bit_length() - 1] += 1
+            bits ^= lowest
+    gaps = max(0, len(ranks) - 1)
+    best_size = None
+    best_k = 0
+    for k in range(BSP4_RICE_MAX_K + 1):
+        bit_count = gaps * (k + 1) + shifted_sum
+        size = 1 + (bit_count + 7) // 8
+        if best_size is None or size < best_size:
+            best_size = size
+            best_k = k
+        shifted_sum = (shifted_sum - ones[k]) // 2
+    return best_k, _rice_rank_payload(ranks, best_k)
+
+
+def _encode_rank_codec(ranks: Sequence[int], codec: int) -> bytes:
+    if not ranks:
+        raise PoolError("cannot encode an empty rank block")
+    if any(rank < 0 or rank > MASK64 for rank in ranks):
+        raise PoolError("rank is outside uint64")
+    if any(ranks[index - 1] >= ranks[index]
+           for index in range(1, len(ranks))):
+        raise PoolError("rank block is not strictly ordered")
+    if codec == BSP4_RANK_POSITIVE:
+        return _positive_rank_payload(ranks)
+    if codec == BSP4_RANK_COMPLEMENT:
+        payload = _complement_rank_payload(ranks)
+        if payload is None:  # No limit was supplied, so this is unreachable.
+            raise PoolError("rank complement could not be encoded")
+        return payload
+    if codec == BSP4_RANK_BITMAP:
+        return _bitmap_rank_payload(ranks)
+    if codec == BSP4_RANK_RICE:
+        _k, payload = _encode_rice_ranks(ranks)
+        return payload
+    raise PoolError("unknown BSP4 rank codec")
+
+
+def _encode_adaptive_ranks_and_canonical(
+        ranks: Sequence[int]) -> Tuple[int, bytes, bytes]:
+    """Choose the smallest valid BSP4 rank representation.
+
+    Ties deliberately prefer the lower codec number, making organizer output
+    deterministic while readers remain able to validate any semantically
+    correct representation.
+    """
+    positive = _encode_rank_codec(ranks, BSP4_RANK_POSITIVE)
+    candidates = [(len(positive), BSP4_RANK_POSITIVE, positive)]
+    complement = _complement_rank_payload(ranks, len(positive))
+    if complement is not None:
+        candidates.append(
+            (len(complement), BSP4_RANK_COMPLEMENT, complement))
+    span = ranks[-1] - ranks[0] + 1
+    bitmap_bytes = (span + 7) // 8
+    if bitmap_bytes < len(positive):
+        bitmap = _bitmap_rank_payload(ranks)
+        candidates.append((len(bitmap), BSP4_RANK_BITMAP, bitmap))
+    size, codec, payload = min(candidates, key=lambda item: (item[0], item[1]))
+    _rice_k, rice = _encode_rice_ranks(ranks)
+    if len(rice) < size:
+        return BSP4_RANK_RICE, rice, positive
+    return codec, payload, positive
+
+
+def _encode_adaptive_ranks(ranks: Sequence[int]) -> Tuple[int, bytes]:
+    codec, payload, _canonical = _encode_adaptive_ranks_and_canonical(ranks)
+    return codec, payload
+
+
+def _decode_rank_codec(payload: bytes, count: int, first: int, last: int,
+                       codec: int) -> List[int]:
+    if not count or first > last:
+        raise PoolError("BSP4 rank bounds are invalid")
+    span = last - first + 1
+    if count > span:
+        raise PoolError("BSP4 rank count exceeds its inclusive span")
+    if codec == BSP4_RANK_POSITIVE:
+        ranks = [first]
+        at = 0
+        while len(ranks) < count:
+            delta, at = decode_varint(payload, at)
+            if not delta or ranks[-1] > MASK64 - delta:
+                raise PoolError("invalid rank delta")
+            ranks.append(ranks[-1] + delta)
+        if at != len(payload) or ranks[-1] != last:
+            raise PoolError("rank payload does not match its block header")
+        return ranks
+    if codec == BSP4_RANK_COMPLEMENT:
+        missing_count = span - count
+        # Every absent rank needs at least one byte.  Reject implausible spans
+        # before any loop or allocation.
+        if missing_count > len(payload):
+            raise PoolError("rank complement payload is too short")
+        missing = []
+        prior = first
+        at = 0
+        for _ in range(missing_count):
+            delta, at = decode_varint(payload, at)
+            if not delta or prior > MASK64 - delta:
+                raise PoolError("invalid rank complement delta")
+            prior += delta
+            if prior <= first or prior >= last:
+                raise PoolError("rank complement lies outside block bounds")
+            missing.append(prior)
+        if at != len(payload):
+            raise PoolError("rank complement has trailing bytes")
+        missing_set = set(missing)
+        ranks = [rank for rank in range(first, last + 1)
+                 if rank not in missing_set]
+        if len(ranks) != count or ranks[0] != first or ranks[-1] != last:
+            raise PoolError("rank complement does not match its block header")
+        return ranks
+    if codec == BSP4_RANK_BITMAP:
+        expected = (span + 7) // 8
+        if len(payload) != expected:
+            raise PoolError("rank bitmap length differs from its block span")
+        remainder = span & 7
+        if remainder and payload[-1] & ~((1 << remainder) - 1):
+            raise PoolError("rank bitmap has nonzero padding bits")
+        ranks = [
+            first + bit for bit in range(span)
+            if payload[bit >> 3] & (1 << (bit & 7))
+        ]
+        if (len(ranks) != count or not ranks
+                or ranks[0] != first or ranks[-1] != last):
+            raise PoolError("rank bitmap does not match its block header")
+        return ranks
+    if codec == BSP4_RANK_RICE:
+        if not payload:
+            raise PoolError("BSP4 Rice payload is missing its parameter")
+        k = payload[0]
+        if k > BSP4_RICE_MAX_K:
+            raise PoolError("BSP4 Rice parameter is outside 0..41")
+        encoded = payload[1:]
+        total_bits = len(encoded) * 8
+        bit_at = 0
+        ranks = [first]
+        for _ in range(1, count):
+            quotient = 0
+            while True:
+                if bit_at >= total_bits:
+                    raise PoolError("BSP4 Rice unary quotient is truncated")
+                bit = (encoded[bit_at >> 3] >> (bit_at & 7)) & 1
+                bit_at += 1
+                if bit:
+                    break
+                quotient += 1
+            remainder = 0
+            for shift in range(k):
+                if bit_at >= total_bits:
+                    raise PoolError("BSP4 Rice remainder is truncated")
+                remainder |= (
+                    (encoded[bit_at >> 3] >> (bit_at & 7)) & 1
+                ) << shift
+                bit_at += 1
+            value = (quotient << k) | remainder
+            delta = value + 1
+            if ranks[-1] > MASK64 - delta:
+                raise PoolError("invalid BSP4 Rice rank delta")
+            ranks.append(ranks[-1] + delta)
+        used_bytes = (bit_at + 7) // 8
+        if used_bytes != len(encoded):
+            raise PoolError("BSP4 Rice payload has trailing bytes")
+        remainder_bits = bit_at & 7
+        if (remainder_bits
+                and encoded[-1] & ~((1 << remainder_bits) - 1)):
+            raise PoolError("BSP4 Rice payload has nonzero padding bits")
+        if ranks[-1] != last:
+            raise PoolError("BSP4 Rice payload does not match its block header")
+        return ranks
+    raise PoolError("unknown BSP4 rank codec")
+
+
+def _descriptor_indexes(
+        per_record: Sequence[Sequence[Occurrence]]) -> Dict[bytes, List[int]]:
+    descriptors = collections.defaultdict(list)  # type: Dict[bytes, List[int]]
+    for index, occurrences in enumerate(per_record):
+        seen = set()
+        for occurrence in occurrences:
+            if occurrence.raw in seen:
+                continue
+            seen.add(occurrence.raw)
+            descriptors[occurrence.raw].append(index)
+    return descriptors
+
+
+def _positive_index_payload(indexes: Sequence[int]) -> bytes:
+    output = bytearray(encode_varint(indexes[0]))
+    for index in range(1, len(indexes)):
+        output.extend(encode_varint(indexes[index] - indexes[index - 1]))
+    return bytes(output)
+
+
+def _complement_index_payload(indexes: Sequence[int], records: int) -> bytes:
+    included = set(indexes)
+    complement = [index for index in range(records) if index not in included]
+    if not complement:
+        return b""
+    return _positive_index_payload(complement)
+
+
+def _bitmap_index_payload(indexes: Sequence[int], records: int) -> bytes:
+    output = bytearray((records + 7) // 8)
+    for index in indexes:
+        output[index >> 3] |= 1 << (index & 7)
+    return bytes(output)
+
+
+def _run_index_payload(indexes: Sequence[int]) -> bytes:
+    runs = []
+    start = prior = indexes[0]
+    for index in indexes[1:]:
+        if index == prior + 1:
+            prior = index
+            continue
+        runs.append((start, prior - start + 1))
+        start = prior = index
+    runs.append((start, prior - start + 1))
+    output = bytearray(encode_varint(len(runs)))
+    prior_end = 0
+    for start, length in runs:
+        output.extend(encode_varint(start - prior_end))
+        output.extend(encode_varint(length))
+        prior_end = start + length
+    return bytes(output)
+
+
+def _encode_adaptive_indexes(
+        indexes: Sequence[int], records: int,
+        positive_payload: Optional[bytes] = None) -> Tuple[int, bytes]:
+    if (not indexes or len(indexes) > records
+            or any(index < 0 or index >= records for index in indexes)
+            or any(indexes[index - 1] >= indexes[index]
+                   for index in range(1, len(indexes)))):
+        raise PoolError("metadata indexes are invalid")
+    candidates = [
+        (BSP4_META_POSITIVE, positive_payload
+         if positive_payload is not None else _positive_index_payload(indexes)),
+        (BSP4_META_COMPLEMENT, _complement_index_payload(indexes, records)),
+        (BSP4_META_BITMAP, _bitmap_index_payload(indexes, records)),
+        (BSP4_META_RUNS, _run_index_payload(indexes)),
+    ]
+    codec, payload = min(candidates, key=lambda item: (len(item[1]), item[0]))
+    return codec, payload
+
+
+def _encode_bsp3_metadata(
+        per_record: Sequence[Sequence[Occurrence]]) -> Tuple[bytes, int]:
+    """Canonical descriptor/list bytes used by BSP3 and BSP4 digests."""
+    descriptors = _descriptor_indexes(per_record)
+    output = bytearray(encode_varint(len(descriptors)))
+    associations = 0
+    for raw in sorted(descriptors):
+        indexes = descriptors[raw]
+        output.extend(encode_varint(len(raw)))
+        output.extend(raw)
+        output.extend(encode_varint(len(indexes)))
+        output.extend(_positive_index_payload(indexes))
+        associations += len(indexes)
+    return bytes(output), associations
+
+
+def _encode_bsp4_metadata(
+        per_record: Sequence[Sequence[Occurrence]]) -> Tuple[bytes, int]:
+    adaptive, _canonical, associations = \
+        _encode_bsp4_metadata_and_canonical(per_record)
+    return adaptive, associations
+
+
+def _encode_bsp4_metadata_and_canonical(
+        per_record: Sequence[Sequence[Occurrence]]
+        ) -> Tuple[bytes, bytes, int]:
+    descriptors = _descriptor_indexes(per_record)
+    output = bytearray(encode_varint(len(descriptors)))
+    canonical = bytearray(encode_varint(len(descriptors)))
+    associations = 0
+    records = len(per_record)
+    for raw in sorted(descriptors):
+        indexes = descriptors[raw]
+        positive = _positive_index_payload(indexes)
+        codec, payload = _encode_adaptive_indexes(
+            indexes, records, positive_payload=positive)
+        common = (
+            encode_varint(len(raw)) + raw + encode_varint(len(indexes)))
+        canonical.extend(common)
+        canonical.extend(positive)
+        output.extend(common)
+        output.append(codec)
+        output.extend(payload)
+        associations += len(indexes)
+    return bytes(output), bytes(canonical), associations
+
+
+def _decode_index_list(payload: bytes, at: int, indexes: int,
+                       records: int) -> Tuple[List[int], int]:
+    output = []
+    prior = None  # type: Optional[int]
+    for number in range(indexes):
+        value, at = decode_varint(payload, at)
+        if number:
+            if not value:
+                raise PoolError("metadata record delta must be positive")
+            value += prior
+        if value >= records:
+            raise PoolError("metadata association is outside its block")
+        output.append(value)
+        prior = value
+    return output, at
+
+
+def _decode_bsp4_indexes(payload: bytes, at: int, codec: int, matches: int,
+                         records: int) -> Tuple[List[int], int]:
+    if codec == BSP4_META_POSITIVE:
+        return _decode_index_list(payload, at, matches, records)
+    if codec == BSP4_META_COMPLEMENT:
+        excluded, at = _decode_index_list(
+            payload, at, records - matches, records)
+        excluded_set = set(excluded)
+        return ([index for index in range(records)
+                 if index not in excluded_set], at)
+    if codec == BSP4_META_BITMAP:
+        size = (records + 7) // 8
+        if size > len(payload) - at:
+            raise PoolError("metadata bitmap is truncated")
+        bitmap = payload[at:at + size]
+        at += size
+        remainder = records & 7
+        if remainder and bitmap[-1] & ~((1 << remainder) - 1):
+            raise PoolError("metadata bitmap has nonzero padding bits")
+        indexes = [
+            index for index in range(records)
+            if bitmap[index >> 3] & (1 << (index & 7))
+        ]
+        if len(indexes) != matches:
+            raise PoolError("metadata bitmap match count differs")
+        return indexes, at
+    if codec == BSP4_META_RUNS:
+        run_count, at = decode_varint(payload, at)
+        if not run_count or run_count > matches:
+            raise PoolError("metadata run count is invalid")
+        indexes = []
+        prior_end = 0
+        for run in range(run_count):
+            gap, at = decode_varint(payload, at)
+            length, at = decode_varint(payload, at)
+            if not length or (run and not gap):
+                raise PoolError("metadata runs are empty or not coalesced")
+            start = prior_end + gap
+            end = start + length
+            if end > records:
+                raise PoolError("metadata run lies outside its block")
+            indexes.extend(range(start, end))
+            prior_end = end
+        if len(indexes) != matches:
+            raise PoolError("metadata run match count differs")
+        return indexes, at
+    raise PoolError("unknown BSP4 metadata descriptor codec")
+
+
+def _bsp4_membership_start() -> int:
+    return fnv64(BSP4_MEMBERSHIP_DOMAIN)
+
+
+def _bsp4_metadata_start() -> int:
+    return fnv64(BSP4_METADATA_DOMAIN)
+
+
+def _bsp4_update_membership_digest(value: int,
+                                   ranks: Sequence[int],
+                                   canonical: Optional[bytes] = None) -> int:
+    """Add one logical rank block to the BSP4 membership digest.
+
+    The exact canonical stream is ``BSP4MEM1`` once, followed for every block
+    by ``<IQQI`` (record count, first rank, last rank, canonical byte count)
+    and the BSP3 positive-delta rank bytes.  Physical rank codec bytes and all
+    event metadata are intentionally excluded.
+    """
+    if canonical is None:
+        canonical = _positive_rank_payload(ranks)
+    frame = struct.pack(
+        "<IQQI", len(ranks), ranks[0], ranks[-1], len(canonical))
+    return fnv64(canonical, fnv64(frame, value))
+
+
+def _bsp4_update_metadata_digest(
+        value: int, per_record: Sequence[Sequence[Occurrence]],
+        canonical: Optional[bytes] = None,
+        associations: Optional[int] = None) -> int:
+    """Add one logical event block to the BSP4 metadata digest.
+
+    The exact canonical stream is ``BSP4META1`` once, followed for every block
+    by ``<III`` (record count, association count, canonical byte count) and
+    canonical BSP3 descriptor/positive-index-list metadata bytes.  Adaptive
+    descriptor codecs therefore cannot change the digest.
+    """
+    if canonical is None or associations is None:
+        canonical, associations = _encode_bsp3_metadata(per_record)
+    frame = struct.pack(
+        "<III", len(per_record), associations, len(canonical))
+    return fnv64(canonical, fnv64(frame, value))
 
 
 @dataclass(frozen=True)
@@ -519,6 +1114,11 @@ def expression_text(value: Dict[str, object], labels=None) -> str:
 
 @dataclass(frozen=True)
 class Block:
+    __slots__ = (
+        "offset", "first_record", "count", "rank_bytes", "metadata_bytes",
+        "associations", "first_rank", "last_rank", "header_bytes",
+        "rank_codec", "metadata_encoding", "flags")
+
     offset: int
     first_record: int
     count: int
@@ -528,6 +1128,9 @@ class Block:
     first_rank: int
     last_rank: int
     header_bytes: int
+    rank_codec: int
+    metadata_encoding: int
+    flags: int
 
     @property
     def payload_bytes(self) -> int:
@@ -577,9 +1180,13 @@ class PoolHeader:
 
 
 class BSPoolReader:
-    """Verified view of exactly one committed BSP2/BSP3 snapshot."""
+    """Verified view of exactly one committed BSP2/BSP3/BSP4 snapshot."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str,
+                 cancel_check: Optional[Callable[[], bool]] = None,
+                 verify_payloads: bool = True):
+        _check_cancel(cancel_check)
+        self.cancel_check = cancel_check
         self.path = os.path.abspath(path)
         text = read_pool_header_text(self.path)
         if not text:
@@ -590,18 +1197,22 @@ class BSPoolReader:
             self.schema = int(magic)
         except ValueError:
             raise PoolError("invalid Brainstorm pool schema")
-        if self.schema not in (2, 3):
-            raise PoolError("organizer supports committed BSP2/BSP3 pools (got BSP%d)" % self.schema)
+        if self.schema not in SUPPORTED_POOL_SCHEMAS:
+            raise PoolError(
+                "organizer supports committed BSP2/BSP3/BSP4 pools "
+                "(got BSP%d)" % self.schema)
         self.header_bytes = self.header.integer("header_bytes")
-        expected_header = HEADER_EVENTS_BYTES if self.schema == 3 else HEADER_PREFIX_BYTES
+        expected_header = HEADER_EVENTS_BYTES \
+            if self.schema in EVENT_POOL_SCHEMAS else HEADER_PREFIX_BYTES
         if self.header_bytes != expected_header:
-            # The format permits future bounded BSP3 headers. Output preserves
+            # Event formats permit bounded extended headers. Output preserves
             # their size, while BSP2 remains the fixed historical 1 KiB.
-            if self.schema != 3 or not (HEADER_PREFIX_BYTES <= self.header_bytes <= HEADER_MAX_BYTES):
+            if (self.schema not in EVENT_POOL_SCHEMAS
+                    or not (HEADER_PREFIX_BYTES <= self.header_bytes
+                            <= HEADER_MAX_BYTES)):
                 raise PoolError("pool header_bytes is invalid")
         self.encoding = self.header.one("encoding")
-        expected_encoding = "delta-varint-events-v1" if self.schema == 3 \
-            else "delta-varint-blocks-v1"
+        expected_encoding = POOL_ENCODINGS[self.schema]
         if self.encoding != expected_encoding:
             raise PoolError("BSP%d pool has incompatible encoding %s" % (self.schema, self.encoding))
         self.modelver = self.header.integer("modelver")
@@ -654,20 +1265,57 @@ class BSPoolReader:
         if self.file_bytes < self.data_end:
             raise PoolError("pool is shorter than its committed data boundary")
         self.blocks = []  # type: List[Block]
-        self.membership_digest = FNV64_OFFSET
-        self.metadata_digest = FNV64_OFFSET if self.schema == 3 else 0
-        self._scan_committed_blocks()
-        self._validate_header_digests()
-        if self.complete:
+        self._payload_verified = False
+        self._verification_lock = threading.RLock()
+        self._declared_membership_digest = self.header.integer(
+            "membership_digest", 16, required=False, default=0)
+        self._declared_metadata_digest = self.header.integer(
+            "metadata_digest", 16, required=False, default=0) \
+            if self.schema in EVENT_POOL_SCHEMAS else 0
+        self._footer_membership_digest = 0
+        self._footer_metadata_digest = 0
+        self.membership_digest = _bsp4_membership_start() \
+            if self.schema == 4 else FNV64_OFFSET
+        self.metadata_digest = _bsp4_metadata_start() \
+            if self.schema == 4 else (FNV64_OFFSET if self.schema == 3 else 0)
+        index_loaded = (
+            not verify_payloads and self.complete and self.schema == 4)
+        if index_loaded:
+            self._load_complete_bsp4_index()
+        else:
+            self._scan_committed_blocks()
+        _check_cancel(cancel_check)
+        if verify_payloads:
+            self._verify_all_payloads()
+        if self.complete and not index_loaded:
             self._validate_final_index()
+        if not verify_payloads:
+            # Identity consumers can use the committed header/footer values
+            # while payload verification is deferred to the first traversal.
+            self.membership_digest = (
+                self._declared_membership_digest
+                or self._footer_membership_digest
+                or self.membership_digest)
+            self.metadata_digest = (
+                self._declared_metadata_digest
+                or self._footer_metadata_digest
+                or self.metadata_digest)
+            if not self.blocks:
+                self._finish_payload_verification(
+                    _bsp4_membership_start()
+                    if self.schema == 4 else FNV64_OFFSET,
+                    _bsp4_metadata_start()
+                    if self.schema == 4
+                    else (FNV64_OFFSET if self.schema == 3 else 0))
+        _check_cancel(cancel_check)
 
     @property
     def metadata_capable(self) -> bool:
-        return self.schema == 3
+        return self.schema in EVENT_POOL_SCHEMAS
 
     @property
     def occurrence_metadata_complete(self) -> bool:
-        if self.schema != 3:
+        if self.schema not in EVENT_POOL_SCHEMAS:
             return False
         if not self.is_composite:
             return True
@@ -736,8 +1384,8 @@ class BSPoolReader:
             raise PoolError("composite_schema is not an integer")
         if schema != COMPOSITE_SCHEMA:
             raise PoolError("composite pool schema %d is unsupported" % schema)
-        if self.schema != 3:
-            raise PoolError("composite provenance requires a BSP3 pool")
+        if self.schema not in EVENT_POOL_SCHEMAS:
+            raise PoolError("composite provenance requires a BSP3/BSP4 pool")
         operation = self.header.one("composite_operation")
         if operation not in COMPOSITE_OPERATIONS:
             raise PoolError("composite pool has an unknown set operation")
@@ -840,12 +1488,134 @@ class BSPoolReader:
         self.composite_operation = operation
         return branches
 
+    def _load_complete_bsp4_index(self) -> None:
+        """Build lazy BSP4 block descriptors from its checked final index.
+
+        Complete BSP4 indexes repeat every structural block field. Reading
+        them once avoids one physical-header seek per block; the header itself
+        is still compared byte-for-byte with the descriptor when that payload
+        is CRC/canonical-validated.
+        """
+        footer_bytes = FOOTER4_BYTES
+        if self.file_bytes < self.data_end + footer_bytes:
+            raise PoolError("complete pool has a truncated BSP4 index")
+        with open(self.path, "rb") as handle:
+            footer = handle_read(
+                handle, self.file_bytes - footer_bytes, footer_bytes)
+            if footer[:8] != b"BSPIDX4\n":
+                raise PoolError("complete pool index footer is missing")
+            if (any(footer[56:88])
+                    or crc64(footer[:88])
+                    != struct.unpack_from("<Q", footer, 88)[0]):
+                raise PoolError("complete BSP4 footer checksum differs")
+            index_offset, block_count, records, data_bytes = \
+                struct.unpack_from("<QQQQ", footer, 8)
+            if (index_offset != self.data_end or records != self.records
+                    or data_bytes != self.data_bytes):
+                raise PoolError(
+                    "complete pool index footer disagrees with committed data")
+            expected_size = (
+                self.data_end + block_count * INDEX4_ENTRY_BYTES
+                + footer_bytes)
+            if self.file_bytes != expected_size:
+                raise PoolError(
+                    "complete pool has trailing or missing index bytes")
+            member, metadata = struct.unpack_from("<QQ", footer, 40)
+            self._footer_membership_digest = member
+            self._footer_metadata_digest = metadata
+            if ((self._declared_membership_digest
+                 and member != self._declared_membership_digest)
+                    or (self._declared_metadata_digest
+                        and metadata != self._declared_metadata_digest)):
+                raise PoolError(
+                    "complete pool footer digest differs from header")
+            raw_index = handle_read(
+                handle, index_offset, block_count * INDEX4_ENTRY_BYTES)
+
+        expected_offset = self.header_bytes
+        expected_first_record = 0
+        entry_format = "<QQQQIIIIBBBBI"
+        for number, fields in enumerate(
+                struct.iter_unpack(entry_format, raw_index)):
+            if number % CANCEL_CHECK_RECORDS == 0:
+                _check_cancel(self.cancel_check)
+            offset, first_record, first_rank, last_rank, count, rank_bytes, \
+                metadata_bytes, associations, rank_codec, \
+                metadata_encoding, flags, reserved8, reserved32 = fields
+            if (reserved8 or reserved32 or flags
+                    or rank_codec not in (
+                        BSP4_RANK_POSITIVE, BSP4_RANK_COMPLEMENT,
+                        BSP4_RANK_BITMAP, BSP4_RANK_RICE)
+                    or metadata_encoding != BSP4_METADATA_ADAPTIVE):
+                raise PoolError(
+                    "complete BSP4 index entry %d is malformed" % number)
+            if (offset != expected_offset
+                    or first_record != expected_first_record):
+                raise PoolError(
+                    "complete BSP4 index entry %d is not contiguous" %
+                    number)
+            if (not count or count > BLOCK_MAX_RECORDS
+                    or first_rank > last_rank
+                    or count > last_rank - first_rank + 1
+                    or first_rank < self.range_start
+                    or last_rank >= self.range_end
+                    or rank_bytes > (count - 1) * 6
+                    or not metadata_bytes
+                    or metadata_bytes > MAX_METADATA_BYTES):
+                raise PoolError(
+                    "complete BSP4 index entry %d has invalid bounds" %
+                    number)
+            payload_bytes = rank_bytes + metadata_bytes
+            if offset + BLOCK4_HEADER_BYTES + payload_bytes > self.data_end:
+                raise PoolError(
+                    "complete BSP4 index entry %d exceeds committed data" %
+                    number)
+            self.blocks.append(Block(
+                offset, first_record, count, rank_bytes, metadata_bytes,
+                associations, first_rank, last_rank, BLOCK4_HEADER_BYTES,
+                rank_codec, metadata_encoding, flags))
+            expected_offset += BLOCK4_HEADER_BYTES + payload_bytes
+            expected_first_record += count
+        _check_cancel(self.cancel_check)
+        if (len(self.blocks) != block_count
+                or expected_offset != self.data_end
+                or expected_first_record != self.records
+                or bool(self.records) != bool(self.blocks)):
+            raise PoolError(
+                "complete BSP4 index does not cover its committed snapshot")
+
     def _scan_committed_blocks(self) -> None:
         total_records = 0
         offset = self.header_bytes
         with open(self.path, "rb") as handle:
             while offset < self.data_end:
-                if self.schema == 3:
+                _check_cancel(self.cancel_check)
+                rank_codec = BSP4_RANK_POSITIVE
+                metadata_encoding = 0
+                flags = 0
+                if self.schema == 4:
+                    header_bytes = handle_read(
+                        handle, offset, BLOCK4_HEADER_BYTES)
+                    fields = struct.unpack(
+                        "<4sBBBBIIIIQQQQQ", header_bytes)
+                    magic, size, rank_codec, metadata_encoding, flags, count, \
+                        rank_bytes, meta_bytes, associations, first, last, \
+                        rank_checksum, metadata_checksum, reserved = fields
+                    if (magic != b"BSP4" or size != BLOCK4_HEADER_BYTES
+                            or rank_codec not in (
+                                BSP4_RANK_POSITIVE,
+                                BSP4_RANK_COMPLEMENT,
+                                BSP4_RANK_BITMAP,
+                                BSP4_RANK_RICE)
+                            or metadata_encoding != BSP4_METADATA_ADAPTIVE
+                            or flags or reserved):
+                        raise PoolError(
+                            "malformed committed BSP4 block at byte %d" %
+                            offset)
+                    if not meta_bytes or meta_bytes > MAX_METADATA_BYTES:
+                        raise PoolError("BSP4 block metadata size is invalid")
+                    block_header_bytes = BLOCK4_HEADER_BYTES
+                elif self.schema == 3:
                     header_bytes = handle_read(handle, offset, BLOCK3_HEADER_BYTES)
                     fields = struct.unpack("<4sBBBBIIIIQQQ", header_bytes)
                     magic, size, z1, z2, z3, count, rank_bytes, meta_bytes, \
@@ -871,31 +1641,14 @@ class BSPoolReader:
                 payload_bytes = rank_bytes + meta_bytes
                 if offset + block_header_bytes + payload_bytes > self.data_end:
                     raise PoolError("committed pool boundary cuts through a block")
-                payload = handle_read(handle, offset + block_header_bytes, payload_bytes)
-                if self.schema == 3:
-                    calculated = crc64(header_bytes[4:40])
-                    calculated = crc64(payload, calculated)
-                    if calculated != checksum:
-                        raise PoolError("BSP3 block checksum differs at byte %d" % offset)
-                    decoded_metadata = self._decode_metadata(
-                        payload[rank_bytes:], count, associations)
-                    if self.is_composite:
-                        self._validate_composite_metadata(decoded_metadata)
-                    self.metadata_digest = fnv64(payload[rank_bytes:], self.metadata_digest)
-                elif fnv32(payload) != checksum:
-                    raise PoolError("BSP2 block checksum differs at byte %d" % offset)
-                ranks = self._decode_ranks(payload[:rank_bytes], count, first, last)
-                for rank in ranks:
-                    if rank < self.range_start or rank >= self.range_end:
-                        raise PoolError("pool contains a rank outside its declared range")
-                self.membership_digest = fnv64(header_bytes, self.membership_digest)
-                self.membership_digest = fnv64(payload, self.membership_digest)
                 self.blocks.append(Block(
                     offset, total_records, count, rank_bytes, meta_bytes,
-                    associations, first, last, block_header_bytes,
+                    associations, first, last, block_header_bytes, rank_codec,
+                    metadata_encoding, flags,
                 ))
                 total_records += count
                 offset += block_header_bytes + payload_bytes
+        _check_cancel(self.cancel_check)
         if offset != self.data_end or total_records != self.records:
             raise PoolError("committed blocks do not match records/data_bytes")
         if bool(self.records) != bool(self.blocks):
@@ -919,40 +1672,98 @@ class BSPoolReader:
                 raise PoolError("composite record provenance does not satisfy its set expression")
 
     def _validate_header_digests(self) -> None:
-        declared_membership = self.header.integer(
-            "membership_digest", 16, required=False, default=0)
-        if declared_membership and declared_membership != self.membership_digest:
+        if (self._declared_membership_digest
+                and self._declared_membership_digest
+                != self.membership_digest):
             raise PoolError("membership_digest differs from committed pool bytes")
-        if self.schema == 3:
-            declared_metadata = self.header.integer(
-                "metadata_digest", 16, required=False, default=0)
-            if declared_metadata and declared_metadata != self.metadata_digest:
-                raise PoolError("metadata_digest differs from committed event metadata")
+        if (self.schema in EVENT_POOL_SCHEMAS
+                and self._declared_metadata_digest
+                and self._declared_metadata_digest != self.metadata_digest):
+            raise PoolError(
+                "metadata_digest differs from committed event metadata")
+        if (self._footer_membership_digest
+                and self._footer_membership_digest
+                != self.membership_digest):
+            raise PoolError("complete pool footer digest differs")
+        if (self._footer_metadata_digest
+                and self._footer_metadata_digest != self.metadata_digest):
+            raise PoolError("complete pool footer digest differs")
 
     def _validate_final_index(self) -> None:
-        entry_bytes = INDEX3_ENTRY_BYTES if self.schema == 3 else INDEX2_ENTRY_BYTES
-        footer_bytes = FOOTER3_BYTES if self.schema == 3 else FOOTER2_BYTES
+        entry_bytes = {
+            2: INDEX2_ENTRY_BYTES,
+            3: INDEX3_ENTRY_BYTES,
+            4: INDEX4_ENTRY_BYTES,
+        }[self.schema]
+        footer_bytes = {
+            2: FOOTER2_BYTES,
+            3: FOOTER3_BYTES,
+            4: FOOTER4_BYTES,
+        }[self.schema]
         expected_size = self.data_end + len(self.blocks) * entry_bytes + footer_bytes
         if self.file_bytes != expected_size:
             raise PoolError("complete pool has trailing or missing index bytes")
         with open(self.path, "rb") as handle:
             footer = handle_read(handle, self.file_bytes - footer_bytes, footer_bytes)
-            magic = b"BSPIDX3\n" if self.schema == 3 else b"BSPIDX2\n"
+            magic = {
+                2: b"BSPIDX2\n",
+                3: b"BSPIDX3\n",
+                4: b"BSPIDX4\n",
+            }[self.schema]
             if footer[:8] != magic:
                 raise PoolError("complete pool index footer is missing")
             index_offset, blocks, records, data_bytes = struct.unpack_from("<QQQQ", footer, 8)
             if (index_offset != self.data_end or blocks != len(self.blocks)
                     or records != self.records or data_bytes != self.data_bytes):
                 raise PoolError("complete pool index footer disagrees with committed data")
-            if self.schema == 3:
+            if self.schema in EVENT_POOL_SCHEMAS:
                 member, metadata = struct.unpack_from("<QQ", footer, 40)
-                if member != self.membership_digest or metadata != self.metadata_digest:
-                    raise PoolError("complete pool footer digest differs")
-                if any(footer[56:72]) or crc64(footer[:72]) != struct.unpack_from("<Q", footer, 72)[0]:
+                self._footer_membership_digest = member
+                self._footer_metadata_digest = metadata
+                if self._payload_verified:
+                    if (member != self.membership_digest
+                            or metadata != self.metadata_digest):
+                        raise PoolError("complete pool footer digest differs")
+                elif ((self._declared_membership_digest
+                       and member != self._declared_membership_digest)
+                      or (self._declared_metadata_digest
+                          and metadata != self._declared_metadata_digest)):
+                    raise PoolError(
+                        "complete pool footer digest differs from header")
+            if self.schema == 3:
+                if (any(footer[56:72])
+                        or crc64(footer[:72])
+                        != struct.unpack_from("<Q", footer, 72)[0]):
                     raise PoolError("complete BSP3 footer checksum differs")
+            elif self.schema == 4:
+                if (any(footer[56:88])
+                        or crc64(footer[:88])
+                        != struct.unpack_from("<Q", footer, 88)[0]):
+                    raise PoolError("complete BSP4 footer checksum differs")
             raw_index = handle_read(handle, index_offset, len(self.blocks) * entry_bytes)
         for number, block in enumerate(self.blocks):
             at = number * entry_bytes
+            if self.schema == 4:
+                fields = struct.unpack_from(
+                    "<QQQQIIIIBBBBI", raw_index, at)
+                offset, first_record, first_rank, last_rank, count, \
+                    rank_bytes, metadata_bytes, associations, rank_codec, \
+                    metadata_encoding, flags, reserved8, reserved32 = fields
+                if (offset, first_record, first_rank, last_rank, count,
+                        rank_bytes, metadata_bytes, associations, rank_codec,
+                        metadata_encoding, flags) != (
+                        block.offset, block.first_record, block.first_rank,
+                        block.last_rank, block.count, block.rank_bytes,
+                        block.metadata_bytes, block.associations,
+                        block.rank_codec, block.metadata_encoding,
+                        block.flags):
+                    raise PoolError(
+                        "complete BSP4 index entry %d differs" % number)
+                if reserved8 or reserved32:
+                    raise PoolError(
+                        "complete BSP4 index entry %d has reserved data" %
+                        number)
+                continue
             offset, first_record, count, rank_bytes = struct.unpack_from("<QQII", raw_index, at)
             if (offset, first_record, count, rank_bytes) != (
                     block.offset, block.first_record, block.count, block.rank_bytes):
@@ -1015,38 +1826,257 @@ class BSPoolReader:
             raise PoolError("metadata byte/association count differs")
         return [tuple(items) for items in per_record]
 
-    def _read_block_records(self, handle, block: Block) -> Tuple[Record, ...]:
-        payload = handle_read(handle, block.offset + block.header_bytes,
-                              block.payload_bytes)
-        ranks = self._decode_ranks(payload[:block.rank_bytes], block.count,
-                                   block.first_rank, block.last_rank)
+    @staticmethod
+    def _decode_metadata4(payload: bytes, records: int,
+                          expected_associations: int
+                          ) -> List[Tuple[Occurrence, ...]]:
+        at = 0
+        descriptor_count, at = decode_varint(payload, at)
+        if descriptor_count > expected_associations:
+            raise PoolError("metadata has more descriptors than associations")
+        per_record = [[] for _ in range(records)]  # type: List[List[Occurrence]]
+        prior = None  # type: Optional[bytes]
+        associations = 0
+        for _ in range(descriptor_count):
+            length, at = decode_varint(payload, at)
+            if not length or length > len(payload) - at:
+                raise PoolError("metadata descriptor is truncated")
+            raw = payload[at:at + length]
+            at += length
+            if prior is not None and prior >= raw:
+                raise PoolError("metadata descriptors are not strictly ordered")
+            prior = raw
+            occurrence = Occurrence.decode(raw)
+            matches, at = decode_varint(payload, at)
+            if not matches or matches > records:
+                raise PoolError("metadata descriptor match count is invalid")
+            if at >= len(payload):
+                raise PoolError("metadata descriptor codec is truncated")
+            codec = payload[at]
+            at += 1
+            indexes, at = _decode_bsp4_indexes(
+                payload, at, codec, matches, records)
+            if len(indexes) != matches:
+                raise PoolError("metadata descriptor match count differs")
+            for index in indexes:
+                per_record[index].append(occurrence)
+            associations += matches
+        if at != len(payload) or associations != expected_associations:
+            raise PoolError("metadata byte/association count differs")
+        return [tuple(items) for items in per_record]
+
+    def _decode_block_payload(
+            self, payload: bytes, block: Block
+            ) -> Tuple[List[int], Sequence[Tuple[Occurrence, ...]]]:
+        if self.schema == 4:
+            ranks = _decode_rank_codec(
+                payload[:block.rank_bytes], block.count, block.first_rank,
+                block.last_rank, block.rank_codec)
+            occurrences = self._decode_metadata4(
+                payload[block.rank_bytes:], block.count, block.associations)
+        else:
+            ranks = self._decode_ranks(
+                payload[:block.rank_bytes], block.count, block.first_rank,
+                block.last_rank)
         if self.schema == 3:
             occurrences = self._decode_metadata(
                 payload[block.rank_bytes:], block.count, block.associations)
-        else:
+        elif self.schema == 2:
             occurrences = [tuple() for _ in range(block.count)]
+        return ranks, occurrences
+
+    def _read_block_records(self, handle, block: Block) -> Tuple[Record, ...]:
+        payload = handle_read(handle, block.offset + block.header_bytes,
+                              block.payload_bytes)
+        ranks, occurrences = self._decode_block_payload(payload, block)
         return tuple(Record(rank, items)
                      for rank, items in zip(ranks, occurrences))
 
-    def iter_records(self) -> Iterator[Record]:
+    def _read_validated_block_records(
+            self, handle, block: Block, membership: int, metadata: int
+            ) -> Tuple[Tuple[Record, ...], int, int]:
+        header = handle_read(handle, block.offset, block.header_bytes)
+        payload = handle_read(
+            handle, block.offset + block.header_bytes, block.payload_bytes)
+        if self.schema == 4:
+            fields = struct.unpack("<4sBBBBIIIIQQQQQ", header)
+            magic, size, rank_codec, metadata_encoding, flags, count, \
+                rank_bytes, metadata_bytes, associations, first, last, \
+                rank_checksum, metadata_checksum, reserved = fields
+            if ((magic, size, rank_codec, metadata_encoding, flags, count,
+                 rank_bytes, metadata_bytes, associations, first, last,
+                 reserved)
+                    != (b"BSP4", block.header_bytes, block.rank_codec,
+                        block.metadata_encoding, block.flags, block.count,
+                        block.rank_bytes, block.metadata_bytes,
+                        block.associations, block.first_rank, block.last_rank,
+                        0)):
+                raise PoolError(
+                    "committed BSP4 block header changed at byte %d" %
+                    block.offset)
+            rank_payload = payload[:block.rank_bytes]
+            metadata_payload = payload[block.rank_bytes:]
+            calculated = crc64(
+                header[4:6] + header[8:16] + header[24:40])
+            calculated = crc64(rank_payload, calculated)
+            if calculated != rank_checksum:
+                raise PoolError(
+                    "BSP4 rank checksum differs at byte %d" % block.offset)
+            calculated = crc64(
+                header[4:5] + header[6:7]
+                + header[8:12] + header[16:24])
+            calculated = crc64(metadata_payload, calculated)
+            if calculated != metadata_checksum:
+                raise PoolError(
+                    "BSP4 metadata checksum differs at byte %d" %
+                    block.offset)
+        elif self.schema == 3:
+            fields = struct.unpack("<4sBBBBIIIIQQQ", header)
+            magic, size, zero1, zero2, zero3, count, rank_bytes, \
+                metadata_bytes, associations, first, last, checksum = fields
+            if ((magic, size, zero1, zero2, zero3, count, rank_bytes,
+                 metadata_bytes, associations, first, last)
+                    != (b"BSP3", block.header_bytes, 0, 0, 0, block.count,
+                        block.rank_bytes, block.metadata_bytes,
+                        block.associations, block.first_rank,
+                        block.last_rank)):
+                raise PoolError(
+                    "committed BSP3 block header changed at byte %d" %
+                    block.offset)
+            calculated = crc64(header[4:40])
+            calculated = crc64(payload, calculated)
+            if calculated != checksum:
+                raise PoolError(
+                    "BSP3 block checksum differs at byte %d" % block.offset)
+        else:
+            magic, count, rank_bytes, checksum, first, last = struct.unpack(
+                "<4sIIIQQ", header)
+            if ((magic, count, rank_bytes, first, last)
+                    != (b"BSP2", block.count, block.rank_bytes,
+                        block.first_rank, block.last_rank)):
+                raise PoolError(
+                    "committed BSP2 block header changed at byte %d" %
+                    block.offset)
+            if fnv32(payload) != checksum:
+                raise PoolError(
+                    "BSP2 block checksum differs at byte %d" % block.offset)
+
+        ranks, occurrences = self._decode_block_payload(payload, block)
+        for rank in ranks:
+            if rank < self.range_start or rank >= self.range_end:
+                raise PoolError(
+                    "pool contains a rank outside its declared range")
+        if self.is_composite:
+            self._validate_composite_metadata(occurrences)
+        if self.schema == 4:
+            membership = _bsp4_update_membership_digest(membership, ranks)
+            metadata = _bsp4_update_metadata_digest(metadata, occurrences)
+        else:
+            membership = fnv64(header, membership)
+            membership = fnv64(payload, membership)
+            if self.schema == 3:
+                metadata = fnv64(payload[block.rank_bytes:], metadata)
+        records = tuple(Record(rank, items)
+                        for rank, items in zip(ranks, occurrences))
+        return records, membership, metadata
+
+    def _digest_starts(self) -> Tuple[int, int]:
+        return (
+            _bsp4_membership_start()
+            if self.schema == 4 else FNV64_OFFSET,
+            _bsp4_metadata_start()
+            if self.schema == 4
+            else (FNV64_OFFSET if self.schema == 3 else 0),
+        )
+
+    def _finish_payload_verification(
+            self, membership: int, metadata: int) -> None:
+        self.membership_digest = membership
+        self.metadata_digest = metadata
+        self._validate_header_digests()
+        self._payload_verified = True
+
+    def _verify_all_payloads(
+            self,
+            cancel_check: Optional[Callable[[], bool]] = None) -> None:
+        current_cancel = cancel_check \
+            if cancel_check is not None else self.cancel_check
+        with self._verification_lock:
+            if self._payload_verified:
+                return
+            membership, metadata = self._digest_starts()
+            with open(self.path, "rb") as handle:
+                for block in self.blocks:
+                    _check_cancel(current_cancel)
+                    _records, membership, metadata = \
+                        self._read_validated_block_records(
+                            handle, block, membership, metadata)
+            _check_cancel(current_cancel)
+            self._finish_payload_verification(membership, metadata)
+
+    def accept_native_verification(
+            self, membership: int, metadata: int) -> None:
+        """Accept digests from a native full-payload validation pass."""
+        with self._verification_lock:
+            self._finish_payload_verification(membership, metadata)
+
+    def iter_records(
+            self,
+            cancel_check: Optional[Callable[[], bool]] = None
+            ) -> Iterator[Record]:
         """Yield records in rank order, independent of physical block order.
 
         Native multi-threaded writers commit each block atomically, but worker
         completion order is intentionally nondeterministic. Every individual
-        block is sorted; the file as a whole need not be. A block-level heap
-        restores global order without loading the whole pool. Decoded active
-        blocks use a bounded LRU cache so heavily interleaved or adversarial
-        inputs cannot make memory scale with total pool size.
+        block is sorted; the file as a whole need not be. Disjoint block
+        intervals can simply be traversed by first rank, keeping one decoded
+        block in memory. Only overlapping intervals need the record-level heap
+        and bounded decoded-block cache.
         """
         if not self.blocks:
             return
-        physically_sorted = all(
-            self.blocks[index - 1].last_rank < self.blocks[index].first_rank
-            for index in range(1, len(self.blocks)))
+        current_cancel = cancel_check \
+            if cancel_check is not None else self.cancel_check
+        ordered_blocks = sorted(
+            self.blocks, key=lambda block: (block.first_rank, block.last_rank))
+        disjoint_intervals = all(
+            ordered_blocks[index - 1].last_rank
+            < ordered_blocks[index].first_rank
+            for index in range(1, len(ordered_blocks)))
+        if not self._payload_verified:
+            with self._verification_lock:
+                if not self._payload_verified:
+                    # Logical BSP4/BSP3 digests follow physical block order.
+                    # A physically rank-ordered file can therefore validate
+                    # and yield each payload exactly once. Shuffled/overlapping
+                    # files take the conservative physical verification pass
+                    # first, then use the bounded ordered traversal below.
+                    if disjoint_intervals and ordered_blocks == self.blocks:
+                        membership, metadata = self._digest_starts()
+                        prior = None
+                        with open(self.path, "rb") as handle:
+                            for block in self.blocks:
+                                _check_cancel(current_cancel)
+                                records, membership, metadata = \
+                                    self._read_validated_block_records(
+                                        handle, block, membership, metadata)
+                                for record in records:
+                                    if (prior is not None
+                                            and record.rank <= prior):
+                                        raise PoolError(
+                                            "pool repeats or misorders a rank "
+                                            "across blocks")
+                                    prior = record.rank
+                                    yield record
+                        _check_cancel(current_cancel)
+                        self._finish_payload_verification(
+                            membership, metadata)
+                        return
+                    self._verify_all_payloads(current_cancel)
         with open(self.path, "rb") as handle:
-            if physically_sorted:
+            if disjoint_intervals:
                 prior = None
-                for block in self.blocks:
+                for block in ordered_blocks:
                     for record in self._read_block_records(handle, block):
                         if prior is not None and record.rank <= prior:
                             raise PoolError("pool repeats or misorders a rank across blocks")
@@ -1066,9 +2096,11 @@ class BSPoolReader:
                 block = self.blocks[block_index]
                 records = self._read_block_records(handle, block)
                 # Parsed Python objects are larger than their encoded bytes.
-                # This conservative estimate bounds the common case while
-                # always retaining the one block currently being consumed.
-                weight = max(block.payload_bytes * 4, block.count * 128)
+                # Charge the measured one-occurrence case while always
+                # retaining the one block currently being consumed.
+                weight = max(
+                    block.payload_bytes * 4,
+                    block.count * DECODED_RECORD_CACHE_BYTES)
                 cache[block_index] = (records, weight)
                 cache_bytes += weight
                 while cache_bytes > SORT_CACHE_BYTES and len(cache) > 1:
@@ -1160,7 +2192,9 @@ def source_summary(reader: BSPoolReader) -> Dict[str, object]:
 
 
 def analyze(reader: BSPoolReader, selected: Optional[set] = None,
-            ambiguity_limit: Optional[int] = None) -> Dict[str, object]:
+            ambiguity_limit: Optional[int] = None,
+            cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, object]:
+    _check_cancel(cancel_check)
     counts = collections.Counter()
     details = {}  # type: Dict[str, Dict[str, object]]
     ambiguous = []
@@ -1178,7 +2212,8 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
     # default eagerly, which previously rebuilt the full label/dictionary for
     # every occurrence even after the category was already known.
     category_ids = {}
-    for record in reader.iter_records():
+    processed = 0
+    for record in reader.iter_records(cancel_check=cancel_check):
         categories_set = set()
         record_provenance = set()
         record_operands = set()
@@ -1223,6 +2258,10 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
                     "rank": record.rank,
                     "candidates": categories,
                 })
+        processed += 1
+        if processed % CANCEL_CHECK_RECORDS == 0:
+            _check_cancel(cancel_check)
+    _check_cancel(cancel_check)
     categories = []
     for category in sorted(counts):
         item = dict(details[category])
@@ -1250,6 +2289,8 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
 
 
 class BSP3OutputWriter:
+    write_records = BSP3_WRITE_RECORDS
+
     def __init__(self, reader: BSPoolReader, category_id: str, label: str,
                  final_path: str, header_bytes: Optional[int] = None,
                  header_builder=None, allow_empty: bool = False):
@@ -1282,7 +2323,7 @@ class BSP3OutputWriter:
             raise PoolError("organizer output records are not strictly ordered")
         self.last_added_rank = record.rank
         self.buffer.append(record)
-        if len(self.buffer) >= EVENT_WRITE_RECORDS:
+        if len(self.buffer) >= self.write_records:
             self._flush()
 
     def _flush(self) -> None:
@@ -1337,6 +2378,7 @@ class BSP3OutputWriter:
         self.blocks.append(Block(
             offset, self.records, len(records), len(rank_payload), len(metadata),
             associations, records[0].rank, records[-1].rank, BLOCK3_HEADER_BYTES,
+            BSP4_RANK_POSITIVE, 0, 0,
         ))
         self.records += len(records)
         self.data_bytes += BLOCK3_HEADER_BYTES + len(rank_payload) + len(metadata)
@@ -1396,13 +2438,132 @@ class BSP3OutputWriter:
             pass
 
 
+class BSP4OutputWriter(BSP3OutputWriter):
+    """Adaptive event-pool writer with the BSP3 add/abort lifecycle."""
+
+    write_records = BSP4_WRITE_RECORDS
+
+    def __init__(self, reader: BSPoolReader, category_id: str, label: str,
+                 final_path: str, header_bytes: Optional[int] = None,
+                 header_builder=None, allow_empty: bool = False):
+        super().__init__(
+            reader, category_id, label, final_path, header_bytes,
+            header_builder, allow_empty)
+        self.membership_digest = _bsp4_membership_start()
+        self.metadata_digest = _bsp4_metadata_start()
+
+    def _flush(self) -> None:
+        if not self.buffer:
+            return
+        records = sorted(self.buffer, key=lambda item: item.rank)
+        if any(records[index - 1].rank >= records[index].rank
+               for index in range(1, len(records))):
+            raise PoolError("output category contains duplicate ranks")
+        ranks = [record.rank for record in records]
+        per_record = [record.occurrences for record in records]
+        rank_codec, rank_payload, canonical_ranks = \
+            _encode_adaptive_ranks_and_canonical(ranks)
+        metadata, canonical_metadata, associations = \
+            _encode_bsp4_metadata_and_canonical(per_record)
+        if not metadata or len(metadata) > MAX_METADATA_BYTES:
+            raise PoolError("output metadata block is too large")
+
+        offset = self.handle.tell()
+        header = bytearray(BLOCK4_HEADER_BYTES)
+        header[:4] = b"BSP4"
+        header[4] = BLOCK4_HEADER_BYTES
+        header[5] = rank_codec
+        header[6] = BSP4_METADATA_ADAPTIVE
+        # Byte 7 and the final u64 are reserved and remain zero.
+        struct.pack_into(
+            "<IIIIQQ", header, 8, len(records), len(rank_payload),
+            len(metadata), associations, ranks[0], ranks[-1])
+        rank_checksum = crc64(
+            bytes(header[4:6] + header[8:16] + header[24:40]))
+        rank_checksum = crc64(rank_payload, rank_checksum)
+        metadata_checksum = crc64(
+            bytes(header[4:5] + header[6:7]
+                  + header[8:12] + header[16:24]))
+        metadata_checksum = crc64(metadata, metadata_checksum)
+        struct.pack_into("<QQ", header, 40, rank_checksum, metadata_checksum)
+
+        self.handle.write(header)
+        self.handle.write(rank_payload)
+        self.handle.write(metadata)
+        self.membership_digest = _bsp4_update_membership_digest(
+            self.membership_digest, ranks, canonical=canonical_ranks)
+        self.metadata_digest = _bsp4_update_metadata_digest(
+            self.metadata_digest, per_record, canonical=canonical_metadata,
+            associations=associations)
+        self.blocks.append(Block(
+            offset, self.records, len(records), len(rank_payload),
+            len(metadata), associations, ranks[0], ranks[-1],
+            BLOCK4_HEADER_BYTES, rank_codec, BSP4_METADATA_ADAPTIVE, 0,
+        ))
+        self.records += len(records)
+        self.data_bytes += (
+            BLOCK4_HEADER_BYTES + len(rank_payload) + len(metadata))
+        self.buffer = []
+
+    def finalize(self) -> Dict[str, object]:
+        self._flush()
+        if not self.records and not self.allow_empty:
+            raise PoolError("refusing to write an empty organizer category")
+        index_offset = self.header_bytes + self.data_bytes
+        if self.handle.tell() != index_offset:
+            raise PoolError("organizer output byte accounting failed")
+        for block in self.blocks:
+            self.handle.write(struct.pack(
+                "<QQQQIIIIBBBBI", block.offset, block.first_record,
+                block.first_rank, block.last_rank, block.count,
+                block.rank_bytes, block.metadata_bytes, block.associations,
+                block.rank_codec, block.metadata_encoding, block.flags, 0, 0))
+        footer = bytearray(FOOTER4_BYTES)
+        footer[:8] = b"BSPIDX4\n"
+        struct.pack_into(
+            "<QQQQQQ", footer, 8, index_offset, len(self.blocks),
+            self.records, self.data_bytes, self.membership_digest,
+            self.metadata_digest)
+        struct.pack_into("<Q", footer, 88, crc64(bytes(footer[:88])))
+        self.handle.write(footer)
+        if self.header_builder is None:
+            header, identity = build_output_header(
+                self.reader, self.category_id, self.label, self.records,
+                self.data_bytes, self.membership_digest, self.metadata_digest,
+                schema=4)
+        else:
+            header, identity = self.header_builder(
+                self.records, self.data_bytes, self.membership_digest,
+                self.metadata_digest)
+        if len(header) != self.header_bytes:
+            raise PoolError(
+                "organizer output header builder returned the wrong size")
+        if not header.startswith(b"BRAINSTORM_SEED_POOL 4"):
+            raise PoolError("BSP4 output header builder returned another schema")
+        self.handle.seek(0)
+        self.handle.write(header)
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.handle.close()
+        self.closed = True
+        identity.update({
+            "path": self.final_path,
+            "records": self.records,
+            "category_id": self.category_id,
+        })
+        return identity
+
+
 def _hex_header(reader: BSPoolReader, key: str, default: int = 0) -> int:
     return reader.header.integer(key, 16, required=False, default=default)
 
 
 def build_output_header(reader: BSPoolReader, category_id: str, label: str,
                         records: int, data_bytes: int, membership: int,
-                        metadata: int) -> Tuple[bytes, Dict[str, object]]:
+                        metadata: int, schema: int = 3
+                        ) -> Tuple[bytes, Dict[str, object]]:
+    if schema not in EVENT_POOL_SCHEMAS:
+        raise PoolError("organizer event output schema is invalid")
     category_hash = fnv64(category_id.encode("utf-8"))
     source_lineage = reader.lineage_id or hash_fields(
         "lineage-fallback", reader.family_id, reader.criteria_hash, 0, 0)
@@ -1433,9 +2594,9 @@ def build_output_header(reader: BSPoolReader, category_id: str, label: str,
     scan_cursor = reader.header.integer("scan_cursor", required=False, default=0)
     parent_segment = reader.segment_id
     lines = [
-        "BRAINSTORM_SEED_POOL 3",
+        "BRAINSTORM_SEED_POOL %d" % schema,
         "modelver %d" % modelver,
-        "encoding delta-varint-events-v1",
+        "encoding %s" % POOL_ENCODINGS[schema],
         "header_bytes %d" % reader.header_bytes,
         "charset %s" % reader.charset,
         "seedspace %d" % reader.seedspace,
@@ -1744,9 +2905,9 @@ def _composite_output_header(context: CombineContext, label: str,
     safe_label = label.replace("\r", " ").replace("\n", " ").replace("\0", " ")
     safe_label = safe_label.encode("ascii", "replace").decode("ascii")[:135]
     lines = [
-        "BRAINSTORM_SEED_POOL 3",
+        "BRAINSTORM_SEED_POOL 4",
         "modelver %d" % first.modelver,
-        "encoding delta-varint-events-v1",
+        "encoding adaptive-events-v1",
         "header_bytes %d" % header_bytes,
         "charset %s" % first.charset,
         "seedspace %d" % first.seedspace,
@@ -1778,7 +2939,7 @@ def _composite_output_header(context: CombineContext, label: str,
     ])
     encoded = ("\n".join(lines) + "\n").encode("latin-1")
     if len(encoded) > header_bytes:
-        raise PoolError("composite metadata exceeds the maximum BSP3 header size")
+        raise PoolError("composite metadata exceeds the maximum BSP4 header size")
     encoded += b"\0" * (header_bytes - len(encoded))
     return encoded, {
         "pool_id": pool_id,
@@ -1812,48 +2973,112 @@ def composite_header_size(context: CombineContext, label: str) -> int:
                 return size
         except PoolError:
             continue
-    raise PoolError("composite branch/filter metadata will not fit in a BSP3 header")
+    raise PoolError("composite branch/filter metadata will not fit in a BSP4 header")
+
+
+class _CombineRecordNormalizer:
+    """Validate provenance while retaining already decoded descriptors."""
+
+    __slots__ = (
+        "context", "allowed_sets", "declared_operand_sets",
+        "direct_provenance", "output_operands")
+
+    def __init__(self, context: CombineContext):
+        self.context = context
+        self.allowed_sets = tuple(
+            frozenset(values) for values in context.source_branch_ids)
+        self.declared_operand_sets = tuple(
+            frozenset(reader.composite_operands)
+            for reader in context.readers)
+        self.direct_provenance = tuple(
+            None if reader.is_composite else Occurrence.decode(
+                provenance_descriptor(next(iter(self.allowed_sets[index]))))
+            for index, reader in enumerate(context.readers))
+        self.output_operands = tuple(
+            Occurrence.decode(operand_descriptor(operand.operand_id))
+            for operand in context.operands)
+
+    def normalize(self, source_index: int, record: Record) -> Record:
+        reader = self.context.readers[source_index]
+        by_raw = {}
+        provenance = set()
+        source_operands = set()
+        for item in record.occurrences:
+            operand_id = item.operand_id
+            if operand_id is not None:
+                source_operands.add(operand_id)
+                continue
+            by_raw.setdefault(item.raw, item)
+            provenance_id = item.provenance_id
+            if provenance_id is not None:
+                provenance.add(provenance_id)
+        if reader.is_composite:
+            if not provenance:
+                raise PoolError(
+                    "composite source %s has a seed without provenance" %
+                    os.path.basename(reader.path))
+            if provenance - self.allowed_sets[source_index]:
+                raise PoolError(
+                    "composite source %s references an undeclared branch" %
+                    os.path.basename(reader.path))
+            if (not source_operands
+                    or source_operands
+                    - self.declared_operand_sets[source_index]):
+                raise PoolError(
+                    "composite source %s has missing or undeclared operand provenance" %
+                    os.path.basename(reader.path))
+            if not expression_matches(
+                    reader.composite_expression, source_operands):
+                raise PoolError(
+                    "composite source %s has operand provenance that does not satisfy its expression" %
+                    os.path.basename(reader.path))
+        else:
+            if provenance or source_operands:
+                raise PoolError(
+                    "non-composite source contains undeclared provenance metadata")
+            item = self.direct_provenance[source_index]
+            by_raw[item.raw] = item
+        return Record(
+            record.rank, tuple(by_raw[raw] for raw in sorted(by_raw)))
+
+    def merged(self, rank: int,
+               group: Sequence[Tuple[int, Record]], present: set) -> Record:
+        by_raw = {
+            item.raw: item
+            for _index, record in group
+            for item in record.occurrences
+        }
+        for index in present:
+            item = self.output_operands[index]
+            by_raw[item.raw] = item
+        return Record(rank, tuple(by_raw[raw] for raw in sorted(by_raw)))
 
 
 def _normalized_combine_record(context: CombineContext, source_index: int,
-                               record: Record) -> Record:
-    reader = context.readers[source_index]
-    allowed = set(context.source_branch_ids[source_index])
-    raw_items = {item.raw for item in record.occurrences if not item.is_operand}
-    provenance = {item.provenance_id for item in record.occurrences
-                  if item.is_provenance}
-    source_operands = {item.operand_id for item in record.occurrences
-                       if item.is_operand}
-    if reader.is_composite:
-        if not provenance:
-            raise PoolError("composite source %s has a seed without provenance" %
-                            os.path.basename(reader.path))
-        unknown = provenance - allowed
-        if unknown:
-            raise PoolError("composite source %s references an undeclared branch" %
-                            os.path.basename(reader.path))
-        if not source_operands or source_operands - set(reader.composite_operands):
-            raise PoolError("composite source %s has missing or undeclared operand provenance" %
-                            os.path.basename(reader.path))
-        if not expression_matches(reader.composite_expression, source_operands):
-            raise PoolError("composite source %s has operand provenance that does not satisfy its expression" %
-                            os.path.basename(reader.path))
-    else:
-        if provenance or source_operands:
-            raise PoolError("non-composite source contains undeclared provenance metadata")
-        branch_id = next(iter(allowed))
-        raw_items.add(provenance_descriptor(branch_id))
-    return Record(record.rank, tuple(Occurrence.decode(raw) for raw in sorted(raw_items)))
+                               record: Record,
+                               normalizer: Optional[
+                                   _CombineRecordNormalizer] = None) -> Record:
+    return (normalizer or _CombineRecordNormalizer(context)).normalize(
+        source_index, record)
 
 
 def _iter_combined_records(context: CombineContext,
-                           progress=None) -> Iterator[Record]:
-    iterators = [iter(reader.iter_records()) for reader in context.readers]
+                           progress=None,
+                           cancel_check: Optional[Callable[[], bool]] = None
+                           ) -> Iterator[Record]:
+    _check_cancel(cancel_check)
+    iterators = [
+        iter(reader.iter_records(cancel_check=cancel_check))
+        for reader in context.readers
+    ]
+    normalizer = _CombineRecordNormalizer(context)
     heap = []
     consumed = 0
+    next_cancel_check = CANCEL_CHECK_RECORDS
     for index, iterator in enumerate(iterators):
         try:
-            record = _normalized_combine_record(context, index, next(iterator))
+            record = _normalized_combine_record(
+                context, index, next(iterator), normalizer)
         except StopIteration:
             continue
         heapq.heappush(heap, (record.rank, index, record))
@@ -1866,7 +3091,7 @@ def _iter_combined_records(context: CombineContext,
             consumed += 1
             try:
                 following = _normalized_combine_record(
-                    context, index, next(iterators[index]))
+                    context, index, next(iterators[index]), normalizer)
             except StopIteration:
                 following = None
             if following is not None:
@@ -1878,30 +3103,35 @@ def _iter_combined_records(context: CombineContext,
             or (context.operation == "difference"
                 and present == {0})
         if include:
-            raw_items = {item.raw for _index, item_record in group
-                         for item in item_record.occurrences}
-            raw_items.update(operand_descriptor(context.operands[index].operand_id)
-                             for index in present)
-            yield Record(rank, tuple(Occurrence.decode(raw)
-                                     for raw in sorted(raw_items)))
+            yield normalizer.merged(rank, group, present)
+        if consumed >= next_cancel_check:
+            _check_cancel(cancel_check)
+            next_cancel_check = consumed + CANCEL_CHECK_RECORDS
         if progress is not None and consumed % 100000 == 0:
             progress(consumed)
+    _check_cancel(cancel_check)
 
 
 def combine_pools(readers: Sequence[BSPoolReader], output_path: str,
                   operation: str = "union", label: str = "Combined seed pool",
-                  progress=None) -> Dict[str, object]:
-    """Stream a literal set operation and atomically publish one BSP3 pool."""
+                  progress=None,
+                  cancel_check: Optional[Callable[[], bool]] = None
+                  ) -> Dict[str, object]:
+    """Stream a literal set operation and atomically publish one BSP4 pool."""
+    _check_cancel(cancel_check)
     output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with pool_writer_guard(output_path):
         return _combine_pools_locked(
-            readers, output_path, operation, label, progress)
+            readers, output_path, operation, label, progress, cancel_check)
 
 
 def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
                           operation: str, label: str,
-                          progress=None) -> Dict[str, object]:
+                          progress=None,
+                          cancel_check: Optional[Callable[[], bool]] = None
+                          ) -> Dict[str, object]:
+    _check_cancel(cancel_check)
     context = prepare_combine(readers, operation)
     directory = os.path.dirname(output_path)
     os.makedirs(directory, exist_ok=True)
@@ -1917,18 +3147,22 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
             context, label, header_bytes, records, data_bytes,
             membership, metadata)
 
-    writer = BSP3OutputWriter(
+    writer = BSP4OutputWriter(
         context.readers[0], "composite:%s" % context.operation, label,
         output_path, header_bytes=header_bytes,
         header_builder=header_builder, allow_empty=True)
     published = False
     try:
-        for record in _iter_combined_records(context, progress=progress):
+        for record in _iter_combined_records(
+                context, progress=progress, cancel_check=cancel_check):
             writer.add(record)
+        _check_cancel(cancel_check)
         identity = writer.finalize()
+        _check_cancel(cancel_check)
         os.link(writer.temp_path, output_path)
         published = True
         os.unlink(writer.temp_path)
+        fsync_directory(directory)
         result = context.as_dict()
         result.update(identity)
         result.update({
@@ -1938,7 +3172,7 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
             "completed": True,
         })
         return result
-    except Exception:
+    except BaseException:
         if published:
             try:
                 os.unlink(output_path)
@@ -1965,7 +3199,8 @@ def atomic_json(path: str, value: object) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
-    except Exception:
+        fsync_directory(directory)
+    except BaseException:
         try:
             os.unlink(temp)
         except OSError:
@@ -2000,6 +3235,8 @@ def load_choices(path: Optional[str], reader: BSPoolReader) -> Dict[str, str]:
 
 def choice_for_record(choices: Dict[str, str], reader: BSPoolReader,
                       record: Record) -> Tuple[Optional[str], Optional[str]]:
+    if not choices:
+        return None, None
     seed = reader.seed(record.rank)
     rank_key = "rank:%d" % record.rank
     if seed in choices and rank_key in choices and choices[seed] != choices[rank_key]:
@@ -2014,13 +3251,17 @@ def choice_for_record(choices: Dict[str, str], reader: BSPoolReader,
 def split_pool(reader: BSPoolReader, output_dir: str,
                selected_ids: Optional[Sequence[str]], choices_path: Optional[str],
                report_path: Optional[str], remainder_name: Optional[str],
-               omit_unmatched: bool) -> Tuple[Dict[str, object], bool]:
+               omit_unmatched: bool,
+               cancel_check: Optional[Callable[[], bool]] = None
+               ) -> Tuple[Dict[str, object], bool]:
+    _check_cancel(cancel_check)
     if not reader.metadata_capable:
-        raise PoolError("BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP3 before splitting")
+        raise PoolError("BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     choices = load_choices(choices_path, reader)
-    all_summary = analyze(reader, ambiguity_limit=0)
+    all_summary = analyze(
+        reader, ambiguity_limit=0, cancel_check=cancel_check)
     available = {item["category_id"]: item for item in all_summary["categories"]}
     if selected_ids:
         unknown = sorted(set(selected_ids) - set(available))
@@ -2039,7 +3280,8 @@ def split_pool(reader: BSPoolReader, output_dir: str,
     used_choices = set()
     remainder_id = "remainder:%s" % quote(remainder_name, safe="_.-") \
         if remainder_name else None
-    for record in reader.iter_records():
+    processed = 0
+    for record in reader.iter_records(cancel_check=cancel_check):
         candidates = record_categories(record, selected)
         chosen = None
         choice_key = None
@@ -2072,6 +3314,10 @@ def split_pool(reader: BSPoolReader, output_dir: str,
                 chosen = remainder_id
         if chosen is not None:
             category_counts[chosen] += 1
+        processed += 1
+        if processed % CANCEL_CHECK_RECORDS == 0:
+            _check_cancel(cancel_check)
+    _check_cancel(cancel_check)
     unused = sorted(set(choices) - used_choices)
     if unused:
         raise PoolError("choices file contains a seed/rank not used by this split: %s" % unused[0])
@@ -2111,71 +3357,285 @@ def split_pool(reader: BSPoolReader, output_dir: str,
         report_path = os.path.join(output_dir, base + "-split-plan.json")
     else:
         report_path = os.path.abspath(report_path)
+    _check_cancel(cancel_check)
     atomic_json(report_path, report)
     if unresolved or (unmatched and not remainder_id and not omit_unmatched):
         return report, False
 
+    return write_prepared_split(
+        reader, output_dir, sorted(selected), choices, category_rows, report,
+        report_path, remainder_id=remainder_id, cancel_check=cancel_check,
+        ambiguity_rules=None)
+
+
+def write_prepared_split(
+        reader: BSPoolReader, output_dir: str, selected_ids: Sequence[str],
+        choices: Dict[str, str], category_rows: Sequence[Dict[str, object]],
+        report: Dict[str, object], report_path: str,
+        remainder_id: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        ambiguity_rules: Optional[Dict[str, str]] = None
+        ) -> Tuple[Dict[str, object], bool]:
+    """Publish one already validated, snapshot-pinned split plan.
+
+    ``category_rows`` supplies identities, labels, and exact output counts only.
+    Output paths are always derived locally from those identities; caller-owned
+    ``path`` or ``name`` fields are deliberately ignored.
+    """
+    _check_cancel(cancel_check)
+    if not reader.metadata_capable:
+        raise PoolError(
+            "BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
+    if (isinstance(selected_ids, (str, bytes))
+            or not isinstance(selected_ids, Sequence)):
+        raise PoolError("prepared split categories must be a sequence")
+
+    def checked_category_id(value, remainder=False):
+        if (not isinstance(value, str) or not value or len(value) > 4096
+                or any(ch.isspace() or ord(ch) < 33 or ord(ch) > 126
+                       for ch in value)
+                or "/" in value or "\\" in value):
+            raise PoolError("prepared split contains an invalid category id")
+        prefixes = ("remainder:",) if remainder else tuple(
+            "%s:" % name for name in KIND_NAMES.values())
+        if not value.startswith(prefixes):
+            raise PoolError("prepared split contains an invalid category id")
+        return value
+
+    selected_values = [checked_category_id(value) for value in selected_ids]
+    if not selected_values:
+        raise PoolError("prepared split has no selected categories")
+    if len(set(selected_values)) != len(selected_values):
+        raise PoolError("prepared split repeats a selected category")
+    selected = set(selected_values)
+
+    if remainder_id is not None:
+        remainder_id = checked_category_id(remainder_id, remainder=True)
+        if remainder_id in selected:
+            raise PoolError("prepared split remainder duplicates a selected category")
+
+    if not isinstance(choices, dict):
+        raise PoolError("prepared split choices must be an object")
+    checked_choices = {}
+    for choice_index, (key, category) in enumerate(choices.items()):
+        if choice_index % CANCEL_CHECK_RECORDS == 0:
+            _check_cancel(cancel_check)
+        if not isinstance(key, str) or not key or not isinstance(category, str):
+            raise PoolError("prepared split choice keys and categories must be strings")
+        category = checked_category_id(category)
+        if category not in selected:
+            raise PoolError("prepared split choice names an unselected category")
+        checked_choices[key] = category
+
+    if ambiguity_rules is None:
+        checked_ambiguity_rules = {}
+    elif not isinstance(ambiguity_rules, dict):
+        raise PoolError("prepared split ambiguity rules must be an object")
+    else:
+        checked_ambiguity_rules = {}
+        for rule_index, (key, category) in enumerate(ambiguity_rules.items()):
+            if rule_index % CANCEL_CHECK_RECORDS == 0:
+                _check_cancel(cancel_check)
+            if (not isinstance(key, str)
+                    or not re.fullmatch(r"[0-9a-f]{16}", key)
+                    or not isinstance(category, str)):
+                raise PoolError(
+                    "prepared split contains an invalid ambiguity rule")
+            category = checked_category_id(category)
+            if category not in selected:
+                raise PoolError(
+                    "prepared split ambiguity rule names an unselected category")
+            checked_ambiguity_rules[key] = category
+
+    if (isinstance(category_rows, (str, bytes))
+            or not isinstance(category_rows, Sequence)):
+        raise PoolError("prepared split outputs must be a sequence")
     destinations = {}
     labels = {}
-    for row in category_rows:
-        category = row["category_id"]
-        destination = os.path.join(output_dir, safe_filename(category))
+    expected_counts = {}
+    clean_rows = []
+    total_records = 0
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    os.makedirs(output_dir, exist_ok=True)
+    for row_index, row in enumerate(category_rows):
+        if row_index % CANCEL_CHECK_RECORDS == 0:
+            _check_cancel(cancel_check)
+        if not isinstance(row, dict):
+            raise PoolError("prepared split output must be an object")
+        category = checked_category_id(
+            row.get("category_id"), remainder=row.get("category_id") == remainder_id)
+        if category not in selected and category != remainder_id:
+            raise PoolError("prepared split output names an unselected category")
+        if category in destinations:
+            raise PoolError("prepared split repeats an output category")
+        label = row.get("label")
+        if (not isinstance(label, str) or not label.strip()
+                or len(label) > 4096):
+            raise PoolError("prepared split output has an invalid label")
+        records = row.get("records")
+        if (isinstance(records, bool) or not isinstance(records, int)
+                or records <= 0 or records > reader.records):
+            raise PoolError("prepared split output has an invalid record count")
+        total_records += records
+        if total_records > reader.records:
+            raise PoolError("prepared split output counts exceed the source snapshot")
+        filename = safe_filename(category)
+        destination = os.path.abspath(os.path.join(output_dir, filename))
+        if (filename != os.path.basename(filename)
+                or os.path.commonpath((output_dir, destination)) != output_dir):
+            raise PoolError("prepared split output escapes its destination folder")
         if destination in destinations.values():
             raise PoolError("two categories resolve to the same output filename")
         destinations[category] = destination
-        labels[category] = row["label"]
+        labels[category] = label
+        expected_counts[category] = records
+        clean_rows.append({
+            "category_id": category,
+            "label": label,
+            "records": records,
+        })
+    if not destinations:
+        raise PoolError("prepared split has no non-empty outputs")
+
+    if not isinstance(report, dict):
+        raise PoolError("prepared split report must be an object")
+    if str(report.get("source_snapshot_id", "")).lower() != reader.snapshot_token:
+        raise PoolError("prepared split report is for a different source snapshot")
+    declared_selected = report.get("selected_categories")
+    if (not isinstance(declared_selected, list)
+            or len(declared_selected) != len(selected_values)
+            or set(declared_selected) != selected):
+        raise PoolError("prepared split report categories do not match its plan")
+    if report.get("unresolved_ambiguities", 0) != 0:
+        raise PoolError("prepared split still has unresolved ambiguities")
+    declared_rules = report.get("ambiguity_rules", {})
+    if (not isinstance(declared_rules, dict)
+            or declared_rules != checked_ambiguity_rules):
+        raise PoolError(
+            "prepared split report ambiguity rules do not match its plan")
+    report["source"] = source_summary(reader)
+    report["source_snapshot_id"] = reader.snapshot_token
+    report["selected_categories"] = sorted(selected)
+    report["categories"] = clean_rows
+    report["outputs"] = []
+    if ambiguity_rules is not None:
+        report["ambiguity_rules"] = dict(checked_ambiguity_rules)
+
+    report_path = os.path.abspath(os.fspath(report_path))
+    forbidden_paths = {os.path.normcase(os.path.realpath(reader.path))}
+    for destination in destinations.values():
+        forbidden_paths.add(os.path.normcase(os.path.realpath(destination)))
+        forbidden_paths.add(os.path.normcase(os.path.realpath(
+            destination + ".writer.lock")))
+    if os.path.normcase(os.path.realpath(report_path)) in forbidden_paths:
+        raise PoolError("prepared split report path conflicts with a pool file")
+
     with ExitStack() as output_locks:
+        _check_cancel(cancel_check)
         for destination in sorted(destinations.values()):
             output_locks.enter_context(pool_writer_guard(destination))
             if os.path.exists(destination):
                 raise PoolError("output already exists: %s" % destination)
         return _write_split_outputs(
-            reader, selected, choices, remainder_id, destinations, labels,
-            report, report_path)
+            reader, selected, checked_choices, remainder_id, destinations,
+            labels, report, report_path, cancel_check,
+            expected_counts=expected_counts,
+            ambiguity_rules=checked_ambiguity_rules)
 
 
 def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
                          choices: Dict[str, str], remainder_id: Optional[str],
                          destinations: Dict[str, str], labels: Dict[str, str],
-                         report: Dict[str, object], report_path: str):
+                         report: Dict[str, object], report_path: str,
+                         cancel_check: Optional[Callable[[], bool]] = None,
+                         expected_counts: Optional[Dict[str, int]] = None,
+                         ambiguity_rules: Optional[Dict[str, str]] = None):
     """Write and publish split outputs while the caller holds every lock."""
-    writers = {}  # type: Dict[str, BSP3OutputWriter]
+    _check_cancel(cancel_check)
+    writers = {}  # type: Dict[str, BSP4OutputWriter]
     linked = []  # type: List[str]
+    rules = ambiguity_rules or {}
+    used_rules = set()
     try:
-        for record in reader.iter_records():
+        processed = 0
+        for record in reader.iter_records(cancel_check=cancel_check):
             candidates = record_categories(record, selected)
             if len(candidates) > 1:
-                category, _ = choice_for_record(choices, reader, record)
+                category, choice_key = choice_for_record(
+                    choices, reader, record)
+                rule_key = ambiguity_rule_key(candidates)
+                if rule_key in rules:
+                    used_rules.add(rule_key)
+                    rule_destination = rules[rule_key]
+                    if rule_destination not in candidates:
+                        raise PoolError(
+                            "prepared split ambiguity rule is not one of its candidates")
+                    if choice_key is None:
+                        category = rule_destination
+                if category is None:
+                    raise PoolError(
+                        "prepared split still has an unresolved ambiguity")
+                if category not in candidates:
+                    raise PoolError(
+                        "prepared split choice is not one of its candidates")
             elif len(candidates) == 1:
                 category = candidates[0]
             else:
                 category = remainder_id
+            processed += 1
+            if processed % CANCEL_CHECK_RECORDS == 0:
+                _check_cancel(cancel_check)
             if category is None:
                 continue
+            if category not in destinations or category not in labels:
+                raise PoolError(
+                    "prepared split produced an unplanned output category")
             writer = writers.get(category)
             if writer is None:
-                writer = BSP3OutputWriter(reader, category, labels[category],
+                writer = BSP4OutputWriter(reader, category, labels[category],
                                           destinations[category])
                 writers[category] = writer
             writer.add(record)
-        outputs = [writers[category].finalize() for category in sorted(writers)]
+        unused_rules = sorted(set(rules) - used_rules)
+        if unused_rules:
+            raise PoolError(
+                "prepared split contains an ambiguity rule not used by this split: %s" %
+                unused_rules[0])
+        outputs = []
+        for category in sorted(writers):
+            _check_cancel(cancel_check)
+            outputs.append(writers[category].finalize())
+        if expected_counts is not None:
+            actual_counts = {
+                output["category_id"]: output["records"] for output in outputs
+            }
+            if actual_counts != expected_counts:
+                raise PoolError(
+                    "prepared split output counts do not match its plan")
         # Hard-linking is a no-overwrite atomic publish on the same filesystem.
         # All files are finalized and fsynced before any becomes visible.
+        _check_cancel(cancel_check)
         for category in sorted(writers):
             writer = writers[category]
+            _check_cancel(cancel_check)
             os.link(writer.temp_path, writer.final_path)
             linked.append(writer.final_path)
         for writer in writers.values():
             os.unlink(writer.temp_path)
+        output_directory = os.path.dirname(next(iter(destinations.values())))
+        fsync_directory(output_directory)
         report["outputs"] = outputs
+        _check_cancel(cancel_check)
         atomic_json(report_path, report)
         return report, True
-    except Exception:
+    except BaseException:
         for path in linked:
             try:
                 os.unlink(path)
             except OSError:
                 pass
+        if linked:
+            fsync_directory(os.path.dirname(linked[0]))
         for writer in writers.values():
             writer.abort()
         raise

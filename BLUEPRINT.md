@@ -36,26 +36,7 @@ build on these semantics rather than the ones they replaced.
    `pool_attachment_matrix.lua` now pins the large-authoritative-over-small-
    accelerator case.
 
-## Priority 0 — correctness and release readiness
-
-### 1. Redesign Organize / Combine
-
-Treat this as a workflow and semantic redesign, not a cosmetic pass. The final
-interface must make source pools, compatibility, ambiguity, unmatched seeds,
-chosen operations, provenance, and output publication obvious before writing.
-
-Re-test end to end:
-
-- inspection and compatibility diagnostics;
-- category/location splitting;
-- seeds occurring in several categories;
-- unmatched-seed keep, omit, and remainder policies;
-- union, intersection, and difference;
-- distributed-part merging and gap/overlap rejection;
-- previously combined and composite inputs;
-- lineage and Boolean provenance;
-- writer locking, cancellation, and atomic output publication;
-- the embedded Builder view and standalone Organizer on both platforms.
+## Priority 0 — post-release platform validation
 
 ### 2. Perform a human in-game Windows smoke test
 
@@ -71,20 +52,6 @@ Balatro session still needs to verify what CI cannot:
 5. Defender/SmartScreen behavior and the documented unblock path are usable.
 
 Record the Balatro, Lovely, Steamodded, Windows, and package versions used.
-
-### 3. Publish a current Windows release
-
-The newest Windows tag predates the attachment and audited vector-gate work.
-After the preceding Priority 0 items are either complete or explicitly accepted
-as nonblocking:
-
-- create a new `win-v*` tag from the intended release commit;
-- let CI build the full and incremental packages;
-- verify both release archives and their checksums;
-- install the full archive into a clean mod directory;
-- upgrade an older installation and confirm pools, checkpoints, manifests,
-  `.attached` markers, settings, and user state are preserved;
-- confirm the published commit and release notes match the tested source.
 
 ## Priority 1 — extend automatic pool attachment safely
 
@@ -129,10 +96,12 @@ validate both implementations from it so new fields cannot silently drift.
 
 ### 8. Measure and improve pool choice
 
-The current deterministic choice favors the fewest records. Benchmark real
-time-to-result using record count, coverage, density, decode cost, active-filter
-acceptance, and storage behavior. Change the heuristic only if those
-measurements beat the simpler rule while preserving deterministic tie-breaks.
+The current deterministic choice prefers authoritative coverage, then the
+fewest records within the same role. Benchmark real time-to-result using record
+count, coverage, density, decode cost, active-filter acceptance, and storage
+behavior. Change the within-role heuristic only if those measurements beat the
+simpler rule while preserving deterministic tie-breaks and authoritative-first
+exhaustion.
 
 ### 9. Measure accelerator revisit cost
 
@@ -143,26 +112,40 @@ changing checkpoint/resume semantics.
 
 ## Priority 2 — performance research
 
-### 10. Reprofile the final pipeline before changing it
+### 10. Profile the final pipeline on intended low-end Windows hardware
 
-The recent exact-route, vector-gate, pack-gate, and handoff work changed the
-hotspots. Capture representative profiles for:
+The 2026-07-22 end-to-end audit reprofiled the macOS portable paths, exact
+Perkeo/Omen/voucher/Joker workloads, dense and sparse Builder publication,
+manual BSP4 search, and Organizer split/combine behavior. Its retained and
+rejected results are in `PERFORMANCE_AUDIT.md`.
 
-- exact Perkeo/first-Soul Antes 1–6;
-- full Omen/Charm recovery;
-- voucher-heavy DFS routes;
-- tag-only and Legendary-plus-tag Builder scans;
-- unrestricted pack, tag, voucher, Soul, and Legendary searches;
-- automatic and manual `.bspool` searches;
-- one thread through all profitable core counts;
-- macOS portable/PGO and Windows portable builds.
+The remaining evidence must come from representative low-end Windows systems,
+not extrapolation from an M1 Max. Measure exact Perkeo/first-Soul A1–6, full
+Omen/Charm recovery, voucher-heavy DFS, joker-first multi-Ante search,
+tag/Legendary Builder scans, and automatic/manual BSP4 search from one thread
+through all profitable core counts. Record end-to-end rate, CPU time by stage,
+scaling, cache behavior, memory pressure, I/O, checkpoint tail time, thermal
+variance, and UI responsiveness. Use the corrected family-specific benchmark
+path and keep result membership nonempty so measurements are not vacuous.
 
-Record end-to-end rate, CPU time by stage, scaling, cache behavior, memory, I/O,
-checkpoint tail time, and thermal variance. Use the corrected family-specific
-benchmark path and keep result membership nonempty so measurements are not
-vacuous.
+### 11. Pack or map legacy Organizer indexes
 
-### 11. Evaluate target-native Windows PGO
+New 4K BSP4 pools reduce index count substantially, but simultaneous Organizer
+operations on several large BSP3 or 1K BSP4 inputs still retain one Python
+object per block for every active reader. Prototype a compact typed-array,
+packed, or read-only mapped index. Benchmark open time, ordered iteration,
+random block lookup, combine throughput, and peak RSS; retain it only if the
+memory reduction does not materially regress streaming transforms.
+
+### 12. Fuse rank-only set cursors with native metadata verification
+
+Difference and some intersection inputs need RHS ranks for set membership but
+do not need materialized RHS occurrence descriptors. A shortcut must still
+validate canonical metadata digests, composite provenance, and corruption
+before publishing output. Design a native verifier/rank cursor that preserves
+that contract, then measure it against the current Python metadata traversal.
+
+### 13. Evaluate target-native Windows PGO
 
 Train Windows search and Builder profiles on Windows, rebuild with matching
 identity metadata, run full Lua/native parity, and compare ordinary plus PGO
@@ -170,7 +153,7 @@ rates. macOS profiles are neither portable nor evidence of a Windows gain.
 Adopt Windows PGO only if the packaged complexity produces a repeatable
 improvement on representative hardware.
 
-### 12. Benchmark searcher survivor rebatching only on a suitable workload
+### 14. Benchmark searcher survivor rebatching only on a suitable workload
 
 The current Soul gate leaves about 1.93% of the bounded fixture for scalar
 evaluation, so a second staged Legendary gate has little room to help. Revisit
@@ -179,7 +162,7 @@ very selective independent predicate. Carry rank, seed, hashed seed, first
 stream result/state, and cached hash-prefix state; preserve FIFO order and flush
 partial batches explicitly.
 
-### 13. Add a cost/selectivity planner only when it has a real choice
+### 15. Add a cost/selectivity planner only when it has a real choice
 
 A planner should choose only among predicates proven independent, using static
 RNG probability plus measured rejection cost. The selected plan must remain
@@ -187,7 +170,7 @@ deterministic and observable in telemetry/pool identity where relevant. Current
 common-case ordering is already close to measured selectivity, so this waits
 for another profitable independent stage.
 
-### 14. Revisit portable SIMD only after profiling
+### 16. Revisit portable SIMD only after profiling
 
 If profiles expose a new lane-parallel hotspot, compare portable ILV code,
 compiler vectorization, Apple NEON, and Windows AVX2/AVX-512 separately. Retain
@@ -197,7 +180,7 @@ project's fixed `Vector512` code literally.
 
 ## Priority 3 — product and UX additions
 
-### 15. Delete paused and incomplete pools safely
+### 17. Delete paused and incomplete pools safely
 
 Extend the Builder's completed-pool deletion workflow to paused, resumable,
 and non-resumable incomplete pools. Refuse deletion while any Builder,
@@ -211,33 +194,33 @@ remove the main pool last, and preserve the reusable writer-lock inode. Test
 paused fresh scans, refilters, distributed parts, missing or damaged sidecars,
 stale confirmations, concurrent writers, and Windows file-lock behavior.
 
-### 16. Show where a found joker was located
+### 18. Show where a found joker was located
 
 The search already records locations. Add a concise result notification such
 as “Found in Shop,” “Found in Pack,” or the exact route label, including when a
 seed is banked rather than immediately applied. Avoid overlapping the existing
 seed-slot and search-progress messages.
 
-### 17. Optional scoring and ranked results
+### 19. Optional scoring and ranked results
 
 Add `should`-style criteria only as a separate result-ranking feature. It must
 not weaken mandatory predicates or be presented as a generation-speed gain.
 Define deterministic scoring, tie-breaking, retention limits, and export.
 
-### 18. Richer native survivor metadata
+### 20. Richer native survivor metadata
 
 Consider returning route/location metadata with survivors to avoid a second
 native analysis pass. Main-thread Lua verification remains the final authority
 before a seed is applied.
 
-### 19. Managed remote search
+### 21. Managed remote search
 
 Consider a remote worker abstraction only after local shards, checkpoints,
 merge publication, and Organizer workflows are dependable. Preserve explicit
 ranges, identities, resumability, provenance, and independent result
 verification.
 
-### 20. General typed filter authoring
+### 22. General typed filter authoring
 
 A JAML-style must/should/must-not and Boolean editor could expand the product,
 but it risks duplicating route semantics. Do not begin it before canonical
@@ -245,7 +228,7 @@ attachment predicates and composite pool semantics are stable.
 
 ## Priority 4 — repository maintenance
 
-### 21. Remove obsolete workspace artifacts
+### 23. Remove obsolete workspace artifacts
 
 After confirming they contain no unique user work, remove the old `.bak` files
 and prune the stale distributed-worktree registration. Keep this separate from
@@ -293,7 +276,23 @@ the keep threshold, or too semantics-heavy for the gain:
 - tested alternate compiler/LTO flag combinations;
 - persistent worker barriers for checkpoint epochs;
 - worker QoS and affinity changes;
-- larger refilter buffers.
+- larger refilter buffers;
+- OpenCL/GPU as the required baseline: retain only as a possible optional
+  fixed-filter backend because driver availability, exact dynamic routes, and
+  low-end compatibility do not match the core product;
+- per-block or whole-stream zstd/LZ4 pool payloads: measured specialized BSP4
+  rank/metadata codecs were smaller per block and preserve cheaper bounded
+  random access and committed-prefix recovery;
+- full CRoaring, Parquet, or DuckDB dependencies for the two pool columns;
+- global Elias–Fano ranks for BSP4: Golomb–Rice was smaller on the sampled
+  production distribution, while adaptive bitmap/complement codecs handle
+  density extremes;
+- reserving Builder scan threads for publication encoders: total-budget
+  variants regressed the dense low-core fixture by 31–100%, while one encoder
+  kept pace with two through four scanners;
+- retaining canonical metadata bytes during native summary to avoid its second
+  run decode: full-pool wall time increased 7.4% and instructions increased
+  3.8%.
 
 ## Guardrails for external ideas
 

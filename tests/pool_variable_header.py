@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 TOOLS = REPO / "tools"
 HEADER_V2 = 1024
 HEADER_V3 = 8192
+HEADER_V4 = 16 * 1024
 HEADER_MAX = 256 * 1024
 
 sys.path.insert(0, str(TOOLS))
@@ -52,6 +53,19 @@ def padded_header(lines, size, late_lines=()):
 
 def make_fixtures(directory):
     paths = {}
+
+    # Schemas 1 and 2 remain fixed at 1 KiB. Text beyond that boundary must
+    # never be mistaken for header metadata.
+    v1_prefix = (
+        b"BRAINSTORM_SEED_POOL 1\n"
+        b"header_bytes 1024\n"
+        b"records 1\n"
+    )
+    v1_prefix += b"#" * (HEADER_V2 - len(v1_prefix) - 1) + b"\n"
+    paths["v1"] = directory / "schema-1-fixed.bspool"
+    paths["v1"].write_bytes(
+        v1_prefix + b"records 99\nlineage_id must-not-be-read\nend\n"
+    )
 
     # A second records line just beyond the valid fixed schema-2 header would
     # overwrite the first if a compatibility reader accidentally read farther.
@@ -120,6 +134,44 @@ def make_fixtures(directory):
         )
     )
 
+    paths["v4"] = directory / "schema-4-valid.bspool"
+    paths["v4"].write_bytes(
+        padded_header(
+            [
+                "BRAINSTORM_SEED_POOL 4",
+                f"header_bytes {HEADER_V4}",
+                "records 11",
+                "complete 1",
+                "coverage_complete 1",
+                "space natural",
+                "encoding adaptive-events-v1",
+                "range_start 0",
+                "range_end 2000",
+            ],
+            HEADER_V4,
+            late,
+        )
+    )
+
+    # Future schemas may remain structurally inspectable, but every native
+    # eligibility surface must fail closed until that schema is implemented.
+    paths["unknown_schema"] = directory / "schema-5-unknown.bspool"
+    paths["unknown_schema"].write_bytes(
+        padded_header(
+            [
+                "BRAINSTORM_SEED_POOL 5",
+                "header_bytes 1024",
+                "records 13",
+                "complete 1",
+                "coverage_complete 1",
+                "space natural",
+                "encoding future-events-v2",
+                "end",
+            ],
+            HEADER_V2,
+        )
+    )
+
     invalid = {
         "missing": ("BRAINSTORM_SEED_POOL 3\nrecords 1\nend\n", HEADER_V3),
         "small": (
@@ -138,12 +190,53 @@ def make_fixtures(directory):
     for name, (text, actual_size) in invalid.items():
         path = directory / ("schema-3-%s.bspool" % name)
         path.write_bytes(text.encode("ascii").ljust(actual_size, b"\0"))
-        paths[name] = path
+        paths["v3_" + name] = path
 
-    return paths, string_fields, numeric_fields
+    invalid_v4 = {
+        "missing": (
+            "BRAINSTORM_SEED_POOL 4\n"
+            "encoding adaptive-events-v1\nrecords 1\nend\n",
+            HEADER_V4,
+        ),
+        "small": (
+            "BRAINSTORM_SEED_POOL 4\nheader_bytes 512\n"
+            "encoding adaptive-events-v1\nrecords 1\nend\n",
+            HEADER_V2,
+        ),
+        "oversized": (
+            f"BRAINSTORM_SEED_POOL 4\nheader_bytes {HEADER_MAX + 1}\n"
+            "encoding adaptive-events-v1\nrecords 1\nend\n",
+            HEADER_V2,
+        ),
+        "truncated": (
+            f"BRAINSTORM_SEED_POOL 4\nheader_bytes {HEADER_V4}\n"
+            "encoding adaptive-events-v1\nrecords 1\nend\n",
+            HEADER_V4 // 2,
+        ),
+        "wrong_encoding": (
+            f"BRAINSTORM_SEED_POOL 4\nheader_bytes {HEADER_V4}\n"
+            "encoding delta-varint-events-v1\nrecords 1\nend\n",
+            HEADER_V4,
+        ),
+    }
+    for name, (text, actual_size) in invalid_v4.items():
+        path = directory / ("schema-4-%s.bspool" % name)
+        path.write_bytes(text.encode("ascii").ljust(actual_size, b"\0"))
+        paths["v4_" + name] = path
+
+    invalid_names = [
+        "v3_missing", "v3_small", "v3_oversized", "v3_truncated",
+        "v4_missing", "v4_small", "v4_oversized", "v4_truncated",
+        "v4_wrong_encoding",
+    ]
+    return paths, string_fields, numeric_fields, invalid_names
 
 
-def check_python(paths, string_fields, numeric_fields):
+def check_python(paths, string_fields, numeric_fields, invalid_names):
+    v1 = core.read_pool_header(paths["v1"])
+    assert v1.get("records") == "1", v1
+    assert "lineage_id" not in v1, v1
+
     v2 = core.read_pool_header(paths["v2"])
     assert v2.get("records") == "2", v2
     assert "lineage_id" not in v2, v2
@@ -151,7 +244,14 @@ def check_python(paths, string_fields, numeric_fields):
     v3 = core.read_pool_header(paths["v3"])
     assert v3.get("records") == "7", v3
     assert v3.get("lineage_id") == string_fields["lineage_id"], v3
-    for name in ("missing", "small", "oversized", "truncated"):
+    v4 = core.read_pool_header(paths["v4"])
+    assert v4.get("records") == "11", v4
+    assert v4.get("encoding") == "adaptive-events-v1", v4
+    assert v4.get("lineage_id") == string_fields["lineage_id"], v4
+    unknown = core.read_pool_header(paths["unknown_schema"])
+    assert unknown.get("schema") == "5", unknown
+    assert "schema 5 is not supported" in core.pool_native_incompatibility(unknown)
+    for name in invalid_names:
         assert core.read_pool_header(paths[name]) == {}, (name, core.read_pool_header(paths[name]))
 
     web = load_web_module()
@@ -176,31 +276,48 @@ def check_python(paths, string_fields, numeric_fields):
         assert item[key] == expected and isinstance(item[key], str), (key, item[key])
     for key, expected in numeric_fields.items():
         assert item[key] == expected and isinstance(item[key], int), (key, item[key])
+    bsp4 = json.loads(json.dumps(listed[paths["v4"].name]))
+    assert bsp4["schema"] == 4
+    assert bsp4["header_bytes"] == HEADER_V4
+    assert bsp4["encoding"] == "adaptive-events-v1"
+    assert bsp4["metadata_capable"] is True
+    assert bsp4["native_compatible"] is True
+    future = json.loads(json.dumps(listed[paths["unknown_schema"].name]))
+    assert future["schema"] == 5
+    assert future["native_compatible"] is False
+    assert "schema 5 is not supported" in future["native_incompatibility"]
 
 
 def lua_command():
     configured = os.environ.get("LUAJIT", "").strip()
     command = shlex.split(configured) if configured else ["luajit"]
-    if not command or shutil.which(command[0]) is None:
+    if os.name == "nt" and command and command[0].startswith("/") \
+            and shutil.which("cygpath"):
+        command[0] = subprocess.check_output(
+            ["cygpath", "-w", command[0]], text=True).strip()
+    if not command or (shutil.which(command[0]) is None
+                       and not Path(command[0]).is_file()):
         raise RuntimeError("LuaJIT not found; set LUAJIT=/path/to/luajit")
     return command
 
 
-def check_lua(paths, directory):
+def check_lua(paths, invalid_names, directory):
     harness = directory / "variable_header_reader.lua"
     harness.write_text(
         r'''
-local reroll, v2Path, v3Path, missingPath, smallPath, oversizedPath, truncatedPath =
-	arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7]
+local reroll, v1Path, v2Path, v3Path, v4Path, unknownSchemaPath =
+	arg[1], arg[2], arg[3], arg[4], arg[5], arg[6]
 
 local function boundedRead(path, size)
+	assert(type(size) == "number" and size >= 0 and size <= 256 * 1024,
+		"production pool-header reader requested an unbounded read")
 	local f = assert(io.open(path, "rb"))
-	local data = f:read(size or "*a")
+	local data = f:read(size)
 	f:close()
 	return data
 end
 
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
 	read = boundedRead, write = function() end, getInfo = function() return nil end,
 }
 package.loaded.lovely = { mod_dir = "" }
@@ -210,20 +327,34 @@ Brainstorm = {
 }
 assert(loadfile(reroll))()
 
+local v1 = assert(Brainstorm.readPoolHeader(v1Path))
+assert(v1.schema == 1 and v1.records == 1 and v1.lineage_id == nil,
+	"schema 1 did not remain fixed at 1024 bytes")
 local v2 = assert(Brainstorm.readPoolHeader(v2Path))
 assert(v2.schema == 2 and v2.records == 2 and v2.lineage_id == nil,
 	"schema 2 did not remain fixed at 1024 bytes")
 local v3 = assert(Brainstorm.readPoolHeader(v3Path))
 assert(v3.schema == 3 and v3.records == 7 and v3.header_bytes == 8192)
+assert(v3.metadata_capable and v3.native_compatible)
 assert(v3.lineage_id == "lineage-c" and v3.scan_cursor == 123456)
 assert(v3.parent_coverage_complete == 1)
 assert(v3.composite_schema == 1 and v3.composite_operation == "union")
 assert(#v3.composite_branches == 2 and #v3.composite_operands == 2)
+local v4 = assert(Brainstorm.readPoolHeader(v4Path))
+assert(v4.schema == 4 and v4.records == 11 and v4.header_bytes == 16384)
+assert(v4.encoding == "adaptive-events-v1")
+assert(v4.metadata_capable and v4.native_compatible)
+assert(Brainstorm.poolNativeCompatible(v4))
+assert(v4.lineage_id == "lineage-c" and v4.scan_cursor == 123456)
+local unknownSchema = assert(Brainstorm.readPoolHeader(unknownSchemaPath))
+assert(unknownSchema.schema == 5 and not unknownSchema.native_compatible)
+assert(not Brainstorm.poolNativeCompatible(unknownSchema),
+	"unknown pool schema crossed the production native compatibility gate")
 
-assert(Brainstorm.readPoolHeader(missingPath) == nil, "accepted missing header_bytes")
-assert(Brainstorm.readPoolHeader(smallPath) == nil, "accepted small header_bytes")
-assert(Brainstorm.readPoolHeader(oversizedPath) == nil, "accepted oversized header_bytes")
-assert(Brainstorm.readPoolHeader(truncatedPath) == nil, "accepted truncated header")
+for index = 7, #arg do
+	assert(Brainstorm.readPoolHeader(arg[index]) == nil,
+		"accepted invalid extended header " .. tostring(arg[index]))
+end
 ''',
         encoding="utf-8",
     )
@@ -233,13 +364,12 @@ assert(Brainstorm.readPoolHeader(truncatedPath) == nil, "accepted truncated head
         + [
             str(harness),
             str(REPO / "Brainstorm_reroll.lua"),
+            str(paths["v1"]),
             str(paths["v2"]),
             str(paths["v3"]),
-            str(paths["missing"]),
-            str(paths["small"]),
-            str(paths["oversized"]),
-            str(paths["truncated"]),
-        ],
+            str(paths["v4"]),
+            str(paths["unknown_schema"]),
+        ] + [str(paths[name]) for name in invalid_names],
         cwd=REPO,
         check=True,
     )
@@ -255,11 +385,11 @@ assert(Brainstorm.readPoolHeader(truncatedPath) == nil, "accepted truncated head
         str(REPO / "Brainstorm_reroll.lua"),
         str(snapshot),
     ]
-    for name in ("v2", "v3"):
+    for name in ("v1", "v2", "v3", "v4"):
         subprocess.run(
             oracle_base + [str(paths[name]), str(seeds)], cwd=REPO, check=True
         )
-    for name in ("missing", "small", "oversized", "truncated"):
+    for name in invalid_names:
         result = subprocess.run(
             oracle_base + [str(paths[name]), str(seeds)],
             cwd=REPO,
@@ -274,10 +404,10 @@ assert(Brainstorm.readPoolHeader(truncatedPath) == nil, "accepted truncated head
 def main():
     with tempfile.TemporaryDirectory(prefix="brainstorm_variable_header_") as temp:
         directory = Path(temp)
-        paths, string_fields, numeric_fields = make_fixtures(directory)
-        check_python(paths, string_fields, numeric_fields)
-        check_lua(paths, directory)
-    print("PASS: bounded schema-2/schema-3 Python, web, production-Lua, and oracle readers")
+        paths, string_fields, numeric_fields, invalid_names = make_fixtures(directory)
+        check_python(paths, string_fields, numeric_fields, invalid_names)
+        check_lua(paths, invalid_names, directory)
+    print("PASS: bounded schema-1/2/3/4 Python, web, production-Lua, and oracle readers")
 
 
 if __name__ == "__main__":

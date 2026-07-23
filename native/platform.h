@@ -86,11 +86,24 @@ static inline void bs_mutex_destroy(bs_mutex_t *m) { (void)m; }
 static inline void bs_mutex_lock(bs_mutex_t *m) { AcquireSRWLockExclusive(m); }
 static inline void bs_mutex_unlock(bs_mutex_t *m) { ReleaseSRWLockExclusive(m); }
 
+static inline void bs_set_errno_from_win32(DWORD code);
+
 typedef CONDITION_VARIABLE bs_cond_t;
+#define BS_COND_INIT CONDITION_VARIABLE_INIT
 static inline void bs_cond_init(bs_cond_t *c) { InitializeConditionVariable(c); }
 static inline void bs_cond_destroy(bs_cond_t *c) { (void)c; }
 static inline void bs_cond_wait(bs_cond_t *c, bs_mutex_t *m) {
 	SleepConditionVariableSRW(c, m, INFINITE, 0);
+}
+/* Return 0 when signalled, ETIMEDOUT when the deadline expires, or the
+ * platform error mapped to errno otherwise.  Keeping this beside the ordinary
+ * wait lets supervisor loops sleep without adding fixed completion latency. */
+static inline int bs_cond_wait_ms(bs_cond_t *c, bs_mutex_t *m, unsigned ms) {
+	if (SleepConditionVariableSRW(c, m, (DWORD)ms, 0)) return 0;
+	DWORD code = GetLastError();
+	if (code == ERROR_TIMEOUT) return ETIMEDOUT;
+	bs_set_errno_from_win32(code);
+	return errno;
 }
 static inline void bs_cond_signal(bs_cond_t *c) { WakeConditionVariable(c); }
 static inline void bs_cond_broadcast(bs_cond_t *c) { WakeAllConditionVariable(c); }
@@ -110,8 +123,6 @@ static inline int64_t bs_pread(int fd, void *buf, size_t count, int64_t offset) 
 static inline int bs_dup(int fd) { return _dup(fd); }
 static inline int bs_close(int fd) { return _close(fd); }
 static inline unsigned long bs_process_id(void) { return (unsigned long)GetCurrentProcessId(); }
-
-static inline void bs_set_errno_from_win32(DWORD code);
 
 typedef HANDLE bs_file_lock_t;
 #define BS_FILE_LOCK_INVALID INVALID_HANDLE_VALUE
@@ -324,9 +335,21 @@ static inline void bs_mutex_lock(bs_mutex_t *m) { pthread_mutex_lock(m); }
 static inline void bs_mutex_unlock(bs_mutex_t *m) { pthread_mutex_unlock(m); }
 
 typedef pthread_cond_t bs_cond_t;
+#define BS_COND_INIT PTHREAD_COND_INITIALIZER
 static inline void bs_cond_init(bs_cond_t *c) { pthread_cond_init(c, NULL); }
 static inline void bs_cond_destroy(bs_cond_t *c) { pthread_cond_destroy(c); }
 static inline void bs_cond_wait(bs_cond_t *c, bs_mutex_t *m) { pthread_cond_wait(c, m); }
+static inline int bs_cond_wait_ms(bs_cond_t *c, bs_mutex_t *m, unsigned ms) {
+	struct timespec deadline;
+	if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return errno;
+	deadline.tv_sec += (time_t)(ms / 1000u);
+	deadline.tv_nsec += (long)(ms % 1000u) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	return pthread_cond_timedwait(c, m, &deadline);
+}
 static inline void bs_cond_signal(bs_cond_t *c) { pthread_cond_signal(c); }
 static inline void bs_cond_broadcast(bs_cond_t *c) { pthread_cond_broadcast(c); }
 

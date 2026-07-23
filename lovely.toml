@@ -1,13 +1,13 @@
 [manifest]
-version = "1.0.0"
+version = "1.2.0"
 dump_lua = true
 priority = 0
 
-[[patches]] #   Include nativefs module
+[[patches]] #   Include Brainstorm's private nativefs module
 [patches.module]
 source = 'nativefs.lua'
 before = 'main.lua'
-name = 'nativefs'
+name = 'brainstorm_nativefs'
 
 [[patches]] #   Patch Brainstorm to main
 [patches.copy]

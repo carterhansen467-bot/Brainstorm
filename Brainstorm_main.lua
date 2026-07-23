@@ -1,7 +1,7 @@
 local lovely = require("lovely")
-local nativefs = require("nativefs")
+local nativefs = require("brainstorm_nativefs")
 Brainstorm.INITIALIZED = true
-Brainstorm.VER = "Brainstorm v1.1.0-alpha"
+Brainstorm.VER = "Brainstorm v1.2.0-alpha"
 
 function Brainstorm.update(dt)
 	-- Autoreroll (threaded search + reroll bookkeeping) lives in Brainstorm_reroll.lua

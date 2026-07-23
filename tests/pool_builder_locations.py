@@ -63,12 +63,13 @@ assert "automatic Omen-purchase recovery omitted" in fast.summary()
 assert core.Criteria().leg_routes == "full"
 
 # A quick estimate must not inherit the multi-minute 100M scan or the sparse
-# 16.8M build checkpoint.  Regular pool builds keep the large checkpoint so
-# resumable output throughput is unchanged.
-quick = criteria.text("count", core.ESTIMATE_COUNT, apply_shard=False,
-                      checkpoint=core.ESTIMATE_CHECKPOINT)
+# 16.8M build checkpoint. It does publish a disposable BSP4 sample so measured
+# speed and density cover the real adaptive writer pipeline.
+quick = core.estimate_criteria_text(criteria)
 assert "count 2000000\n" in quick
 assert "checkpoint 262144\n" in quick
+assert "format binary\n" in quick
+assert "output_schema 4\n" in quick
 assert "checkpoint 16777216\n" in criteria.text("binary", 100_000_000)
 
 # The middle seed-space option covers every seed vanilla can preserve while

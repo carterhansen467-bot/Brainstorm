@@ -220,7 +220,7 @@ local CASES = {
 -- SEARCH_WORKER_SRC (each file version carries its own copy).
 local function captureWorkerSrc(fileText)
 	package.loaded["lovely"] = { mod_dir = "" }
-	package.loaded["nativefs"] = {
+	package.loaded["brainstorm_nativefs"] = {
 		write = function() end, read = function() return "" end, getInfo = function() return nil end,
 	}
 	G = { FUNCS = {} }
@@ -236,20 +236,22 @@ end
 -- which is what the DIRECT tests then drive.
 local function runWorker(fileText, workerSrc, snap, maxBatches, threadIndex, numThreads)
 	local channels = {}
-	local batches = 0
+	local sessionPeeks = 0
 	local function getChannel(name)
 		local c = channels[name]
 		if not c then
 			c = { items = {} }
 			c.push = function(self, v)
 				self.items[#self.items + 1] = v
-				if name == "brainstorm_search_progress" then
-					batches = batches + 1
-					if batches >= maxBatches then channels["brainstorm_search_session"].items = {} end
-				end
 			end
 			c.pop = function(self) return table.remove(self.items, 1) end
-			c.peek = function(self) return self.items[1] end
+			c.peek = function(self)
+				if name == "brainstorm_search_session" and maxBatches > 0 then
+					sessionPeeks = sessionPeeks + 1
+					if sessionPeeks > maxBatches then self.items = {} end
+				end
+				return self.items[1]
+			end
 			c.clear = function(self) self.items = {} end
 			channels[name] = c
 		end
@@ -264,8 +266,13 @@ local function runWorker(fileText, workerSrc, snap, maxBatches, threadIndex, num
 	local prog = channels["brainstorm_search_progress"]
 	if prog then
 		for _, raw in ipairs(prog.items) do
-			local t = load("return " .. raw)()
-			if t and t.n and t.n > out.tried then out.tried = t.n end
+			local n = type(raw) == "string"
+				and tonumber(raw:match("^%d+:(%d+)$")) or nil
+			if not n then
+				local ok, t = pcall(function() return load("return " .. raw)() end)
+				n = ok and t and t.n or nil
+			end
+			if n and n > out.tried then out.tried = n end
 		end
 	end
 	local resChan = channels["brainstorm_search_result"]

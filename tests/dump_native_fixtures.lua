@@ -237,7 +237,7 @@ local CASES = {
 -- ---- worker-style bootstrap (fake love.thread, stale session => no loop) ----
 local function captureWorkerSrc()
 	package.loaded["lovely"] = { mod_dir = "" }
-	package.loaded["nativefs"] = {
+	package.loaded["brainstorm_nativefs"] = {
 		write = function() end, read = function() return "" end, getInfo = function() return nil end,
 	}
 	G = { FUNCS = {} }

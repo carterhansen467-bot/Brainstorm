@@ -225,18 +225,37 @@ For the exhaustive run, copy the example criteria and change:
 ```text
 count all
 format binary
+output_schema 4
 ```
 
-Then run the same command with an output name ending in `.bspool`. New scans
-use schema 3: sorted numeric seed-rank deltas and a block-local occurrence
-metadata section share one CRC-protected block, followed by an index for fast
-randomized access. Its 8 KiB header includes schema/model versions, the scanned
-range, record count, completion flag, alphabet, catalog/criteria fingerprints,
-and the criteria themselves, leaving room for lineage and route identity while
-keeping a shared `.bspool` self-describing. Compression changes only the
-representation: seed evaluation, checkpoint boundaries, and exhaustive search
-semantics are unchanged. Schema-1 and schema-2 pools remain readable; schema-2
-conversion is kept as the compatibility target for finished legacy files.
+Then run the same command with an output name ending in `.bspool`. Builder
+scans—and direct scans with the directive above—use schema 4
+(`adaptive-events-v1`). Each 4,096-record block independently
+chooses positive deltas, complement deltas, a bitmap, or Golomb–Rice gaps for
+ranks, plus positive indexes, complement indexes, a bitmap, or runs for each
+occurrence descriptor. Rank and metadata checksums are separate, so an in-game
+search reads only the rank column. A trailing index provides fast randomized
+access. The 8 KiB header includes schema/model versions, the scanned range,
+record count, completion flag, alphabet, catalog/criteria fingerprints, and
+the criteria themselves, leaving room for lineage and route identity while
+keeping a shared `.bspool` self-describing. Readers retain support for earlier
+1,024-record BSP4 blocks and accept bounded blocks of up to 8,192 records.
+
+The graphical/terminal Builder inserts `output_schema 4` automatically.
+Direct native criteria can still explicitly request schema 3 for compatibility.
+Schema 1–3 pools remain readable by the Builder, Organizer, and in-game native
+search. Compression changes only the representation: seed evaluation,
+checkpoint boundaries, committed-prefix recovery, and exhaustive search
+semantics are unchanged.
+
+The Builder's `threads` value is the number of seed-scanning workers. Adaptive
+binary publication also starts one encoder helper per four scanners, rounded
+up and capped at four; those helpers sleep when no completed block is ready.
+This deliberate pipeline can briefly make one more runnable thread on a
+one-to-four-core scan. Reserving a scanner for encoding was measured 31–100%
+slower on the low-core dense fixture, so users prioritizing foreground
+responsiveness should select fewer scan threads rather than interpreting the
+field as a strict process-wide thread cap.
 
 Current helpers still read existing schema-1 `u64le` pools. To shrink a
 finished legacy pool without rescanning the seed space, give the output a new
@@ -257,8 +276,20 @@ Conversion streams the old file, preserves its pool ID and embedded criteria,
 and reports the measured reduction. Keep the original until an export or
 refilter of the converted pool has been verified. If conversion is interrupted,
 delete the incomplete output and run it again; the input is never modified.
-Older Brainstorm helpers do not understand the current schema-3 format, so
+Older Brainstorm helpers do not understand the current event-pool formats, so
 anyone receiving a newly generated pool must also update both native helpers.
+
+To upgrade a completed schema-3 event pool to adaptive schema 4 without
+rescanning, use a different output filename:
+
+```sh
+./native/brainstorm_seed_pool upgrade seed_pools/input-bsp3.bspool \
+  seed_pools/output-bsp4.bspool
+```
+
+The operation refuses to overwrite an existing output, preserves source
+identity, criteria, lineage, and provenance, and recomputes the encoding-
+dependent snapshot and logical digests. The source is never modified.
 
 #### Filtering an existing pool again
 
@@ -481,6 +512,32 @@ shortcuts. Exact-location splits show ambiguous seeds for an explicit category
 choice; incomplete sources use only their committed checkpoint; and every
 derivative records the source snapshot and lineage.
 
+Large ambiguity sets are grouped by their exact candidate-category set, so one
+reviewed destination rule can resolve every seed with the same choices. The
+response retains only a bounded set of example seeds and unresolved candidate
+sets instead of materializing millions of controls. If more sets exist, apply
+the displayed rules and analyze again for the next bounded window. Saved plans
+may still carry explicit seed/rank overrides, which are shown separately and
+take precedence over the group rule. A verified source reader is reused across
+inspect, plan, and publish while the file identity remains unchanged.
+
+The Organizer now separates analysis from publication. Changing a source,
+category, ambiguity choice, unmatched policy, operation, Difference base, or
+output name invalidates the reviewed plan. Before the publish button is enabled,
+the page shows the pinned snapshot, exact destination filenames and projected
+counts, unmatched disposition, collisions, compatibility checks, coverage and
+metadata state, Boolean expression, provenance branches, and report filename.
+The source pool is never modified. Unmatched seeds can be kept in an automatic
+**Unmatched seeds** pool, put in a user-named review/remainder pool, or explicitly
+omitted from the derivative outputs. Long analysis, split, and combine work can
+be cancelled; cancellation rolls back temporary and not-yet-committed outputs.
+Every output is fsynced, writer-locked, and published without overwriting an
+existing file. Each file publication is atomic. A split produces several files,
+so the whole set cannot be one filesystem-atomic transaction: reported errors
+and cancellation roll it back, but terminating the process or operating system
+during the final link sequence can leave a partial set that must be removed or
+completed manually.
+
 General combining is separate from **Merge distributed pool parts**. The shard
 merge remains the strict fast path for completed, contiguous parts of one
 identical search. The organizer accepts 2–64 compatible recorded pools and:
@@ -489,7 +546,8 @@ identical search. The organizer accepts 2–64 compatible recorded pools and:
 - **Intersection** keeps a seed found in every selected pool;
 - **Difference** keeps seeds from the chosen base pool unless they occur in any
   other selected pool;
-- deduplicates ranks while merging every available BSP3 occurrence descriptor;
+- deduplicates ranks while merging every available BSP3/BSP4 occurrence
+  descriptor;
 - records both the exact input-snapshot expression and, per seed, every
   original source-filter branch it matched, so combining a Perkeo pool and a
   Negative Tag pool remains `Perkeo OR Negative Tag` rather than being
@@ -536,11 +594,13 @@ Automatic** (the default),
 Brainstorm may automatically choose a compatible `.attached` pool whose
 embedded predicate is proven broader than the active request. Manual selection
 always wins. Automatic records still pass the native filters and the independent
-main-thread Lua verification. Brainstorm tries compatible attachments from
-fewest to most records; an exhausted or invalid accelerator advances to the
-next safe attachment and then to unrestricted generation. An authoritative
-full-natural-space pool revalidates its marker and file identity before it may
-report definitive exhaustion. The initial conservative matcher supports classic tag
+main-thread Lua verification. A compatible authoritative attachment is chosen
+before accelerators because its exhaustion is definitive; within the same role,
+fewer records win, followed by stable identity/filename tie-breaks. An
+exhausted or invalid accelerator advances to the next safe source and then to
+unrestricted generation. An authoritative full-natural-space pool revalidates
+its marker and file identity before it may report definitive exhaustion. The
+initial conservative matcher supports classic tag
 and classic Legendary/Charm relationships, including wider ending windows,
 optional Negative, first-or-second Soul breadth, and full versus Fast Exact
 coverage. Voucher, Legendary-anywhere, composite, tag-anywhere, and ambiguous
@@ -650,6 +710,20 @@ generic canonical-then-Charm route evaluator for differential testing.
   Builder checks in CI on macOS and Windows. It also exhausts every high-byte
   bucket interval for catalog sizes 1 through 256; duplicate modded target
   keys conservatively disable index-specific tag/voucher gates.
+
+## End-to-end efficiency audit (2026-07-22)
+
+The follow-up audit covers unrestricted and pool-backed in-game search, Lua
+fallback, dense Builder publication, complex multi-Ante filters, adaptive pool
+storage, refilter/merge, and Organizer split/combine work. The largest newly
+retained results are a 6.60x dense writer gain, 40–41% faster Joker-first
+multi-Ante search, 96.29% smaller buffered event hits, 2.84x faster controlled
+64-input Organizer work, and a 57.11% reduction on a real
+355,038,024-record BSP3 pool after lossless BSP4 upgrade.
+
+The complete benchmark tables, production-pool identity proof, external
+comparisons, rejected approaches, low-end-hardware tradeoffs, and remaining
+ranked work are in [`PERFORMANCE_AUDIT.md`](PERFORMANCE_AUDIT.md).
 
 ### Future work
 

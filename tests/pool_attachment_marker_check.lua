@@ -19,7 +19,7 @@ local function normalized(path)
   return package.config:sub(1, 1) == "\\" and path:lower() or path
 end
 
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
   read = read,
   write = function() end,
   getInfo = function(path)

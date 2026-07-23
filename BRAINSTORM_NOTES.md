@@ -944,6 +944,63 @@ time the tab re-renders, even though the underlying saved value is untouched.
       barriers, QoS/affinity changes, larger refilter buffers, and the separate
       metadata-free reachability precheck.
 
+29. **End-to-end efficiency and BSP4 audit**
+    (`seed-pool-integrity-audit`, 2026-07-22):
+    - Unrestricted search now primes eight independent joker-first streams in
+      an interleaved lane without changing scalar draw order. Joker-heavy
+      fixtures improved 40.4% at one thread and 41.0% at nine threads; 14
+      lane-on/lane-off/Lua differential cases retain the scalar reference.
+      Any-Ante voucher checks stop on the first exact match, improving the
+      representative A1-4 case about 10%.
+    - Native status/UI polling is capped at 10 Hz, heartbeats use monotonic
+      two-second time, and terminal wakeup is immediate. Lua fallback workers
+      publish compact `worker:count` progress at 10 Hz plus final instead of
+      compiling serialized tables on every message.
+    - Builder hits now retain four inline occurrences plus an overflow arena,
+      reducing the ordinary hit from 1,296 to 48 bytes. Sorting, adaptive
+      encoding, and CRC work occur outside the ordered writer lock; the dense
+      publication fixture improved 6.60x. Encoder concurrency scales as one
+      per four scanners (minimum one, maximum four). Short restricted-pool
+      searches use 4K-aligned claims sized to expose roughly four claims per
+      scan worker.
+    - Schema 4 (`adaptive-events-v1`) independently selects positive,
+      complement, bitmap, or Golomb-Rice rank encoding and positive,
+      complement, bitmap, or run metadata encoding. Normal publication uses
+      4,096-record blocks; readers accept legacy 1K blocks through the bounded
+      8K contract, while schema-3 boundaries and bytes remain unchanged.
+      Rank and metadata CRCs are separate so in-game search remains rank-only.
+    - The untouched 355,038,024-record production BSP3 pool was losslessly
+      upgraded from 1,471,452,792 to 631,165,420 bytes (57.11% smaller).
+      Record totals, exact occurrence totals, schema-independent per-rank raw
+      metadata digest, exported text, identity/provenance, and native
+      restricted-search behavior match. The converted proof artifacts remain
+      in `/tmp`; the source pool was not replaced.
+    - Complete BSP4 opens trust the checksummed final index for structure and
+      validate each physical header/rank CRC on first use. Organizer readers
+      can defer exact-once payload verification, use slotted block/record
+      objects, weighted 64 MiB reader retention, and bounded reviewed-plan and
+      ambiguity caches. Real 4K structural open was 4.42x faster with 67.75%
+      less peak RSS than the 1K control; controlled 64-input combine improved
+      from 107.13 to 37.76 s.
+    - Organizer split/combine publishes BSP4, reuses decoded descriptors,
+      streams shuffled disjoint blocks in rank order, and reuses exact reviewed
+      split plans. Python Rice selection is linear in record count plus 42
+      parameters and reuses canonical bytes, cutting the writer fixture 41.5%.
+      Rank-only Difference remains deferred until a fused verifier can preserve
+      metadata-digest and composite-provenance checks.
+    - Quick Estimate now measures a disposable real BSP4 publication including
+      occurrence capture, sorting, codecs, checksums, and atomic completion,
+      then removes every temporary sidecar. On the paired 2M one-thread
+      `tag_rare` fixture, count-only overstated real publication throughput by
+      29.92%.
+    - `PERFORMANCE_AUDIT.md` records the complete measurements, external
+      comparisons, rejected alternatives, production proof, and ranked
+      remaining work. New codec, corruption, deterministic publication,
+      native reader/writer, allocation-failure, Organizer cancellation,
+      polling/progress, bounded-read, attachment, and estimate tests run on
+      both CI platforms. The Windows joker differential accepts multiword
+      compiler commands such as the Zig cross-driver used by CI.
+
 ## Future work
 
 The sole forward-looking task list is [`BLUEPRINT.md`](BLUEPRINT.md). This

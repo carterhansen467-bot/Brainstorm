@@ -23,7 +23,7 @@ CATALOG = "1111111111111111"
 
 
 def write_pool(path, range_end=100_000_000, criteria=None, records=7,
-               catalog=CATALOG):
+               catalog=CATALOG, schema=2):
     criteria = criteria or [
         "tag_route collect",
         "tag tag_charm 1 small 1 small 1",
@@ -31,8 +31,15 @@ def write_pool(path, range_end=100_000_000, criteria=None, records=7,
         "legendary j_perkeo 1 small 1 small 0 charm",
     ]
     lines = [
-        "BRAINSTORM_SEED_POOL 2",
+        "BRAINSTORM_SEED_POOL %d" % schema,
         "modelver 6",
+    ]
+    if schema in core.POOL_EXTENDED_HEADER_SCHEMAS:
+        lines.extend([
+            "encoding %s" % core.POOL_EVENT_ENCODINGS[schema],
+            "header_bytes 8192",
+        ])
+    lines += [
         "charset 123456789ABCDEFGHIJKLMNPQRSTUVWXYZ",
         "seedspace %d" % core.SEEDSPACE,
         "space natural",
@@ -50,7 +57,8 @@ def write_pool(path, range_end=100_000_000, criteria=None, records=7,
         "",
     ]
     with open(path, "wb") as handle:
-        handle.write("\n".join(lines).encode("ascii").ljust(1024, b"\0"))
+        header_bytes = 8192 if schema in core.POOL_EXTENDED_HEADER_SCHEMAS else 1024
+        handle.write("\n".join(lines).encode("ascii").ljust(header_bytes, b"\0"))
         handle.write(b"records")
 
 
@@ -141,6 +149,28 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_attach_") as pool_dir:
     core.attach_completed_pool("accelerator-large.bspool", "accelerator",
                                pool_dir, CATALOG)
 
+    # BSP4 is a production-native pool format: the Builder must expose it to
+    # the same attachment path as BSP1-3.  This fixture intentionally contains
+    # only a valid header because this test stops at attachment preflight; the
+    # native block reader has its own byte-level integration regressions.
+    bsp4_name = "adaptive-native.bspool"
+    bsp4_path = os.path.join(pool_dir, bsp4_name)
+    write_pool(bsp4_path, schema=4)
+    bsp4_pool = core.PoolInfo(bsp4_path).as_dict()
+    assert bsp4_pool["schema"] == 4
+    assert bsp4_pool["encoding"] == "adaptive-events-v1"
+    assert bsp4_pool["metadata_capable"]
+    assert bsp4_pool["native_compatible"]
+    assert not bsp4_pool["native_incompatibility"]
+    assert bsp4_pool["attachment_accelerator_eligible"], \
+        bsp4_pool["attachment_accelerator_blockers"]
+    bsp4_marker = core.attach_completed_pool(
+        bsp4_name, "accelerator", pool_dir, CATALOG)
+    assert bsp4_marker["valid"] and bsp4_marker["enabled"]
+    assert bsp4_marker["role"] == "accelerator"
+    bsp4_marker_path = bsp4_path + ".attached"
+    assert os.path.isfile(bsp4_marker_path)
+
     inherited_name = "refiltered.bspool"
     inherited_path = os.path.join(pool_dir, inherited_name)
     write_pool(inherited_path, criteria=[
@@ -174,12 +204,12 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_attach_") as pool_dir:
     harness = os.path.join(pool_dir, "attachment_matcher.lua")
     with open(harness, "w", encoding="utf-8") as handle:
         handle.write(r'''
-local reroll, poolDir, markerPath = arg[1], arg[2], arg[3]
+local reroll, poolDir, markerPath, bsp4MarkerPath = arg[1], arg[2], arg[3], arg[4]
 local function read(path, bytes)
   local f = io.open(path, "rb"); if not f then return nil end
   local value = f:read(bytes or "*a"); f:close(); return value
 end
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
   read = read, write = function() end,
   getInfo = function(path)
     local f = io.open(path, "rb"); if not f then return nil end
@@ -193,6 +223,13 @@ G = {FUNCS = {}}
 Brainstorm = {SETTINGS = {autoreroll = {}, multiAnteSearch = {}}, AUTOREROLL = {}}
 assert(loadfile(reroll))()
 Brainstorm.seedPoolDir = function() return poolDir end
+local adaptive, adaptiveReason = Brainstorm.readPoolAttachment(bsp4MarkerPath)
+assert(adaptive, adaptiveReason)
+assert(adaptive.header.schema == 4
+  and adaptive.header.encoding == "adaptive-events-v1"
+  and adaptive.header.native_compatible
+  and Brainstorm.poolNativeCompatible(adaptive.header),
+  "production Lua did not accept the attached BSP4 header")
 Brainstorm.SETTINGS.autoreroll = {
   seedPoolFile = "", searchTag = "tag_charm", searchTagAnywhere = false,
   searchLegendary = "j_perkeo", searchLegendaryAnywhere = false,
@@ -202,6 +239,7 @@ local marker, reason = Brainstorm.readPoolAttachment(markerPath)
 assert(marker, reason)
 assert(marker.role == "authoritative")
 assert(Brainstorm.attachmentMatchesActiveFilters(marker))
+assert(Brainstorm.attachmentMatchesActiveFilters(adaptive))
 Brainstorm.SETTINGS.autoreroll.searchTag = ""
 assert(#Brainstorm.activeAttachmentPredicates() == 1)
 assert(not Brainstorm.attachmentMatchesActiveFilters(marker))
@@ -227,12 +265,12 @@ local selected = assert(Brainstorm.findAutomaticSeedPool())
 -- (ATTACHED_SEED_POOLS.md runtime selection rule 3): its exhaustion is
 -- definitive, so a miss never falls back to a full unrestricted scan.
 assert(selected.pool_file == "full.bspool")
-require("nativefs").getDirectoryItems = function()
+require("brainstorm_nativefs").getDirectoryItems = function()
   return {"full.bspool.attached"}
 end
 selected = assert(Brainstorm.findAutomaticSeedPool())
 assert(selected.pool_file == "full.bspool")
-require("nativefs").getDirectoryItems = function()
+require("brainstorm_nativefs").getDirectoryItems = function()
   return {"accelerator-large.bspool.attached", "accelerator-small.bspool.attached"}
 end
 selected = assert(Brainstorm.findAutomaticSeedPool())
@@ -255,7 +293,7 @@ assert(Brainstorm.findAutomaticSeedPool() == nil)
 local effective = assert(Brainstorm.effectiveSeedPoolSelection())
 assert(effective.role == "manual" and not effective.automatic)
 Brainstorm.SETTINGS.autoreroll.seedPoolFile = ""
-local nativefs = require("nativefs")
+local nativefs = require("brainstorm_nativefs")
 local statusText = "P 7\nE pool: no seed in the pool matches the active filters\n"
 local fileRead = nativefs.read
 local denyAttachment = false
@@ -325,7 +363,8 @@ assert(Brainstorm.AUTOREROLL.autoPoolTried[marker.path])
 assert(Brainstorm.AUTOREROLL.autoPoolWarned:find("changed during search", 1, true))
 ''')
     subprocess.run(lua + [harness, os.path.join(ROOT, "Brainstorm_reroll.lua"),
-                          pool_dir, full_path + ".attached"], check=True)
+                          pool_dir, full_path + ".attached", bsp4_marker_path],
+                   check=True)
 
     # Exercise the browser's Attach/Detach endpoints against the current
     # snapshot hash rather than trusting a client-supplied catalog identity.

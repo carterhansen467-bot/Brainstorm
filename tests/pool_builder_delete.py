@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safety regression for completed-pool deletion in the Builder."""
+"""Safety regression for stopped-pool deletion in the Builder."""
 
 import json
 import os
@@ -140,12 +140,15 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
 
     incomplete = os.path.join(pool_dir, "paused.bspool")
     write_pool(incomplete, complete=False)
-    try:
-        core.pool_delete_plan("paused.bspool", pool_dir)
-    except ValueError as exc:
-        assert "Only completed" in str(exc)
-    else:
-        raise AssertionError("incomplete pool was deletable")
+    with open(incomplete + ".state", "w", encoding="utf-8") as handle:
+        handle.write("paused checkpoint\n")
+    paused_plan = core.pool_delete_plan("paused.bspool", pool_dir)
+    paused_result = core.delete_completed_pool(
+        "paused.bspool", paused_plan["token"], pool_dir)
+    assert set(paused_result["removed"]) == {
+        "paused.bspool", "paused.bspool.state",
+    }
+    assert not os.path.exists(incomplete)
 
     limited = os.path.join(pool_dir, "limited.bspool")
     write_pool(limited, range_end=100_000_000)
@@ -205,7 +208,7 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
 
 # The browser contract is deliberately two-step and visibly destructive.
 for marker in ("/api/delete-plan", 'parsed.path == "/api/delete"',
-               "Delete completed pool…", "This cannot be undone.",
+               "Delete pool…", "This cannot be undone.",
                "data-pool"):
     assert marker in web.PAGE or marker in open(web.__file__, encoding="utf-8").read()
 
@@ -219,4 +222,4 @@ if node:
                              capture_output=True)
     assert checked.returncode == 0, checked.stderr
 
-print("pool builder completed-pool deletion: ok")
+print("pool builder stopped-pool deletion: ok")

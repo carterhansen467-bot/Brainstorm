@@ -1,4 +1,4 @@
-local nativefs = require("nativefs")
+local nativefs = require("brainstorm_nativefs")
 
 local searchLegendaryKeys = {"None", "Caino", "Triboulet", "Yorick", "Chicot", "Perkeo"}
 local legendaryKeyByName = {["None"]="", ["Caino"]="j_caino", ["Triboulet"]="j_triboulet", ["Yorick"]="j_yorick", ["Chicot"]="j_chicot", ["Perkeo"]="j_perkeo"}

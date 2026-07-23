@@ -29,7 +29,7 @@ end
 
 local fileText = read(rerollPath)
 package.loaded.lovely = { mod_dir = "" }
-package.loaded.nativefs = {
+package.loaded.brainstorm_nativefs = {
 	write = function() end, read = function() return "" end,
 	getInfo = function() return nil end,
 }
@@ -102,12 +102,12 @@ package.loaded["love.thread"] = true
 assert(load(workerSrc, "worker"))(serialize(snap), fileText, 0, 1)
 G.GAME.selected_back = { effect = { config = { vouchers = startingVouchers } } }
 
-package.loaded.nativefs.read = function(path, bytes)
+package.loaded.brainstorm_nativefs.read = function(path, bytes)
 	local f = io.open(path, "rb")
 	if not f then return nil end
 	local value = f:read(bytes or "*a"); f:close(); return value
 end
-package.loaded.nativefs.getInfo = function(path)
+package.loaded.brainstorm_nativefs.getInfo = function(path)
 	local f = io.open(path, "rb")
 	if not f then return nil end
 	f:close(); return { type = "file" }

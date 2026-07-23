@@ -2,18 +2,22 @@
 """Point-and-click UI for the Brainstorm seed pool organizer.
 
 The server binds to 127.0.0.1 and uses only the Python standard library.  It
-organizes the committed checkpoint of a BSP3 pool; an unfinished writer tail
-is never read.  Every plan is pinned to the source snapshot id so a paused
-scan cannot silently grow underneath the user's category choices.
+organizes the committed checkpoint of a BSP3 or BSP4 event pool; an unfinished
+writer tail is never read.  Every plan is pinned to the source snapshot id so
+a paused scan cannot silently grow underneath the user's category choices.
+Both event schemas are accepted by the native scanner/searcher.
 """
 
 from __future__ import print_function
 
+import collections
+import copy
 import json
 import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -63,9 +67,155 @@ MOD_DIR = _find_mod_dir()
 POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 DEFAULT_PORT = 8918
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
+AMBIGUITY_SAMPLE_LIMIT = 500
+AMBIGUITY_GROUP_LIMIT = 100
 SPLIT_LOCK = threading.Lock()
 COMBINE_LOCK = threading.Lock()
+ACTIVE_OPERATION_LOCK = threading.Lock()
+ACTIVE_OPERATIONS = {}
+READER_CACHE_LOCK = threading.Lock()
+READER_CACHE = collections.OrderedDict()
 MAX_COMBINE_INPUTS = organizer.COMPOSITE_MAX_INPUTS
+# A reviewed combine can contain MAX_COMBINE_INPUTS immutable readers. Keep
+# the whole reviewed set so its execute pass does not evict the remaining
+# readers while walking the same source order a second time, but only while
+# their retained indexes fit a low-end-safe aggregate memory budget.
+READER_CACHE_LIMIT = MAX_COMBINE_INPUTS
+READER_CACHE_MAX_BYTES = 64 * 1024 * 1024
+REVIEWED_SPLIT_CACHE_LOCK = threading.Lock()
+REVIEWED_SPLIT_CACHE = collections.OrderedDict()
+REVIEWED_SPLIT_CACHE_LIMIT = 8
+NATIVE_SUMMARY_MIN_BYTES = 32 * 1024 * 1024
+SUMMARY_CACHE_SCHEMA = 1
+_POOL_BINARY_NAME = "brainstorm_seed_pool" + (".exe" if os.name == "nt" else "")
+_POOL_BINARY_CANDIDATES = [
+    os.path.join(APP_DIR, _POOL_BINARY_NAME),
+    os.path.join(APP_DIR, "native", _POOL_BINARY_NAME),
+    os.path.join(MOD_DIR, "Seed Pool Builder", _POOL_BINARY_NAME),
+    os.path.join(MOD_DIR, "native", _POOL_BINARY_NAME),
+]
+
+
+def _operation_cancelled(cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise organizer.PoolError("operation cancelled")
+
+
+def _plan_token(kind, value):
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "%016x" % organizer.fnv64(
+        ("organizer-plan:%s:" % kind).encode("ascii") + payload.encode("ascii"))
+
+
+def _split_request_key(reader, selected_ids, choices, ambiguity_rules,
+                       publication):
+    """Canonical no-scan identity for one reviewed split request."""
+    if selected_ids is None:
+        selected = None
+    else:
+        if not isinstance(selected_ids, list) or not all(
+                isinstance(item, str) for item in selected_ids):
+            raise organizer.PoolError("selectedCategories must be a list")
+        if not selected_ids:
+            raise organizer.PoolError("select at least one exact category")
+        selected = tuple(sorted(set(selected_ids)))
+    request = publication if isinstance(publication, dict) else {}
+    policy = str(request.get("unmatchedPolicy", "stop")).lower()
+    if policy not in ("stop", "keep", "remainder", "omit"):
+        raise organizer.PoolError("unknown unmatched-seed policy")
+    if policy == "keep":
+        remainder_label = "Unmatched seeds"
+    elif policy == "remainder":
+        remainder_label = str(
+            request.get("remainderName", "Needs review")).strip()
+        if not remainder_label:
+            raise organizer.PoolError(
+                "give the review/remainder pool a name")
+    else:
+        remainder_label = ""
+    return (
+        reader.snapshot_token,
+        selected,
+        tuple(sorted(choices.items())),
+        tuple(sorted(ambiguity_rules.items())),
+        policy,
+        remainder_label,
+        sanitize_prefix(request.get("prefix"),
+                        os.path.basename(reader.path)),
+    )
+
+
+def _remember_reviewed_split(reader, selected_ids, choices, ambiguity_rules,
+                             publication, plan):
+    """Retain a small immutable preflight for its immediate execute request."""
+    details = plan.get("publication", {})
+    token = str(details.get("plan_token") or "")
+    if not token or not details.get("ready"):
+        return
+    identity = _reader_cache_key(reader.path)
+    request_key = _split_request_key(
+        reader, selected_ids, choices, ambiguity_rules, publication)
+    cache_key = (token, identity)
+    with REVIEWED_SPLIT_CACHE_LOCK:
+        REVIEWED_SPLIT_CACHE[cache_key] = (
+            request_key, copy.deepcopy(plan))
+        REVIEWED_SPLIT_CACHE.move_to_end(cache_key)
+        while len(REVIEWED_SPLIT_CACHE) > REVIEWED_SPLIT_CACHE_LIMIT:
+            REVIEWED_SPLIT_CACHE.popitem(last=False)
+
+
+def _reviewed_split_preflight(reader, selected_ids, choices, ambiguity_rules,
+                              publication, reviewed_token):
+    """Return an unchanged reviewed preflight, or require an exact rescan."""
+    identity = _reader_cache_key(reader.path)
+    cache_key = (reviewed_token, identity)
+    request_key = _split_request_key(
+        reader, selected_ids, choices, ambiguity_rules, publication)
+    with REVIEWED_SPLIT_CACHE_LOCK:
+        cached = REVIEWED_SPLIT_CACHE.get(cache_key)
+        if cached is None or cached[0] != request_key:
+            return None
+        REVIEWED_SPLIT_CACHE.move_to_end(cache_key)
+        preflight = copy.deepcopy(cached[1])
+    directory = os.path.dirname(os.path.abspath(reader.path))
+    details = preflight["publication"]
+    # Existence is intentionally checked again immediately before staging.
+    # A collision makes the cached preview stale and falls back to the exact
+    # planner, preserving its blocker/report-name behavior.
+    if any(os.path.exists(os.path.join(directory, row["name"]))
+           for row in details["outputs"]):
+        return None
+    if os.path.exists(os.path.join(directory, details["report_name"])):
+        return None
+    return preflight
+
+
+def _begin_operation(kind):
+    """Register one cancellable local mutation and return its Event."""
+    event = threading.Event()
+    with ACTIVE_OPERATION_LOCK:
+        if kind in ACTIVE_OPERATIONS:
+            raise organizer.PoolError("another organizer %s is still running" % kind)
+        ACTIVE_OPERATIONS[kind] = event
+    return event
+
+
+def _finish_operation(kind, event):
+    with ACTIVE_OPERATION_LOCK:
+        if ACTIVE_OPERATIONS.get(kind) is event:
+            del ACTIVE_OPERATIONS[kind]
+
+
+def cancel_operation(kind):
+    if kind not in ("analysis", "split", "combine"):
+        raise organizer.PoolError("choose analysis, split, or combine to cancel")
+    with ACTIVE_OPERATION_LOCK:
+        event = ACTIVE_OPERATIONS.get(kind)
+        if event is None:
+            return {"ok": True, "operation": kind, "state": "idle"}
+        event.set()
+    return {"ok": True, "operation": kind, "state": "cancelling"}
 
 
 def _pool_root(pool_dir=None):
@@ -90,6 +240,97 @@ def resolve_source(name, pool_dir=None):
     return path
 
 
+def _reader_cache_key(path):
+    status = os.stat(path)
+    return (os.path.abspath(path), status.st_dev, status.st_ino,
+            status.st_size, getattr(status, "st_mtime_ns",
+                                    int(status.st_mtime * 1000000000)))
+
+
+def _reader_cache_weight(reader):
+    cached = getattr(reader, "_organizer_cache_weight", None)
+    if cached is not None:
+        return cached
+    blocks = reader.blocks
+    if blocks:
+        field_names = (
+            "offset", "first_record", "count", "rank_bytes",
+            "metadata_bytes", "associations", "first_rank", "last_rank",
+            "header_bytes", "rank_codec", "metadata_encoding", "flags")
+
+        def block_weight(block):
+            attributes = getattr(block, "__dict__", None)
+            return (sys.getsizeof(block)
+                    + (sys.getsizeof(attributes)
+                       if attributes is not None else 0)
+                    + sum(
+                sys.getsizeof(getattr(block, field))
+                for field in field_names))
+
+        per_block = max(block_weight(blocks[0]),
+                        block_weight(blocks[-1]))
+    else:
+        per_block = 0
+    weight = (
+        sys.getsizeof(reader)
+        + sys.getsizeof(blocks)
+        + len(blocks) * per_block
+        + len(reader.header.text.encode("utf-8")))
+    reader._organizer_cache_weight = weight
+    return weight
+
+
+def _trim_reader_cache():
+    total = sum(_reader_cache_weight(reader)
+                for reader in READER_CACHE.values())
+    while (READER_CACHE
+           and (len(READER_CACHE) > READER_CACHE_LIMIT
+                or total > READER_CACHE_MAX_BYTES)):
+        _key, reader = READER_CACHE.popitem(last=False)
+        total -= _reader_cache_weight(reader)
+
+
+def _evict_cached_reader_paths(paths):
+    targets = {os.path.abspath(path) for path in paths}
+    with READER_CACHE_LOCK:
+        for key in list(READER_CACHE):
+            if key[0] in targets:
+                del READER_CACHE[key]
+
+
+def verified_source_reader(name, pool_dir=None, cancel_check=None):
+    """Reuse a structurally verified snapshot while file identity is stable.
+
+    Payload CRC/canonical verification is deferred to the first record
+    traversal, avoiding the former decode-twice path for split/combine work.
+    """
+    _operation_cancelled(cancel_check)
+    path = resolve_source(name, pool_dir)
+    before = _reader_cache_key(path)
+    with READER_CACHE_LOCK:
+        reader = READER_CACHE.get(before)
+        if reader is not None:
+            READER_CACHE.move_to_end(before)
+            return reader
+    reader = organizer.BSPoolReader(
+        path, cancel_check=cancel_check, verify_payloads=False)
+    after = _reader_cache_key(path)
+    if after != before:
+        raise organizer.PoolError(
+            "source changed while its committed snapshot was being verified; inspect it again")
+    # The callback is only needed by constructor verification. Do not retain
+    # a completed request's Event in a long-lived immutable cache entry.
+    reader.cancel_check = None
+    with READER_CACHE_LOCK:
+        for key in list(READER_CACHE):
+            if key[0] == path and key != after:
+                del READER_CACHE[key]
+        READER_CACHE[after] = reader
+        READER_CACHE.move_to_end(after)
+        _trim_reader_cache()
+    return reader
+
+
 def _bounded_header(path):
     text = organizer.read_pool_header_text(path)
     if not text:
@@ -110,6 +351,11 @@ def list_sources(pool_dir=None):
             path = resolve_source(name, root)
             header = _bounded_header(path)
             schema = int(header.one("BRAINSTORM_SEED_POOL"))
+            encoding = header.one("encoding", required=False, default="")
+            if schema == 4 and encoding != organizer.POOL_ENCODINGS[4]:
+                raise organizer.PoolError(
+                    "BSP4 pool has incompatible encoding %s"
+                    % (encoding or "(missing)"))
             records = header.integer("records")
             complete = bool(header.integer("complete"))
             coverage = bool(header.integer(
@@ -121,7 +367,9 @@ def list_sources(pool_dir=None):
                 "records": records,
                 "complete": complete,
                 "coverage_complete": coverage,
-                "metadata_capable": schema == 3,
+                "metadata_capable": schema in organizer.EVENT_POOL_SCHEMAS,
+                "encoding": encoding,
+                "native_compatible": schema in (1, 2, 3, 4),
                 "modelver": header.integer("modelver"),
                 "catalog_hash": header.one("catalog_hash"),
                 "criteria_hash": header.one("criteria_hash"),
@@ -160,53 +408,352 @@ def _notices(source):
         notices.append({
             "kind": "warning",
             "title": "Provisional coverage",
-            "text": ("Derivative pools will remain coverage-incomplete. They are "
-                     "valid pools of the currently recorded seeds, not a claim that "
-                     "the source search range was fully covered."),
+            "text": ("New pools made from this source will also be marked "
+                     "provisional. They are valid lists of the currently recorded "
+                     "seeds, but they do not claim that the original search range "
+                     "was fully scanned."),
         })
     if not source["metadata_capable"]:
         notices.append({
             "kind": "error",
-            "title": "Position metadata unavailable",
-            "text": ("BSP2 can be inspected and exported, but it cannot be split by "
-                     "exact tag, Legendary, or voucher location. Refilter or rescan "
-                     "it into BSP3 first."),
+            "title": "This older pool does not contain exact match details",
+            "text": ("BSP2 records which seeds matched but not the exact tag, "
+                     "Legendary, or voucher location for each seed. It can be "
+                     "inspected, downloaded, or combined by seed membership, but "
+                     "it cannot be split into location categories. Refilter or "
+                     "rescan it into BSP4 first."),
         })
     if source.get("family_id") or source.get("lineage_id"):
         notices.append({
             "kind": "info",
-            "title": "Lineage is preserved",
-            "text": ("Every output retains the source family, records snapshot %s as "
-                     "its parent, and receives a category-specific derived lineage.")
-                    % source["snapshot_id"],
+            "title": "New pools remain traceable to this source",
+            "text": ("Every new pool records source snapshot %s, so Brainstorm can "
+                     "tell exactly which saved version it came from.") %
+                    source["snapshot_id"],
         })
     return notices
 
 
-def inspect_source(name, pool_dir=None, ambiguity_limit=100):
-    reader = organizer.BSPoolReader(resolve_source(name, pool_dir))
-    report = organizer.analyze(reader, ambiguity_limit=ambiguity_limit)
-    report["notices"] = _notices(report["source"])
+def _native_pool_binary():
+    return next((path for path in _POOL_BINARY_CANDIDATES
+                 if os.path.isfile(path) and os.access(path, os.X_OK)), "")
+
+
+def _summary_identity(path):
+    status = os.stat(path)
+    return {
+        "device": int(status.st_dev),
+        "inode": int(status.st_ino),
+        "bytes": int(status.st_size),
+        "mtime_ns": int(getattr(
+            status, "st_mtime_ns", int(status.st_mtime * 1000000000))),
+    }
+
+
+def _summary_cache_path(path):
+    return path + ".organizer-summary.json"
+
+
+def _cached_summary(path, identity):
+    try:
+        with open(_summary_cache_path(path), "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if (not isinstance(cached, dict)
+                or cached.get("cache_schema") != SUMMARY_CACHE_SCHEMA
+                or cached.get("identity") != identity
+                or not isinstance(cached.get("report"), dict)):
+            return None
+        report = cached["report"]
+        if (not isinstance(report.get("source"), dict)
+                or report["source"].get("records") < 0
+                or report.get("organizer_schema") != 1):
+            return None
+        return report
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+class _InspectionPlanReader:
+    """Minimal immutable reader view for a summary-backed split review."""
+
+    def __init__(self, path, source):
+        self.path = os.path.abspath(path)
+        self.metadata_capable = bool(source.get("metadata_capable"))
+        self.records = int(source.get("records", -1))
+        self.snapshot_token = str(source.get("snapshot_id", "")).lower()
+
+    def iter_records(self):
+        raise AssertionError("summary-backed review attempted a record scan")
+
+
+def _inferred_category_groups(report):
+    """Return exact full-category groups when the summary proves them.
+
+    The native summary stores marginal category counts plus the number of
+    ambiguous records.  A common filter shape has one category on every
+    matched record (for example the required Charm tag) and exactly one
+    additional result category (for example normal or Negative Perkeo).  The
+    equality checks below mathematically prove that shape; no probabilistic or
+    heuristic inference is used.
+    """
+    try:
+        source = report["source"]
+        total = int(source["records"])
+        unmatched = int(report["unmatched_count"])
+        ambiguous = int(report["ambiguous_count"])
+        rows = report["categories"]
+        counts = {
+            str(row["category_id"]): int(row["records"])
+            for row in rows
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (total < 0 or unmatched < 0 or ambiguous < 0
+            or unmatched > total or ambiguous > total - unmatched
+            or len(counts) != len(rows)
+            or any(count < 0 or count > total for count in counts.values())):
+        return None
+    known = total - unmatched
+    if known == 0:
+        return []
+    # The minimum number of category associations is one for each known
+    # record, plus one more for every record known to be ambiguous. Equality
+    # proves that no record has a third category.
+    if sum(counts.values()) != known + ambiguous:
+        return None
+    universal = sorted(
+        category for category, count in counts.items() if count == known)
+    if not universal:
+        return None
+    anchor = universal[0]
+    others = [(category, count) for category, count in sorted(counts.items())
+              if category != anchor and count]
+    if sum(count for _category, count in others) != ambiguous:
+        return None
+    groups = []
+    anchor_only = known - ambiguous
+    if anchor_only:
+        groups.append({"categories": [anchor], "records": anchor_only,
+                       "samples": []})
+    groups.extend({
+        "categories": sorted((anchor, category)),
+        "records": count,
+        "samples": [],
+    } for category, count in others)
+    return groups
+
+
+def _summary_can_project(report, selected_ids):
+    if (not isinstance(selected_ids, list) or not selected_ids
+            or not all(isinstance(item, str) for item in selected_ids)):
+        return False
+    selected = set(selected_ids)
+    available = {
+        row.get("category_id") for row in report.get("categories", [])
+        if isinstance(row, dict)
+    }
+    if not selected.issubset(available):
+        return False
+    if len(selected) == 1:
+        return True
+    return _inferred_category_groups(report) is not None
+
+
+def _choice_plan_has_individual_decisions(value):
+    if value is None:
+        return False
+    if not isinstance(value, dict):
+        return True
+    choices = value.get("choices", value)
+    if not isinstance(choices, dict):
+        return True
+    return any(bool(destination) for destination in choices.values())
+
+
+def _parse_native_summary(text):
+    lines = text.splitlines()
+    if (not lines or lines[0] != "BRAINSTORM_POOL_SUMMARY 1"
+            or lines[-1] != "end"):
+        raise organizer.PoolError("native pool summary returned an invalid document")
+    singular = {}
+    categories = []
+    provenance = {}
+    operands = {}
+    integer_fields = {
+        "records", "ambiguous_count", "unmatched_count",
+        "opaque_associations", "records_without_provenance",
+        "records_without_operands",
+    }
+    for line in lines[1:-1]:
+        parts = line.split()
+        if not parts:
+            continue
+        key = parts[0]
+        if key in integer_fields:
+            if (len(parts) != 2 or key in singular
+                    or not re.fullmatch(r"[0-9]+", parts[1])):
+                raise organizer.PoolError("native pool summary repeats or malforms %s" % key)
+            singular[key] = int(parts[1])
+        elif key in (
+                "membership_digest", "metadata_digest",
+                "record_metadata_digest"):
+            if (len(parts) != 2 or key in singular
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[1])):
+                raise organizer.PoolError("native pool summary malforms %s" % key)
+            singular[key] = parts[1]
+        elif key == "category":
+            if (len(parts) != 3
+                    or not re.fullmatch(r"[0-9a-f]+", parts[1])
+                    or len(parts[1]) % 2
+                    or not re.fullmatch(r"[0-9]+", parts[2])):
+                raise organizer.PoolError("native pool summary has a malformed category")
+            categories.append((bytes.fromhex(parts[1]), int(parts[2])))
+        elif key in ("provenance", "operand"):
+            if (len(parts) != 3
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[1])
+                    or not re.fullmatch(r"[0-9]+", parts[2])):
+                raise organizer.PoolError("native pool summary has malformed provenance")
+            destination = provenance if key == "provenance" else operands
+            if parts[1] in destination:
+                raise organizer.PoolError("native pool summary repeats provenance")
+            destination[parts[1]] = int(parts[2])
+        else:
+            raise organizer.PoolError("native pool summary has an unknown field")
+    required = integer_fields | {"membership_digest", "metadata_digest"}
+    if not required.issubset(singular) or (
+            set(singular) - required - {"record_metadata_digest"}):
+        raise organizer.PoolError("native pool summary is incomplete")
+    records = singular["records"]
+    if (singular["ambiguous_count"] > records
+            or singular["unmatched_count"] > records
+            or singular["records_without_provenance"] > records
+            or singular["records_without_operands"] > records
+            or any(count > records for _raw, count in categories)
+            or any(count > records for count in provenance.values())
+            or any(count > records for count in operands.values())):
+        raise organizer.PoolError("native pool summary count exceeds its records")
+    singular["categories"] = categories
+    singular["provenance_counts"] = provenance
+    singular["operand_counts"] = operands
+    return singular
+
+
+def _run_native_summary(path, cancel_check=None):
+    binary = _native_pool_binary()
+    if not binary:
+        return None
+    try:
+        process = subprocess.Popen(
+            [binary, "summarize", path], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace")
+    except OSError:
+        return None
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_check is not None and cancel_check():
+                process.terminate()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise organizer.PoolError("operation cancelled")
+    if process.returncode:
+        message = (stderr or "").strip().splitlines()
+        raise organizer.PoolError(
+            message[-1] if message else "native pool summary failed")
+    return _parse_native_summary(stdout)
+
+
+def _source_from_native_summary(reader, summary):
+    reader.accept_native_verification(
+        int(summary["membership_digest"], 16),
+        int(summary["metadata_digest"], 16))
+    return organizer.source_summary(reader)
+
+
+def _report_from_native_summary(reader, summary):
+    source = _source_from_native_summary(reader, summary)
+    if summary["records"] != source["records"]:
+        raise organizer.PoolError("native summary record count differs from pool header")
+    categories = []
+    seen = set()
+    for raw, records in summary["categories"]:
+        occurrence = organizer.Occurrence.decode(raw)
+        if not occurrence.known or occurrence.category_id in seen:
+            raise organizer.PoolError("native summary returned a duplicate or opaque category")
+        seen.add(occurrence.category_id)
+        item = occurrence.as_dict()
+        item["records"] = records
+        categories.append(item)
+    categories.sort(key=lambda item: item["category_id"])
+    report = {
+        "organizer_schema": 1,
+        "source": source,
+        "categories": categories,
+        "category_count": len(categories),
+        "ambiguous_count": summary["ambiguous_count"],
+        "ambiguous": [],
+        "ambiguities_truncated": summary["ambiguous_count"],
+        "unmatched_count": summary["unmatched_count"],
+        "opaque_associations": summary["opaque_associations"],
+        "records_without_provenance": (
+            summary["records_without_provenance"] if source["composite"] else 0),
+        "records_without_operands": (
+            summary["records_without_operands"] if source["composite"] else 0),
+        "provenance_counts": summary["provenance_counts"],
+        "operand_counts": summary["operand_counts"],
+    }
+    report["notices"] = _notices(source)
     return report
 
 
-def _selected_categories(reader, selected_ids):
-    summary = organizer.analyze(reader, ambiguity_limit=0)
-    available = {row["category_id"]: row for row in summary["categories"]}
-    if selected_ids is None:
-        selected = set(available)
-    else:
-        if not isinstance(selected_ids, list) or not all(
-                isinstance(item, str) for item in selected_ids):
-            raise organizer.PoolError("selectedCategories must be a list")
-        unknown = sorted(set(selected_ids) - set(available))
-        if unknown:
+def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
+    path = resolve_source(name, pool_dir)
+    identity = _summary_identity(path)
+    header = _bounded_header(path)
+    # Composite inspection retains the full semantic per-record validation.
+    # Large ordinary event pools can use the bounded native block summary.
+    use_native = (
+        identity["bytes"] >= NATIVE_SUMMARY_MIN_BYTES
+        and int(header.one("BRAINSTORM_SEED_POOL"))
+        in organizer.EVENT_POOL_SCHEMAS
+        and not header.values.get("composite_schema")
+        and bool(_native_pool_binary()))
+    if use_native:
+        cached = _cached_summary(path, identity)
+        if cached is not None:
+            _operation_cancelled(cancel_check)
+            return cached
+        reader = organizer.BSPoolReader(
+            path, cancel_check=cancel_check, verify_payloads=False)
+        if _summary_identity(path) != identity:
             raise organizer.PoolError(
-                "selected category is absent from snapshot: %s" % unknown[0])
-        selected = set(selected_ids)
-    if not selected:
-        raise organizer.PoolError("select at least one exact category")
-    return summary, available, selected
+                "source changed while its committed snapshot was being "
+                "structurally opened; inspect it again")
+        summary = _run_native_summary(path, cancel_check=cancel_check)
+        _operation_cancelled(cancel_check)
+        if summary is not None:
+            if _summary_identity(path) != identity:
+                raise organizer.PoolError(
+                    "source changed while its committed snapshot was being summarized; inspect it again")
+            report = _report_from_native_summary(reader, summary)
+            organizer.atomic_json(_summary_cache_path(path), {
+                "cache_schema": SUMMARY_CACHE_SCHEMA,
+                "identity": identity,
+                "report": report,
+            })
+            return report
+    reader = verified_source_reader(
+        name, pool_dir, cancel_check=cancel_check)
+    report = organizer.analyze(
+        reader, ambiguity_limit=ambiguity_limit, cancel_check=cancel_check)
+    report["notices"] = _notices(report["source"])
+    return report
 
 
 def _choice_document(value, reader):
@@ -232,20 +779,184 @@ def _choice_document(value, reader):
     return choices
 
 
-def build_split_plan(reader, selected_ids=None, choice_plan=None):
-    """Build a no-write split plan for the UI."""
-    summary, available, selected = _selected_categories(reader, selected_ids)
+def _ambiguity_rules(value, reader):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise organizer.PoolError("choice plan must be a JSON object")
+    if "source_snapshot_id" in value:
+        snapshot = str(value.get("source_snapshot_id", "")).lower()
+        if snapshot != reader.snapshot_token:
+            raise organizer.PoolError(
+                "choice plan is for snapshot %s; inspect current snapshot %s" % (
+                    snapshot or "(missing)", reader.snapshot_token))
+    rules = value.get("ambiguity_rules", {})
+    if not isinstance(rules, dict):
+        raise organizer.PoolError(
+            "choice plan needs an object-valued ambiguity_rules field")
+    result = {}
+    for key, category in rules.items():
+        if (not isinstance(key, str) or not isinstance(category, str)
+                or not re.fullmatch(r"[0-9a-f]{16}", key) or not category):
+            raise organizer.PoolError(
+                "ambiguity rule keys must be lowercase 16-hex tokens and "
+                "destinations must be nonempty strings")
+        result[key] = category
+    return result
+
+
+def _ambiguity_rule_key(candidates):
+    return organizer.ambiguity_rule_key(candidates)
+
+
+def build_split_plan(reader, selected_ids=None, choice_plan=None,
+                     publication=None, cancel_check=None, inspection=None):
+    """Build an exact, snapshot-pinned, no-write publication preflight."""
+    _operation_cancelled(cancel_check)
+    if not reader.metadata_capable:
+        raise organizer.PoolError(
+            "BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
+    if selected_ids is None:
+        selected_filter = None
+    else:
+        if not isinstance(selected_ids, list) or not all(
+                isinstance(item, str) for item in selected_ids):
+            raise organizer.PoolError("selectedCategories must be a list")
+        selected_filter = set(selected_ids)
+        if not selected_filter:
+            raise organizer.PoolError("select at least one exact category")
     choices = _choice_document(choice_plan, reader)
+    ambiguity_rules = _ambiguity_rules(choice_plan, reader)
     used_choices = set()
+    used_rules = set()
     ambiguous = []
+    ambiguity_groups = {}
+    ambiguity_groups_truncated = False
+    ambiguous_count = 0
+    unresolved_count = 0
     unmatched = 0
-    counts = {}
-    for category in selected:
-        counts[category] = 0
-    for record in reader.iter_records():
-        candidates = organizer.record_categories(record, selected)
+    opaque_associations = 0
+    available = {}
+    category_ids = {}
+    candidate_counts = {}
+    assigned_counts = {}
+    pending_counts = {}
+    summary_projection = False
+    if inspection is not None:
+        if (not isinstance(inspection, dict)
+                or not isinstance(inspection.get("source"), dict)
+                or str(inspection["source"].get("snapshot_id", "")).lower()
+                != reader.snapshot_token
+                or int(inspection["source"].get("records", -1))
+                != reader.records):
+            raise organizer.PoolError(
+                "cached inspection does not match the selected pool snapshot")
+        summary_rows = {
+            row["category_id"]: dict(row)
+            for row in inspection.get("categories", [])
+            if isinstance(row, dict) and isinstance(row.get("category_id"), str)
+        }
+        if (selected_filter is not None and not choices
+                and _summary_can_project(inspection, selected_ids)):
+            available.update(summary_rows)
+            opaque_associations = int(
+                inspection.get("opaque_associations", 0))
+            if len(selected_filter) == 1:
+                category = next(iter(selected_filter))
+                row = summary_rows.get(category)
+                if row is not None:
+                    count = int(row.get("records", -1))
+                    if count < 0 or count > reader.records:
+                        raise organizer.PoolError(
+                            "cached inspection has an invalid category count")
+                    candidate_counts[category] = count
+                    assigned_counts[category] = count
+                    unmatched = reader.records - count
+                    summary_projection = True
+            else:
+                full_groups = _inferred_category_groups(inspection)
+                if full_groups is not None:
+                    unmatched = int(inspection.get("unmatched_count", 0))
+                    projected = {}
+                    for full_group in full_groups:
+                        count = int(full_group["records"])
+                        candidates = sorted(
+                            selected_filter.intersection(
+                                full_group["categories"]))
+                        if not candidates:
+                            unmatched += count
+                            continue
+                        for category in candidates:
+                            candidate_counts[category] = \
+                                candidate_counts.get(category, 0) + count
+                        if len(candidates) == 1:
+                            category = candidates[0]
+                            assigned_counts[category] = \
+                                assigned_counts.get(category, 0) + count
+                            continue
+                        ambiguous_count += count
+                        rule_key = _ambiguity_rule_key(candidates)
+                        destination = ambiguity_rules.get(rule_key)
+                        if destination is not None:
+                            used_rules.add(rule_key)
+                            if destination not in candidates:
+                                raise organizer.PoolError(
+                                    "ambiguity rule is not one of its selected categories")
+                            assigned_counts[destination] = \
+                                assigned_counts.get(destination, 0) + count
+                            continue
+                        unresolved_count += count
+                        for category in candidates:
+                            pending_counts[category] = \
+                                pending_counts.get(category, 0) + count
+                        group = projected.get(rule_key)
+                        if group is None:
+                            group = {
+                                "rule_key": rule_key,
+                                "candidates": candidates,
+                                "records": 0,
+                                "unresolved_records": 0,
+                                "samples": [],
+                            }
+                            projected[rule_key] = group
+                        elif group["candidates"] != candidates:
+                            raise organizer.PoolError(
+                                "summary category sets produced the same rule token")
+                        group["records"] += count
+                        group["unresolved_records"] += count
+                        for seed in full_group.get("samples", []):
+                            if len(group["samples"]) < 3 \
+                                    and seed not in group["samples"]:
+                                group["samples"].append(seed)
+                    for rule_key in sorted(projected):
+                        if len(ambiguity_groups) >= AMBIGUITY_GROUP_LIMIT:
+                            ambiguity_groups_truncated = True
+                            break
+                        ambiguity_groups[rule_key] = projected[rule_key]
+                    summary_projection = True
+    record_source = () if summary_projection else reader.iter_records(
+        cancel_check=cancel_check)
+    for record_index, record in enumerate(record_source):
+        if record_index % 8192 == 0:
+            _operation_cancelled(cancel_check)
+        candidate_set = set()
+        for occurrence in record.occurrences:
+            if occurrence.known:
+                category = category_ids.get(occurrence.raw)
+                if category is None:
+                    category = occurrence.category_id
+                    category_ids[occurrence.raw] = category
+                if selected_filter is None or category in selected_filter:
+                    candidate_set.add(category)
+                    if category not in available:
+                        available[category] = occurrence.as_dict()
+                continue
+            if (occurrence.provenance_id is None
+                    and occurrence.operand_id is None):
+                opaque_associations += 1
+        candidates = sorted(candidate_set)
         for category in candidates:
-            counts[category] += 1
+            candidate_counts[category] = candidate_counts.get(category, 0) + 1
         if not candidates:
             unmatched += 1
             continue
@@ -257,44 +968,213 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None):
                     raise organizer.PoolError(
                         "choice for unambiguous seed %s conflicts with its category"
                         % reader.seed(record.rank))
+            category = candidates[0]
+            assigned_counts[category] = assigned_counts.get(category, 0) + 1
             continue
         chosen, choice_key = organizer.choice_for_record(choices, reader, record)
         if choice_key:
             used_choices.add(choice_key)
+        rule_key = _ambiguity_rule_key(candidates)
+        if rule_key in ambiguity_rules:
+            used_rules.add(rule_key)
+            if ambiguity_rules[rule_key] not in candidates:
+                raise organizer.PoolError(
+                    "ambiguity rule for %s is not one of that group's "
+                    "selected categories" % reader.seed(record.rank))
+            if chosen is None:
+                chosen = ambiguity_rules[rule_key]
         if chosen is not None and chosen not in candidates:
             raise organizer.PoolError(
                 "choice for %s is not one of that seed's selected categories"
                 % reader.seed(record.rank))
-        ambiguous.append({
-            "seed": reader.seed(record.rank),
-            "rank": record.rank,
-            "candidates": candidates,
-            "choice": chosen or "",
-        })
+        ambiguous_count += 1
+        if chosen:
+            assigned_counts[chosen] = assigned_counts.get(chosen, 0) + 1
+        else:
+            unresolved_count += 1
+            for category in candidates:
+                pending_counts[category] = pending_counts.get(category, 0) + 1
+            group = ambiguity_groups.get(rule_key)
+            if group is None and len(ambiguity_groups) < AMBIGUITY_GROUP_LIMIT:
+                group = {
+                    "rule_key": rule_key,
+                    "candidates": candidates,
+                    "records": 0,
+                    "unresolved_records": 0,
+                    "samples": [],
+                }
+                ambiguity_groups[rule_key] = group
+            elif group is None:
+                ambiguity_groups_truncated = True
+            elif group["candidates"] != candidates:
+                raise organizer.PoolError(
+                    "ambiguity candidate sets produced the same rule token")
+            if group is not None:
+                group["records"] += 1
+                group["unresolved_records"] += 1
+                if len(group["samples"]) < 3:
+                    group["samples"].append(reader.seed(record.rank))
+        if len(ambiguous) < AMBIGUITY_SAMPLE_LIMIT:
+            ambiguous.append({
+                "seed": reader.seed(record.rank),
+                "rank": record.rank,
+                "rule_key": rule_key,
+                "candidates": candidates,
+                "choice": chosen if choice_key else "",
+                "resolved_by_rule": bool(
+                    not choice_key and rule_key in ambiguity_rules),
+            })
+    _operation_cancelled(cancel_check)
+    selected = set(available) if selected_filter is None else selected_filter
+    unknown = sorted(selected - set(available))
+    if unknown:
+        raise organizer.PoolError(
+            "selected category is absent from snapshot: %s" % unknown[0])
+    if not selected:
+        raise organizer.PoolError(
+            "snapshot has no known tag/Legendary/voucher occurrence categories")
     unused = sorted(set(choices) - used_choices)
     if unused:
         raise organizer.PoolError(
             "choice plan contains a seed/rank not used by this split: %s" % unused[0])
+    unused_rules = sorted(set(ambiguity_rules) - used_rules)
+    if unused_rules:
+        raise organizer.PoolError(
+            "choice plan contains an ambiguity rule not used by this split: %s" %
+            unused_rules[0])
     categories = []
     for category in sorted(selected):
         row = dict(available[category])
-        row["records"] = counts[category]
+        # Candidate counts can overlap. Assigned counts are projected output
+        # membership after applying the current ambiguity choices.
+        row["association_records"] = candidate_counts.get(category, 0)
+        row["records"] = assigned_counts.get(category, 0)
+        row["pending_ambiguities"] = pending_counts.get(category, 0)
         categories.append(row)
-    source = organizer.source_summary(reader)
-    return {
-        "organizer_schema": 1,
+    source = dict(inspection["source"]) if summary_projection \
+        else organizer.source_summary(reader)
+    request = publication if isinstance(publication, dict) else {}
+    policy = str(request.get("unmatchedPolicy", "stop")).lower()
+    if policy not in ("stop", "keep", "remainder", "omit"):
+        raise organizer.PoolError("unknown unmatched-seed policy")
+    remainder_label = ""
+    if policy == "keep":
+        remainder_label = "Unmatched seeds"
+    elif policy == "remainder":
+        remainder_label = str(request.get("remainderName", "Needs review")).strip()
+        if not remainder_label:
+            raise organizer.PoolError("give the review/remainder pool a name")
+    prefix = sanitize_prefix(
+        request.get("prefix"), os.path.basename(reader.path))
+    outputs = []
+    for row in categories:
+        if not row["records"] and not row["pending_ambiguities"]:
+            continue
+        outputs.append({
+            "category_id": row["category_id"],
+            "label": row["label"],
+            "name": prefix + "--" + organizer.safe_filename(row["category_id"]),
+            "records": row["records"],
+            "pending_ambiguities": row["pending_ambiguities"],
+            "records_exact": row["pending_ambiguities"] == 0,
+            "kind": "category",
+        })
+    if unmatched and remainder_label:
+        remainder_id = "remainder:%s" % quote(remainder_label, safe="_.-")
+        outputs.append({
+            "category_id": remainder_id,
+            "label": remainder_label,
+            "name": prefix + "--" + organizer.safe_filename(remainder_id),
+            "records": unmatched,
+            "pending_ambiguities": 0,
+            "records_exact": True,
+            "kind": "unmatched",
+        })
+    publication_dir = os.path.dirname(os.path.abspath(reader.path))
+    for output in outputs:
+        output["exists"] = os.path.exists(
+            os.path.join(publication_dir, output["name"]))
+        output["collision_status"] = "exists" if output["exists"] else "available"
+    blockers = []
+    if unresolved_count:
+        blockers.append("Choose one destination for %s multi-category seed(s)." %
+                        format(unresolved_count, ","))
+    if unmatched and policy == "stop":
+        blockers.append(
+            "Choose whether to keep, name, or omit %s unmatched seed(s)." %
+            format(unmatched, ","))
+    report_name = os.path.basename(_unique_report_path(
+        publication_dir, prefix, reader.snapshot_token))
+    collisions = [row["name"] for row in outputs if row["exists"]]
+    if collisions:
+        blockers.append("Output already exists: %s" % collisions[0])
+    token = _plan_token("split", {
+        "snapshot": reader.snapshot_token,
+        "selected_categories": sorted(selected),
+        "choices": sorted(choices.items()),
+        "ambiguity_rules": sorted(ambiguity_rules.items()),
+        "unmatched_policy": policy,
+        "remainder_label": remainder_label,
+        "output_prefix": prefix,
+        "outputs": [(row["name"], row["records"], row["pending_ambiguities"])
+                    for row in outputs],
+        "report_name": report_name,
+    })
+    result = {
+        "organizer_schema": 2,
+        "planning_mode": "summary_projection" if summary_projection
+        else "record_scan",
         "source": source,
         "source_snapshot_id": reader.snapshot_token,
         "selected_categories": sorted(selected),
         "categories": categories,
-        "ambiguous_count": len(ambiguous),
-        "unresolved_ambiguities": sum(not row["choice"] for row in ambiguous),
+        "ambiguous_count": ambiguous_count,
+        "unresolved_ambiguities": unresolved_count,
         "ambiguous": ambiguous,
-        "choices": {row["seed"]: row["choice"] for row in ambiguous},
+        "ambiguities_truncated": ambiguous_count - len(ambiguous),
+        "ambiguity_groups": [dict(
+            ambiguity_groups[key],
+            choice=ambiguity_rules.get(key, ""))
+            for key in sorted(ambiguity_groups)],
+        "ambiguity_groups_truncated": ambiguity_groups_truncated,
+        "unrepresented_ambiguities": unresolved_count - sum(
+            row["unresolved_records"] for row in ambiguity_groups.values()),
+        "ambiguity_rules": dict(ambiguity_rules),
+        "choices": dict(choices),
         "unmatched_count": unmatched,
-        "opaque_associations": summary["opaque_associations"],
+        "opaque_associations": opaque_associations,
         "notices": _notices(source),
+        "compatibility": {
+            "status": "ready",
+            "format": "BSP%d" % source["schema"],
+            "snapshot_pinned": True,
+            "state": "finished" if source["complete"] else "paused",
+            "coverage": "complete" if source["coverage_complete"] else "provisional",
+            "metadata": "exact locations",
+        },
+        "publication": {
+            "ready": not blockers,
+            "blockers": blockers,
+            "outputs": outputs,
+            "output_count": len(outputs),
+            "output_prefix": prefix,
+            "report_name": report_name,
+            "directory": publication_dir,
+            "unmatched_policy": policy,
+            "omitted_records": unmatched if policy == "omit" else 0,
+            "source_retained": True,
+            "atomic_per_file": True,
+            "transaction_atomic": False,
+            "writer_locked": True,
+            "parent_snapshot_id": reader.snapshot_token,
+            "plan_token": token,
+            "coverage_complete": source["coverage_complete"],
+            "occurrence_metadata_complete": source["occurrence_metadata_complete"],
+        },
     }
+    _remember_reviewed_split(
+        reader, selected_ids, choices, ambiguity_rules, request, result)
+    return result
 
 
 def sanitize_prefix(value, source_name):
@@ -319,12 +1199,13 @@ def _unique_report_path(pool_dir, prefix, snapshot):
     return candidate
 
 
-def execute_split(name, request, pool_dir=None):
-    """Verify a pinned plan, split in staging, and atomically publish outputs."""
+def execute_split(name, request, pool_dir=None, cancel_check=None):
+    """Verify a pinned plan, then publish staged no-overwrite outputs."""
+    _operation_cancelled(cancel_check)
     root = _pool_root(pool_dir)
     os.makedirs(root, exist_ok=True)
-    source_path = resolve_source(name, root)
-    reader = organizer.BSPoolReader(source_path)
+    reader = verified_source_reader(
+        name, root, cancel_check=cancel_check)
     expected = str(request.get("snapshot", "")).lower()
     if expected != reader.snapshot_token:
         raise organizer.PoolError(
@@ -332,41 +1213,83 @@ def execute_split(name, request, pool_dir=None):
                 expected or "(missing)", reader.snapshot_token))
     selected = request.get("selectedCategories")
     choice_plan = request.get("choicePlan")
-    # Validate the whole plan before creating any files.
-    build_split_plan(reader, selected, choice_plan)
+    reviewed_token = str(request.get("reviewedPlanToken") or "")
     choices = _choice_document(choice_plan, reader)
-    policy = str(request.get("unmatchedPolicy", "stop"))
-    if policy not in ("stop", "remainder", "omit"):
-        raise organizer.PoolError("unknown unmatched-seed policy")
-    remainder = None
-    omit = False
-    if policy == "remainder":
-        remainder = str(request.get("remainderName", "Needs review")).strip()
-        if not remainder:
-            raise organizer.PoolError("give the review/remainder pool a name")
-    elif policy == "omit":
-        omit = True
+    ambiguity_rules = _ambiguity_rules(choice_plan, reader)
+    preflight = None
+    if reviewed_token:
+        preflight = _reviewed_split_preflight(
+            reader, selected, choices, ambiguity_rules, request,
+            reviewed_token)
+    if preflight is None:
+        # A cache miss, changed request, changed file identity, or newly
+        # occupied destination takes the original exact validation path.
+        preflight = build_split_plan(
+            reader, selected, choice_plan, request,
+            cancel_check=cancel_check)
+    if reviewed_token and reviewed_token != preflight["publication"]["plan_token"]:
+        raise organizer.PoolError(
+            "split choices changed after review; prepare the plan again")
+    if not preflight["publication"]["ready"]:
+        preflight["completed"] = False
+        return preflight
+    policy = preflight["publication"]["unmatched_policy"]
     prefix = sanitize_prefix(request.get("prefix"), name)
+    category_rows = []
+    remainder_id = None
+    for output in preflight["publication"]["outputs"]:
+        category_rows.append({
+            "category_id": output["category_id"],
+            "label": output["label"],
+            "records": output["records"],
+        })
+        if output["kind"] == "unmatched":
+            remainder_id = output["category_id"]
+    report = {
+        "organizer_schema": 2,
+        "source": preflight["source"],
+        "source_snapshot_id": reader.snapshot_token,
+        "choices": choices,
+        "ambiguity_rules": ambiguity_rules,
+        "selected_categories": preflight["selected_categories"],
+        "categories": category_rows,
+        "ambiguous_count": preflight["ambiguous_count"],
+        "unresolved_ambiguities": 0,
+        "ambiguous": preflight["ambiguous"],
+        "ambiguities_truncated": preflight["ambiguities_truncated"],
+        "ambiguity_groups": preflight["ambiguity_groups"],
+        "ambiguity_groups_truncated": preflight["ambiguity_groups_truncated"],
+        "unrepresented_ambiguities": preflight["unrepresented_ambiguities"],
+        "unmatched_count": preflight["unmatched_count"],
+        "unmatched_policy": policy,
+        "notices": preflight["notices"],
+        "preflight": preflight["publication"],
+        "outputs": [],
+    }
     stage = tempfile.mkdtemp(prefix=".organizer-stage-", dir=root)
-    linked = []
+    report_path = os.path.join(root, preflight["publication"]["report_name"])
+    publications = []
+    committed = False
+    report_write_started = False
     publish_locks = ExitStack()
     try:
-        choices_path = os.path.join(stage, "choices.json")
-        organizer.atomic_json(choices_path, {
-            "source_snapshot_id": reader.snapshot_token,
-            "choices": choices,
-        })
+        _operation_cancelled(cancel_check)
+        publish_locks.enter_context(organizer.pool_writer_guard(report_path))
+        if os.path.exists(report_path):
+            raise organizer.PoolError(
+                "publication changed after review; prepare the split plan again")
         stage_report = os.path.join(stage, "split-report.json")
-        report, completed = organizer.split_pool(
-            reader, stage, selected, choices_path, stage_report,
-            remainder, omit)
-        report["notices"] = _notices(report["source"])
+        report, completed = organizer.write_prepared_split(
+            reader, stage, preflight["selected_categories"], choices,
+            category_rows, report, stage_report,
+            remainder_id=remainder_id, cancel_check=cancel_check,
+            ambiguity_rules=ambiguity_rules)
         if not completed:
             report["completed"] = False
             return report
 
-        publications = []
         for output in report["outputs"]:
+            _operation_cancelled(cancel_check)
             old_path = output["path"]
             final_name = prefix + "--" + os.path.basename(old_path)
             final_path = os.path.join(root, final_name)
@@ -376,31 +1299,64 @@ def execute_split(name, request, pool_dir=None):
                     "output already exists; choose another prefix: %s" % final_name)
             publications.append((old_path, final_path, output))
         for old_path, final_path, _output in publications:
+            _operation_cancelled(cancel_check)
             # Staging and seed_pools share a filesystem.  link() is atomic and
             # refuses overwrite; rollback below removes only links made here.
             os.link(old_path, final_path)
-            linked.append(final_path)
         for _old_path, final_path, output in publications:
             output["path"] = final_path
             output["name"] = os.path.basename(final_path)
         report["completed"] = True
-        report_path = _unique_report_path(root, prefix, reader.snapshot_token)
+        _operation_cancelled(cancel_check)
+        if os.path.exists(report_path):
+            raise organizer.PoolError(
+                "publication changed after review; prepare the split plan again")
         report["report_path"] = report_path
+        report_write_started = True
         organizer.atomic_json(report_path, report)
-        for old_path, _final_path, _output in publications:
-            os.unlink(old_path)
-        linked = []  # published files now belong to the user
+        committed = True
         return report
-    except Exception:
-        for path in linked:
+    except BaseException:
+        rollback_outputs = not committed
+        if rollback_outputs and report_write_started and os.path.exists(report_path):
             try:
-                os.unlink(path)
+                os.unlink(report_path)
             except OSError:
-                pass
+                # A completed report must never be left pointing at pools we
+                # then remove. If report rollback fails, preserve its complete
+                # output set and surface the original error.
+                rollback_outputs = False
+        if rollback_outputs:
+            for old_path, final_path, _output in publications:
+                try:
+                    # The planned stage file remains available until finally,
+                    # so inode identity closes the post-link/pre-bookkeeping
+                    # interruption window without deleting a foreign file.
+                    if (os.path.exists(final_path)
+                            and os.path.samefile(old_path, final_path)):
+                        os.unlink(final_path)
+                except OSError:
+                    pass
+        organizer.fsync_directory(root)
         raise
     finally:
-        publish_locks.close()
-        shutil.rmtree(stage, ignore_errors=True)
+        primary_error = sys.exc_info()[0] is not None
+        cleanup_error = None
+        try:
+            publish_locks.close()
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            shutil.rmtree(stage, ignore_errors=True)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        # Once every output and the completed report are durable, a cleanup
+        # failure must not turn success into a reported failure. Before that
+        # point, surface cleanup trouble only when it would not mask the
+        # original publication error.
+        if cleanup_error is not None and not committed and not primary_error:
+            raise cleanup_error
 
 
 def _combine_source_names(value):
@@ -436,14 +1392,17 @@ def _ordered_combine_names(request):
     return names, operation
 
 
-def _combine_readers(request, pool_dir=None, pin_snapshots=False):
+def _combine_readers(request, pool_dir=None, pin_snapshots=False,
+                     cancel_check=None):
     names, operation = _ordered_combine_names(request)
     expected = request.get("snapshots", {})
     if pin_snapshots and not isinstance(expected, dict):
         raise organizer.PoolError("combined-pool snapshot pins are malformed")
     readers = []
     for name in names:
-        reader = organizer.BSPoolReader(resolve_source(name, pool_dir))
+        _operation_cancelled(cancel_check)
+        reader = verified_source_reader(
+            name, pool_dir, cancel_check=cancel_check)
         if pin_snapshots:
             pinned = str(expected.get(name, "")).lower()
             if pinned != reader.snapshot_token:
@@ -459,52 +1418,231 @@ def _combine_notices(context):
     if len({branch.criteria_hash for branch in context.branches}) > 1:
         notices.append({
             "kind": "info",
-            "title": "Different base filters preserved",
-            "text": ("The output uses %s semantics and records exactly which "
-                     "source-filter branch admitted each seed. Source criteria "
-                     "are not incorrectly stacked into one AND filter.") %
-                    context.operation.upper(),
+            "title": "Different original filters are supported",
+            "text": ("The new pool uses the selected %s membership rule and "
+                     "remembers which original filter or filters each seed came "
+                     "from. It does not incorrectly require every original "
+                     "filter to be true at once.") % context.operation.upper(),
         })
     if not context.coverage_complete:
         notices.append({
             "kind": "warning",
-            "title": "Provisional combined coverage",
-            "text": ("The operation still uses every currently committed seed. "
-                     "At least one source is paused/provisional or the source "
-                     "ranges differ, so the output will not claim exhaustive coverage."),
+            "title": "The new pool will have provisional coverage",
+            "text": ("Every currently committed seed is still included in the "
+                     "comparison. However, at least one input is paused, covers "
+                     "only part of its search range, or uses a different range. "
+                     "The new pool therefore cannot claim that its search was exhaustive."),
         })
     if not context.metadata_complete:
         notices.append({
             "kind": "warning",
-            "title": "Some exact occurrence metadata is unavailable",
-            "text": ("At least one BSP2 source predates per-seed locations. Its "
-                     "membership and source provenance are preserved, but exact "
-                     "tag/Legendary/voucher locations cannot be reconstructed."),
+            "title": "Some inputs do not contain exact match details",
+            "text": ("At least one older BSP2 input records which seeds matched "
+                     "but not the exact tag, Legendary, or voucher location for "
+                     "each seed. Those seeds remain usable in the combined pool, "
+                     "but missing details cannot be recreated."),
         })
     if context.operation == "difference":
         notices.append({
             "kind": "info",
-            "title": "Difference keeps only the base",
+            "title": "Difference starts with the chosen base pool",
             "text": ("The first/base pool is kept, then every seed found in any "
                      "other selected pool is removed."),
         })
     return notices
 
 
-def build_combine_plan(request, pool_dir=None):
-    names, operation, readers = _combine_readers(request, pool_dir)
-    context = organizer.prepare_combine(readers, operation)
-    report = context.as_dict()
+def _combine_input_matrix(readers, operation):
+    first = readers[0]
+    rows = []
+    for index, reader in enumerate(readers):
+        source = organizer.source_summary(reader)
+        rows.append({
+            "name": os.path.basename(reader.path),
+            "role": "base" if operation == "difference" and index == 0 else (
+                "subtract" if operation == "difference" else "member"),
+            "snapshot_id": reader.snapshot_token,
+            "records": reader.records,
+            "schema": reader.schema,
+            "state": "finished" if reader.complete else "paused",
+            "coverage": "complete" if reader.coverage_complete else "provisional",
+            "metadata": "exact locations" if reader.occurrence_metadata_complete
+            else "membership only",
+            "modelver": reader.modelver,
+            "catalog_hash": "%016x" % reader.catalog_hash,
+            "space": reader.space_name,
+            "charset": reader.charset,
+            "seedspace": reader.seedspace,
+            "range_start": reader.range_start,
+            "range_end": reader.range_end,
+            "family_id": source["family_id"],
+            "lineage_id": source["lineage_id"],
+            "composite": reader.is_composite,
+            "composite_operation": reader.composite_operation,
+            "composite_expression_text": source["composite_expression_text"],
+            "matches_model": reader.modelver == first.modelver,
+            "matches_catalog": reader.catalog_hash == first.catalog_hash,
+            "matches_seed_space": (
+                reader.charset == first.charset and reader.seedspace == first.seedspace),
+        })
+    return rows
+
+
+def _combine_compatibility_checks(readers):
+    first = readers[0]
+    identities = [
+        (reader.snapshot_id, reader.segment_id, reader.membership_digest,
+         reader.records) for reader in readers]
+    checks = [
+        {
+            "field": "rng_model",
+            "label": "Game/RNG data version",
+            "status": "pass" if all(reader.modelver == first.modelver
+                                      for reader in readers) else "fail",
+            "detail": ("The selected pools must interpret a seed using the same "
+                       "Brainstorm RNG-data version."),
+            "blocking": True,
+        },
+        {
+            "field": "catalog",
+            "label": "Unlocked-content catalog",
+            "status": "pass" if all(reader.catalog_hash == first.catalog_hash
+                                      for reader in readers) else "fail",
+            "detail": ("The selected pools must have been built from the same "
+                       "catalog of available Jokers, tags, vouchers, and other content."),
+            "blocking": True,
+        },
+        {
+            "field": "seed_space",
+            "label": "Seed alphabet and space",
+            "status": "pass" if all(
+                reader.charset == first.charset and reader.seedspace == first.seedspace
+                for reader in readers) else "fail",
+            "detail": ("All inputs must use the same seed alphabet and space "
+                       "(Natural, Vanilla-settable, or All possible)."),
+            "blocking": True,
+        },
+        {
+            "field": "snapshots",
+            "label": "No input selected twice",
+            "status": "pass" if len(set(identities)) == len(identities) else "fail",
+            "detail": "Each selected file must represent a different recorded pool version.",
+            "blocking": True,
+        },
+        {
+            "field": "ranges",
+            "label": "Search ranges",
+            "status": "pass" if all(
+                (reader.range_start, reader.range_end) ==
+                (first.range_start, first.range_end) for reader in readers)
+            else "warning",
+            "detail": ("Matching search ranges can preserve complete coverage. "
+                       "Different ranges may still be combined, but the new pool "
+                       "will be marked provisional."),
+            "blocking": False,
+        },
+        {
+            "field": "metadata",
+            "label": "Recorded match details",
+            "status": "pass" if all(reader.occurrence_metadata_complete
+                                      for reader in readers) else "warning",
+            "detail": ("Older BSP2 pools can be compared by seed membership, "
+                       "but missing per-seed match locations cannot be recreated."),
+            "blocking": False,
+        },
+    ]
+    return checks
+
+
+def build_combine_plan(request, pool_dir=None, cancel_check=None):
+    _operation_cancelled(cancel_check)
+    names, operation, readers = _combine_readers(
+        request, pool_dir, cancel_check=cancel_check)
+    input_matrix = _combine_input_matrix(readers, operation)
+    checks = _combine_compatibility_checks(readers)
+    blockers = [row["detail"] for row in checks
+                if row["blocking"] and row["status"] == "fail"]
+    context = None
+    if not blockers:
+        try:
+            context = organizer.prepare_combine(readers, operation)
+        except organizer.PoolError as exc:
+            blockers.append(str(exc))
+    output_name = sanitize_combine_name(request.get("name"))
+    root = _pool_root(pool_dir)
+    output_filename = output_name + ".bspool"
+    output_exists = os.path.exists(os.path.join(root, output_filename))
+    if output_exists:
+        blockers.append("Output already exists: %s" % output_filename)
+    report_name = os.path.basename(_unique_combine_report_path(root, output_name))
+    if context is not None:
+        report = context.as_dict()
+        notices = _combine_notices(context)
+        source_names = [os.path.basename(reader.path)
+                        for reader in context.readers]
+    else:
+        report = {
+            "operation": operation,
+            "inputs": [organizer.source_summary(reader) for reader in readers],
+            "input_count": len(readers),
+            "branches": [],
+            "branch_count": 0,
+            "operands": [],
+            "operand_count": len(readers),
+            "coverage_complete": False,
+            "metadata_complete": all(
+                reader.occurrence_metadata_complete for reader in readers),
+            "criteria_differ": len({reader.criteria_hash for reader in readers}) > 1,
+            "expression": {},
+            "expression_text": "Blocked until compatibility errors are resolved",
+        }
+        notices = [{
+            "kind": "error",
+            "title": "Inputs are not compatible",
+            "text": blockers[0],
+        }]
+        source_names = [os.path.basename(reader.path) for reader in readers]
+    plan_token = _plan_token("combine", {
+        "operation": operation,
+        "source_names": names,
+        "snapshots": [(os.path.basename(reader.path), reader.snapshot_token)
+                      for reader in readers],
+        "output_name": output_filename,
+        "label": str(request.get("label") or output_name).strip() or output_name,
+        "report_name": report_name,
+        "compatible": context is not None,
+    })
     report.update({
-        "organizer_schema": 2,
-        "source_names": [os.path.basename(reader.path)
-                         for reader in context.readers],
+        "organizer_schema": 3,
+        "source_names": source_names,
         "selected_names": names,
         "snapshots": {
             os.path.basename(reader.path): reader.snapshot_token
             for reader in readers
         },
-        "notices": _combine_notices(context),
+        "compatible": context is not None,
+        "compatibility": {
+            "compatible": context is not None,
+            "checks": checks,
+            "inputs": input_matrix,
+            "blockers": blockers,
+        },
+        "publication": {
+            "ready": context is not None and not blockers,
+            "blockers": blockers,
+            "name": output_filename,
+            "label": str(request.get("label") or output_name).strip() or output_name,
+            "report_name": report_name,
+            "plan_token": plan_token,
+            "directory": root,
+            "output_exists": output_exists,
+            "atomic_per_file": True,
+            "transaction_atomic": False,
+            "writer_locked": True,
+            "record_count": None,
+            "record_count_note": "Exact result count is streamed during publication.",
+        },
+        "notices": notices,
     })
     return report
 
@@ -519,11 +1657,35 @@ def sanitize_combine_name(value):
     return value[:96]
 
 
-def execute_combine(request, pool_dir=None):
+def _unique_combine_report_path(root, output_name):
+    report_path = os.path.join(root, output_name + "-combine-report.json")
+    if os.path.exists(report_path):
+        suffix = 2
+        while os.path.exists(os.path.join(
+                root, "%s-combine-report-%d.json" % (output_name, suffix))):
+            suffix += 1
+        report_path = os.path.join(
+            root, "%s-combine-report-%d.json" % (output_name, suffix))
+    return report_path
+
+
+def execute_combine(request, pool_dir=None, cancel_check=None):
+    _operation_cancelled(cancel_check)
     root = _pool_root(pool_dir)
     os.makedirs(root, exist_ok=True)
     _names, operation, readers = _combine_readers(
-        request, root, pin_snapshots=True)
+        request, root, pin_snapshots=True, cancel_check=cancel_check)
+    try:
+        return _execute_combine_with_readers(
+            request, root, _names, operation, readers, cancel_check)
+    finally:
+        # Reader indexes are useful between review and execute, but a finished
+        # 64-way operation must not pin all of them in the long-lived server.
+        _evict_cached_reader_paths(reader.path for reader in readers)
+
+
+def _execute_combine_with_readers(
+        request, root, _names, operation, readers, cancel_check):
     # Recompute the plan from the pinned reader instances immediately before
     # writing, so compatibility and output semantics cannot drift between the
     # preview and publication steps.
@@ -531,8 +1693,39 @@ def execute_combine(request, pool_dir=None):
     output_name = sanitize_combine_name(request.get("name"))
     output_path = os.path.join(root, output_name + ".bspool")
     label = str(request.get("label") or output_name).strip() or output_name
+    reviewed = request.get("reviewedPublication")
+    if reviewed is not None:
+        if not isinstance(reviewed, dict):
+            raise organizer.PoolError("reviewed publication is malformed")
+        if reviewed.get("name") != os.path.basename(output_path):
+            raise organizer.PoolError(
+                "output name changed after review; check compatibility again")
+        expected_plan = _plan_token("combine", {
+            "operation": operation,
+            "source_names": _names,
+            "snapshots": [(os.path.basename(reader.path), reader.snapshot_token)
+                          for reader in readers],
+            "output_name": os.path.basename(output_path),
+            "label": label,
+            "report_name": str(reviewed.get("report_name") or ""),
+            "compatible": True,
+        })
+        if reviewed.get("plan_token") != expected_plan:
+            raise organizer.PoolError(
+                "combine inputs or output changed after review; check compatibility again")
+        report_name = str(reviewed.get("report_name") or "")
+        if not report_name or report_name != os.path.basename(report_name):
+            raise organizer.PoolError("reviewed report name is malformed")
+        report_path = os.path.join(root, report_name)
+        if os.path.exists(report_path):
+            raise organizer.PoolError(
+                "publication changed after review; check compatibility again")
+    else:
+        report_path = _unique_combine_report_path(root, output_name)
+    _operation_cancelled(cancel_check)
     result = organizer.combine_pools(
-        context.readers, output_path, operation, label)
+        context.readers, output_path, operation, label,
+        cancel_check=cancel_check)
     result["name"] = os.path.basename(output_path)
     result["notices"] = _combine_notices(context)
     if not result["records"]:
@@ -543,26 +1736,114 @@ def execute_combine(request, pool_dir=None):
                      "seeds. Keep the file as a verified result or combine it "
                      "again; an empty pool cannot be searched in-game."),
         })
-    report_path = os.path.join(root, output_name + "-combine-report.json")
-    if os.path.exists(report_path):
-        suffix = 2
-        while os.path.exists(os.path.join(
-                root, "%s-combine-report-%d.json" % (output_name, suffix))):
-            suffix += 1
-        report_path = os.path.join(
-            root, "%s-combine-report-%d.json" % (output_name, suffix))
     result["report_path"] = report_path
     try:
+        _operation_cancelled(cancel_check)
         organizer.atomic_json(report_path, result)
-    except Exception:
+    except BaseException:
         # Publication is one user action: never leave a seemingly successful
         # pool behind when its pinned provenance report could not be saved.
         try:
             os.unlink(result["path"])
         except OSError:
             pass
+        organizer.fsync_directory(root)
         raise
     return result
+
+
+def _run_analysis(callback):
+    event = _begin_operation("analysis")
+    try:
+        return callback(event.is_set)
+    finally:
+        _finish_operation("analysis", event)
+
+
+def run_inspect(name, pool_dir=None, ambiguity_limit=100):
+    return _run_analysis(lambda cancelled: inspect_source(
+        name, pool_dir, ambiguity_limit, cancel_check=cancelled))
+
+
+def _cached_split_plan(request, pool_dir, cancel_check):
+    """Review a projectable selection from the verified inspection cache."""
+    selected = request.get("selectedCategories")
+    choice_plan = request.get("choicePlan")
+    if _choice_plan_has_individual_decisions(choice_plan):
+        return None
+    path = resolve_source(request.get("source", ""), pool_dir)
+    identity = _summary_identity(path)
+    report = _cached_summary(path, identity)
+    if report is None or not _summary_can_project(report, selected):
+        return None
+    _operation_cancelled(cancel_check)
+    reader = _InspectionPlanReader(path, report["source"])
+    expected = str(request.get("snapshot", "")).lower()
+    if expected and expected != reader.snapshot_token:
+        raise organizer.PoolError(
+            "source changed from snapshot %s to %s; inspect it again" % (
+                expected, reader.snapshot_token))
+    result = build_split_plan(
+        reader, selected, choice_plan, request,
+        cancel_check=cancel_check, inspection=report)
+    _operation_cancelled(cancel_check)
+    if _summary_identity(path) != identity:
+        raise organizer.PoolError(
+            "source changed while its cached assignments were being reviewed; inspect it again")
+    return result
+
+
+def run_split_plan(request, pool_dir=None):
+    def analyze_plan(cancelled):
+        cached = _cached_split_plan(request, pool_dir, cancelled)
+        if cached is not None:
+            return cached
+        reader = verified_source_reader(
+            request.get("source", ""), pool_dir, cancel_check=cancelled)
+        expected = str(request.get("snapshot", "")).lower()
+        if expected and expected != reader.snapshot_token:
+            raise organizer.PoolError(
+                "source changed from snapshot %s to %s; inspect it again" % (
+                    expected, reader.snapshot_token))
+        return build_split_plan(
+            reader, request.get("selectedCategories"),
+            request.get("choicePlan"), request, cancel_check=cancelled)
+    return _run_analysis(analyze_plan)
+
+
+def run_combine_plan(request, pool_dir=None):
+    return _run_analysis(lambda cancelled: build_combine_plan(
+        request, pool_dir, cancel_check=cancelled))
+
+
+def run_split(name, request, pool_dir=None):
+    """Run one split under the shared library lock and cancellation registry."""
+    if not SPLIT_LOCK.acquire(False):
+        raise organizer.PoolError("another organizer split is still running")
+    event = None
+    try:
+        event = _begin_operation("split")
+        return execute_split(
+            name, request, pool_dir, cancel_check=event.is_set)
+    finally:
+        if event is not None:
+            _finish_operation("split", event)
+        SPLIT_LOCK.release()
+
+
+def run_combine(request, pool_dir=None):
+    """Run one combine under the shared library lock and cancellation registry."""
+    if not COMBINE_LOCK.acquire(False):
+        raise organizer.PoolError("another pool combine is still running")
+    event = None
+    try:
+        event = _begin_operation("combine")
+        return execute_combine(
+            request, pool_dir, cancel_check=event.is_set)
+    finally:
+        if event is not None:
+            _finish_operation("combine", event)
+        COMBINE_LOCK.release()
 
 
 def iter_record_export(reader):
@@ -597,7 +1878,7 @@ h1{font-size:clamp(23px,3vw,32px);line-height:1.1;margin:0}.sub{margin:7px 0 0;c
  margin-right:8px;border-radius:50%;background:var(--green)}
 .appnav{display:flex;gap:7px;margin:-8px 0 18px;padding:5px;width:max-content;border:1px solid #34394d;border-radius:12px;background:#10131c}
 .appnav a{padding:8px 13px;border-radius:8px;color:var(--muted);font-size:12px;font-weight:800;text-decoration:none}
-.appnav a.active{background:#29213b;color:#ded6ff}.toolnav{display:flex;gap:8px;margin-bottom:18px}
+.appnav a.active{background:#29213b;color:#ded6ff}.toolnav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
 .toolnav button{background:#171b27;border-color:#373d54;color:#aaa6b6}.toolnav button.active{background:#3a3155;border-color:#61548a;color:#eee9ff}
 .privacy{margin-bottom:18px;padding:12px 15px;border:1px solid #3c3650;border-radius:12px;background:#191624cc;color:#cac5d6;font-size:13px}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:18px;align-items:start}.stack{display:grid;gap:18px}
@@ -611,128 +1892,233 @@ select[multiple]{min-height:190px}.poolchoices{display:grid;gap:7px;max-height:3
 .combine-settings{display:grid;grid-template-columns:1fr 1fr;gap:12px}.branchlist{display:grid;gap:7px;margin-top:12px}.branch{padding:9px 10px;border:1px solid #2d3245;border-radius:9px;background:#11141d;font-size:11px}.branch b{display:block}.branch span{color:var(--faint);overflow-wrap:anywhere}
 button{min-height:40px;padding:8px 14px;border:1px solid transparent;border-radius:10px;background:#3b5fd1;color:white;font-weight:750;cursor:pointer}
 button:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px)}button:disabled{background:#292d3c;color:#777482;cursor:not-allowed}
-button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.ghost{background:transparent;border-color:#3b425b;color:#d7d2df}button.small{min-height:33px;padding:5px 9px;background:#292e42;border-color:#3d435c;font-size:12px}
+button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid #8cc8ff;outline-offset:2px}
+button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{background:#522a30;border-color:#88434b;color:#ffd1d1}button.ghost{background:transparent;border-color:#3b425b;color:#d7d2df}button.small{min-height:33px;padding:5px 9px;background:#292e42;border-color:#3d435c;font-size:12px}
 .row{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:13px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .source{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:13px}.metric{padding:11px;border:1px solid #292e40;border-radius:11px;background:var(--card2)}
 .metric span{display:block;color:var(--faint);font-size:11px}.metric b{display:block;margin-top:3px;overflow-wrap:anywhere}.mono{font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 .notice{margin-top:10px;padding:11px 12px;border:1px solid #355273;border-radius:11px;background:#142131;color:#b9dafb;font-size:12px}.notice.warning{border-color:#6a5726;background:#29230f;color:#f2d67c}.notice.error{border-color:#74383e;background:#2b171b;color:#ffb5b5}.notice strong{display:block;margin-bottom:2px;color:inherit}
+.explain{margin-top:12px;padding:12px 13px;border:1px solid #343b52;border-radius:11px;background:#11151f;color:#bbb7c7;font-size:12px;line-height:1.55}.explain strong{display:block;margin-bottom:3px;color:#eee9f5}.explain ul{margin:7px 0 0;padding-left:19px}.explain li+li{margin-top:4px}
 .categories{display:grid;gap:7px;max-height:370px;overflow:auto;margin-top:12px;padding-right:3px}.category{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:start;padding:10px;border:1px solid #292e40;border-radius:10px;background:var(--card2)}
 .category input{width:17px;height:17px;margin-top:2px;accent-color:var(--purple)}.category b{font-size:12px}.category span{color:var(--faint);font-size:11px}.count{color:#d9d4e4!important;white-space:nowrap}
 .side{position:sticky;top:18px;display:grid;gap:18px}.summary dl{margin:11px 0 0}.summary div{display:grid;grid-template-columns:95px 1fr;gap:9px;padding:9px 0;border-top:1px solid #302c40;font-size:12px}.summary dt{color:var(--faint)}.summary dd{margin:0;text-align:right;overflow-wrap:anywhere}
 .actions{display:grid;gap:9px;margin-top:14px}.actions button{width:100%}.error{margin-top:10px;color:#ffadad;font-size:13px;white-space:pre-wrap}.hint{color:var(--faint);font-size:12px}
 .plan{margin-top:18px}.planbar{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{padding:4px 8px;border-radius:999px;background:#3b3017;color:#f4d46b;font-size:10px;font-weight:850;text-transform:uppercase}.pill.ok{background:#163424;color:#80e4a6}
-.amb{display:grid;gap:8px;margin-top:12px}.ambrow{display:grid;grid-template-columns:100px 1fr;gap:10px;align-items:center;padding:10px;border:1px solid #292e40;border-radius:10px;background:var(--card2)}.ambrow b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.ambrow select{min-height:38px}
+.amb{display:grid;gap:8px;margin-top:12px}.ambrow{display:grid;grid-template-columns:100px 1fr;gap:10px;align-items:center;padding:10px;border:1px solid #292e40;border-radius:10px;background:var(--card2)}.ambrow b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.ambrow label,.ambrow .hint{display:block}.ambrow select{min-height:38px;margin-top:6px}
 .pager{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:11px;color:var(--muted);font-size:12px}.result{margin-top:13px}.output{padding:10px 0;border-top:1px solid #302c40;font-size:12px}.output b{display:block;overflow-wrap:anywhere}.output span{color:var(--muted)}
-[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static;grid-row:1}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings{grid-template-columns:1fr}.ambrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}}
+.workstatus{display:grid;grid-template-columns:auto 1fr;gap:11px;align-items:center;margin-top:12px;padding:12px 13px;border:1px solid #44527a;border-radius:11px;background:#141b2c;color:#dbe5ff}.workstatus b,.workstatus span{display:block}.workstatus span{margin-top:3px;color:#a9b4ce;font-size:12px;line-height:1.4}.workstatus.success{border-color:#39704d;background:#13241a;color:#bdecca}.workstatus.error{border-color:#7b3d45;background:#2a171b;color:#ffc0c5}.spinner{width:20px;height:20px;border:3px solid #536181;border-top-color:#9cc7ff;border-radius:50%;animation:spin .8s linear infinite}.workstatus.success .spinner,.workstatus.error .spinner{display:none}@keyframes spin{to{transform:rotate(360deg)}}
+.manifest{display:grid;gap:7px;margin-top:12px}.manifestrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:10px;border:1px solid #30364b;border-radius:10px;background:#10131c;font-size:12px}.manifestrow b,.manifestrow span{overflow-wrap:anywhere}.manifestrow small{display:block;color:var(--faint)}.manifestrow .count{text-align:right}
+.checkgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}.check{padding:10px;border:1px solid #30364b;border-radius:10px;background:#10131c;font-size:11px}.check b{display:block}.check.pass{border-color:#2d6845;color:#a8e7bf}.check.warning{border-color:#6a5726;color:#f2d67c}.check.fail{border-color:#74383e;color:#ffb5b5}.statehint{margin-top:10px;padding:9px 10px;border-left:3px solid #7361aa;background:#171426;color:#cfc6e7;font-size:12px}.source-retained{color:#a8e7bf}.reviewtitle{margin:18px 0 0;font-size:14px}.live{min-height:1px}
+[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}}
 </style></head><body><main class="app">
-<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Inspect, split, and combine recorded seed pools without rerunning their searches.</p></div></div><div class="local">Running locally</div></header>
+<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Turn one recorded pool into smaller category pools, or create a new pool by comparing the seeds in several pools.</p></div></div><div class="local">Running locally</div></header>
 <nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
-<div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. Outputs are published into <code>seed_pools</code> so the mod can see them immediately.</div>
-<div class="toolnav"><button class="active" id="splitModeBtn">Split by recorded location</button><button id="combineModeBtn">Combine seed pools</button></div>
-<div class="grid" id="splitWorkspace"><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Both finished and paused BSP3 pools are supported. Only the committed checkpoint is read.</p></div></div>
+<div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. New pools are saved in <code>seed_pools</code> so the mod can see them immediately.</div>
+<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button></div>
+<div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Finished and paused BSP3/BSP4 event pools are supported. Only the committed checkpoint is read, and both event schemas work with native search.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
- <div class="row"><button class="go" id="inspectBtn">Inspect pool</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
+ <div class="row"><button class="go" id="inspectBtn" disabled>Loading pools…</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
+ <div class="workstatus" id="inspectionStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="inspectionTitle">Inspecting pool…</b><span id="inspectionDetail">Reading the committed snapshot.</span></div></div>
  <div id="sourceInfo" hidden><div class="source" id="sourceMetrics"></div><div id="notices"></div></div>
 </section>
-<section class="card" id="categoryCard" hidden><div class="head"><span class="step">2</span><div><h2>Choose exact categories</h2><p class="copy">A category includes the recorded item, Ante, blind, source, occurrence, and flags.</p></div></div>
- <div class="row"><button class="small" id="allBtn">Select all</button><button class="small" id="noneBtn">Select none</button><button class="ghost" id="exportBtn">Export every seed and occurrence (.ndjson)</button></div>
+<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose the new category pools you want</h2><p class="copy">Brainstorm recorded where and how each seed matched. Each row is one exact combination of item, Ante, blind, source, occurrence number, and flags such as Negative.</p></div></div>
+ <div class="explain"><strong>What these checkboxes control</strong>Each checked category will become a separate new seed pool. If a seed fits more than one checked category, Step 3 will ask which one should receive it. Unchecking a category never removes anything from the original pool.</div>
+ <div class="row"><button class="small" id="allBtn">Check all categories</button><button class="small" id="noneBtn">Clear category selection</button><button class="ghost" id="exportBtn">Download full record list (.ndjson)</button></div>
+ <div class="explain"><strong>Optional advanced download</strong>The NDJSON download contains one JSON line for every seed, including its numeric rank and every recorded match. It is for analysis in scripts or data tools; it does not create a seed pool or change the source. For a very large pool, this download can be much larger than the compressed <code>.bspool</code> file and may take a long time.</div>
  <div class="categories" id="categories"></div>
 </section>
-<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Plan the split</h2><p class="copy">Seeds in several selected categories need one explicit destination. A saved plan only works with this exact snapshot.</p></div></div>
- <div class="two"><div class="field"><label for="policy">Seeds outside selected categories</label><select id="policy"><option value="stop">Stop and ask me</option><option value="remainder">Put in a review pool</option><option value="omit">Explicitly leave them out</option></select></div>
- <div class="field" id="remainderField" hidden><label for="remainder">Review pool label</label><input type="text" id="remainder" value="Needs review"></div></div>
- <div class="field"><label for="prefix">Output filename prefix</label><input type="text" id="prefix"><span class="hint">Unique prefixes let different source pools use the same exact categories.</span></div>
- <div class="row"><button id="planBtn">Prepare split plan</button><button class="ghost" id="saveBtn" disabled>Save choice plan</button><button class="ghost" id="loadBtn">Load choice plan</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div>
- <div class="plan" id="plan" hidden><div class="planbar"><div><b id="planTitle">Choices</b><div class="hint" id="planHint"></div></div><span class="pill" id="choicePill">Needs choices</span></div><div class="amb" id="ambiguities"></div><div class="pager" id="pager"></div></div>
+<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Review how seeds will be divided</h2><p class="copy">This step calculates the new files and asks for any decisions it needs. Nothing is written until you press the final Create button, and the original pool is always kept unchanged.</p></div></div>
+ <div class="explain"><strong>How assignment works</strong>A seed that fits exactly one checked category goes to that category automatically. If it fits several checked categories, choose one destination for that group of seeds. If it fits none of the checked categories, use the option below to keep it in an extra pool or leave it out of the new files.</div>
+ <div class="two"><div class="field"><label for="policy">Seeds that fit none of the checked categories</label><select id="policy"><option value="stop">Do not decide yet · block file creation</option><option value="keep">Create an extra pool named “Unmatched seeds”</option><option value="remainder">Create an extra pool with a name I choose</option><option value="omit">Leave them out of the new pools</option></select></div>
+ <div class="field" id="remainderField" hidden><label for="remainder">Name for the extra pool</label><input type="text" id="remainder" value="Needs review"></div></div>
+ <div class="field"><label for="prefix">Beginning of each new filename</label><input type="text" id="prefix"><span class="hint">The organizer adds the category to this prefix. Existing files are never overwritten, so use a different prefix when making another split.</span></div>
+ <div class="row"><button id="planBtn">Review the split (no files created)</button><button class="ghost" id="saveBtn" disabled>Save decisions (.json)</button><button class="ghost" id="loadBtn">Load saved decisions</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div>
+ <div class="workstatus" id="reviewStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="reviewTitle">Reviewing seed assignments…</b><span id="reviewDetail">Calculating destinations from the selected categories.</span></div></div>
+ <div class="explain"><strong>Review and saved decisions</strong>Review reads the source and shows the exact filenames and seed counts before creating anything. Saving decisions creates a small JSON file—not a seed pool—so the same choices can be loaded again for this exact unchanged source snapshot.</div>
+ <div class="plan" id="plan" hidden><div class="planbar"><div><b id="planTitle">Seeds that fit more than one checked category</b><div class="hint" id="planHint"></div></div><span class="pill" id="choicePill" role="status" aria-live="polite">Choose destinations</span></div><div class="row"><button class="ghost small" id="clearRulesBtn" hidden>Clear shared decisions</button><button class="ghost small" id="clearChoicesBtn" hidden>Clear individual seed decisions</button></div><div class="amb" id="ambiguities"></div><div class="pager" id="pager"></div></div>
+ <div id="splitPublication" hidden><h3 class="reviewtitle">Files that will be created</h3><div class="statehint" id="splitPublicationState"></div><div class="manifest" id="splitManifest"></div><div class="hint" id="splitReport"></div></div>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Organizer summary</h2><dl>
- <div><dt>Source</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot</dt><dd id="sumSnapshot">—</dd></div><div><dt>Committed</dt><dd id="sumRecords">—</dd></div><div><dt>Categories</dt><dd id="sumCategories">—</dd></div><div><dt>Ambiguous</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Unmatched</dt><dd id="sumUnmatched">—</dd></div></dl>
- <div class="actions"><button class="go" id="splitBtn" disabled>Create organized pools</button></div><div class="error" id="error" role="alert"></div><div class="result" id="result"></div>
+ <div><dt>Source pool</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot ID</dt><dd id="sumSnapshot">—</dd></div><div><dt>Recorded seeds</dt><dd id="sumRecords">—</dd></div><div><dt>Available categories</dt><dd id="sumCategories">—</dd></div><div><dt>Multiple matches</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Outside selection</dt><dd id="sumUnmatched">—</dd></div><div><dt>New files</dt><dd id="sumPublication">Not reviewed</dd></div></dl>
+ <div class="actions"><button class="go" id="splitBtn" disabled>Create these seed pools</button><button class="cancel" id="analysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="splitCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="error" role="alert"></div><div class="result live" id="result" aria-live="polite"></div>
 </section></aside></div>
-<div class="grid" id="combineWorkspace" hidden><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Select pools to combine</h2><p class="copy">Pools may have different base filters. Finished, paused, and previously combined pools are supported; only committed records are read.</p></div></div>
- <div class="row"><button class="small" id="combineAllBtn">Select all readable pools</button><button class="small" id="combineNoneBtn">Select none</button><button class="ghost" id="combineRefreshBtn">Refresh list</button></div>
+<div class="grid" id="combineWorkspace" role="tabpanel" aria-labelledby="combineModeBtn" hidden><div class="stack">
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Choose two or more pools to compare</h2><p class="copy">Combine works with the seeds already recorded in each pool. The same seed appearing in several inputs is counted once. Finished, paused, and previously combined pools are supported.</p></div></div>
+ <div class="explain"><strong>Your selected pools are read-only</strong>The organizer reads each pool’s committed records and creates one separate output. It does not edit, rename, or delete any selected input pool.</div>
+ <div class="row"><button class="small" id="combineAllBtn">Select all readable pools</button><button class="small" id="combineNoneBtn">Clear pool selection</button><button class="ghost" id="combineRefreshBtn">Refresh list</button></div>
  <div class="poolchoices" id="combineChoices"><div class="hint">Loading seed pools…</div></div>
 </section>
-<section class="card"><div class="head"><span class="step">2</span><div><h2>Choose the set operation</h2><p class="copy">Source filters remain separate branches, so a union means A OR B—not one accidental combined AND filter.</p></div></div>
- <div class="combine-settings"><div class="field"><label for="combineOperation">Operation</label><select id="combineOperation"><option value="union">Union · keep seeds in any selected pool</option><option value="intersection">Intersection · keep seeds in every selected pool</option><option value="difference">Difference · keep base minus the others</option></select></div>
- <div class="field" id="combineBaseField" hidden><label for="combineBase">Base pool to keep from</label><select id="combineBase"></select></div>
- <div class="field"><label for="combineName">Output filename</label><input type="text" id="combineName" value="combined-pool"></div>
- <div class="field"><label for="combineLabel">Display label</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
- <div class="row"><button id="combinePlanBtn">Check compatibility</button></div><div id="combineNotices"></div>
+<section class="card"><div class="head"><span class="step">2</span><div><h2>Choose which seeds the new pool should contain</h2><p class="copy">Choose one rule below, then review the result before creating the new pool. The review checks whether the selected pools can be compared safely; it does not write a file.</p></div></div>
+ <div class="explain"><strong>The three combine rules</strong><ul><li><b>Union:</b> keep a seed if it appears in at least one selected pool.</li><li><b>Intersection:</b> keep a seed only if it appears in every selected pool.</li><li><b>Difference:</b> start with one base pool, then remove seeds that also appear in any other selected pool.</li></ul></div>
+ <div class="notice warning"><strong>Combining different pools is not the same as merging scan parts</strong>Use this tab when you want to compare the contents of separate pools. If these files are numbered parts of one distributed build, use <b>Merge distributed pool parts</b> instead; Merge checks that the parts are from the same search and have no gaps or overlaps. <a id="mergeLink" href="/">Open Build / Search</a><span id="standaloneMerge" hidden> Launch the Seed Pool Builder to merge parts.</span></div>
+ <div class="combine-settings"><div class="field"><label for="combineOperation">How should the seed lists be combined?</label><select id="combineOperation"><option value="union">Union · seeds found in any selected pool</option><option value="intersection">Intersection · only seeds found in every selected pool</option><option value="difference">Difference · base pool minus all other selected pools</option></select></div>
+ <div class="field" id="combineBaseField" hidden><label for="combineBase">Start with seeds from this base pool</label><select id="combineBase"></select><span class="hint">Seeds that also appear in any other selected pool will be removed from the new pool.</span></div>
+ <div class="field"><label for="combineName">New pool filename</label><input type="text" id="combineName" value="combined-pool"><span class="hint">The organizer adds <code>.bspool</code>. An existing file with the same name will not be overwritten.</span></div>
+ <div class="field"><label for="combineLabel">Name shown inside Brainstorm</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
+ <div class="row"><button id="combinePlanBtn">Review the combined pool (no file created)</button></div><div id="combineNotices"></div>
+ <div class="checkgrid" id="combineChecks"></div>
  <div id="combineBranches" class="branchlist"></div>
+ <div id="combinePublication" hidden><h3 class="reviewtitle">File that will be created</h3><div class="manifest" id="combineManifest"></div><div class="hint" id="combineReport"></div></div>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Combine summary</h2><dl>
- <div><dt>Operation</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Inputs</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Source filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Expression</dt><dd id="combineSumExpression">—</dd></div><div><dt>Coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Metadata</dt><dd id="combineSumMetadata">—</dd></div></dl>
- <div class="actions"><button class="go" id="combineCreateBtn" disabled>Create combined pool</button></div><div class="error" id="combineError" role="alert"></div><div class="result" id="combineResult"></div>
+ <div><dt>Rule</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Selected pools</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Can combine?</dt><dd id="combineSumCompatibility">Not reviewed</dd></div><div><dt>Recorded filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Membership rule</dt><dd id="combineSumExpression">—</dd></div><div><dt>Search coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Match details</dt><dd id="combineSumMetadata">—</dd></div></dl>
+ <div class="actions"><button class="go" id="combineCreateBtn" disabled>Create combined seed pool</button><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
 </section></aside></div></main>
 <script>
-const $=id=>document.getElementById(id);const UNIFIED=location.pathname.startsWith("/organize");
+const $=id=>document.getElementById(id);
+const UNIFIED=location.pathname.startsWith("/organize");
 const apiPath=path=>UNIFIED?"/organizer"+path:path;
-let inspected=null,plan=null,choices={},page=0,poolRows=[],combinePlan=null;const PAGE_SIZE=100;
+let inspected=null,inspectedName="",plan=null,choices={},rules={},poolRows=[];
+let splitReviewedFingerprint="",splitRunning=false;
+let combinePlan=null,combineReviewedFingerprint="",combineRunning=false;
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
-async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}:{};const r=await fetch(apiPath(path),opt);const v=await r.json();if(!r.ok||v.error)throw Error(v.error||`Request failed (${r.status})`);return v}
-function fail(e){$("error").textContent=e.message||String(e)}function clear(){$("error").textContent="";$("result").innerHTML=""}
-async function loadPools(){clear();const v=await api("/api/pools");poolRows=v.pools||[];const old=$("source").value;$("source").innerHTML=poolRows.length?poolRows.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds${p.complete?"":" · paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';if([...$("source").options].some(o=>o.value===old))$("source").value=old;renderCombineChoices()}
-function notices(rows){$("notices").innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
-function sourceMetrics(s){return `<div class="metric"><span>Committed seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Format</span><b>BSP${s.schema}${s.metadata_capable?" · exact metadata":" · no exact metadata"}</b></div><div class="metric"><span>Snapshot</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Lineage</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
+async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error)throw Error(v.error||`Request failed (${r.status})`);return v}
+function fail(e){$("error").textContent=e.message||String(e)}
+function clear(){$("error").textContent="";$("result").innerHTML=""}
+function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
+function reviewState(kind,title,detail){const box=$("reviewStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("reviewTitle").textContent=title;$("reviewDetail").textContent=detail}
+function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
+function notices(rows){renderNoticeList("notices",rows)}
+function sourceMetrics(s){return `<div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div><div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
 function categoryHTML(c){return `<label class="category"><input type="checkbox" class="cat" value="${esc(c.category_id)}" checked><span><b>${esc(c.label)}</b><br><span class="mono">${esc(c.category_id)}</span></span><span class="count">${fmt(c.records)}</span></label>`}
-async function inspect(){clear();const source=$("source").value;if(!source)return;const button=$("inspectBtn"),refresh=$("refreshBtn"),picker=$("source");const row=poolRows.find(p=>p.name===source);button.disabled=true;refresh.disabled=true;picker.disabled=true;button.textContent=row?`Inspecting ${fmt(row.records)} seeds…`:"Inspecting pool…";try{const v=await api("/api/inspect",{source});inspected=v;plan=null;choices={};page=0;$("sourceInfo").hidden=false;$("sourceMetrics").innerHTML=sourceMetrics(v.source);notices(v.notices);$("categoryCard").hidden=false;$("planCard").hidden=!v.source.metadata_capable;$("categories").innerHTML=v.categories.length?v.categories.map(categoryHTML).join(""):'<div class="hint">This snapshot has no known exact categories.</div>';$("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";$("sumSource").textContent=source;$("sumSnapshot").textContent=v.source.snapshot_id;$("sumRecords").textContent=fmt(v.source.records);$("sumCategories").textContent=fmt(v.category_count);$("sumAmbiguous").textContent=fmt(v.ambiguous_count);$("sumUnmatched").textContent=fmt(v.unmatched_count);$("plan").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true}catch(e){fail(e)}finally{button.disabled=false;refresh.disabled=false;picker.disabled=false;button.textContent="Inspect pool"}}
-function selected(){return [...document.querySelectorAll(".cat:checked")].map(x=>x.value)}
-function choiceDoc(){return {source_snapshot_id:inspected.source.snapshot_id,choices:{...choices},selected_categories:selected()}}
-async function prepare(){clear();if(!inspected)return;try{const v=await api("/api/plan",{source:$("source").value,snapshot:inspected.source.snapshot_id,selectedCategories:selected(),choicePlan:choiceDoc()});plan=v;choices={...v.choices};page=0;renderPlan();$("saveBtn").disabled=false}catch(e){fail(e)}}
-function unresolved(){return !plan?0:plan.ambiguous.filter(a=>!choices[a.seed]).length}
-function categoryName(id){const c=(plan?plan.categories:inspected.categories).find(x=>x.category_id===id);return c?c.label:id}
-function renderPlan(){if(!plan)return;$("plan").hidden=false;const total=plan.ambiguous.length,pages=Math.max(1,Math.ceil(total/PAGE_SIZE));page=Math.max(0,Math.min(page,pages-1));const rows=plan.ambiguous.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE);$("ambiguities").innerHTML=rows.length?rows.map(a=>`<div class="ambrow"><b>${esc(a.seed)}</b><select data-seed="${esc(a.seed)}"><option value="">Choose one destination…</option>${a.candidates.map(c=>`<option value="${esc(c)}" ${choices[a.seed]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div>`).join(""):'<div class="notice"><strong>No category conflicts</strong>Every matching seed has one selected destination.</div>';document.querySelectorAll(".ambrow select").forEach(s=>s.onchange=()=>{choices[s.dataset.seed]=s.value;renderStatus()});$("pager").innerHTML=total?`<button class="small" id="prev" ${page===0?"disabled":""}>Previous</button><span>Seeds ${fmt(page*PAGE_SIZE+1)}–${fmt(Math.min(total,(page+1)*PAGE_SIZE))} of ${fmt(total)}</span><button class="small" id="next" ${page>=pages-1?"disabled":""}>Next</button>`:"";if($("prev"))$("prev").onclick=()=>{page--;renderPlan()};if($("next"))$("next").onclick=()=>{page++;renderPlan()};renderStatus()}
-function renderStatus(){if(!plan)return;const left=unresolved();$("planTitle").textContent=`${fmt(plan.ambiguous_count)} multi-category seed${plan.ambiguous_count===1?"":"s"}`;$("planHint").textContent=plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) are outside the selected categories; choose their policy above.`:"Every source seed matches at least one selected category.";$("choicePill").textContent=left?`${fmt(left)} choices left`:"Choices complete";$("choicePill").className="pill"+(left?"":" ok");$("sumAmbiguous").textContent=fmt(plan.ambiguous_count);$("sumUnmatched").textContent=fmt(plan.unmatched_count);const policyReady=!plan.unmatched_count||$("policy").value!=="stop";$("splitBtn").disabled=!!left||!policyReady}
+
+function resetSplitInspection(message="Choose and inspect a pool"){
+ inspected=null;inspectedName="";plan=null;choices={};rules={};splitReviewedFingerprint="";
+ $("sourceInfo").hidden=true;$("categoryCard").hidden=true;$("planCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("reviewStatus").hidden=true;
+ $("categories").innerHTML="";$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+ $("sumSource").textContent=message;$("sumSnapshot").textContent="—";$("sumRecords").textContent="—";$("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";$("sumPublication").textContent="Not reviewed";
+}
+function invalidateSplitReview(message="Selections changed — review the split again"){
+ splitReviewedFingerprint="";$("splitPublication").hidden=true;$("reviewStatus").hidden=true;$("splitBtn").disabled=true;$("sumPublication").textContent=message;$("result").innerHTML="";
+}
+function invalidateSplitSelection(){plan=null;choices={};rules={};$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Category selection changed — review the split again")}
+async function loadPools(preserve=false){
+ if(!preserve){clear();resetSplitInspection();invalidateCombine()}
+ const priorSource=$("source").value;const selectedCombine=new Set(combineSelected());
+ const inspectButton=$("inspectBtn");inspectButton.disabled=true;inspectButton.textContent="Loading pools…";
+ try{
+  const v=await api("/api/pools");poolRows=v.pools||[];
+  $("source").innerHTML=poolRows.length?poolRows.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"} · ${p.coverage_complete?"complete":"provisional"} coverage`}</option>`).join(""):'<option value="">No .bspool files found</option>';
+  if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
+  renderCombineChoices(selectedCombine);
+  inspectButton.disabled=!poolRows.some(p=>!p.error);inspectButton.textContent="Inspect pool";
+ }catch(e){
+  poolRows=[];$("source").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);
+  inspectButton.disabled=true;inspectButton.textContent="Inspect unavailable";
+  inspectionState("error","Seed pool list failed to load",e.message||String(e));fail(e);throw e;
+ }
+}
+async function inspect(){
+ clear();const source=$("source").value;
+ if(!source){inspectionState("error","No seed pool selected","Wait for the pool list to finish loading, then choose a pool.");return}
+ resetSplitInspection(`Inspecting ${source}`);
+ const button=$("inspectBtn"),refresh=$("refreshBtn"),picker=$("source"),row=poolRows.find(p=>p.name===source);
+ const started=performance.now();
+ button.disabled=true;refresh.disabled=true;picker.disabled=true;$("analysisCancelBtn").hidden=false;button.textContent=row?`Inspecting ${fmt(row.records)} seeds…`:"Inspecting pool…";
+ inspectionState("",`Inspecting ${source}`,row&&row.records>=32000000?`Verifying a large pool (${fmt(row.records)} committed seeds). First inspection can take several seconds; cached inspections are immediate.`:"Reading and verifying the committed snapshot.");
+ const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("inspectionDetail").textContent=`Still working — ${seconds}s elapsed. The source pool is not being changed.`},1000);
+ // Yield once so the busy state paints before a CPU-heavy local request.
+ await new Promise(resolve=>setTimeout(resolve,40));
+ try{
+  const v=await api("/api/inspect",{source});inspected=v;inspectedName=source;choices={};rules={};
+  $("sourceInfo").hidden=false;$("sourceMetrics").innerHTML=sourceMetrics(v.source);notices(v.notices);$("categoryCard").hidden=false;$("planCard").hidden=!v.source.metadata_capable;
+  $("categories").innerHTML=v.categories.length?v.categories.map(categoryHTML).join(""):'<div class="hint">This snapshot has no known exact categories.</div>';
+  $("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";$("sumSource").textContent=source;$("sumSnapshot").textContent=v.source.snapshot_id;$("sumRecords").textContent=fmt(v.source.records);$("sumCategories").textContent=fmt(v.category_count);$("sumAmbiguous").textContent=fmt(v.ambiguous_count);$("sumUnmatched").textContent=fmt(v.unmatched_count);$("sumPublication").textContent="Review needed";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+  const elapsed=(performance.now()-started)/1000;inspectionState("success","Inspection complete",`${fmt(v.source.records)} seeds and ${fmt(v.category_count)} exact categories loaded in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s. Results are shown below.`);
+  $("categoryCard").scrollIntoView({behavior:"smooth",block:"start"});$("categoryCard").focus({preventScroll:true});
+ }catch(e){resetSplitInspection();inspectionState("error","Inspection failed",e.message||String(e));fail(e)
+ }finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;refresh.disabled=false;picker.disabled=false;button.textContent="Inspect pool"}
+}
+function selected(){return [...document.querySelectorAll(".cat:checked")].map(x=>x.value).sort()}
+function cleanChoiceMap(value){return Object.fromEntries(Object.entries(value||{}).filter(([,destination])=>destination))}
+function choiceDoc(){return {source_snapshot_id:inspected.source.snapshot_id,choices:cleanChoiceMap(choices),ambiguity_rules:{...rules},selected_categories:selected()}}
+function splitRequest(){return {source:inspectedName,snapshot:inspected.source.snapshot_id,selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value}}
+function splitFingerprint(){if(!inspected)return "";const request=splitRequest();return JSON.stringify({source:request.source,snapshot:request.snapshot,categories:request.selectedCategories,choices:Object.entries(request.choicePlan.choices).sort(),rules:Object.entries(request.choicePlan.ambiguity_rules).sort(),policy:request.unmatchedPolicy,remainder:request.remainderName,prefix:request.prefix})}
+async function prepare(){
+ clear();if(!inspected)return;const button=$("planBtn"),request=splitRequest(),fingerprint=splitFingerprint(),row=poolRows.find(p=>p.name===inspectedName),started=performance.now();button.disabled=true;$("analysisCancelBtn").hidden=false;button.textContent="Reviewing seed assignments…";reviewState("","Reviewing seed assignments",row?`Calculating destinations for ${fmt(row.records)} recorded seeds. The source pool is not being changed.`:"Calculating destinations from the selected categories.");
+ const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("reviewDetail").textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`},1000);
+ await new Promise(resolve=>setTimeout(resolve,40));
+ try{const v=await api("/api/plan",request);if(fingerprint!==splitFingerprint())throw Error("Selections changed while the review was running. Review the current choices again.");plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=fingerprint;renderPlan();renderSplitPublication();$("saveBtn").disabled=false;const elapsed=(performance.now()-started)/1000;reviewState("success","Seed assignments reviewed",v.planning_mode==="summary_projection"?`Reused the verified inspection totals; no full rescan was needed. Finished in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`:`Finished the exact record review in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`)}catch(e){invalidateSplitReview();reviewState("error","Seed assignment review failed",e.message||String(e));fail(e)}finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;button.textContent="Review the split (no files created)"}
+}
+function unresolved(){if(!plan)return 0;const newlyResolved=(plan.ambiguity_groups||[]).reduce((total,g)=>total+(rules[g.rule_key]?g.unresolved_records:0),0);return Math.max(0,plan.unresolved_ambiguities-newlyResolved)}
+function categoryName(id){const rows=plan?plan.categories:(inspected?inspected.categories:[]);const c=rows.find(x=>x.category_id===id);return c?c.label:id}
+function renderPlan(){
+ if(!plan)return;$("plan").hidden=false;const groups=plan.ambiguity_groups||[];
+ const groupRows=groups.map(g=>{const id=`rule-${g.rule_key}`,description=`${id}-description`,examples=(g.samples||[]).length?`<br>Example seeds: ${esc(g.samples.join(", "))}.`:"";return `<div class="ambrow"><b>${fmt(g.unresolved_records)} seed${g.unresolved_records===1?"":"s"}</b><div><label for="${id}">Choose the one output pool that should receive these seeds</label><span class="hint" id="${description}">Every seed in this group matched all of these checked categories: ${esc(g.candidates.map(categoryName).join(" · "))}.${examples} A previously saved individual-seed decision, if present, takes priority.</span><select id="${id}" aria-describedby="${description}" data-rule="${esc(g.rule_key)}"><option value="">Choose an output pool for this group…</option>${g.candidates.map(c=>`<option value="${esc(c)}" ${rules[g.rule_key]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div></div>`}).join("");
+ $("ambiguities").innerHTML=groupRows||'<div class="notice"><strong>No destination decisions are currently needed</strong>Each seed now has one destination. If additional category combinations remain, review the split again after applying the displayed decisions.</div>';
+ document.querySelectorAll("[data-rule]").forEach(s=>s.onchange=()=>{if(s.value)rules[s.dataset.rule]=s.value;else delete rules[s.dataset.rule];invalidateSplitReview("Destinations changed — review the split again");renderStatus()});
+ const overflow=plan.unrepresented_ambiguities||0;$("pager").innerHTML=overflow?`The groups above cover ${fmt(plan.unresolved_ambiguities-overflow)} seeds. ${fmt(overflow)} more seeds have different combinations of matching categories; choose the displayed destinations, then review again to see the next groups.`:plan.ambiguities_truncated?`All combinations of matching categories fit on this page. The examples are only a small sample; each choice applies to the full seed count shown for its group.`:"";
+ $("clearRulesBtn").hidden=!Object.keys(rules).length;$("clearChoicesBtn").hidden=!Object.keys(choices).length;
+ renderStatus();
+}
+function renderStatus(){
+ if(!plan)return;const left=unresolved(),reviewed=splitReviewedFingerprint===splitFingerprint();
+ $("planTitle").textContent=`${fmt(plan.ambiguous_count)} seed${plan.ambiguous_count===1?"":"s"} fit more than one checked category`;
+ const overrideText=Object.keys(choices).length?` ${fmt(Object.keys(choices).length)} saved individual-seed decision(s) are active.`:"";const ruleText=Object.keys(rules).length?` ${fmt(Object.keys(rules).length)} shared destination decision(s) are active.`:"";$("planHint").textContent=(plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) fit none of the checked categories and will follow the “Seeds that fit none” option above. The original source still keeps every seed.`:"Every source seed fits at least one checked category.")+overrideText+ruleText;
+ $("choicePill").textContent=left?`${fmt(left)} destinations needed`:(reviewed?"Split reviewed":"Review changes");$("choicePill").className="pill"+(!left&&reviewed?" ok":"");
+ $("sumAmbiguous").textContent=fmt(plan.ambiguous_count);$("sumUnmatched").textContent=fmt(plan.unmatched_count);
+ const ready=reviewed&&plan.publication&&plan.publication.ready;$("splitBtn").disabled=splitRunning||!ready;$("sumPublication").textContent=ready?`${fmt(plan.publication.output_count)} files ready`:reviewed?(plan.publication.blockers[0]||"Blocked"):"Review needed";
+}
+function renderSplitPublication(){
+ if(!plan||splitReviewedFingerprint!==splitFingerprint())return;const publication=plan.publication;$("splitPublication").hidden=false;
+ const blockers=publication.blockers||[];$("splitPublicationState").innerHTML=publication.ready?`<strong>Ready to create ${fmt(publication.output_count)} new pool file(s).</strong> <span class="source-retained">The original source pool will remain unchanged.</span> Existing files will not be overwritten. If creation reports an error or you cancel it, unfinished new files are removed.`:`<strong>More decisions are needed before files can be created.</strong> ${blockers.map(esc).join(" ")}`;
+ $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for seeds outside the selection":"one checked category"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
+ $("splitReport").textContent=`A small audit report named ${publication.report_name} will also record the choices and source snapshot. The new pools will have ${publication.coverage_complete?"complete":"provisional"} search coverage. ${publication.omitted_records?fmt(publication.omitted_records)+" seed(s) will be left out of the new files but remain in the source pool.":"No seeds will be deliberately left out."}`;
+ renderStatus();
+}
 function download(name,type,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},0)}
 function savePlan(){if(!plan)return;download(`${$("prefix").value||"seed-pool"}-choices.json`,"application/json",JSON.stringify(choiceDoc(),null,2)+"\n")}
-function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("That plan belongs to a different committed snapshot.");choices={...(v.choices||{})};prepare()}catch(e){fail(e)}};r.readAsText(file)}
-async function split(){clear();if(!plan)return;$("splitBtn").disabled=true;$("splitBtn").textContent="Creating pools…";try{const v=await api("/api/split",{source:$("source").value,snapshot:inspected.source.snapshot_id,selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value});if(!v.completed){plan=v;choices={...v.choices};renderPlan();throw Error("The split still needs choices or an unmatched-seed policy.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} organized pool(s)</strong>They are ready in seed_pools. Report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds · lineage ${esc(o.lineage_id)}</span></div>`).join("");await loadPools()}catch(e){fail(e)}finally{$("splitBtn").textContent="Create organized pools";renderStatus()}}
-function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
+function clearDecisionSet(kind){if(kind==="rules")rules={};else choices={};plan=null;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview(kind==="rules"?"Shared destinations cleared — review the split again":"Individual seed decisions cleared — review the split again")}
+function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("Those saved decisions belong to a different version of this source pool.");choices={...(v.choices||{})};rules={...(v.ambiguity_rules||{})};invalidateSplitReview("Saved decisions loaded — reviewing the split");prepare()}catch(e){fail(e)}};r.readAsText(file)}
+async function split(){
+ if(!plan||splitReviewedFingerprint!==splitFingerprint()||!plan.publication.ready)return;clear();splitRunning=true;$("splitBtn").disabled=true;$("splitBtn").textContent="Creating new seed pools…";$("splitCancelBtn").hidden=false;
+ try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=splitFingerprint();renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");plan=null;choices={};rules={};splitReviewedFingerprint="";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — review again to make another split";await loadPools(true)}catch(e){fail(e)}finally{splitRunning=false;$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
+}
+async function cancelSplit(){$("splitCancelBtn").disabled=true;$("splitCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"split"})}catch(e){fail(e)}finally{$("splitCancelBtn").disabled=false;$("splitCancelBtn").textContent="Cancel file creation"}}
+async function cancelAnalysis(){$("analysisCancelBtn").disabled=true;$("analysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){fail(e)}finally{$("analysisCancelBtn").disabled=false;$("analysisCancelBtn").textContent="Cancel review"}}
+
 function combineSelected(){return [...document.querySelectorAll(".combinePick:checked")].map(x=>x.value)}
-function renderCombineChoices(){
- const selected=new Set(combineSelected());
- $("combineChoices").innerHTML=poolRows.length?poolRows.map(p=>{
-  const state=p.error?"Unreadable":p.complete?(p.coverage_complete?"Finished":"Provisional"):"Paused / incomplete";
-  const extra=p.composite?` · ${esc(p.composite_operation||"composite")} · ${fmt(p.composite_operand_count||p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters`:p.criteria_hash?` · filter ${esc(p.criteria_hash.slice(0,8))}`:"";
-  return `<label class="poolchoice"><input type="checkbox" class="combinePick" value="${esc(p.name)}" ${selected.has(p.name)?"checked":""} ${p.error?"disabled":""}><span><b>${esc(p.name)}</b><small>${esc(state)} · BSP${esc(p.schema||"?")}${extra}</small></span><span class="count">${p.error?"—":fmt(p.records)}</span></label>`;
- }).join(""):'<div class="hint">No .bspool files found.</div>';
- document.querySelectorAll(".combinePick").forEach(input=>input.onchange=()=>{updateCombineBase();invalidateCombine()});
- updateCombineBase();
+function renderCombineChoices(selectedValues=new Set(combineSelected())){
+ $("combineChoices").innerHTML=poolRows.length?poolRows.map(p=>{const state=p.error?"Unreadable":p.complete?(p.coverage_complete?"Finished · complete search coverage":"Finished · provisional search coverage"):"Paused · committed seeds only";const extra=p.composite?` · already combined from ${fmt(p.composite_operand_count||p.composite_branch_count)} input pools · ${fmt(p.composite_branch_count)} recorded filters`:p.criteria_hash?` · filter ID ${esc(p.criteria_hash.slice(0,8))}`:"";return `<label class="poolchoice"><input type="checkbox" class="combinePick" value="${esc(p.name)}" ${selectedValues.has(p.name)?"checked":""} ${p.error?"disabled":""}><span><b>${esc(p.name)}</b><small>${esc(state)} · ${esc(p.space||"?")} seed space${extra}</small></span><span class="count">${p.error?"—":fmt(p.records)} seeds</span></label>`}).join(""):'<div class="hint">No .bspool files found.</div>';
+ document.querySelectorAll(".combinePick").forEach(input=>input.onchange=()=>{updateCombineBase();invalidateCombine()});updateCombineBase();
 }
-function updateCombineBase(){
- const names=combineSelected(),old=$("combineBase").value;
- $("combineBase").innerHTML=names.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");
- if(names.includes(old))$("combineBase").value=old;
- $("combineBaseField").hidden=$("combineOperation").value!=="difference";
- $("combineSumInputs").textContent=names.length?`${fmt(names.length)} selected`:"Choose at least two";
- $("combineSumOperation").textContent=$("combineOperation").selectedOptions[0].textContent.split(" · ")[0];
+function updateCombineBase(){const names=combineSelected(),old=$("combineBase").value;$("combineBase").innerHTML=names.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");if(names.includes(old))$("combineBase").value=old;$("combineBaseField").hidden=$("combineOperation").value!=="difference";$("combineSumInputs").textContent=names.length?`${fmt(names.length)} selected`:"Choose at least two";$("combineSumOperation").textContent=$("combineOperation").selectedOptions[0].textContent.split(" · ")[0]}
+function invalidateCombine(message="Not reviewed"){
+ combinePlan=null;combineReviewedFingerprint="";$("combineCreateBtn").disabled=true;$("combineBranches").innerHTML="";$("combineChecks").innerHTML="";$("combinePublication").hidden=true;$("combineNotices").innerHTML="";$("combineSumCompatibility").textContent=message;$("combineSumBranches").textContent="—";$("combineSumExpression").textContent="—";$("combineSumCoverage").textContent="—";$("combineSumMetadata").textContent="—";$("combineResult").innerHTML="";
 }
-function invalidateCombine(){combinePlan=null;$("combineCreateBtn").disabled=true;$("combineBranches").innerHTML="";$("combineNotices").innerHTML="";$("combineSumBranches").textContent="—";$("combineSumExpression").textContent="—";$("combineSumCoverage").textContent="—";$("combineSumMetadata").textContent="—";$("combineResult").innerHTML=""}
-function combineRequest(withPins){const value={sources:combineSelected(),operation:$("combineOperation").value,base:$("combineBase").value,name:$("combineName").value,label:$("combineLabel").value};if(withPins&&combinePlan)value.snapshots=combinePlan.snapshots;return value}
-function renderCombinePlan(v){
- combinePlan=v;renderNoticeList("combineNotices",v.notices);$("combineSumInputs").textContent=`${fmt(v.operand_count)} exact pool snapshots`;$("combineSumBranches").textContent=fmt(v.branch_count);$("combineSumExpression").textContent=v.expression_text;$("combineSumCoverage").textContent=v.coverage_complete?"Complete":"Provisional";$("combineSumMetadata").textContent=v.metadata_complete?"Exact locations preserved":"Some membership only";
- const inputs=v.operands.map((o,index)=>`<div class="branch"><b>Input ${fmt(index+1)} · ${esc(o.label||o.pool_id||o.operand_id)}</b><span>${fmt(o.records)} seeds · snapshot ${esc(o.snapshot_id.slice(0,8))} · operand ${esc(o.operand_id.slice(0,8))}</span></div>`).join("");
- const sources=v.branches.map(b=>`<div class="branch"><b>Source filter · ${esc(b.label||b.pool_id||b.branch_id)}</b><span>source ${esc(b.branch_id.slice(0,8))} · filter ${esc(b.criteria_hash.slice(0,8))}${b.criteria.length?` · ${b.criteria.map(esc).join(" · ")}`:" · no embedded criteria"}</span></div>`).join("");
- $("combineBranches").innerHTML=`<div class="notice"><strong>Exact snapshot expression</strong>${esc(v.expression_text)}</div><div class="hint">Exact input snapshots</div>${inputs}<div class="hint">Original source filters retained per seed</div>${sources}`;
- $("combineCreateBtn").disabled=false;
+function combineRequest(withPins){const value={sources:combineSelected(),operation:$("combineOperation").value,base:$("combineBase").value,name:$("combineName").value,label:$("combineLabel").value};if(withPins&&combinePlan){value.snapshots=combinePlan.snapshots;value.reviewedPublication=combinePlan.publication}return value}
+function combineFingerprint(){return JSON.stringify(combineRequest(false))}
+function renderCombinePlan(v,fingerprint=combineFingerprint()){
+ combinePlan=v;combineReviewedFingerprint=fingerprint;renderNoticeList("combineNotices",v.notices);$("combineSumInputs").textContent=`${fmt(v.input_count)} selected`;$("combineSumCompatibility").textContent=v.compatible?"Yes":"No · see explanation";$("combineSumBranches").textContent=`${fmt(v.branch_count)} retained`;$("combineSumExpression").textContent=v.expression_text;$("combineSumCoverage").textContent=v.coverage_complete?"Complete":"Provisional";$("combineSumMetadata").textContent=v.metadata_complete?"Exact details retained":"Some inputs have seeds only";
+ $("combineChecks").innerHTML=v.compatibility.checks.map(c=>`<div class="check ${esc(c.status)}"><b>${esc(c.label)} · ${esc(c.status)}</b>${esc(c.detail)}</div>`).join("");
+ const inputs=v.compatibility.inputs.map(o=>{const role=o.role==="base"?"START WITH":o.role==="subtract"?"REMOVE MATCHES FROM":"INPUT";return `<div class="branch"><b>${role} · ${esc(o.name)}</b><span>${fmt(o.records)} seeds · ${esc(o.state)} pool · ${esc(o.coverage)} search coverage · ${esc(o.metadata)} · ${esc(o.space)} seed space · snapshot ID ${esc(o.snapshot_id.slice(0,8))}${o.composite?` · prior rule ${esc(o.composite_expression_text||o.composite_operation)}`:""}</span></div>`}).join("");
+ const sources=(v.branches||[]).map(b=>`<div class="branch"><b>Recorded source filter · ${esc(b.label||b.pool_id||b.branch_id)}</b><span>${b.criteria.length?`Original requirements: ${b.criteria.map(esc).join(" · ")}`:"This older pool does not contain a readable description of its original requirements."}</span></div>`).join("");
+ $("combineBranches").innerHTML=`<div class="notice ${v.compatible?"":"error"}"><strong>Seed-membership rule</strong>${esc(v.expression_text)}. This rule compares whether each seed is present in the selected pools; it does not rerun their original search filters.</div><div class="hint">Selected input pools</div>${inputs}${sources?'<div class="hint">Recorded filter history carried into the new pool</div>'+sources:""}`;
+ const publication=v.publication;$("combinePublication").hidden=false;$("combineManifest").innerHTML=`<div class="manifestrow"><span><b>${esc(publication.name)}</b><small>${esc(publication.label)} · ${esc(v.operation.toUpperCase())} · ${publication.output_exists?"filename already exists":"filename available"}</small></span><span class="count">Seed count calculated while the file is created</span></div>`;$("combineReport").textContent=`A small audit report named ${publication.report_name} will record the selected input versions and the membership rule. The input pools remain unchanged, and an existing output file is never overwritten.`;
+ $("combineCreateBtn").disabled=combineRunning||!publication.ready||combineReviewedFingerprint!==combineFingerprint();
 }
-async function checkCombine(){
- $("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn");button.disabled=true;button.textContent="Checking…";
- try{const v=await api("/api/combine/plan",combineRequest(false));renderCombinePlan(v)}catch(e){invalidateCombine();$("combineError").textContent=e.message||String(e)}finally{button.disabled=false;button.textContent="Check compatibility"}
-}
+async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Reviewing selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed while the review was running. Review them again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Review failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.disabled=false;button.textContent="Review the combined pool (no file created)"}}
 async function createCombine(){
- if(!combinePlan)return;$("combineError").textContent="";const button=$("combineCreateBtn");button.disabled=true;button.textContent="Combining…";
- try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" This is a verified empty result and cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>${fmt(v.records)} unique seed(s) · ${esc(v.operation.toUpperCase())}.${esc(empty)} Report: ${esc(v.report_path)}</div>`;await loadPools();combinePlan=null}catch(e){$("combineError").textContent=e.message||String(e);button.disabled=false}finally{button.textContent="Create combined pool"}
+ if(!combinePlan||combineReviewedFingerprint!==combineFingerprint()||!combinePlan.publication.ready)return;$("combineError").textContent="";combineRunning=true;$("combineCreateBtn").disabled=true;$("combineCreateBtn").textContent="Creating combined seed pool…";$("combineCancelBtn").hidden=false;
+ try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);combinePlan=null;combineReviewedFingerprint=""}catch(e){$("combineError").textContent=e.message||String(e);invalidateCombine("Review again after this failure")}finally{combineRunning=false;$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool"}
 }
-function showMode(mode){const combine=mode==="combine";$("splitWorkspace").hidden=combine;$("combineWorkspace").hidden=!combine;$("splitModeBtn").classList.toggle("active",!combine);$("combineModeBtn").classList.toggle("active",combine)}
-$("inspectBtn").onclick=inspect;$("refreshBtn").onclick=loadPools;$("allBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=true);$("noneBtn").onclick=()=>document.querySelectorAll(".cat").forEach(x=>x.checked=false);$("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("splitBtn").onclick=split;$("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";renderStatus()};$("exportBtn").onclick=()=>{if(!inspected)return;location.href=apiPath(`/api/export?source=${encodeURIComponent($("source").value)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`)};
-$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineRefreshBtn").onclick=loadPools;$("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine()};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine()};$("combineOperation").onchange=()=>{updateCombineBase();invalidateCombine()};$("combineBase").onchange=invalidateCombine;
-document.addEventListener("change",e=>{if(e.target.classList.contains("cat")){plan=null;choices={};$("plan").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true}});
-if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/"}loadPools();
+async function cancelCombine(){$("combineCancelBtn").disabled=true;$("combineCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"combine"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineCancelBtn").disabled=false;$("combineCancelBtn").textContent="Cancel file creation"}}
+async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel review"}}
+function showMode(mode){const combine=mode==="combine";$("splitWorkspace").hidden=combine;$("combineWorkspace").hidden=!combine;$("splitModeBtn").classList.toggle("active",!combine);$("combineModeBtn").classList.toggle("active",combine);$("splitModeBtn").setAttribute("aria-selected",String(!combine));$("combineModeBtn").setAttribute("aria-selected",String(combine))}
+
+$("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
+$("allBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=true);invalidateSplitSelection()};$("noneBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=false);invalidateSplitSelection()};
+$("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("clearRulesBtn").onclick=()=>clearDecisionSet("rules");$("clearChoicesBtn").onclick=()=>clearDecisionSet("choices");$("splitBtn").onclick=split;$("analysisCancelBtn").onclick=cancelAnalysis;$("splitCancelBtn").onclick=cancelSplit;
+$("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";invalidateSplitReview()};$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>invalidateSplitReview();
+$("exportBtn").onclick=()=>{if(!inspected)return;location.href=apiPath(`/api/export?source=${encodeURIComponent(inspectedName)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`)};
+$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
+$("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine("Selection changed")};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine("Selection changed")};
+$("combineOperation").onchange=()=>{updateCombineBase();invalidateCombine("Operation changed")};$("combineBase").onchange=()=>invalidateCombine("Base changed");$("combineName").oninput=()=>invalidateCombine("Output changed");$("combineLabel").oninput=()=>invalidateCombine("Output changed");
+document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection()});
+if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/";$("mergeLink").hidden=true;$("standaloneMerge").hidden=false}
+resetSplitInspection();invalidateCombine();loadPools(true).catch(()=>{});
 </script></body></html>'''
 
 
@@ -768,7 +2154,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
 
     def _reader_for_request(self, data):
         name = data.get("source", "")
-        reader = organizer.BSPoolReader(resolve_source(name, self.pool_dir))
+        reader = verified_source_reader(name, self.pool_dir)
         expected = str(data.get("snapshot", "")).lower()
         if expected and expected != reader.snapshot_token:
             raise organizer.PoolError(
@@ -794,7 +2180,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/export":
                 query = parse_qs(parsed.query)
                 name = query.get("source", [""])[0]
-                reader = organizer.BSPoolReader(resolve_source(name, self.pool_dir))
+                reader = verified_source_reader(name, self.pool_dir)
                 expected = query.get("snapshot", [""])[0].lower()
                 if expected != reader.snapshot_token:
                     raise organizer.PoolError(
@@ -824,29 +2210,19 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         try:
             data = self._body()
             if parsed.path == "/api/inspect":
-                self._json(inspect_source(data.get("source", ""), self.pool_dir))
+                self._json(run_inspect(
+                    data.get("source", ""), self.pool_dir))
             elif parsed.path == "/api/plan":
-                reader = self._reader_for_request(data)
-                self._json(build_split_plan(
-                    reader, data.get("selectedCategories"), data.get("choicePlan")))
+                self._json(run_split_plan(data, self.pool_dir))
             elif parsed.path == "/api/combine/plan":
-                self._json(build_combine_plan(data, self.pool_dir))
+                self._json(run_combine_plan(data, self.pool_dir))
             elif parsed.path == "/api/split":
-                if not SPLIT_LOCK.acquire(False):
-                    raise organizer.PoolError("another organizer split is still running")
-                try:
-                    report = execute_split(data.get("source", ""), data, self.pool_dir)
-                finally:
-                    SPLIT_LOCK.release()
-                self._json(report)
+                self._json(run_split(
+                    data.get("source", ""), data, self.pool_dir))
             elif parsed.path == "/api/combine":
-                if not COMBINE_LOCK.acquire(False):
-                    raise organizer.PoolError("another pool combine is still running")
-                try:
-                    report = execute_combine(data, self.pool_dir)
-                finally:
-                    COMBINE_LOCK.release()
-                self._json(report)
+                self._json(run_combine(data, self.pool_dir))
+            elif parsed.path == "/api/cancel":
+                self._json(cancel_operation(str(data.get("operation", ""))))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError, organizer.PoolError) as exc:
