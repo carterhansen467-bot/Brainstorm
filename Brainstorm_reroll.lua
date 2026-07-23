@@ -4021,14 +4021,14 @@ function Brainstorm.pollNativeSearch()
 		end
 		return nil
 	end
-	local tried = txt:match("P (%d+)")
+	local tried = txt:match("^P (%d+)") or txt:match("\nP (%d+)")
 	if tried then A.searchTried = tonumber(tried) end
-	local wmsg = txt:match("W ([^\n]+)")
+	local wmsg = txt:match("^W ([^\n]+)") or txt:match("\nW ([^\n]+)")
 	if wmsg and wmsg ~= A.nativeWarned then
 		A.nativeWarned = wmsg
 		print("[Brainstorm] native search: " .. wmsg)
 	end
-	local emsg = txt:match("E ([^\n]+)")
+	local emsg = txt:match("^E ([^\n]+)") or txt:match("\nE ([^\n]+)")
 	if emsg then
 		local selected = Brainstorm.effectiveSeedPoolSelection
 			and Brainstorm.effectiveSeedPoolSelection()
@@ -4074,7 +4074,8 @@ function Brainstorm.pollNativeSearch()
 		end
 		return nil
 	end
-	local seed, label = txt:match("R (%S+) ([^\n]+)")
+	local seed, label = txt:match("^R (%S+) ([^\n]+)")
+	if not seed then seed, label = txt:match("\nR (%S+) ([^\n]+)") end
 	if seed then
 		return { seed = seed, jokerFoundAt = (label ~= "-") and label or nil, session = A.searchSession }
 	end

@@ -74,12 +74,14 @@ Brainstorm.pollNativeSearch()
 assert(heartbeatWrites == 1, "heartbeat was not written after two seconds")
 
 -- A terminal result is surfaced on the next scheduled read (at most 100 ms).
-statusText = "P 2\nR TESTSEED Found_at_Ante_2\n"
+-- The seed intentionally ends in E: status tokens must only match at line
+-- starts, rather than misreading that final E as an error record.
+statusText = "P 2\nR TESTSEEE Found_at_Ante_2\n"
 now = now + 0.079
 assert(Brainstorm.pollNativeSearch() == nil)
 now = now + 0.002
 local result = assert(Brainstorm.pollNativeSearch())
-assert(result.seed == "TESTSEED")
+assert(result.seed == "TESTSEEE")
 assert(result.jokerFoundAt == "Found_at_Ante_2")
 
 -- Errors remain prompt and clear the timing state for the next search.
