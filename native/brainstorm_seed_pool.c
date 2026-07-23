@@ -5043,7 +5043,20 @@ static bool pool_append_adaptive_index(FILE *f, int headerBytes,
 		entry[48] = header[5];
 		entry[49] = header[6];
 		entry[50] = header[7];
-		if (fwrite(entry, 1, sizeof entry, f) != sizeof entry) {
+		/* ReadFile may advance the underlying Windows handle even though
+		 * bs_pread supplies an explicit offset. Reassert the append position
+		 * before every stdio write so the CRT stream and OS handle cannot
+		 * disagree after the positional header read. */
+		if (blocks > (UINT64_MAX - indexOff)
+					/ BSPOOL4_INDEX_ENTRY_SIZE) {
+			snprintf(err, errsz, "adaptive pool index offset overflows");
+			return false;
+		}
+		uint64_t entryOff = indexOff
+				+ blocks * BSPOOL4_INDEX_ENTRY_SIZE;
+		if (entryOff > (uint64_t)INT64_MAX
+				|| bs_fseeko(f, (int64_t)entryOff, SEEK_SET) != 0
+				|| fwrite(entry, 1, sizeof entry, f) != sizeof entry) {
 			snprintf(err, errsz, "cannot write adaptive pool index");
 			return false;
 		}
