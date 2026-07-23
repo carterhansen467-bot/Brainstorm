@@ -85,7 +85,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
-          python3 tests/pool_builder_refilter_sources.py
+          python3 tests/pool_builder_refilter_sources.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
           python3 tests/pool_builder_delete.py
           python3 tests/pool_attachment.py
           python3 tests/pool_attachment_marker_matrix.py
@@ -180,7 +180,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" LUAJIT_BIN="$LUAJIT" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
-          python tests/pool_builder_refilter_sources.py
+          python tests/pool_builder_refilter_sources.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
           python tests/pool_builder_delete.py
           python tests/pool_attachment.py
           python tests/pool_attachment_marker_matrix.py

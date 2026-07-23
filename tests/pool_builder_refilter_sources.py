@@ -100,8 +100,8 @@ def compatibility_matrix():
         assert "unavailable:" in web.PAGE
 
 
-def custom_pool_directory_start():
-    snapshot = core.Snapshot(os.path.join(ROOT, "native_search.cfg"))
+def custom_pool_directory_start(snapshot_path):
+    snapshot = core.Snapshot(snapshot_path)
     catalog = core.catalog_hash_file(snapshot.current_model_copy())
     with tempfile.TemporaryDirectory(
             prefix="bs-refilter-custom-") as directory, \
@@ -175,6 +175,8 @@ def custom_pool_directory_start():
 
 
 if __name__ == "__main__":
+    snapshot_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        ROOT, "native_search.cfg")
     compatibility_matrix()
-    custom_pool_directory_start()
+    custom_pool_directory_start(snapshot_path)
     print("pool builder refilter sources: ok")
