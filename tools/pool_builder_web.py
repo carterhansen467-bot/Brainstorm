@@ -335,7 +335,7 @@ def _cleanup_replaced_estimate_locked():
         runner.result_manifest(cleanup=True)
 
 
-def start_job(kind, data, snap):
+def start_job(kind, data, snap, pool_dir=None):
     with LOCK:
         if JOB["closing"]:
             raise ValueError("The Builder is closing; reopen it to start another job.")
@@ -343,23 +343,26 @@ def start_job(kind, data, snap):
         if r is not None and not r.done():
             raise ValueError("A scan is already running -- stop it first.")
         _cleanup_replaced_estimate_locked()
+        root = pool_dir or core.POOL_DIR
         crit = criteria_from_json(data, snap)
+        snapshot_copy = snap.current_model_copy()
+        current_catalog_hash = core.catalog_hash_file(snapshot_copy)
         input_name = os.path.basename(str(data.get("inputPool", "")))
         input_pool = None
         input_records = 0
         if input_name:
-            candidate = os.path.join(core.POOL_DIR, input_name)
-            head = read_pool_header(candidate)
-            if not input_name.endswith(".bspool") or not os.path.isfile(candidate):
+            candidate = os.path.join(root, input_name)
+            if not input_name.lower().endswith(".bspool") \
+                    or not os.path.isfile(candidate):
                 raise ValueError("The selected input pool no longer exists.")
-            native_incompatibility = core.pool_native_incompatibility(head)
-            if native_incompatibility:
+            head = read_pool_header(candidate)
+            blockers = core.pool_refilter_blockers(
+                head, current_catalog_hash)
+            if blockers:
                 raise ValueError(
                     "%s cannot be used as a Builder input: %s."
-                    % (input_name, native_incompatibility))
+                    % (input_name, "; ".join(blockers)))
             input_records = int(head.get("records", "0") or 0)
-            if input_records <= 0:
-                raise ValueError("The selected pool has no committed seeds to process yet.")
             input_pool = candidate
             crit.space = head.get("space", "natural")
             if crit.shard_total > 1:
@@ -371,8 +374,8 @@ def start_job(kind, data, snap):
             context = estimate_context(crit, data, input_name, input_records)
             out = None
         else:
-            os.makedirs(core.POOL_DIR, exist_ok=True)
-            out = os.path.join(core.POOL_DIR, crit.pool_name() + ".bspool")
+            os.makedirs(root, exist_ok=True)
+            out = os.path.join(root, crit.pool_name() + ".bspool")
             if core.read_state(out + ".state").get("done") == "1":
                 raise ValueError("That pool is already complete. Pick a different "
                                  "name, or delete the old files first.")
@@ -380,14 +383,13 @@ def start_job(kind, data, snap):
             text = crit.text("binary", count)
             context = None
         if (input_pool and out is not None
-                and os.path.abspath(input_pool) == os.path.abspath(out)):
+                and core.same_pool_path(input_pool, out)):
             raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
         summary = crit.summary()
         if kind == "estimate" and not input_pool:
             summary += " [%s-seed quick sample]" % format(sample, ",")
         # Resolve every fallible setup input before creating the disposable
         # directory. Runner owns exact artifact cleanup from this point on.
-        snapshot_copy = snap.current_model_copy()
         if kind == "estimate":
             out = os.path.join(
                 tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
@@ -399,7 +401,7 @@ def start_job(kind, data, snap):
                    estimate_context=context)
 
 
-def start_merge_job(data):
+def start_merge_job(data, pool_dir=None):
     with LOCK:
         if JOB["closing"]:
             raise ValueError("The Builder is closing; reopen it to start another job.")
@@ -407,6 +409,7 @@ def start_merge_job(data):
         if r is not None and not r.done():
             raise ValueError("A scan or merge is already running.")
         _cleanup_replaced_estimate_locked()
+        root = pool_dir or core.POOL_DIR
         names = []
         for value in data.get("pools", []):
             name = os.path.basename(str(value))
@@ -416,10 +419,10 @@ def start_merge_job(data):
             raise ValueError("Select at least two completed shard pools.")
         inputs = []
         for name in names:
-            path = os.path.join(core.POOL_DIR, name)
-            head = read_pool_header(path)
-            if not name.endswith(".bspool") or not os.path.isfile(path):
+            path = os.path.join(root, name)
+            if not name.lower().endswith(".bspool") or not os.path.isfile(path):
                 raise ValueError("A selected pool no longer exists: %s" % name)
+            head = read_pool_header(path)
             native_incompatibility = core.pool_native_incompatibility(head)
             if native_incompatibility:
                 raise ValueError(
@@ -433,8 +436,8 @@ def start_merge_job(data):
             base = base[:-7]
         if not base:
             base = "merged-pool"
-        os.makedirs(core.POOL_DIR, exist_ok=True)
-        output = os.path.join(core.POOL_DIR, base + ".bspool")
+        os.makedirs(root, exist_ok=True)
+        output = os.path.join(root, base + ".bspool")
         if os.path.exists(output):
             raise ValueError("That output already exists. Pick a different merged-pool name.")
         JOB.update(runner=core.MergeRunner(inputs, output), kind="merge",
@@ -890,7 +893,8 @@ function setOptions(sel, html, keepValue){
   const old = keepValue ? sel.value : null;
   sel.dataset.opts = html;
   sel.innerHTML = html;
-  if (keepValue && [...sel.options].some(o=>o.value===old)) sel.value = old;
+  if (keepValue && [...sel.options].some(o=>o.value===old && !o.disabled))
+    sel.value = old;
 }
 
 function esc(value){
@@ -1322,8 +1326,7 @@ function inputPoolOptions(groups){
   let html = `<option value="">Balatro's seed space</option>`;
   for (const family of (groups || [])) {
     for (const lineage of family.lineages) {
-      const available = lineage.pools.filter(
-        p=>p.records > 0 && p.native_compatible !== false);
+      const available = lineage.pools || [];
       if (!available.length) continue;
       const groupLabel = family.legacy ? family.label
         : `${family.label} · ${lineage.label}`;
@@ -1334,7 +1337,12 @@ function inputPoolOptions(groups){
         const update = p.update_available ? ` · +${fmt(p.new_records)} source seeds` : "";
         const composite = p.composite
           ? ` · ${p.composite_operation || "composite"} · ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
-        return `<option value="${esc(p.name)}" data-space="${esc(p.space)}" data-composite="${p.composite?"1":"0"}">${esc(p.name)} (${fmt(p.records)} seeds${state}${update}${composite})</option>`;
+        const blockers = p.refilter_blockers || [];
+        const eligible = p.refilter_eligible === true;
+        const unavailable = eligible ? ""
+          : ` · unavailable: ${esc(blockers[0] || "incompatible pool")}`;
+        const detail = blockers.length ? ` title="${esc(blockers.join("; "))}"` : "";
+        return `<option value="${esc(p.name)}" data-space="${esc(p.space)}" data-composite="${p.composite?"1":"0"}"${eligible?"":" disabled"}${detail}>${esc(p.name)} (${fmt(p.records)} seeds${state}${update}${composite}${unavailable})</option>`;
       }).join("") + `</optgroup>`;
     }
   }
@@ -1613,13 +1621,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "request must be a JSON object"}, 400)
         if parsed.path == "/api/run":
             try:
-                start_job(data.get("kind", "build"), data.get("criteria", {}), self.snap)
+                start_job(data.get("kind", "build"),
+                          data.get("criteria", {}), self.snap, self.pool_dir)
                 self._json({"ok": True})
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
         elif parsed.path == "/api/merge":
             try:
-                start_merge_job(data)
+                start_merge_job(data, self.pool_dir)
                 self._json({"ok": True})
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)

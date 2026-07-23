@@ -107,6 +107,14 @@ POOL_DIR = os.path.join(MOD_DIR, "seed_pools")
 POOL_HEADER_PREFIX_BYTES = 1024
 POOL_HEADER_MAX_BYTES = 256 * 1024
 POOL_EXTENDED_HEADER_SCHEMAS = (3, 4)
+POOL_ENCODINGS = {
+    1: "u64le",
+    2: "delta-varint-blocks-v1",
+    3: "delta-varint-events-v1",
+    4: "adaptive-events-v1",
+}
+# Compatibility name retained for callers that specifically enumerate the
+# metadata-bearing event formats.
 POOL_EVENT_ENCODINGS = {
     3: "delta-varint-events-v1",
     4: "adaptive-events-v1",
@@ -584,6 +592,12 @@ def _cleanup_estimate_artifacts(output):
     return removed
 
 
+def same_pool_path(left, right):
+    """Compare pool paths with platform case and symlink semantics."""
+    return os.path.normcase(os.path.realpath(left)) == \
+        os.path.normcase(os.path.realpath(right))
+
+
 class Runner:
     """One scanner process: criteria written to disk, stderr streamed."""
 
@@ -594,7 +608,7 @@ class Runner:
         self.temporary = bool(temporary)
         try:
             if input_pool:
-                if os.path.abspath(input_pool) == os.path.abspath(output):
+                if same_pool_path(input_pool, output):
                     raise ValueError("Input and output pool must be different files.")
                 native_incompatibility = pool_native_incompatibility(
                     read_pool_header(input_pool))
@@ -874,6 +888,44 @@ def _pool_identity(value):
     if compact and all(ch == "0" for ch in compact):
         return ""
     return value
+
+
+def pool_refilter_blockers(pool, current_catalog_hash=None,
+                           current_model=MODEL_VERSION):
+    """Return reasons this pool cannot be a Builder refilter source.
+
+    Completion is deliberately not required. Every published pool schema
+    stores committed records independently of its scan checkpoint, so a
+    paused pool with at least one record is a valid point-in-time source.
+    """
+    blockers = []
+    incompatibility = pool_native_incompatibility(pool)
+    if not pool.get("native_compatible", True) or incompatibility:
+        blockers.append(incompatibility or
+                        "the pool is unavailable to the native search helper")
+    schema = _pool_int(pool.get("schema"))
+    encoding = str(pool.get("encoding", ""))
+    if not incompatibility and encoding != POOL_ENCODINGS[schema]:
+        blockers.append("pool schema %d requires encoding %s" % (
+            schema, POOL_ENCODINGS[schema]))
+
+    if _pool_int(pool.get("records")) <= 0:
+        blockers.append("the pool contains no committed seed records")
+
+    model = _pool_int(pool.get("modelver"))
+    if not model:
+        blockers.append("the pool does not identify its route model")
+    elif model != current_model:
+        blockers.append("the pool uses route model %d; the Builder uses model %d"
+                        % (model, current_model))
+
+    catalog_hash = _pool_identity(pool.get("catalog_hash"))
+    if not catalog_hash:
+        blockers.append("the pool has no profile/catalog fingerprint")
+    elif current_catalog_hash and str(catalog_hash).lower() \
+            != str(current_catalog_hash).lower():
+        blockers.append("the pool was built from a different profile/catalog snapshot")
+    return blockers
 
 
 ATTACHMENT_SCHEMA = 1
@@ -1239,6 +1291,9 @@ class PoolInfo:
             pool["attachment_accelerator_blockers"])
         pool["attachment_base_eligible"] = \
             pool["attachment_accelerator_eligible"]
+        pool["refilter_blockers"] = pool_refilter_blockers(
+            pool, current_catalog_hash)
+        pool["refilter_eligible"] = not pool["refilter_blockers"]
         attachment = read_pool_attachment(
             self.path, pool, current_catalog_hash) \
             if include_attachment else None
@@ -1367,7 +1422,7 @@ def read_pool_library(pool_dir=POOL_DIR, current_catalog_hash=None):
     pools = []
     if os.path.isdir(pool_dir):
         for name in sorted(os.listdir(pool_dir)):
-            if name.endswith(".bspool"):
+            if name.lower().endswith(".bspool"):
                 pools.append(PoolInfo(os.path.join(pool_dir, name)).as_dict(
                     current_catalog_hash=current_catalog_hash))
     _link_pool_parents(pools)
@@ -1695,16 +1750,17 @@ class App:
         self.vouchers = [key for key, _prerequisite in snap.usable_vouchers()]
         self.voucher_prerequisite = dict(snap.usable_vouchers())
         self.input_pools = [""]
+        current_catalog_hash = catalog_hash_file(snap.current_model_copy())
         if os.path.isdir(POOL_DIR):
             for fn in sorted(os.listdir(POOL_DIR)):
                 path = os.path.join(POOL_DIR, fn)
-                head = read_pool_header(path) if fn.endswith(".bspool") else {}
+                is_pool = fn.lower().endswith(".bspool")
+                head = read_pool_header(path) if is_pool else {}
                 # Committed blocks are independently checksummed and readable
                 # before a scan finishes. Refiltering a paused pool is a
                 # snapshot operation over only those currently recorded seeds.
-                if (fn.endswith(".bspool")
-                        and int(head.get("records", "0") or 0) > 0
-                        and not pool_native_incompatibility(head)):
+                if (is_pool and not pool_refilter_blockers(
+                        head, current_catalog_hash)):
                     self.input_pools.append(path)
         self.input_idx = 0
         curses.curs_set(0)

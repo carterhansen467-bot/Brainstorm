@@ -86,7 +86,7 @@ REVIEWED_SPLIT_CACHE_LOCK = threading.Lock()
 REVIEWED_SPLIT_CACHE = collections.OrderedDict()
 REVIEWED_SPLIT_CACHE_LIMIT = 8
 NATIVE_SUMMARY_MIN_BYTES = 32 * 1024 * 1024
-SUMMARY_CACHE_SCHEMA = 1
+SUMMARY_CACHE_SCHEMA = 2
 _POOL_BINARY_NAME = "brainstorm_seed_pool" + (".exe" if os.name == "nt" else "")
 _POOL_BINARY_CANDIDATES = [
     os.path.join(APP_DIR, _POOL_BINARY_NAME),
@@ -108,6 +108,18 @@ def _plan_token(kind, value):
         ("organizer-plan:%s:" % kind).encode("ascii") + payload.encode("ascii"))
 
 
+def _group_by_filter(request):
+    if not isinstance(request, dict):
+        return None
+    value = request.get("groupByFilter")
+    if value in (None, ""):
+        return None
+    if (not isinstance(value, str) or len(value) > 4096
+            or not re.fullmatch(r"(?:tag|legendary|voucher):[^\\/\s]+", value)):
+        raise organizer.PoolError("choose a valid recorded filter to organize by")
+    return value
+
+
 def _split_request_key(reader, selected_ids, choices, ambiguity_rules,
                        publication):
     """Canonical no-scan identity for one reviewed split request."""
@@ -118,7 +130,8 @@ def _split_request_key(reader, selected_ids, choices, ambiguity_rules,
                 isinstance(item, str) for item in selected_ids):
             raise organizer.PoolError("selectedCategories must be a list")
         if not selected_ids:
-            raise organizer.PoolError("select at least one exact category")
+            raise organizer.PoolError(
+                "select at least one shown location or exact category")
         selected = tuple(sorted(set(selected_ids)))
     request = publication if isinstance(publication, dict) else {}
     policy = str(request.get("unmatchedPolicy", "stop")).lower()
@@ -136,6 +149,7 @@ def _split_request_key(reader, selected_ids, choices, ambiguity_rules,
         remainder_label = ""
     return (
         reader.snapshot_token,
+        _group_by_filter(request),
         selected,
         tuple(sorted(choices.items())),
         tuple(sorted(ambiguity_rules.items())),
@@ -543,10 +557,23 @@ def _inferred_category_groups(report):
     return groups
 
 
-def _summary_can_project(report, selected_ids):
+def _summary_can_project(report, selected_ids, group_by_filter=None):
     if (not isinstance(selected_ids, list) or not selected_ids
             or not all(isinstance(item, str) for item in selected_ids)):
         return False
+    if group_by_filter:
+        filter_row = next((
+            row for row in report.get("filters", [])
+            if isinstance(row, dict)
+            and row.get("filter_id") == group_by_filter), None)
+        if filter_row is None \
+                or int(filter_row.get("multiple_location_records", -1)) != 0:
+            return False
+        available = {
+            row.get("location_id") for row in filter_row.get("locations", [])
+            if isinstance(row, dict)
+        }
+        return set(selected_ids).issubset(available)
     selected = set(selected_ids)
     available = {
         row.get("category_id") for row in report.get("categories", [])
@@ -572,11 +599,13 @@ def _choice_plan_has_individual_decisions(value):
 
 def _parse_native_summary(text):
     lines = text.splitlines()
-    if (not lines or lines[0] != "BRAINSTORM_POOL_SUMMARY 1"
+    if (not lines or lines[0] != "BRAINSTORM_POOL_SUMMARY 2"
             or lines[-1] != "end"):
         raise organizer.PoolError("native pool summary returned an invalid document")
     singular = {}
     categories = []
+    filters = []
+    locations = []
     provenance = {}
     operands = {}
     integer_fields = {
@@ -608,6 +637,40 @@ def _parse_native_summary(text):
                     or not re.fullmatch(r"[0-9]+", parts[2])):
                 raise organizer.PoolError("native pool summary has a malformed category")
             categories.append((bytes.fromhex(parts[1]), int(parts[2])))
+        elif key == "filter":
+            if (len(parts) != 6 or parts[1] not in ("1", "2", "3")
+                    or not re.fullmatch(r"(?:[0-9a-f]{2})+", parts[2])
+                    or not all(re.fullmatch(r"[0-9]+", value)
+                               for value in parts[3:])):
+                raise organizer.PoolError(
+                    "native pool summary has a malformed filter")
+            raw_key = bytes.fromhex(parts[2])
+            if len(raw_key) > 255 \
+                    or any(byte < 33 or byte > 126 for byte in raw_key):
+                raise organizer.PoolError(
+                    "native pool summary filter key is unsafe")
+            filters.append((
+                int(parts[1]), raw_key, int(parts[3]), int(parts[4]),
+                int(parts[5])))
+        elif key == "location":
+            if (len(parts) != 6 or parts[1] not in ("1", "2", "3")
+                    or not re.fullmatch(r"(?:[0-9a-f]{2})+", parts[2])
+                    or not all(re.fullmatch(r"[0-9]+", value)
+                               for value in parts[3:])):
+                raise organizer.PoolError(
+                    "native pool summary has a malformed location")
+            raw_key = bytes.fromhex(parts[2])
+            if len(raw_key) > 255 \
+                    or any(byte < 33 or byte > 126 for byte in raw_key):
+                raise organizer.PoolError(
+                    "native pool summary location key is unsafe")
+            filters_kind, ante, phase, location_records = (
+                int(parts[1]), int(parts[3]), int(parts[4]), int(parts[5]))
+            if not ante or ante > 255 or phase > 255:
+                raise organizer.PoolError(
+                    "native pool summary location is outside event bounds")
+            locations.append((
+                filters_kind, raw_key, ante, phase, location_records))
         elif key in ("provenance", "operand"):
             if (len(parts) != 3
                     or not re.fullmatch(r"[0-9a-f]{16}", parts[1])
@@ -629,10 +692,28 @@ def _parse_native_summary(text):
             or singular["records_without_provenance"] > records
             or singular["records_without_operands"] > records
             or any(count > records for _raw, count in categories)
+            or any(covered > records or multiple > covered
+                   or associations < covered
+                   for _kind, _key, covered, multiple, associations in filters)
+            or any(count > records
+                   for _kind, _key, _ante, _phase, count in locations)
             or any(count > records for count in provenance.values())
             or any(count > records for count in operands.values())):
         raise organizer.PoolError("native pool summary count exceeds its records")
+    filter_keys = [(kind, raw_key) for kind, raw_key, *_rest in filters]
+    location_keys = [
+        (kind, raw_key, ante, phase)
+        for kind, raw_key, ante, phase, _records in locations
+    ]
+    if len(set(filter_keys)) != len(filter_keys):
+        raise organizer.PoolError(
+            "native pool summary repeats a recorded filter")
+    if len(set(location_keys)) != len(location_keys):
+        raise organizer.PoolError(
+            "native pool summary repeats a recorded location")
     singular["categories"] = categories
+    singular["filters"] = filters
+    singular["locations"] = locations
     singular["provenance_counts"] = provenance
     singular["operand_counts"] = operands
     return singular
@@ -690,11 +771,68 @@ def _report_from_native_summary(reader, summary):
         item = occurrence.as_dict()
         item["records"] = records
         categories.append(item)
-    categories.sort(key=lambda item: item["category_id"])
+    categories.sort(key=organizer._category_row_sort_key)
+    category_by_location = collections.defaultdict(list)
+    for row in categories:
+        category_by_location[row["location_id"]].append(row)
+    location_counts = {}
+    for kind, raw_key, ante, phase, records in summary.get("locations", []):
+        key = raw_key.decode("ascii")
+        descriptor = bytes((kind, len(raw_key))) + raw_key + bytes(
+            (ante, phase, 0, 0, 0))
+        occurrence = organizer.Occurrence.decode(descriptor)
+        location_counts[occurrence.location_id] = records
+        # A native location must be backed by at least one exact descriptor;
+        # otherwise the two views disagree about the verified metadata.
+        if occurrence.location_id not in category_by_location:
+            raise organizer.PoolError(
+                "native summary location has no exact category")
+    filter_covered = {}
+    filter_multiple = {}
+    filter_associations = {}
+    for kind, raw_key, covered, multiple, associations in summary.get(
+            "filters", []):
+        key = raw_key.decode("ascii")
+        descriptor = bytes((kind, len(raw_key))) + raw_key + bytes(
+            (1, 1, 0, 0, 0))
+        occurrence = organizer.Occurrence.decode(descriptor)
+        if occurrence.filter_id in filter_covered:
+            raise organizer.PoolError(
+                "native summary repeats a recorded filter")
+        filter_covered[occurrence.filter_id] = covered
+        filter_multiple[occurrence.filter_id] = multiple
+        filter_associations[occurrence.filter_id] = associations
+    expected_filters = {row["filter_id"] for row in categories}
+    expected_locations = {row["location_id"] for row in categories}
+    if (set(filter_covered) != expected_filters
+            or set(location_counts) != expected_locations):
+        raise organizer.PoolError(
+            "native filter/location summary is incomplete")
+    location_associations = collections.Counter()
+    for location_id, count in location_counts.items():
+        location_associations[
+            category_by_location[location_id][0]["filter_id"]] += count
+    for filter_id, associations in filter_associations.items():
+        if (location_associations[filter_id] != associations
+                or associations < filter_covered[filter_id]
+                    + filter_multiple[filter_id]):
+            raise organizer.PoolError(
+                "native filter/location summary counts disagree")
+    filters, recommended = organizer.build_filter_report(
+        categories, location_counts, filter_covered, filter_multiple,
+        filter_associations, reader.records, reader.is_composite)
+    if (set(filter_covered) != {row["filter_id"] for row in filters}
+            or set(location_counts) != {
+                location["location_id"] for row in filters
+                for location in row["locations"]}):
+        raise organizer.PoolError(
+            "native filter/location summary is incomplete")
     report = {
         "organizer_schema": 1,
         "source": source,
         "categories": categories,
+        "filters": filters,
+        "recommended_filter_id": recommended,
         "category_count": len(categories),
         "ambiguous_count": summary["ambiguous_count"],
         "ambiguous": [],
@@ -809,10 +947,29 @@ def _ambiguity_rule_key(candidates):
     return organizer.ambiguity_rule_key(candidates)
 
 
+def _assignment_sort_key(category, available, group_by_filter):
+    if not group_by_filter:
+        return (category,)
+    row = available.get(category, {})
+    return (
+        int(row.get("ante", organizer.MASK64)),
+        organizer.PHASE_SORT_ORDER.get(str(row.get("phase", "")), 1000),
+        str(row.get("label", "")).casefold(),
+        category,
+    )
+
+
 def build_split_plan(reader, selected_ids=None, choice_plan=None,
                      publication=None, cancel_check=None, inspection=None):
     """Build an exact, snapshot-pinned, no-write publication preflight."""
     _operation_cancelled(cancel_check)
+    request = publication if isinstance(publication, dict) else {}
+    group_by_filter = _group_by_filter(request)
+    if isinstance(choice_plan, dict) and "group_by_filter" in choice_plan \
+            and str(choice_plan.get("group_by_filter") or "") != (
+                group_by_filter or ""):
+        raise organizer.PoolError(
+            "saved decisions use a different organizing filter")
     if not reader.metadata_capable:
         raise organizer.PoolError(
             "BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
@@ -824,7 +981,8 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
             raise organizer.PoolError("selectedCategories must be a list")
         selected_filter = set(selected_ids)
         if not selected_filter:
-            raise organizer.PoolError("select at least one exact category")
+            raise organizer.PoolError(
+                "select at least one shown location or exact category")
     choices = _choice_document(choice_plan, reader)
     ambiguity_rules = _ambiguity_rules(choice_plan, reader)
     used_choices = set()
@@ -851,17 +1009,52 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
                 != reader.records):
             raise organizer.PoolError(
                 "cached inspection does not match the selected pool snapshot")
-        summary_rows = {
-            row["category_id"]: dict(row)
-            for row in inspection.get("categories", [])
-            if isinstance(row, dict) and isinstance(row.get("category_id"), str)
-        }
+        if group_by_filter:
+            filter_row = next((
+                row for row in inspection.get("filters", [])
+                if isinstance(row, dict)
+                and row.get("filter_id") == group_by_filter), None)
+            if filter_row is None:
+                raise organizer.PoolError(
+                    "the selected filter is absent from this pool snapshot")
+            summary_rows = {
+                row["location_id"]: dict(row, category_id=row["location_id"])
+                for row in filter_row.get("locations", [])
+                if isinstance(row, dict)
+                and isinstance(row.get("location_id"), str)
+            }
+        else:
+            summary_rows = {
+                row["category_id"]: dict(row)
+                for row in inspection.get("categories", [])
+                if isinstance(row, dict)
+                and isinstance(row.get("category_id"), str)
+            }
         if (selected_filter is not None and not choices
-                and _summary_can_project(inspection, selected_ids)):
+                and _summary_can_project(
+                    inspection, selected_ids, group_by_filter)):
             available.update(summary_rows)
             opaque_associations = int(
                 inspection.get("opaque_associations", 0))
-            if len(selected_filter) == 1:
+            if group_by_filter:
+                selected_total = 0
+                for category in selected_filter:
+                    row = summary_rows.get(category)
+                    if row is None:
+                        continue
+                    count = int(row.get("records", -1))
+                    if count < 0 or count > reader.records:
+                        raise organizer.PoolError(
+                            "cached inspection has an invalid location count")
+                    candidate_counts[category] = count
+                    assigned_counts[category] = count
+                    selected_total += count
+                if selected_total > reader.records:
+                    raise organizer.PoolError(
+                        "cached inspection location counts overlap unexpectedly")
+                unmatched = reader.records - selected_total
+                summary_projection = True
+            elif len(selected_filter) == 1:
                 category = next(iter(selected_filter))
                 row = summary_rows.get(category)
                 if row is not None:
@@ -942,19 +1135,27 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         candidate_set = set()
         for occurrence in record.occurrences:
             if occurrence.known:
-                category = category_ids.get(occurrence.raw)
-                if category is None:
-                    category = occurrence.category_id
-                    category_ids[occurrence.raw] = category
+                if group_by_filter:
+                    if occurrence.filter_id != group_by_filter:
+                        continue
+                    category = occurrence.location_id
+                else:
+                    category = category_ids.get(occurrence.raw)
+                    if category is None:
+                        category = occurrence.category_id
+                        category_ids[occurrence.raw] = category
                 if selected_filter is None or category in selected_filter:
                     candidate_set.add(category)
                     if category not in available:
-                        available[category] = occurrence.as_dict()
+                        available[category] = occurrence.location_dict() \
+                            if group_by_filter else occurrence.as_dict()
                 continue
             if (occurrence.provenance_id is None
                     and occurrence.operand_id is None):
                 opaque_associations += 1
-        candidates = sorted(candidate_set)
+        candidates = sorted(candidate_set, key=lambda category:
+                            _assignment_sort_key(
+                                category, available, group_by_filter))
         for category in candidates:
             candidate_counts[category] = candidate_counts.get(category, 0) + 1
         if not candidates:
@@ -1043,7 +1244,9 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
             "choice plan contains an ambiguity rule not used by this split: %s" %
             unused_rules[0])
     categories = []
-    for category in sorted(selected):
+    for category in sorted(
+            selected, key=lambda value: _assignment_sort_key(
+                value, available, group_by_filter)):
         row = dict(available[category])
         # Candidate counts can overlap. Assigned counts are projected output
         # membership after applying the current ambiguity choices.
@@ -1053,7 +1256,6 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         categories.append(row)
     source = dict(inspection["source"]) if summary_projection \
         else organizer.source_summary(reader)
-    request = publication if isinstance(publication, dict) else {}
     policy = str(request.get("unmatchedPolicy", "stop")).lower()
     if policy not in ("stop", "keep", "remainder", "omit"):
         raise organizer.PoolError("unknown unmatched-seed policy")
@@ -1097,8 +1299,10 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         output["collision_status"] = "exists" if output["exists"] else "available"
     blockers = []
     if unresolved_count:
-        blockers.append("Choose one destination for %s multi-category seed(s)." %
-                        format(unresolved_count, ","))
+        blockers.append(
+            "Choose one destination for %s seed(s) with multiple %s." % (
+                format(unresolved_count, ","),
+                "locations" if group_by_filter else "exact categories"))
     if unmatched and policy == "stop":
         blockers.append(
             "Choose whether to keep, name, or omit %s unmatched seed(s)." %
@@ -1110,6 +1314,7 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         blockers.append("Output already exists: %s" % collisions[0])
     token = _plan_token("split", {
         "snapshot": reader.snapshot_token,
+        "group_by_filter": group_by_filter or "",
         "selected_categories": sorted(selected),
         "choices": sorted(choices.items()),
         "ambiguity_rules": sorted(ambiguity_rules.items()),
@@ -1126,6 +1331,7 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         else "record_scan",
         "source": source,
         "source_snapshot_id": reader.snapshot_token,
+        "group_by_filter": group_by_filter or "",
         "selected_categories": sorted(selected),
         "categories": categories,
         "ambiguous_count": ambiguous_count,
@@ -1212,6 +1418,7 @@ def execute_split(name, request, pool_dir=None, cancel_check=None):
             "source changed from snapshot %s to %s; inspect it again" % (
                 expected or "(missing)", reader.snapshot_token))
     selected = request.get("selectedCategories")
+    group_by_filter = _group_by_filter(request)
     choice_plan = request.get("choicePlan")
     reviewed_token = str(request.get("reviewedPlanToken") or "")
     choices = _choice_document(choice_plan, reader)
@@ -1249,6 +1456,7 @@ def execute_split(name, request, pool_dir=None, cancel_check=None):
         "organizer_schema": 2,
         "source": preflight["source"],
         "source_snapshot_id": reader.snapshot_token,
+        "group_by_filter": group_by_filter or "",
         "choices": choices,
         "ambiguity_rules": ambiguity_rules,
         "selected_categories": preflight["selected_categories"],
@@ -1283,7 +1491,8 @@ def execute_split(name, request, pool_dir=None, cancel_check=None):
             reader, stage, preflight["selected_categories"], choices,
             category_rows, report, stage_report,
             remainder_id=remainder_id, cancel_check=cancel_check,
-            ambiguity_rules=ambiguity_rules)
+            ambiguity_rules=ambiguity_rules,
+            group_by_filter=group_by_filter)
         if not completed:
             report["completed"] = False
             return report
@@ -1768,13 +1977,15 @@ def run_inspect(name, pool_dir=None, ambiguity_limit=100):
 def _cached_split_plan(request, pool_dir, cancel_check):
     """Review a projectable selection from the verified inspection cache."""
     selected = request.get("selectedCategories")
+    group_by_filter = _group_by_filter(request)
     choice_plan = request.get("choicePlan")
     if _choice_plan_has_individual_decisions(choice_plan):
         return None
     path = resolve_source(request.get("source", ""), pool_dir)
     identity = _summary_identity(path)
     report = _cached_summary(path, identity)
-    if report is None or not _summary_can_project(report, selected):
+    if report is None or not _summary_can_project(
+            report, selected, group_by_filter):
         return None
     _operation_cancelled(cancel_check)
     reader = _InspectionPlanReader(path, report["source"])
@@ -1900,7 +2111,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 .notice{margin-top:10px;padding:11px 12px;border:1px solid #355273;border-radius:11px;background:#142131;color:#b9dafb;font-size:12px}.notice.warning{border-color:#6a5726;background:#29230f;color:#f2d67c}.notice.error{border-color:#74383e;background:#2b171b;color:#ffb5b5}.notice strong{display:block;margin-bottom:2px;color:inherit}
 .explain{margin-top:12px;padding:12px 13px;border:1px solid #343b52;border-radius:11px;background:#11151f;color:#bbb7c7;font-size:12px;line-height:1.55}.explain strong{display:block;margin-bottom:3px;color:#eee9f5}.explain ul{margin:7px 0 0;padding-left:19px}.explain li+li{margin-top:4px}
 .categories{display:grid;gap:7px;max-height:370px;overflow:auto;margin-top:12px;padding-right:3px}.category{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:start;padding:10px;border:1px solid #292e40;border-radius:10px;background:var(--card2)}
-.category input{width:17px;height:17px;margin-top:2px;accent-color:var(--purple)}.category b{font-size:12px}.category span{color:var(--faint);font-size:11px}.count{color:#d9d4e4!important;white-space:nowrap}
+.category input{width:17px;height:17px;margin-top:2px;accent-color:var(--purple)}.category b{font-size:12px}.category span{color:var(--faint);font-size:11px}.category details{margin-top:3px;color:var(--faint);font-size:10px}.category summary{cursor:pointer}.category code{display:block;margin-top:3px;overflow-wrap:anywhere;white-space:normal}.count{color:#d9d4e4!important;white-space:nowrap}
 .side{position:sticky;top:18px;display:grid;gap:18px}.summary dl{margin:11px 0 0}.summary div{display:grid;grid-template-columns:95px 1fr;gap:9px;padding:9px 0;border-top:1px solid #302c40;font-size:12px}.summary dt{color:var(--faint)}.summary dd{margin:0;text-align:right;overflow-wrap:anywhere}
 .actions{display:grid;gap:9px;margin-top:14px}.actions button{width:100%}.error{margin-top:10px;color:#ffadad;font-size:13px;white-space:pre-wrap}.hint{color:var(--faint);font-size:12px}
 .plan{margin-top:18px}.planbar{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{padding:4px 8px;border-radius:999px;background:#3b3017;color:#f4d46b;font-size:10px;font-weight:850;text-transform:uppercase}.pill.ok{background:#163424;color:#80e4a6}
@@ -1922,25 +2133,27 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  <div class="workstatus" id="inspectionStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="inspectionTitle">Inspecting pool…</b><span id="inspectionDetail">Reading the committed snapshot.</span></div></div>
  <div id="sourceInfo" hidden><div class="source" id="sourceMetrics"></div><div id="notices"></div></div>
 </section>
-<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose the new category pools you want</h2><p class="copy">Brainstorm recorded where and how each seed matched. Each row is one exact combination of item, Ante, blind, source, occurrence number, and flags such as Negative.</p></div></div>
- <div class="explain"><strong>What these checkboxes control</strong>Each checked category will become a separate new seed pool. If a seed fits more than one checked category, Step 3 will ask which one should receive it. Unchecking a category never removes anything from the original pool.</div>
- <div class="row"><button class="small" id="allBtn">Check all categories</button><button class="small" id="noneBtn">Clear category selection</button><button class="ghost" id="exportBtn">Download full record list (.ndjson)</button></div>
+<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose how to divide the pool</h2><p class="copy">Pick one recorded filter, then choose the Ante and blind locations that should become new pools.</p></div></div>
+ <div class="field"><label for="organizeBy">Organize seeds by</label><select id="organizeBy"></select><span class="hint">Brainstorm recommends the filter that gives the simplest complete location split. You can switch to any other recorded filter.</span></div>
+ <div class="explain" id="organizeByInfo"><strong>Choose a recorded filter</strong>The Organizer will show its Ante and blind locations in play order.</div>
+ <div class="explain"><strong>What these checkboxes control</strong>Each checked location will become a separate new seed pool. A label such as “Perkeo Ante 1 Big” includes every matching source and technical metadata variant at that location. All other recorded filter details stay attached to the output seeds.</div>
+ <div class="row"><button class="small" id="allBtn">Check all shown locations</button><button class="small" id="noneBtn">Clear location selection</button><button class="ghost" id="exportBtn">Download full record list (.ndjson)</button></div>
  <div class="explain"><strong>Optional advanced download</strong>The NDJSON download contains one JSON line for every seed, including its numeric rank and every recorded match. It is for analysis in scripts or data tools; it does not create a seed pool or change the source. For a very large pool, this download can be much larger than the compressed <code>.bspool</code> file and may take a long time.</div>
  <div class="categories" id="categories"></div>
 </section>
 <section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Review how seeds will be divided</h2><p class="copy">This step calculates the new files and asks for any decisions it needs. Nothing is written until you press the final Create button, and the original pool is always kept unchanged.</p></div></div>
- <div class="explain"><strong>How assignment works</strong>A seed that fits exactly one checked category goes to that category automatically. If it fits several checked categories, choose one destination for that group of seeds. If it fits none of the checked categories, use the option below to keep it in an extra pool or leave it out of the new files.</div>
- <div class="two"><div class="field"><label for="policy">Seeds that fit none of the checked categories</label><select id="policy"><option value="stop">Do not decide yet · block file creation</option><option value="keep">Create an extra pool named “Unmatched seeds”</option><option value="remainder">Create an extra pool with a name I choose</option><option value="omit">Leave them out of the new pools</option></select></div>
+ <div class="explain"><strong>How assignment works</strong>A seed at exactly one checked location goes there automatically. If the chosen filter appears at several checked locations in one seed, choose one destination for that group. Seeds outside the checked locations follow the option below.</div>
+ <div class="two"><div class="field"><label for="policy">Seeds outside the checked locations</label><select id="policy"><option value="stop">Do not decide yet · block file creation</option><option value="keep">Create an extra pool named “Unmatched seeds”</option><option value="remainder">Create an extra pool with a name I choose</option><option value="omit">Leave them out of the new pools</option></select></div>
  <div class="field" id="remainderField" hidden><label for="remainder">Name for the extra pool</label><input type="text" id="remainder" value="Needs review"></div></div>
- <div class="field"><label for="prefix">Beginning of each new filename</label><input type="text" id="prefix"><span class="hint">The organizer adds the category to this prefix. Existing files are never overwritten, so use a different prefix when making another split.</span></div>
+ <div class="field"><label for="prefix">Beginning of each new filename</label><input type="text" id="prefix"><span class="hint">The Organizer adds the selected location to this prefix. Existing files are never overwritten, so use a different prefix when making another split.</span></div>
  <div class="row"><button id="planBtn">Review the split (no files created)</button><button class="ghost" id="saveBtn" disabled>Save decisions (.json)</button><button class="ghost" id="loadBtn">Load saved decisions</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div>
- <div class="workstatus" id="reviewStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="reviewTitle">Reviewing seed assignments…</b><span id="reviewDetail">Calculating destinations from the selected categories.</span></div></div>
+ <div class="workstatus" id="reviewStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="reviewTitle">Reviewing seed assignments…</b><span id="reviewDetail">Calculating destinations from the checked locations.</span></div></div>
  <div class="explain"><strong>Review and saved decisions</strong>Review reads the source and shows the exact filenames and seed counts before creating anything. Saving decisions creates a small JSON file—not a seed pool—so the same choices can be loaded again for this exact unchanged source snapshot.</div>
  <div class="plan" id="plan" hidden><div class="planbar"><div><b id="planTitle">Seeds that fit more than one checked category</b><div class="hint" id="planHint"></div></div><span class="pill" id="choicePill" role="status" aria-live="polite">Choose destinations</span></div><div class="row"><button class="ghost small" id="clearRulesBtn" hidden>Clear shared decisions</button><button class="ghost small" id="clearChoicesBtn" hidden>Clear individual seed decisions</button></div><div class="amb" id="ambiguities"></div><div class="pager" id="pager"></div></div>
  <div id="splitPublication" hidden><h3 class="reviewtitle">Files that will be created</h3><div class="statehint" id="splitPublicationState"></div><div class="manifest" id="splitManifest"></div><div class="hint" id="splitReport"></div></div>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Organizer summary</h2><dl>
- <div><dt>Source pool</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot ID</dt><dd id="sumSnapshot">—</dd></div><div><dt>Recorded seeds</dt><dd id="sumRecords">—</dd></div><div><dt>Available categories</dt><dd id="sumCategories">—</dd></div><div><dt>Multiple matches</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Outside selection</dt><dd id="sumUnmatched">—</dd></div><div><dt>New files</dt><dd id="sumPublication">Not reviewed</dd></div></dl>
+ <div><dt>Source pool</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot ID</dt><dd id="sumSnapshot">—</dd></div><div><dt>Recorded seeds</dt><dd id="sumRecords">—</dd></div><div><dt>Shown locations</dt><dd id="sumCategories">—</dd></div><div><dt>Multiple locations</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Outside selection</dt><dd id="sumUnmatched">—</dd></div><div><dt>New files</dt><dd id="sumPublication">Not reviewed</dd></div></dl>
  <div class="actions"><button class="go" id="splitBtn" disabled>Create these seed pools</button><button class="cancel" id="analysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="splitCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="error" role="alert"></div><div class="result live" id="result" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="combineWorkspace" role="tabpanel" aria-labelledby="combineModeBtn" hidden><div class="stack">
@@ -1982,12 +2195,31 @@ function reviewState(kind,title,detail){const box=$("reviewStatus");box.hidden=f
 function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
 function notices(rows){renderNoticeList("notices",rows)}
 function sourceMetrics(s){return `<div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div><div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
-function categoryHTML(c){return `<label class="category"><input type="checkbox" class="cat" value="${esc(c.category_id)}" checked><span><b>${esc(c.label)}</b><br><span class="mono">${esc(c.category_id)}</span></span><span class="count">${fmt(c.records)}</span></label>`}
+function categoryHTML(c,exact=false){const id=exact?c.category_id:c.location_id;const label=c.location_label||c.label;const details=exact?`<details><summary>Technical match details</summary>${esc(c.label)}<code>${esc(c.category_id)}</code></details>`:"";return `<label class="category"><input type="checkbox" class="cat" value="${esc(id)}" checked><span><b>${esc(label)}</b>${details}</span><span class="count">${fmt(c.records)} seeds</span></label>`}
+function selectedFilter(){if(!inspected)return null;const id=$("organizeBy").value;if(!id||id==="__exact__")return null;return (inspected.filters||[]).find(row=>row.filter_id===id)||null}
+function groupByFilter(){const row=selectedFilter();return row?row.filter_id:""}
+function renderInspectLocations(){
+ if(!inspected)return;const value=$("organizeBy").value,exact=value==="__exact__",filter=selectedFilter();let rows=[];
+ if(exact)rows=inspected.categories||[];else if(filter)rows=filter.locations||[];
+ $("categories").innerHTML=rows.length?rows.map(row=>categoryHTML(row,exact)).join(""):'<div class="hint">Choose a recorded filter to see its Ante and blind locations.</div>';
+ $("planBtn").disabled=!rows.length;
+ if(filter){
+  const repeated=filter.multiple_location_records?`${fmt(filter.multiple_location_records)} seeds contain this filter at more than one shown location; Step 3 will ask where those seeds should go.`:"Every covered seed has one recorded location for this filter, so checking all locations produces a direct split.";
+  $("organizeByInfo").innerHTML=`<strong>${esc(filter.label)} · ${fmt(filter.location_count)} location${filter.location_count===1?"":"s"}</strong>${fmt(filter.covered_records)} of ${fmt(inspected.source.records)} seeds contain this filter. ${esc(repeated)}`;
+  $("sumCategories").textContent=fmt(filter.location_count);$("sumAmbiguous").textContent=fmt(filter.multiple_location_records);$("sumUnmatched").textContent=fmt(filter.unmatched_records);
+ }else if(exact){
+  $("organizeByInfo").innerHTML=`<strong>Advanced exact metadata</strong>This compatibility view separates source, occurrence number, and flags. Most users should organize by one named filter instead.`;
+  $("sumCategories").textContent=fmt(rows.length);$("sumAmbiguous").textContent=fmt(inspected.ambiguous_count);$("sumUnmatched").textContent=fmt(inspected.unmatched_count);
+ }else{
+  $("organizeByInfo").innerHTML="<strong>Choose a recorded filter</strong>The Organizer will show its Ante and blind locations in play order.";
+  $("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";
+ }
+}
 
 function resetSplitInspection(message="Choose and inspect a pool"){
  inspected=null;inspectedName="";plan=null;choices={};rules={};splitReviewedFingerprint="";
  $("sourceInfo").hidden=true;$("categoryCard").hidden=true;$("planCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("reviewStatus").hidden=true;
- $("categories").innerHTML="";$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+ $("categories").innerHTML="";$("organizeBy").innerHTML="";$("saveBtn").disabled=true;$("splitBtn").disabled=true;
  $("sumSource").textContent=message;$("sumSnapshot").textContent="—";$("sumRecords").textContent="—";$("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";$("sumPublication").textContent="Not reviewed";
 }
 function invalidateSplitReview(message="Selections changed — review the split again"){
@@ -2022,20 +2254,25 @@ async function inspect(){
  // Yield once so the busy state paints before a CPU-heavy local request.
  await new Promise(resolve=>setTimeout(resolve,40));
  try{
-  const v=await api("/api/inspect",{source});inspected=v;inspectedName=source;choices={};rules={};
+ const v=await api("/api/inspect",{source});inspected=v;inspectedName=source;choices={};rules={};
   $("sourceInfo").hidden=false;$("sourceMetrics").innerHTML=sourceMetrics(v.source);notices(v.notices);$("categoryCard").hidden=false;$("planCard").hidden=!v.source.metadata_capable;
-  $("categories").innerHTML=v.categories.length?v.categories.map(categoryHTML).join(""):'<div class="hint">This snapshot has no known exact categories.</div>';
-  $("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";$("sumSource").textContent=source;$("sumSnapshot").textContent=v.source.snapshot_id;$("sumRecords").textContent=fmt(v.source.records);$("sumCategories").textContent=fmt(v.category_count);$("sumAmbiguous").textContent=fmt(v.ambiguous_count);$("sumUnmatched").textContent=fmt(v.unmatched_count);$("sumPublication").textContent="Review needed";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;
-  const elapsed=(performance.now()-started)/1000;inspectionState("success","Inspection complete",`${fmt(v.source.records)} seeds and ${fmt(v.category_count)} exact categories loaded in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s. Results are shown below.`);
+  const filterOptions=(v.filters||[]).map(f=>`<option value="${esc(f.filter_id)}" ${f.filter_id===v.recommended_filter_id?"selected":""}>${esc(f.label)} · ${fmt(f.location_count)} location${f.location_count===1?"":"s"}${f.filter_id===v.recommended_filter_id?" · recommended":""}</option>`).join("");
+  const needsChoice=v.source.composite&&!v.recommended_filter_id&&filterOptions?'<option value="" selected>Choose a recorded filter…</option>':"";
+  const advanced=(v.categories||[]).length?'<option value="__exact__">Advanced · exact technical metadata</option>':"";
+  $("organizeBy").innerHTML=needsChoice+filterOptions+advanced||'<option value="">No recorded filters found</option>';
+  if(!needsChoice&&v.recommended_filter_id)$("organizeBy").value=v.recommended_filter_id;
+  renderInspectLocations();
+  $("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";$("sumSource").textContent=source;$("sumSnapshot").textContent=v.source.snapshot_id;$("sumRecords").textContent=fmt(v.source.records);$("sumPublication").textContent="Review needed";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+  const elapsed=(performance.now()-started)/1000;inspectionState("success","Inspection complete",`${fmt(v.source.records)} seeds across ${fmt((v.filters||[]).length)} recorded filter${(v.filters||[]).length===1?"":"s"} loaded in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s. Results are shown below.`);
   $("categoryCard").scrollIntoView({behavior:"smooth",block:"start"});$("categoryCard").focus({preventScroll:true});
  }catch(e){resetSplitInspection();inspectionState("error","Inspection failed",e.message||String(e));fail(e)
  }finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;refresh.disabled=false;picker.disabled=false;button.textContent="Inspect pool"}
 }
 function selected(){return [...document.querySelectorAll(".cat:checked")].map(x=>x.value).sort()}
 function cleanChoiceMap(value){return Object.fromEntries(Object.entries(value||{}).filter(([,destination])=>destination))}
-function choiceDoc(){return {source_snapshot_id:inspected.source.snapshot_id,choices:cleanChoiceMap(choices),ambiguity_rules:{...rules},selected_categories:selected()}}
-function splitRequest(){return {source:inspectedName,snapshot:inspected.source.snapshot_id,selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value}}
-function splitFingerprint(){if(!inspected)return "";const request=splitRequest();return JSON.stringify({source:request.source,snapshot:request.snapshot,categories:request.selectedCategories,choices:Object.entries(request.choicePlan.choices).sort(),rules:Object.entries(request.choicePlan.ambiguity_rules).sort(),policy:request.unmatchedPolicy,remainder:request.remainderName,prefix:request.prefix})}
+function choiceDoc(){return {source_snapshot_id:inspected.source.snapshot_id,group_by_filter:groupByFilter(),choices:cleanChoiceMap(choices),ambiguity_rules:{...rules},selected_categories:selected()}}
+function splitRequest(){return {source:inspectedName,snapshot:inspected.source.snapshot_id,groupByFilter:groupByFilter(),selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value}}
+function splitFingerprint(){if(!inspected)return "";const request=splitRequest();return JSON.stringify({source:request.source,snapshot:request.snapshot,groupByFilter:request.groupByFilter,categories:request.selectedCategories,choices:Object.entries(request.choicePlan.choices).sort(),rules:Object.entries(request.choicePlan.ambiguity_rules).sort(),policy:request.unmatchedPolicy,remainder:request.remainderName,prefix:request.prefix})}
 async function prepare(){
  clear();if(!inspected)return;const button=$("planBtn"),request=splitRequest(),fingerprint=splitFingerprint(),row=poolRows.find(p=>p.name===inspectedName),started=performance.now();button.disabled=true;$("analysisCancelBtn").hidden=false;button.textContent="Reviewing seed assignments…";reviewState("","Reviewing seed assignments",row?`Calculating destinations for ${fmt(row.records)} recorded seeds. The source pool is not being changed.`:"Calculating destinations from the selected categories.");
  const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("reviewDetail").textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`},1000);
@@ -2046,17 +2283,18 @@ function unresolved(){if(!plan)return 0;const newlyResolved=(plan.ambiguity_grou
 function categoryName(id){const rows=plan?plan.categories:(inspected?inspected.categories:[]);const c=rows.find(x=>x.category_id===id);return c?c.label:id}
 function renderPlan(){
  if(!plan)return;$("plan").hidden=false;const groups=plan.ambiguity_groups||[];
- const groupRows=groups.map(g=>{const id=`rule-${g.rule_key}`,description=`${id}-description`,examples=(g.samples||[]).length?`<br>Example seeds: ${esc(g.samples.join(", "))}.`:"";return `<div class="ambrow"><b>${fmt(g.unresolved_records)} seed${g.unresolved_records===1?"":"s"}</b><div><label for="${id}">Choose the one output pool that should receive these seeds</label><span class="hint" id="${description}">Every seed in this group matched all of these checked categories: ${esc(g.candidates.map(categoryName).join(" · "))}.${examples} A previously saved individual-seed decision, if present, takes priority.</span><select id="${id}" aria-describedby="${description}" data-rule="${esc(g.rule_key)}"><option value="">Choose an output pool for this group…</option>${g.candidates.map(c=>`<option value="${esc(c)}" ${rules[g.rule_key]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div></div>`}).join("");
+ const noun=plan.group_by_filter?"locations":"exact categories";
+ const groupRows=groups.map(g=>{const id=`rule-${g.rule_key}`,description=`${id}-description`,examples=(g.samples||[]).length?`<br>Example seeds: ${esc(g.samples.join(", "))}.`:"";return `<div class="ambrow"><b>${fmt(g.unresolved_records)} seed${g.unresolved_records===1?"":"s"}</b><div><label for="${id}">Choose the one output pool that should receive these seeds</label><span class="hint" id="${description}">Every seed in this group matched all of these checked ${noun}: ${esc(g.candidates.map(categoryName).join(" · "))}.${examples} A previously saved individual-seed decision, if present, takes priority.</span><select id="${id}" aria-describedby="${description}" data-rule="${esc(g.rule_key)}"><option value="">Choose an output pool for this group…</option>${g.candidates.map(c=>`<option value="${esc(c)}" ${rules[g.rule_key]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div></div>`}).join("");
  $("ambiguities").innerHTML=groupRows||'<div class="notice"><strong>No destination decisions are currently needed</strong>Each seed now has one destination. If additional category combinations remain, review the split again after applying the displayed decisions.</div>';
  document.querySelectorAll("[data-rule]").forEach(s=>s.onchange=()=>{if(s.value)rules[s.dataset.rule]=s.value;else delete rules[s.dataset.rule];invalidateSplitReview("Destinations changed — review the split again");renderStatus()});
- const overflow=plan.unrepresented_ambiguities||0;$("pager").innerHTML=overflow?`The groups above cover ${fmt(plan.unresolved_ambiguities-overflow)} seeds. ${fmt(overflow)} more seeds have different combinations of matching categories; choose the displayed destinations, then review again to see the next groups.`:plan.ambiguities_truncated?`All combinations of matching categories fit on this page. The examples are only a small sample; each choice applies to the full seed count shown for its group.`:"";
+  const overflow=plan.unrepresented_ambiguities||0;$("pager").innerHTML=overflow?`The groups above cover ${fmt(plan.unresolved_ambiguities-overflow)} seeds. ${fmt(overflow)} more seeds have different combinations of matching ${noun}; choose the displayed destinations, then review again to see the next groups.`:plan.ambiguities_truncated?`All combinations of matching ${noun} fit on this page. The examples are only a small sample; each choice applies to the full seed count shown for its group.`:"";
  $("clearRulesBtn").hidden=!Object.keys(rules).length;$("clearChoicesBtn").hidden=!Object.keys(choices).length;
  renderStatus();
 }
 function renderStatus(){
  if(!plan)return;const left=unresolved(),reviewed=splitReviewedFingerprint===splitFingerprint();
- $("planTitle").textContent=`${fmt(plan.ambiguous_count)} seed${plan.ambiguous_count===1?"":"s"} fit more than one checked category`;
- const overrideText=Object.keys(choices).length?` ${fmt(Object.keys(choices).length)} saved individual-seed decision(s) are active.`:"";const ruleText=Object.keys(rules).length?` ${fmt(Object.keys(rules).length)} shared destination decision(s) are active.`:"";$("planHint").textContent=(plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) fit none of the checked categories and will follow the “Seeds that fit none” option above. The original source still keeps every seed.`:"Every source seed fits at least one checked category.")+overrideText+ruleText;
+ $("planTitle").textContent=`${fmt(plan.ambiguous_count)} seed${plan.ambiguous_count===1?"":"s"} fit more than one checked ${plan.group_by_filter?"location":"category"}`;
+ const noun=plan.group_by_filter?"location":"exact category",plural=plan.group_by_filter?"locations":"exact categories";const overrideText=Object.keys(choices).length?` ${fmt(Object.keys(choices).length)} saved individual-seed decision(s) are active.`:"";const ruleText=Object.keys(rules).length?` ${fmt(Object.keys(rules).length)} shared destination decision(s) are active.`:"";$("planHint").textContent=(plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) fit none of the checked ${plural} and will follow the unmatched-seed option above. The original source still keeps every seed.`:`Every source seed fits at least one checked ${noun}.`)+overrideText+ruleText;
  $("choicePill").textContent=left?`${fmt(left)} destinations needed`:(reviewed?"Split reviewed":"Review changes");$("choicePill").className="pill"+(!left&&reviewed?" ok":"");
  $("sumAmbiguous").textContent=fmt(plan.ambiguous_count);$("sumUnmatched").textContent=fmt(plan.unmatched_count);
  const ready=reviewed&&plan.publication&&plan.publication.ready;$("splitBtn").disabled=splitRunning||!ready;$("sumPublication").textContent=ready?`${fmt(plan.publication.output_count)} files ready`:reviewed?(plan.publication.blockers[0]||"Blocked"):"Review needed";
@@ -2064,14 +2302,14 @@ function renderStatus(){
 function renderSplitPublication(){
  if(!plan||splitReviewedFingerprint!==splitFingerprint())return;const publication=plan.publication;$("splitPublication").hidden=false;
  const blockers=publication.blockers||[];$("splitPublicationState").innerHTML=publication.ready?`<strong>Ready to create ${fmt(publication.output_count)} new pool file(s).</strong> <span class="source-retained">The original source pool will remain unchanged.</span> Existing files will not be overwritten. If creation reports an error or you cancel it, unfinished new files are removed.`:`<strong>More decisions are needed before files can be created.</strong> ${blockers.map(esc).join(" ")}`;
- $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for seeds outside the selection":"one checked category"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
+ $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for seeds outside the selection":plan.group_by_filter?"one checked location":"one exact metadata category"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
  $("splitReport").textContent=`A small audit report named ${publication.report_name} will also record the choices and source snapshot. The new pools will have ${publication.coverage_complete?"complete":"provisional"} search coverage. ${publication.omitted_records?fmt(publication.omitted_records)+" seed(s) will be left out of the new files but remain in the source pool.":"No seeds will be deliberately left out."}`;
  renderStatus();
 }
 function download(name,type,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},0)}
 function savePlan(){if(!plan)return;download(`${$("prefix").value||"seed-pool"}-choices.json`,"application/json",JSON.stringify(choiceDoc(),null,2)+"\n")}
 function clearDecisionSet(kind){if(kind==="rules")rules={};else choices={};plan=null;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview(kind==="rules"?"Shared destinations cleared — review the split again":"Individual seed decisions cleared — review the split again")}
-function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("Those saved decisions belong to a different version of this source pool.");choices={...(v.choices||{})};rules={...(v.ambiguity_rules||{})};invalidateSplitReview("Saved decisions loaded — reviewing the split");prepare()}catch(e){fail(e)}};r.readAsText(file)}
+function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("Those saved decisions belong to a different version of this source pool.");if(String(v.group_by_filter||"")!==groupByFilter())throw Error("Those saved decisions use a different organizing filter.");choices={...(v.choices||{})};rules={...(v.ambiguity_rules||{})};invalidateSplitReview("Saved decisions loaded — reviewing the split");prepare()}catch(e){fail(e)}};r.readAsText(file)}
 async function split(){
  if(!plan||splitReviewedFingerprint!==splitFingerprint()||!plan.publication.ready)return;clear();splitRunning=true;$("splitBtn").disabled=true;$("splitBtn").textContent="Creating new seed pools…";$("splitCancelBtn").hidden=false;
  try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=splitFingerprint();renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");plan=null;choices={};rules={};splitReviewedFingerprint="";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — review again to make another split";await loadPools(true)}catch(e){fail(e)}finally{splitRunning=false;$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
@@ -2109,6 +2347,7 @@ async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=tr
 function showMode(mode){const combine=mode==="combine";$("splitWorkspace").hidden=combine;$("combineWorkspace").hidden=!combine;$("splitModeBtn").classList.toggle("active",!combine);$("combineModeBtn").classList.toggle("active",combine);$("splitModeBtn").setAttribute("aria-selected",String(!combine));$("combineModeBtn").setAttribute("aria-selected",String(combine))}
 
 $("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
+$("organizeBy").onchange=()=>{plan=null;choices={};rules={};renderInspectLocations();$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Organizing filter changed — review the split again")};
 $("allBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=true);invalidateSplitSelection()};$("noneBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=false);invalidateSplitSelection()};
 $("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("clearRulesBtn").onclick=()=>clearDecisionSet("rules");$("clearChoicesBtn").onclick=()=>clearDecisionSet("choices");$("splitBtn").onclick=split;$("analysisCancelBtn").onclick=cancelAnalysis;$("splitCancelBtn").onclick=cancelSplit;
 $("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";invalidateSplitReview()};$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>invalidateSplitReview();

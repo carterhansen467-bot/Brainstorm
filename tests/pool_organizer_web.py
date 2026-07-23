@@ -81,7 +81,7 @@ class OrganizerWebRegression(unittest.TestCase):
 
     def test_native_summary_accepts_optional_record_metadata_digest(self):
         document = "\n".join([
-            "BRAINSTORM_POOL_SUMMARY 1",
+            "BRAINSTORM_POOL_SUMMARY 2",
             "records 2",
             "membership_digest 1111111111111111",
             "metadata_digest 2222222222222222",
@@ -271,6 +271,176 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertEqual(derived.header.one("parent_snapshot_id"),
                          self.identity["snapshot"])
         self.assertEqual(derived.family_id, int(self.identity["family"], 16))
+
+    def test_selected_filter_split_collapses_variants_and_preserves_metadata(self):
+        perkeo_a1_shop = fixture.descriptor(
+            2, "j_perkeo", 1, 2, 1, 0, 0)
+        perkeo_a1_charm = fixture.descriptor(
+            2, "j_perkeo", 1, 2, 2, 1, 1)
+        perkeo_a2 = fixture.descriptor(
+            2, "j_perkeo", 2, 1, 1, 0, 0)
+        negative_a3 = fixture.descriptor(
+            1, "tag_negative", 3, 1, 0, 0, 0)
+        negative_a4 = fixture.descriptor(
+            1, "tag_negative", 4, 2, 0, 0, 0)
+        voucher = fixture.descriptor(
+            3, "v_overstock_norm", 2, 0, 1, 1, 4)
+        opaque = bytes((9, 2, 0xAA, 0xBB))
+        name = "filter-location-roundtrip.bspool"
+        path = os.path.join(self.temp.name, name)
+        identity = fixture.write_custom_bsp3(
+            path, [20, 21, 22, 23], [
+                [perkeo_a1_shop, perkeo_a1_charm, negative_a3, voucher],
+                [perkeo_a1_shop, negative_a4],
+                [perkeo_a2, negative_a3, opaque],
+                [perkeo_a2, negative_a4, voucher],
+            ],
+            "13579bdf2468ace0", [
+                "tag_route collect",
+                "tag tag_negative 3 small 4 big 1",
+                "legendary j_perkeo 1 big 2 small 1 shop",
+                "voucher v_overstock_norm 2 2",
+            ])
+        reader = organizer.BSPoolReader(path)
+        inspection = organizer.analyze(reader)
+        filters = {
+            row["filter_id"]: row for row in inspection["filters"]
+        }
+        perkeo_filter = "legendary:j_perkeo"
+        tag_filter = "tag:tag_negative"
+        perkeo_locations = [
+            row["location_id"] for row in filters[perkeo_filter]["locations"]
+        ]
+        tag_locations = [
+            row["location_id"] for row in filters[tag_filter]["locations"]
+        ]
+        self.assertEqual(perkeo_locations, [
+            "legendary:j_perkeo:A1:big",
+            "legendary:j_perkeo:A2:small",
+        ])
+        self.assertEqual(
+            filters[perkeo_filter]["multiple_location_records"], 0)
+
+        choice_plan = {
+            "source_snapshot_id": identity["snapshot"],
+            "group_by_filter": perkeo_filter,
+            "choices": {},
+            "ambiguity_rules": {},
+        }
+        request = {
+            "snapshot": identity["snapshot"],
+            "groupByFilter": perkeo_filter,
+            "selectedCategories": perkeo_locations,
+            "choicePlan": choice_plan,
+            "unmatchedPolicy": "stop",
+            "prefix": "organized-by-perkeo",
+        }
+        plan = web.build_split_plan(
+            reader, selected_ids=perkeo_locations,
+            choice_plan=choice_plan, publication=request,
+            inspection=inspection)
+        self.assertEqual(plan["group_by_filter"], perkeo_filter)
+        self.assertEqual(plan["selected_categories"], perkeo_locations)
+        self.assertEqual(plan["planning_mode"], "summary_projection")
+        self.assertEqual(plan["unresolved_ambiguities"], 0)
+        self.assertTrue(plan["publication"]["ready"])
+        self.assertTrue(plan["publication"]["plan_token"])
+
+        # The chosen grouping filter is part of saved decisions and cannot be
+        # silently reused for a different view of the same snapshot.
+        mismatched_decisions = dict(choice_plan, group_by_filter=tag_filter)
+        with self.assertRaisesRegex(
+                organizer.PoolError, "different organizing filter"):
+            web.build_split_plan(
+                reader, selected_ids=perkeo_locations,
+                choice_plan=mismatched_decisions, publication=request)
+
+        tag_choice_plan = dict(choice_plan, group_by_filter=tag_filter)
+        tag_request = dict(
+            request, groupByFilter=tag_filter,
+            selectedCategories=tag_locations, choicePlan=tag_choice_plan,
+            prefix="organized-by-tag")
+        tag_plan = web.build_split_plan(
+            reader, selected_ids=tag_locations,
+            choice_plan=tag_choice_plan, publication=tag_request,
+            inspection=inspection)
+        self.assertEqual(tag_plan["group_by_filter"], tag_filter)
+        self.assertNotEqual(
+            tag_plan["publication"]["plan_token"],
+            plan["publication"]["plan_token"])
+
+        original_metadata = {
+            record.rank: {item.raw for item in record.occurrences}
+            for record in organizer.BSPoolReader(path).iter_records()
+        }
+        request["reviewedPlanToken"] = plan["publication"]["plan_token"]
+        result = web.execute_split(name, request, self.temp.name)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["group_by_filter"], perkeo_filter)
+        self.assertEqual(len(result["outputs"]), 2)
+        self.assertEqual(
+            {row["category_id"] for row in result["outputs"]},
+            set(perkeo_locations))
+        roundtripped = {}
+        for output in result["outputs"]:
+            derived = organizer.BSPoolReader(output["path"])
+            for record in derived.iter_records():
+                self.assertNotIn(record.rank, roundtripped)
+                roundtripped[record.rank] = {
+                    item.raw for item in record.occurrences
+                }
+        self.assertEqual(roundtripped, original_metadata)
+
+    def test_selected_filter_reports_only_true_multi_location_ambiguity(self):
+        perkeo_a1_shop = fixture.descriptor(
+            2, "j_perkeo", 1, 2, 1, 0, 0)
+        perkeo_a1_charm = fixture.descriptor(
+            2, "j_perkeo", 1, 2, 2, 1, 1)
+        perkeo_a2 = fixture.descriptor(
+            2, "j_perkeo", 2, 1, 1, 0, 0)
+        path = os.path.join(self.temp.name, "multi-location.bspool")
+        identity = fixture.write_custom_bsp3(
+            path, [30, 31], [
+                [perkeo_a1_shop, perkeo_a1_charm, fixture.TAG],
+                [perkeo_a1_shop, perkeo_a2, fixture.TAG],
+            ],
+            "02468ace13579bdf", [
+                "tag_route collect",
+                "tag tag_negative 3 small 3 small 1",
+                "legendary j_perkeo 1 big 2 small 1 shop",
+            ])
+        reader = organizer.BSPoolReader(path)
+        inspection = organizer.analyze(reader)
+        perkeo_filter = next(
+            row for row in inspection["filters"]
+            if row["filter_id"] == "legendary:j_perkeo")
+        locations = [
+            row["location_id"] for row in perkeo_filter["locations"]
+        ]
+        self.assertEqual(perkeo_filter["multiple_location_records"], 1)
+        self.assertEqual(perkeo_filter["location_associations"], 3)
+
+        choice_plan = {
+            "source_snapshot_id": identity["snapshot"],
+            "group_by_filter": perkeo_filter["filter_id"],
+            "choices": {},
+            "ambiguity_rules": {},
+        }
+        plan = web.build_split_plan(
+            reader, selected_ids=locations, choice_plan=choice_plan,
+            publication={
+                "groupByFilter": perkeo_filter["filter_id"],
+                "unmatchedPolicy": "omit",
+                "prefix": "true-multi-location",
+            })
+        self.assertEqual(plan["ambiguous_count"], 1)
+        self.assertEqual(plan["unresolved_ambiguities"], 1)
+        self.assertEqual(len(plan["ambiguous"]), 1)
+        self.assertEqual(plan["ambiguous"][0]["rank"], 31)
+        self.assertEqual(plan["ambiguous"][0]["candidates"], locations)
+        self.assertEqual(len(plan["ambiguity_groups"]), 1)
+        self.assertIn(
+            "multiple locations", plan["publication"]["blockers"][0])
 
     def test_large_inspection_has_visible_busy_feedback(self):
         page = web.PAGE
@@ -487,7 +657,8 @@ class OrganizerWebRegression(unittest.TestCase):
             for key in (
                     "category_count", "ambiguous_count", "unmatched_count",
                     "opaque_associations", "provenance_counts",
-                    "operand_counts"):
+                    "operand_counts", "filters",
+                    "recommended_filter_id"):
                 self.assertEqual(first[key], expected[key])
             self.assertEqual([
                 (row["category_id"], row["records"])
@@ -511,6 +682,19 @@ class OrganizerWebRegression(unittest.TestCase):
         finally:
             web._run_native_summary = original_runner
             web.NATIVE_SUMMARY_MIN_BYTES = original_minimum
+
+    def test_native_summary_rejects_missing_friendly_group_rows(self):
+        if not web._native_pool_binary():
+            self.skipTest("native pool helper is not built")
+        summary = web._run_native_summary(self.source)
+        self.assertTrue(summary["filters"])
+        self.assertTrue(summary["locations"])
+        reader = organizer.BSPoolReader(
+            self.source, verify_payloads=False)
+        missing_filter = dict(summary, filters=summary["filters"][:-1])
+        with self.assertRaisesRegex(
+                organizer.PoolError, "filter/location summary is incomplete"):
+            web._report_from_native_summary(reader, missing_filter)
 
     def test_large_universal_category_review_reuses_cached_exact_groups(self):
         if not web._native_pool_binary():
@@ -1424,7 +1608,10 @@ class OrganizerWebRegression(unittest.TestCase):
 
     def test_page_invalidates_stale_plans_and_exposes_preflight_cancellation(self):
         page = web.PAGE
-        self.assertIn("Choose the new category pools you want", page)
+        self.assertIn("Choose how to divide the pool", page)
+        self.assertIn("Organize seeds by", page)
+        self.assertIn("Perkeo Ante 1 Big", page)
+        self.assertIn("Advanced · exact technical metadata", page)
         self.assertIn("one JSON line for every seed", page)
         self.assertIn("it does not create a seed pool or change the source", page)
         self.assertIn("How assignment works", page)

@@ -128,6 +128,44 @@ KIND_NAMES = {1: "tag", 2: "legendary", 3: "voucher"}
 PHASE_NAMES = {0: "boss", 1: "small", 2: "big"}
 SOURCE_NAMES = {0: "none", 1: "shop", 2: "charm", 3: "ethereal"}
 FLAG_NAMES = ((1, "negative"), (2, "charm-required"), (4, "purchased"))
+PHASE_SORT_ORDER = {"small": 0, "big": 1, "boss": 2}
+SOURCE_SORT_ORDER = {"none": 0, "shop": 1, "charm": 2, "ethereal": 3}
+
+# Inspect is intentionally catalog-key tolerant: known vanilla keys receive
+# their familiar names, while modded keys still get a readable deterministic
+# fallback instead of disappearing from the Organizer.
+TAG_DISPLAY_NAMES = {
+    "tag_uncommon": "Uncommon Tag", "tag_rare": "Rare Tag",
+    "tag_negative": "Negative Tag", "tag_foil": "Foil Tag",
+    "tag_holo": "Holographic Tag", "tag_polychrome": "Polychrome Tag",
+    "tag_investment": "Investment Tag", "tag_voucher": "Voucher Tag",
+    "tag_boss": "Boss Tag", "tag_standard": "Standard Tag",
+    "tag_charm": "Charm Tag", "tag_meteor": "Meteor Tag",
+    "tag_buffoon": "Buffoon Tag", "tag_handy": "Handy Tag",
+    "tag_garbage": "Garbage Tag", "tag_ethereal": "Ethereal Tag",
+    "tag_coupon": "Coupon Tag", "tag_double": "Double Tag",
+    "tag_juggle": "Juggle Tag", "tag_d_six": "D6 Tag",
+    "tag_top_up": "Top-up Tag", "tag_skip": "Skip Tag",
+    "tag_orbital": "Orbital Tag", "tag_economy": "Economy Tag",
+}
+VOUCHER_DISPLAY_NAMES = {
+    "v_overstock_norm": "Overstock", "v_overstock_plus": "Overstock Plus",
+    "v_clearance_sale": "Clearance Sale", "v_liquidation": "Liquidation",
+    "v_hone": "Hone", "v_glow_up": "Glow Up",
+    "v_reroll_surplus": "Reroll Surplus", "v_reroll_glut": "Reroll Glut",
+    "v_crystal_ball": "Crystal Ball", "v_omen_globe": "Omen Globe",
+    "v_telescope": "Telescope", "v_observatory": "Observatory",
+    "v_grabber": "Grabber", "v_nacho_tong": "Nacho Tong",
+    "v_wasteful": "Wasteful", "v_recyclomancy": "Recyclomancy",
+    "v_tarot_merchant": "Tarot Merchant", "v_tarot_tycoon": "Tarot Tycoon",
+    "v_planet_merchant": "Planet Merchant", "v_planet_tycoon": "Planet Tycoon",
+    "v_seed_money": "Seed Money", "v_money_tree": "Money Tree",
+    "v_blank": "Blank", "v_antimatter": "Antimatter",
+    "v_magic_trick": "Magic Trick", "v_illusion": "Illusion",
+    "v_hieroglyph": "Hieroglyph", "v_petroglyph": "Petroglyph",
+    "v_directors_cut": "Director's Cut", "v_retcon": "Retcon",
+    "v_paint_brush": "Paint Brush", "v_palette": "Palette",
+}
 
 # BSP3 deliberately permits unknown length-delimited metadata descriptors so
 # newer organizer features can coexist with older native readers.  Composite
@@ -359,6 +397,23 @@ def _source_text(source: int) -> str:
     return SOURCE_NAMES.get(source, "source-%d" % source)
 
 
+def _fallback_item_name(key: str, prefix: str) -> str:
+    value = key[len(prefix):] if key.startswith(prefix) else key
+    return value.replace("_", " ").strip().title() or key
+
+
+def occurrence_item_name(kind: int, key: str) -> str:
+    if kind == 1:
+        return TAG_DISPLAY_NAMES.get(
+            key, "%s Tag" % _fallback_item_name(key, "tag_"))
+    if kind == 2:
+        return _fallback_item_name(key, "j_")
+    if kind == 3:
+        return VOUCHER_DISPLAY_NAMES.get(
+            key, _fallback_item_name(key, "v_"))
+    return _fallback_item_name(key, "")
+
+
 @dataclass(frozen=True)
 class Occurrence:
     raw: bytes
@@ -421,6 +476,48 @@ class Occurrence:
             _flag_text(self.flags),
         )
 
+    @functools.cached_property
+    def filter_id(self) -> Optional[str]:
+        if not self.known:
+            return None
+        return "%s:%s" % (
+            KIND_NAMES[self.kind], quote(self.key, safe="_.-"))
+
+    @functools.cached_property
+    def location_id(self) -> Optional[str]:
+        if not self.known:
+            return None
+        return "%s:A%d:%s" % (
+            self.filter_id, self.ante, _phase_text(self.phase))
+
+    @functools.cached_property
+    def item_name(self) -> str:
+        return occurrence_item_name(self.kind, self.key) \
+            if self.known else "Unknown"
+
+    @functools.cached_property
+    def location_label(self) -> str:
+        if not self.known:
+            return "Unknown location"
+        return "%s Ante %d %s" % (
+            self.item_name, self.ante, _phase_text(self.phase).title())
+
+    @property
+    def location_sort_key(self) -> Tuple[object, ...]:
+        phase = _phase_text(self.phase) if self.known else ""
+        source = _source_text(self.source) if self.known else ""
+        return (
+            self.ante if self.known else MASK64,
+            PHASE_SORT_ORDER.get(phase, 1000 + (self.phase or 0)),
+            self.item_name.casefold(),
+            SOURCE_SORT_ORDER.get(source, 1000 + (self.source or 0)),
+            self.ordinal or 0,
+            self.flags or 0,
+            self.kind or 0,
+            self.key or "",
+            self.category_id or self.raw.hex(),
+        )
+
     @property
     def label(self) -> str:
         if not self.known:
@@ -458,6 +555,19 @@ class Occurrence:
             "known": True,
             "category_id": self.category_id,
             "label": self.label,
+            "filter_id": self.filter_id,
+            "filter_label": self.item_name,
+            "location_id": self.location_id,
+            "location_label": self.location_label,
+            "location_sort": [
+                self.ante,
+                PHASE_SORT_ORDER.get(
+                    _phase_text(self.phase), 1000 + self.phase),
+                SOURCE_SORT_ORDER.get(
+                    _source_text(self.source), 1000 + self.source),
+                self.ordinal,
+                self.flags,
+            ],
             "kind": KIND_NAMES[self.kind],
             "key": self.key,
             "ante": self.ante,
@@ -465,6 +575,23 @@ class Occurrence:
             "source": _source_text(self.source),
             "ordinal": self.ordinal,
             "flags": _flag_text(self.flags),
+        }
+
+    def location_dict(self) -> Dict[str, object]:
+        if not self.known:
+            return {"known": False, "raw_hex": self.raw.hex()}
+        return {
+            "known": True,
+            "category_id": self.location_id,
+            "location_id": self.location_id,
+            "label": self.location_label,
+            "location_label": self.location_label,
+            "filter_id": self.filter_id,
+            "filter_label": self.item_name,
+            "kind": KIND_NAMES[self.kind],
+            "key": self.key,
+            "ante": self.ante,
+            "phase": _phase_text(self.phase),
         }
 
 
@@ -2145,6 +2272,126 @@ def record_categories(record: Record, selected: Optional[set] = None) -> List[st
     return sorted(categories)
 
 
+def record_locations(record: Record, filter_id: str,
+                     selected: Optional[set] = None) -> List[str]:
+    locations = {}
+    for item in record.occurrences:
+        if (not item.known or item.filter_id != filter_id
+                or (selected is not None
+                    and item.location_id not in selected)):
+            continue
+        prior = locations.get(item.location_id)
+        if prior is None or item.location_sort_key < prior:
+            locations[item.location_id] = item.location_sort_key
+    return sorted(locations, key=lambda location: (
+        locations[location], location))
+
+
+def _category_row_sort_key(item: Dict[str, object]) -> Tuple[object, ...]:
+    phase = str(item.get("phase", ""))
+    source = str(item.get("source", ""))
+    return (
+        str(item.get("filter_label", "")).casefold(),
+        int(item.get("ante", MASK64)),
+        PHASE_SORT_ORDER.get(phase, 1000),
+        SOURCE_SORT_ORDER.get(source, 1000),
+        int(item.get("ordinal", 0)),
+        str(item.get("flags", "")),
+        str(item.get("kind", "")),
+        str(item.get("key", "")),
+        str(item.get("category_id", "")),
+    )
+
+
+def build_filter_report(
+        category_rows: Sequence[Dict[str, object]],
+        location_counts: Dict[str, int],
+        filter_covered: Dict[str, int],
+        filter_multiple: Dict[str, int],
+        filter_associations: Dict[str, int],
+        total_records: int,
+        composite: bool = False
+        ) -> Tuple[List[Dict[str, object]], str]:
+    """Build the small user-facing filter/location index for Inspect.
+
+    Counts are per-record unions, not sums of exact descriptor counts. A seed
+    may carry several source/ordinal/flag variants for one visible location,
+    so callers must compute these counters while traversing records (or with
+    the native summary's equivalent transpose).
+    """
+    location_details = {}
+    location_categories = collections.defaultdict(set)
+    for row in category_rows:
+        filter_id = row.get("filter_id")
+        location_id = row.get("location_id")
+        category_id = row.get("category_id")
+        if not all(isinstance(value, str) and value
+                   for value in (filter_id, location_id, category_id)):
+            continue
+        location_categories[location_id].add(category_id)
+        if location_id not in location_details:
+            location_details[location_id] = {
+                "location_id": location_id,
+                "label": row.get("location_label") or row.get("label"),
+                "filter_id": filter_id,
+                "filter_label": row.get("filter_label") or filter_id,
+                "kind": row.get("kind"),
+                "key": row.get("key"),
+                "ante": row.get("ante"),
+                "phase": row.get("phase"),
+            }
+    filters = {}
+    for location_id, count in location_counts.items():
+        details = location_details.get(location_id)
+        if details is None:
+            continue
+        filter_id = details["filter_id"]
+        location = dict(details)
+        location["records"] = int(count)
+        location["exact_category_ids"] = sorted(
+            location_categories.get(location_id, ()))
+        filters.setdefault(filter_id, {
+            "filter_id": filter_id,
+            "label": details["filter_label"],
+            "kind": details["kind"],
+            "key": details["key"],
+            "locations": [],
+        })["locations"].append(location)
+    rows = []
+    for filter_id, item in filters.items():
+        item["locations"].sort(key=lambda location: (
+            int(location.get("ante", MASK64)),
+            PHASE_SORT_ORDER.get(str(location.get("phase", "")), 1000),
+            str(location.get("location_id", "")),
+        ))
+        covered = int(filter_covered.get(filter_id, 0))
+        associations = int(filter_associations.get(filter_id, 0))
+        item.update({
+            "covered_records": covered,
+            "unmatched_records": max(0, int(total_records) - covered),
+            "multiple_location_records": int(
+                filter_multiple.get(filter_id, 0)),
+            "location_associations": associations,
+            "extra_location_associations": max(0, associations - covered),
+            "location_count": len(item["locations"]),
+        })
+        rows.append(item)
+    rows.sort(key=lambda item: (
+        item["label"].casefold(), item["filter_id"]))
+    recommended = ""
+    if rows and not composite:
+        recommended = min(rows, key=lambda item: (
+            item["covered_records"] != total_records,
+            item["unmatched_records"],
+            item["multiple_location_records"],
+            item["extra_location_associations"],
+            item["location_count"],
+            item["label"].casefold(),
+            item["filter_id"],
+        ))["filter_id"]
+    return rows, recommended
+
+
 def source_summary(reader: BSPoolReader) -> Dict[str, object]:
     return {
         "path": reader.path,
@@ -2205,6 +2452,10 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
     operand_counts = collections.Counter()
     records_without_provenance = 0
     records_without_operands = 0
+    location_counts = collections.Counter()
+    filter_covered = collections.Counter()
+    filter_multiple = collections.Counter()
+    filter_associations = collections.Counter()
     # Descriptor text is block-local but normally repeats for hundreds of
     # thousands (or millions) of records.  Resolve each raw descriptor once.
     # Besides avoiding repeated formatting, do not use
@@ -2215,6 +2466,7 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
     processed = 0
     for record in reader.iter_records(cancel_check=cancel_check):
         categories_set = set()
+        filter_locations = collections.defaultdict(set)
         record_provenance = set()
         record_operands = set()
         for item in record.occurrences:
@@ -2227,6 +2479,7 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
                     categories_set.add(category)
                     if category not in details:
                         details[category] = item.as_dict()
+                filter_locations[item.filter_id].add(item.location_id)
                 continue
             provenance_id = item.provenance_id
             if provenance_id is not None:
@@ -2248,6 +2501,13 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
             records_without_operands += 1
         for category in categories:
             counts[category] += 1
+        for filter_id, locations in filter_locations.items():
+            filter_covered[filter_id] += 1
+            filter_associations[filter_id] += len(locations)
+            if len(locations) > 1:
+                filter_multiple[filter_id] += 1
+            for location in locations:
+                location_counts[location] += 1
         if not categories:
             unmatched += 1
         elif len(categories) > 1:
@@ -2263,14 +2523,20 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
             _check_cancel(cancel_check)
     _check_cancel(cancel_check)
     categories = []
-    for category in sorted(counts):
+    for category in counts:
         item = dict(details[category])
         item["records"] = counts[category]
         categories.append(item)
+    categories.sort(key=_category_row_sort_key)
+    filters, recommended = build_filter_report(
+        categories, location_counts, filter_covered, filter_multiple,
+        filter_associations, reader.records, reader.is_composite)
     return {
         "organizer_schema": 1,
         "source": source_summary(reader),
         "categories": categories,
+        "filters": filters,
+        "recommended_filter_id": recommended,
         "category_count": len(categories),
         "ambiguous_count": ambiguous_count,
         "ambiguous": ambiguous,
@@ -3374,7 +3640,8 @@ def write_prepared_split(
         report: Dict[str, object], report_path: str,
         remainder_id: Optional[str] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
-        ambiguity_rules: Optional[Dict[str, str]] = None
+        ambiguity_rules: Optional[Dict[str, str]] = None,
+        group_by_filter: Optional[str] = None
         ) -> Tuple[Dict[str, object], bool]:
     """Publish one already validated, snapshot-pinned split plan.
 
@@ -3408,6 +3675,19 @@ def write_prepared_split(
     if len(set(selected_values)) != len(selected_values):
         raise PoolError("prepared split repeats a selected category")
     selected = set(selected_values)
+    if group_by_filter is not None:
+        if (not isinstance(group_by_filter, str) or not group_by_filter
+                or len(group_by_filter) > 4096
+                or any(ch.isspace() or ord(ch) < 33 or ord(ch) > 126
+                       for ch in group_by_filter)
+                or "/" in group_by_filter or "\\" in group_by_filter
+                or not group_by_filter.startswith(tuple(
+                    "%s:" % name for name in KIND_NAMES.values()))):
+            raise PoolError("prepared split has an invalid organizing filter")
+        prefix = group_by_filter + ":A"
+        if any(not category.startswith(prefix) for category in selected):
+            raise PoolError(
+                "prepared split location does not belong to its organizing filter")
 
     if remainder_id is not None:
         remainder_id = checked_category_id(remainder_id, remainder=True)
@@ -3501,6 +3781,10 @@ def write_prepared_split(
         raise PoolError("prepared split report must be an object")
     if str(report.get("source_snapshot_id", "")).lower() != reader.snapshot_token:
         raise PoolError("prepared split report is for a different source snapshot")
+    if str(report.get("group_by_filter", "") or "") != (
+            group_by_filter or ""):
+        raise PoolError(
+            "prepared split report organizing filter does not match its plan")
     declared_selected = report.get("selected_categories")
     if (not isinstance(declared_selected, list)
             or len(declared_selected) != len(selected_values)
@@ -3515,6 +3799,7 @@ def write_prepared_split(
             "prepared split report ambiguity rules do not match its plan")
     report["source"] = source_summary(reader)
     report["source_snapshot_id"] = reader.snapshot_token
+    report["group_by_filter"] = group_by_filter or ""
     report["selected_categories"] = sorted(selected)
     report["categories"] = clean_rows
     report["outputs"] = []
@@ -3540,7 +3825,8 @@ def write_prepared_split(
             reader, selected, checked_choices, remainder_id, destinations,
             labels, report, report_path, cancel_check,
             expected_counts=expected_counts,
-            ambiguity_rules=checked_ambiguity_rules)
+            ambiguity_rules=checked_ambiguity_rules,
+            group_by_filter=group_by_filter)
 
 
 def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
@@ -3549,7 +3835,8 @@ def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
                          report: Dict[str, object], report_path: str,
                          cancel_check: Optional[Callable[[], bool]] = None,
                          expected_counts: Optional[Dict[str, int]] = None,
-                         ambiguity_rules: Optional[Dict[str, str]] = None):
+                         ambiguity_rules: Optional[Dict[str, str]] = None,
+                         group_by_filter: Optional[str] = None):
     """Write and publish split outputs while the caller holds every lock."""
     _check_cancel(cancel_check)
     writers = {}  # type: Dict[str, BSP4OutputWriter]
@@ -3559,7 +3846,9 @@ def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
     try:
         processed = 0
         for record in reader.iter_records(cancel_check=cancel_check):
-            candidates = record_categories(record, selected)
+            candidates = record_locations(
+                record, group_by_filter, selected) if group_by_filter \
+                else record_categories(record, selected)
             if len(candidates) > 1:
                 category, choice_key = choice_for_record(
                     choices, reader, record)

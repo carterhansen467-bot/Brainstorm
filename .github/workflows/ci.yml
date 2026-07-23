@@ -85,6 +85,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
+          python3 tests/pool_builder_refilter_sources.py
           python3 tests/pool_builder_delete.py
           python3 tests/pool_attachment.py
           python3 tests/pool_attachment_marker_matrix.py
@@ -179,6 +180,7 @@ jobs:
           SNAPSHOT="${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" LUAJIT_BIN="$LUAJIT" bash tests/omen_charm_regression.sh
           sh tests/pool_organizer.sh
           sh tests/pool_organizer_web.sh
+          python tests/pool_builder_refilter_sources.py
           python tests/pool_builder_delete.py
           python tests/pool_attachment.py
           python tests/pool_attachment_marker_matrix.py
@@ -236,4 +238,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             out/brainstorm-windows-full.zip \
             --title "Brainstorm Windows $GITHUB_REF_NAME" \
-            --notes "Brainstorm 1.2.0-alpha for Windows x64. This release adds safe automatic accelerator/authoritative pool attachment, vectorized first gates, direct Charm-source evaluation, deterministic parallel publication, adaptive BSP4 pools, lower-memory pipelined Builder output, faster Joker-heavy and multi-Ante searches, bounded in-game telemetry, and the redesigned Organizer split/combine workflow. Extract the full ZIP and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. Existing BSP3 pools remain readable, but BSP4 pools require this release or newer. Built from $GITHUB_SHA after the full Lua/native, pool-route, Soul-depth, attachment, BSP4 corruption, deterministic publication, Organizer, shard/merge, pause/resume, installer, and Windows/macOS equivalence suites passed."
+            --notes "Brainstorm 1.2.0-alpha for Windows x64. This release reorganizes Inspector around friendly filter, Ante, and blind locations; lets users choose the recorded filter used for a split; keeps compatible completed or paused BSP3 pools available as Builder refilter sources with explicit incompatibility reasons; and repairs historical shuffled or overlapping BSP3 event pools during non-destructive upgrade and merge. Exact technical metadata remains preserved in every derivative. Extract the full ZIP and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. Historical out-of-order BSP3 pools should be upgraded to BSP4 before refiltering. Built from $GITHUB_SHA after the full Lua/native, pool-route, BSP4 corruption, Organizer, Builder-source, shard/merge, pause/resume, installer, and Windows/macOS equivalence suites passed."

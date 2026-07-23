@@ -186,6 +186,14 @@ class BSP4CodecRegression(unittest.TestCase):
                 "metadata_digest": "%016x" % verified.metadata_digest,
                 "record_metadata_digest": "0123456789abcdef",
                 "categories": [(TAG.raw, 2), (LEGENDARY.raw, 1)],
+                "filters": [
+                    (1, b"tag_charm", 2, 0, 2),
+                    (2, b"j_perkeo", 1, 0, 1),
+                ],
+                "locations": [
+                    (1, b"tag_charm", 1, 1, 2),
+                    (2, b"j_perkeo", 2, 1, 1),
+                ],
                 "ambiguous_count": 1,
                 "unmatched_count": 0,
                 "opaque_associations": 0,

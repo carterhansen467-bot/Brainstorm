@@ -216,6 +216,60 @@ def write_bsp2(path, complete=False):
                                      len(ranks), len(block)))
 
 
+def write_rank_bsp2_shard(path, block_ranks, range_start, range_end,
+                          criteria_hash="abababababababab"):
+    """Write a complete BSP2 shard, preserving the supplied physical order."""
+    encoded = []
+    for ranks in block_ranks:
+        if not ranks:
+            raise ValueError("rank block cannot be empty")
+        rank_payload = b"".join(
+            varint(ranks[index] - ranks[index - 1])
+            for index in range(1, len(ranks)))
+        block = struct.pack(
+            "<4sIIIQQ", b"BSP2", len(ranks), len(rank_payload),
+            independent_fnv32(rank_payload), ranks[0], ranks[-1])
+        encoded.append(block + rank_payload)
+    records = sum(len(ranks) for ranks in block_ranks)
+    data_bytes = sum(len(block) for block in encoded)
+    membership = FNV64_OFFSET
+    for block in encoded:
+        membership = independent_fnv64(block, membership)
+    lines = [
+        "BRAINSTORM_SEED_POOL 2", "modelver 6",
+        "encoding delta-varint-blocks-v1", "header_bytes 1024",
+        "charset %s" % organizer.NATURAL_CHARSET,
+        "seedspace %d" % organizer.NATURAL_SEEDSPACE,
+        "space natural", "range_start %d" % range_start,
+        "range_end %d" % range_end,
+        "catalog_hash aaaaaaaaaaaaaaaa",
+        "criteria_hash %s" % criteria_hash,
+        "pool_id rank-shard-%d" % range_start,
+        "tag_route observe", "records %d" % records,
+        "data_bytes %d" % data_bytes,
+        "complete 1", "coverage_complete 1", "end",
+    ]
+    header = ("\n".join(lines) + "\n").encode("ascii").ljust(
+        1024, b"\0")
+    index_rows = []
+    offset = 1024
+    first_record = 0
+    with open(path, "wb") as handle:
+        handle.write(header)
+        for ranks, block in zip(block_ranks, encoded):
+            handle.write(block)
+            index_rows.append((offset, first_record, len(ranks),
+                               len(block) - 32))
+            offset += len(block)
+            first_record += len(ranks)
+        index_offset = 1024 + data_bytes
+        for row in index_rows:
+            handle.write(struct.pack("<QQII", *row))
+        handle.write(struct.pack(
+            "<8sQQQQ", b"BSPIDX2\n", index_offset, len(index_rows),
+            records, data_bytes))
+
+
 def write_custom_bsp3(path, ranks, per_record, criteria_hash,
                       criteria_lines, complete=True, coverage_complete=None,
                       catalog_hash="aaaaaaaaaaaaaaaa", modelver=6,
@@ -299,22 +353,63 @@ def write_custom_bsp3(path, ranks, per_record, criteria_hash,
     }
 
 
-def write_out_of_order_bsp3(path, overlapping=True):
+def write_out_of_order_bsp3(path, overlapping=True, duplicate=False,
+                            range_start=0, range_end=100,
+                            long_opaque=False, boundary=False):
     """Write two sorted blocks in deliberately wrong physical order."""
-    specs = (
-        [([1, 5], [[TAG], [TAG]]), ([2, 4], [[TAG], [TAG]])]
-        if overlapping else
-        [([4, 5], [[TAG], [TAG]]), ([1, 2], [[TAG], [TAG]])])
+    if boundary:
+        tag_variant = descriptor(
+            1, "tag_negative", 3, 1, 2, 7, 4)
+        long_descriptor = b"\x70" + b"x" * 299
+        logical = []
+        for pair in range(3):
+            start = pair * 1800
+            for parity in (0, 1):
+                ranks = list(range(start + parity, start + 1800, 2))
+                occurrences = []
+                for rank in ranks:
+                    row = [TAG]
+                    if rank % 3 == 0:
+                        row.append(LEGENDARY)
+                    if rank % 7 == 0:
+                        row.append(tag_variant)
+                    if rank % 101 == 0:
+                        row.append(long_descriptor)
+                    occurrences.append(row)
+                logical.append((ranks, occurrences))
+        # Shuffled physical order plus pairwise-overlapping intervals force
+        # the k-way path. The 5,400 records cross a BSP4 flush boundary and
+        # split the final source-block pair across output batches.
+        base_specs = [logical[index] for index in (2, 1, 4, 3, 0, 5)]
+        range_end = max(range_end, range_start + 6000)
+    else:
+        base_specs = (
+            [([1, 5], [[TAG], [TAG]]), ([1, 4], [[TAG], [TAG]])]
+            if duplicate else
+            [([1, 5], [[TAG], [TAG]]), ([2, 4], [[TAG], [TAG]])]
+            if overlapping else
+            [([4, 5], [[TAG], [TAG]]), ([1, 2], [[TAG], [TAG]])])
+    specs = [
+        ([rank + range_start for rank in ranks], occurrences)
+        for ranks, occurrences in base_specs
+    ]
+    if long_opaque:
+        # BSP3's forward-compatible contract permits arbitrary
+        # length-delimited opaque descriptors, not only native-sized filter
+        # descriptors. Keep this above MAX_KEY + 8 to exercise repacking.
+        specs[0][1][0].append(b"\x70" + b"x" * 299)
     encoded = [event_block(ranks, occurrences)
                for ranks, occurrences in specs]
+    total_records = sum(len(ranks) for ranks, _occurrences in specs)
     membership = FNV64_OFFSET
     metadata_digest = FNV64_OFFSET
     for block, metadata in encoded:
         membership = independent_fnv64(block, membership)
         metadata_digest = independent_fnv64(metadata, metadata_digest)
-    segment = 0x7654321012345678
+    segment = 0x7654321012345678 ^ range_start
     data_bytes = sum(len(block) for block, _metadata in encoded)
-    snapshot = hash_fields("snapshot", segment, 4, data_bytes, membership)
+    snapshot = hash_fields(
+        "snapshot", segment, total_records, data_bytes, membership)
     lines = [
         "BRAINSTORM_SEED_POOL 3",
         "modelver 6",
@@ -323,8 +418,8 @@ def write_out_of_order_bsp3(path, overlapping=True):
         "charset %s" % organizer.NATURAL_CHARSET,
         "seedspace %d" % organizer.NATURAL_SEEDSPACE,
         "space natural",
-        "range_start 0",
-        "range_end 100",
+        "range_start %d" % range_start,
+        "range_end %d" % range_end,
         "catalog_hash aaaaaaaaaaaaaaaa",
         "criteria_hash 9999999999999999",
         "pool_id out-of-order-fixture",
@@ -336,11 +431,11 @@ def write_out_of_order_bsp3(path, overlapping=True):
         "snapshot_id %016x" % snapshot,
         "membership_digest %016x" % membership,
         "metadata_digest %016x" % metadata_digest,
-        "scan_cursor 100",
+        "scan_cursor %d" % range_end,
         "label Out of order blocks",
         "tag_route collect",
         "tag tag_negative 1 small 4 big 1",
-        "records 4",
+        "records %d" % total_records,
         "data_bytes %d" % data_bytes,
         "complete 1",
         "coverage_complete 1",
@@ -365,7 +460,7 @@ def write_out_of_order_bsp3(path, overlapping=True):
         footer = bytearray(80)
         footer[:8] = b"BSPIDX3\n"
         struct.pack_into("<QQQQQQ", footer, 8, 8192 + data_bytes,
-                         len(index_rows), 4, data_bytes, membership,
+                         len(index_rows), total_records, data_bytes, membership,
                          metadata_digest)
         struct.pack_into("<Q", footer, 72,
                          independent_crc64(bytes(footer[:72])))
@@ -407,6 +502,66 @@ class OrganizerRegression(unittest.TestCase):
                          ["11111111", "21111111", "31111111", "41111111"])
         self.assertEqual(len(decoded[1]["occurrences"]), 3)
         self.assertFalse(decoded[3]["occurrences"][0]["known"])
+
+    def test_inspect_groups_exact_variants_into_friendly_ordered_locations(self):
+        perkeo_a2_small_shop = descriptor(
+            2, "j_perkeo", 2, 1, 1, 0, 0)
+        perkeo_a2_small_charm = descriptor(
+            2, "j_perkeo", 2, 1, 2, 1, 1)
+        perkeo_a2_big = descriptor(2, "j_perkeo", 2, 2, 1, 0, 0)
+        perkeo_a2_boss = descriptor(2, "j_perkeo", 2, 0, 1, 0, 0)
+        perkeo_a10_small = descriptor(2, "j_perkeo", 10, 1, 1, 0, 0)
+        negative_tags = [
+            descriptor(1, "tag_negative", ante, 1, 0, 0, 0)
+            for ante in range(1, 6)
+        ]
+        path = os.path.join(self.temp.name, "friendly-locations.bspool")
+        write_custom_bsp3(
+            path, list(range(5)), [
+                [perkeo_a2_small_shop, perkeo_a2_small_charm,
+                 negative_tags[0]],
+                [perkeo_a2_big, negative_tags[1]],
+                [perkeo_a2_boss, negative_tags[2]],
+                [perkeo_a10_small, negative_tags[3]],
+                [perkeo_a10_small, negative_tags[4]],
+            ],
+            "1234567890abcdef", [
+                "tag_route collect",
+                "tag tag_negative 1 small 5 small 1",
+                "legendary j_perkeo 2 small 10 small 1 shop",
+            ])
+
+        report = organizer.analyze(organizer.BSPoolReader(path))
+        filters = {
+            row["filter_id"]: row for row in report["filters"]
+        }
+        self.assertEqual(
+            report["recommended_filter_id"], "legendary:j_perkeo")
+        self.assertEqual(filters["legendary:j_perkeo"]["label"], "Perkeo")
+        self.assertEqual(
+            [row["label"]
+             for row in filters["legendary:j_perkeo"]["locations"]],
+            [
+                "Perkeo Ante 2 Small",
+                "Perkeo Ante 2 Big",
+                "Perkeo Ante 2 Boss",
+                "Perkeo Ante 10 Small",
+            ])
+
+        # Source, ordinal, and flag variants are retained as exact metadata,
+        # but collapse into one new-user-facing Ante/blind location.
+        small = filters["legendary:j_perkeo"]["locations"][0]
+        self.assertEqual(small["records"], 1)
+        self.assertEqual(len(small["exact_category_ids"]), 2)
+        self.assertTrue(any(":shop:o0:none" in category
+                            for category in small["exact_category_ids"]))
+        self.assertTrue(any(":charm:o1:negative" in category
+                            for category in small["exact_category_ids"]))
+        self.assertEqual(
+            filters["legendary:j_perkeo"]["multiple_location_records"], 0)
+        self.assertEqual(
+            filters["legendary:j_perkeo"]["location_associations"], 5)
+        self.assertEqual(filters["tag:tag_negative"]["location_count"], 5)
 
     def test_settable_space_maps_every_rank_without_zero(self):
         self.assertEqual(organizer.rank_to_seed(0, organizer.SETTABLE_CHARSET), "1")

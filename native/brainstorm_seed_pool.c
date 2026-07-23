@@ -3536,8 +3536,9 @@ static bool pool_event_run_append(PoolEventRun *dst, const PoolEventRun *src,
 }
 
 typedef struct {
-	uint8_t len;
+	size_t len;
 	unsigned char bytes[MAX_KEY + 8];
+	unsigned char *longBytes;
 	uint16_t *records;
 	uint32_t count, cap;
 } PoolMetaDescriptor;
@@ -3577,8 +3578,16 @@ static int pool_event_hit_compare(const void *a, const void *b) {
 static int pool_meta_descriptor_compare(const void *a, const void *b) {
 	const PoolMetaDescriptor *x = a, *y = b;
 	size_t common = x->len < y->len ? x->len : y->len;
-	int cmp = memcmp(x->bytes, y->bytes, common);
+	const unsigned char *xb = x->longBytes ? x->longBytes : x->bytes;
+	const unsigned char *yb = y->longBytes ? y->longBytes : y->bytes;
+	int cmp = memcmp(xb, yb, common);
 	return cmp ? cmp : x->len < y->len ? -1 : x->len > y->len;
+}
+
+static int pool_u16_compare(const void *a, const void *b) {
+	uint16_t x, y;
+	memcpy(&x, a, sizeof x); memcpy(&y, b, sizeof y);
+	return x < y ? -1 : x > y;
 }
 
 static bool pool_byte_reserve(PoolByteBuffer *b, size_t add) {
@@ -3757,8 +3766,30 @@ static bool pool_meta_record(PoolMetaDescriptor *d, uint16_t record) {
 	return true;
 }
 
+static bool pool_meta_descriptor_set(PoolMetaDescriptor *d,
+		const unsigned char *bytes, size_t len) {
+	if (!len || len > BSPOOL3_BLOCK_MAX_METADATA) return false;
+	d->len = len;
+	if (len <= sizeof d->bytes) {
+		memcpy(d->bytes, bytes, len);
+		return true;
+	}
+	d->longBytes = malloc(len);
+	if (!d->longBytes) return false;
+	memcpy(d->longBytes, bytes, len);
+	return true;
+}
+
+static const unsigned char *pool_meta_descriptor_bytes(
+		const PoolMetaDescriptor *d) {
+	return d->longBytes ? d->longBytes : d->bytes;
+}
+
 static void pool_meta_descriptors_free(PoolMetaDescriptor *d, size_t n) {
-	for (size_t i = 0; i < n; i++) free(d[i].records);
+	for (size_t i = 0; i < n; i++) {
+		free(d[i].longBytes);
+		free(d[i].records);
+	}
 	free(d);
 }
 
@@ -3918,7 +3949,9 @@ static bool pool_encode_event_block(const Config *g, int schema,
 				goto fail_desc;
 			size_t d = 0;
 			for (; d < ndescriptors; d++)
-				if (descriptors[d].len == len && !memcmp(descriptors[d].bytes, bytes, len)) break;
+				if (descriptors[d].len == len
+						&& !memcmp(pool_meta_descriptor_bytes(
+							&descriptors[d]), bytes, len)) break;
 			if (d == ndescriptors) {
 				if (ndescriptors == descriptorCap) {
 					size_t cap = descriptorCap ? descriptorCap * 2 : 16;
@@ -3927,8 +3960,9 @@ static bool pool_encode_event_block(const Config *g, int schema,
 					descriptors = p; descriptorCap = cap;
 				}
 				memset(&descriptors[d], 0, sizeof descriptors[d]);
-				descriptors[d].len = len;
-				memcpy(descriptors[d].bytes, bytes, len);
+				if (!pool_meta_descriptor_set(
+						&descriptors[d], bytes, len))
+					goto fail_desc;
 				ndescriptors++;
 			}
 			/* Metadata is a set of descriptor-to-record associations. Mirror
@@ -3957,7 +3991,8 @@ static bool pool_encode_event_block(const Config *g, int schema,
 					(uint32_t)count, &indexes))
 			goto fail_meta;
 		if (!pool_byte_varint(&metadata, entry->len)
-				|| !pool_byte_append(&metadata, entry->bytes, entry->len)
+				|| !pool_byte_append(&metadata,
+					pool_meta_descriptor_bytes(entry), entry->len)
 				|| !pool_byte_varint(&metadata, entry->count))
 			goto fail_meta;
 		if (schema == BSPOOL_SCHEMA_ADAPTIVE) {
@@ -3965,8 +4000,8 @@ static bool pool_encode_event_block(const Config *g, int schema,
 					|| !pool_byte_append(&metadata, indexes.selected,
 						indexes.selectedBytes)
 					|| !pool_byte_varint(&canonicalMetadata, entry->len)
-					|| !pool_byte_append(&canonicalMetadata, entry->bytes,
-						entry->len)
+					|| !pool_byte_append(&canonicalMetadata,
+						pool_meta_descriptor_bytes(entry), entry->len)
 					|| !pool_byte_varint(&canonicalMetadata, entry->count)
 					|| !pool_byte_append(&canonicalMetadata, indexes.positive,
 						indexes.positiveBytes))
@@ -6291,6 +6326,19 @@ typedef struct {
 	uint64_t id, records;
 } PoolSummaryId;
 
+typedef struct {
+	uint8_t kind, keyLen;
+	unsigned char key[UINT8_MAX];
+	uint64_t covered, multiple, associations;
+	uint64_t counterBlock;
+} PoolSummaryFilter;
+
+typedef struct {
+	uint8_t kind, keyLen, ante, phase;
+	unsigned char key[UINT8_MAX];
+	uint64_t records;
+} PoolSummaryLocation;
+
 /* Codec- and block-layout-independent per-record metadata identity.
  *
  * record_metadata_digest = FNV64("BSPRECM1" ||
@@ -6349,6 +6397,63 @@ static bool pool_summary_id_add(PoolSummaryId **items, size_t *used,
 	}
 	(*items)[*used] = (PoolSummaryId){ .id = id, .records = records };
 	(*used)++;
+	return true;
+}
+
+static bool pool_summary_filter_find(PoolSummaryFilter **items, size_t *used,
+		size_t *cap, uint8_t kind, const unsigned char *key, uint8_t keyLen,
+		size_t *index) {
+	for (size_t i = 0; i < *used; i++) {
+		if ((*items)[i].kind == kind && (*items)[i].keyLen == keyLen
+				&& !memcmp((*items)[i].key, key, keyLen)) {
+			*index = i;
+			return true;
+		}
+	}
+	if (*used == *cap) {
+		size_t next = *cap ? *cap * 2 : 16;
+		if (next < *cap || next > SIZE_MAX / sizeof **items) return false;
+		PoolSummaryFilter *p = realloc(*items, next * sizeof *p);
+		if (!p) return false;
+		*items = p; *cap = next;
+	}
+	PoolSummaryFilter *item = &(*items)[*used];
+	memset(item, 0, sizeof *item);
+	item->kind = kind;
+	item->keyLen = keyLen;
+	memcpy(item->key, key, keyLen);
+	item->counterBlock = UINT64_MAX;
+	*index = (*used)++;
+	return true;
+}
+
+static bool pool_summary_location_find(PoolSummaryLocation **items,
+		size_t *used, size_t *cap, uint8_t kind,
+		const unsigned char *key, uint8_t keyLen, uint8_t ante,
+		uint8_t phase, size_t *index) {
+	for (size_t i = 0; i < *used; i++) {
+		if ((*items)[i].kind == kind && (*items)[i].keyLen == keyLen
+				&& (*items)[i].ante == ante && (*items)[i].phase == phase
+				&& !memcmp((*items)[i].key, key, keyLen)) {
+			*index = i;
+			return true;
+		}
+	}
+	if (*used == *cap) {
+		size_t next = *cap ? *cap * 2 : 32;
+		if (next < *cap || next > SIZE_MAX / sizeof **items) return false;
+		PoolSummaryLocation *p = realloc(*items, next * sizeof *p);
+		if (!p) return false;
+		*items = p; *cap = next;
+	}
+	PoolSummaryLocation *item = &(*items)[*used];
+	memset(item, 0, sizeof *item);
+	item->kind = kind;
+	item->keyLen = keyLen;
+	item->ante = ante;
+	item->phase = phase;
+	memcpy(item->key, key, keyLen);
+	*index = (*used)++;
 	return true;
 }
 
@@ -6452,9 +6557,13 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
 	PoolSummaryCategory *categories = NULL;
 	PoolSummaryId *provenance = NULL, *operands = NULL;
+	PoolSummaryFilter *filters = NULL;
+	PoolSummaryLocation *locations = NULL;
 	size_t ncategories = 0, categoryCap = 0;
 	size_t nprovenance = 0, provenanceCap = 0;
 	size_t noperands = 0, operandCap = 0;
+	size_t nfilters = 0, filterCap = 0, filterCounterRows = 0;
+	size_t nlocations = 0, locationCap = 0;
 	uint32_t *known = calloc(BSPOOL_BLOCK_MAX_RECORDS, sizeof *known);
 	uint32_t *descriptorRecords =
 			malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *descriptorRecords);
@@ -6468,6 +6577,8 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 				* sizeof *recordDescriptorCounts) : NULL;
 	unsigned char *hasProvenance = calloc(BSPOOL_BLOCK_MAX_RECORDS, 1);
 	unsigned char *hasOperand = calloc(BSPOOL_BLOCK_MAX_RECORDS, 1);
+	unsigned char *locationSeen = calloc(BSPOOL_BLOCK_MAX_RECORDS, 1);
+	uint16_t *filterLocationCounts = NULL;
 	uint64_t ambiguous = 0, unmatched = 0, opaque = 0;
 	uint64_t withoutProvenance = 0, withoutOperands = 0;
 	uint64_t membershipDigest = adaptive
@@ -6485,7 +6596,7 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 	if (!known || !descriptorRecords
 			|| (wantRecordDigest && (!recordRanks
 				|| !recordDescriptorDigests || !recordDescriptorCounts))
-			|| !hasProvenance || !hasOperand) {
+			|| !hasProvenance || !hasOperand || !locationSeen) {
 		snprintf(err, sizeof err, "cannot allocate summary counters"); goto fail;
 	}
 	for (uint64_t b = 0; b < reader.nblocks; b++) {
@@ -6607,6 +6718,7 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 		uint64_t canonicalBytes = 0;
 		const unsigned char *prior = NULL;
 		size_t priorLen = 0;
+		size_t currentLocation = SIZE_MAX;
 		if (!bspool_varint_read(metadata, block->metadataBytes, &at, &descriptors)
 				|| descriptors > block->associations) {
 			snprintf(err, sizeof err, "cannot decode event descriptor count"); goto fail;
@@ -6657,6 +6769,7 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 			associations += matches;
 			int kind = 0;
 			uint64_t specialId = 0;
+			size_t filterIndex = SIZE_MAX, locationIndex = SIZE_MAX;
 			if (raw[0] >= 1 && raw[0] <= 3) {
 				unsigned keyLen = len > 1 ? raw[1] : 0;
 				if (!keyLen || len != (size_t)keyLen + 7
@@ -6672,6 +6785,53 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 				if (!pool_summary_category_add(&categories, &ncategories,
 						&categoryCap, raw, len, matches)) {
 					snprintf(err, sizeof err, "cannot allocate category summary"); goto fail;
+				}
+				if (!pool_summary_filter_find(&filters, &nfilters,
+							&filterCap, raw[0], raw + 2,
+							(uint8_t)keyLen, &filterIndex)
+						|| !pool_summary_location_find(
+							&locations, &nlocations, &locationCap,
+							raw[0], raw + 2, (uint8_t)keyLen,
+							raw[2 + keyLen], raw[3 + keyLen],
+							&locationIndex)) {
+					snprintf(err, sizeof err,
+							"cannot allocate location summary"); goto fail;
+				}
+				if (nfilters > filterCounterRows) {
+					if (nfilters > SIZE_MAX / BSPOOL_BLOCK_MAX_RECORDS
+							|| nfilters * BSPOOL_BLOCK_MAX_RECORDS
+								> SIZE_MAX / sizeof *filterLocationCounts) {
+						snprintf(err, sizeof err,
+								"location summary counter size overflows");
+						goto fail;
+					}
+					size_t oldRows = filterCounterRows;
+					uint16_t *p = realloc(filterLocationCounts,
+							nfilters * BSPOOL_BLOCK_MAX_RECORDS
+								* sizeof *p);
+					if (!p) {
+						snprintf(err, sizeof err,
+								"cannot allocate location summary counters");
+						goto fail;
+					}
+					filterLocationCounts = p;
+					memset(filterLocationCounts
+								+ oldRows * BSPOOL_BLOCK_MAX_RECORDS,
+							0, (nfilters - oldRows)
+								* BSPOOL_BLOCK_MAX_RECORDS
+								* sizeof *filterLocationCounts);
+					filterCounterRows = nfilters;
+				}
+				if (filters[filterIndex].counterBlock != b) {
+					memset(filterLocationCounts
+								+ filterIndex * BSPOOL_BLOCK_MAX_RECORDS,
+							0, block->count
+								* sizeof *filterLocationCounts);
+					filters[filterIndex].counterBlock = b;
+				}
+				if (currentLocation != locationIndex) {
+					memset(locationSeen, 0, block->count);
+					currentLocation = locationIndex;
 				}
 			} else if (len == 9 && raw[0] == 0x80) {
 				kind = 2; specialId = pool_summary_be64(raw + 1);
@@ -6749,6 +6909,34 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 						snprintf(err, sizeof err, "category count overflows"); goto fail;
 					}
 					known[record]++;
+					if (!locationSeen[record]) {
+						uint16_t *locationCount = filterLocationCounts
+								+ filterIndex * BSPOOL_BLOCK_MAX_RECORDS
+								+ record;
+						if (*locationCount == UINT16_MAX
+								|| locations[locationIndex].records
+									== UINT64_MAX
+								|| filters[filterIndex].associations
+									== UINT64_MAX
+								|| (!*locationCount
+									&& filters[filterIndex].covered
+										== UINT64_MAX)
+								|| (*locationCount == 1
+									&& filters[filterIndex].multiple
+										== UINT64_MAX)) {
+							snprintf(err, sizeof err,
+									"location summary count overflows");
+							goto fail;
+						}
+						locationSeen[record] = 1;
+						if (!*locationCount)
+							filters[filterIndex].covered++;
+						else if (*locationCount == 1)
+							filters[filterIndex].multiple++;
+						(*locationCount)++;
+						locations[locationIndex].records++;
+						filters[filterIndex].associations++;
+					}
 				} else if (kind == 2) hasProvenance[record] = 1;
 				else if (kind == 3) hasOperand[record] = 1;
 				if (wantRecordDigest) {
@@ -6820,7 +7008,7 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 	if (h.metadataDigest && h.metadataDigest != metadataDigest) {
 		snprintf(err, sizeof err, "metadata_digest differs from committed event metadata"); goto fail;
 	}
-	printf("BRAINSTORM_POOL_SUMMARY 1\n");
+	printf("BRAINSTORM_POOL_SUMMARY 2\n");
 	printf("records %" PRIu64 "\n", h.records);
 	printf("membership_digest %016" PRIx64 "\n", membershipDigest);
 	printf("metadata_digest %016" PRIx64 "\n", metadataDigest);
@@ -6838,6 +7026,22 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 			printf("%02x", categories[i].raw[j]);
 		printf(" %" PRIu64 "\n", categories[i].records);
 	}
+	for (size_t i = 0; i < nfilters; i++) {
+		printf("filter %u ", filters[i].kind);
+		for (uint8_t j = 0; j < filters[i].keyLen; j++)
+			printf("%02x", filters[i].key[j]);
+		printf(" %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+				filters[i].covered, filters[i].multiple,
+				filters[i].associations);
+	}
+	for (size_t i = 0; i < nlocations; i++) {
+		printf("location %u ", locations[i].kind);
+		for (uint8_t j = 0; j < locations[i].keyLen; j++)
+			printf("%02x", locations[i].key[j]);
+		printf(" %u %u %" PRIu64 "\n",
+				locations[i].ante, locations[i].phase,
+				locations[i].records);
+	}
 	for (size_t i = 0; i < nprovenance; i++)
 		printf("provenance %016" PRIx64 " %" PRIu64 "\n",
 				provenance[i].id, provenance[i].records);
@@ -6848,7 +7052,9 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 	free(known); free(descriptorRecords); free(recordRanks);
 	free(recordDescriptorDigests); free(recordDescriptorCounts);
 	free(hasProvenance); free(hasOperand);
+	free(locationSeen); free(filterLocationCounts);
 	free(categories); free(provenance); free(operands);
+	free(filters); free(locations);
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 	return ferror(stdout) ? 1 : 0;
 fail:
@@ -6856,7 +7062,9 @@ fail:
 	free(known); free(descriptorRecords); free(recordRanks);
 	free(recordDescriptorDigests); free(recordDescriptorCounts);
 	free(hasProvenance); free(hasOperand);
+	free(locationSeen); free(filterLocationCounts);
 	free(categories); free(provenance); free(operands);
+	free(filters); free(locations);
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 	return 1;
 }
@@ -7105,6 +7313,7 @@ typedef struct {
 	BspoolHeader header;
 	BspoolReader reader;
 	uint64_t fileBytes;
+	bool blocksAscending;
 } PoolMergePart;
 
 typedef struct {
@@ -7114,7 +7323,7 @@ typedef struct {
 	size_t ndescriptors, descriptorCap;
 	uint32_t associations;
 	uint64_t priorRank;
-	bool hasPriorRank;
+	bool hasPriorRank, metadataNeedsSort;
 } PoolMergeEventBlock;
 
 typedef struct {
@@ -7127,11 +7336,12 @@ typedef struct {
 static bool pool_raw_descriptor_record(PoolMetaDescriptor **descriptors,
 		size_t *ndescriptors, size_t *descriptorCap, uint32_t *associations,
 		const unsigned char *bytes, size_t len, uint16_t record) {
-	if (!len || len > sizeof (*descriptors)[0].bytes) return false;
+	if (!len || len > BSPOOL3_BLOCK_MAX_METADATA) return false;
 	size_t d = 0;
 	for (; d < *ndescriptors; d++)
 		if ((*descriptors)[d].len == len
-				&& !memcmp((*descriptors)[d].bytes, bytes, len)) break;
+				&& !memcmp(pool_meta_descriptor_bytes(
+					&(*descriptors)[d]), bytes, len)) break;
 	if (d == *ndescriptors) {
 		if (*ndescriptors == *descriptorCap) {
 			size_t cap = *descriptorCap ? *descriptorCap * 2 : 16;
@@ -7142,8 +7352,9 @@ static bool pool_raw_descriptor_record(PoolMetaDescriptor **descriptors,
 			*descriptors = p; *descriptorCap = cap;
 		}
 		memset(&(*descriptors)[d], 0, sizeof (*descriptors)[d]);
-		(*descriptors)[d].len = (uint8_t)len;
-		memcpy((*descriptors)[d].bytes, bytes, len);
+		if (!pool_meta_descriptor_set(
+				&(*descriptors)[d], bytes, len))
+			return false;
 		(*ndescriptors)++;
 	}
 	if ((*descriptors)[d].count
@@ -7185,6 +7396,23 @@ static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
 		encoded.rankBytes = encoded.canonicalRankBytes;
 		encoded.rankCodec = BSPOOL4_RANK_POSITIVE;
 	}
+	if (block->metadataNeedsSort) {
+		/* Historical overlapping source blocks contribute one descriptor in
+		 * source-block order, which can interleave its output record indexes.
+		 * Restore descriptor-local record order before selecting a codec.
+		 * Canonical input retains the prior allocation-free fast path. */
+		for (size_t d = 0; d < block->ndescriptors; d++) {
+			PoolMetaDescriptor *entry = &block->descriptors[d];
+			qsort(entry->records, entry->count,
+					sizeof *entry->records, pool_u16_compare);
+			for (uint32_t i = 1; i < entry->count; i++)
+				if (entry->records[i] <= entry->records[i - 1]) {
+					snprintf(err, errsz,
+							"merged event metadata contains duplicate records");
+					return false;
+				}
+		}
+	}
 	qsort(block->descriptors, block->ndescriptors,
 			sizeof *block->descriptors, pool_meta_descriptor_compare);
 	PoolByteBuffer metadata = { 0 };
@@ -7202,7 +7430,8 @@ static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
 					entry->count, (uint32_t)block->used, &indexes))
 			goto memory;
 		if (!pool_byte_varint(&metadata, entry->len)
-				|| !pool_byte_append(&metadata, entry->bytes, entry->len)
+				|| !pool_byte_append(&metadata,
+					pool_meta_descriptor_bytes(entry), entry->len)
 				|| !pool_byte_varint(&metadata, entry->count))
 			goto memory;
 		if (schema == BSPOOL_SCHEMA_ADAPTIVE) {
@@ -7212,7 +7441,7 @@ static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
 					|| !pool_byte_varint(
 						&canonicalMetadata, entry->len)
 					|| !pool_byte_append(&canonicalMetadata,
-						entry->bytes, entry->len)
+						pool_meta_descriptor_bytes(entry), entry->len)
 					|| !pool_byte_varint(
 						&canonicalMetadata, entry->count)
 					|| !pool_byte_append(&canonicalMetadata,
@@ -7478,6 +7707,530 @@ static bool pool_merge_append_ranks(FILE *out, PoolMergeRankBlock *block,
 	return true;
 }
 
+#define POOL_ORDERED_MERGE_RANK_CACHE_MAX (64u * 1024u * 1024u)
+
+typedef struct {
+	uint64_t block, first, last, next;
+} PoolMergeBlockRef;
+
+typedef struct {
+	uint64_t head, tail, last;
+} PoolMergeChain;
+
+typedef struct {
+	uint64_t ref;
+	uint64_t *ranks;
+	size_t rankCap;
+	uint32_t record, count;
+} PoolMergeCursor;
+
+typedef struct {
+	uint64_t block;
+	uint32_t sourceRecord;
+	uint16_t outputRecord;
+} PoolMergeRecordRef;
+
+static int pool_merge_block_ref_compare(const void *a, const void *b) {
+	const PoolMergeBlockRef *x = a, *y = b;
+	return x->first < y->first ? -1 : x->first > y->first ? 1
+			: x->last < y->last ? -1 : x->last > y->last ? 1
+			: x->block < y->block ? -1 : x->block > y->block;
+}
+
+static int pool_merge_record_ref_compare(const void *a, const void *b) {
+	const PoolMergeRecordRef *x = a, *y = b;
+	return x->block < y->block ? -1 : x->block > y->block ? 1
+			: x->sourceRecord < y->sourceRecord ? -1
+			: x->sourceRecord > y->sourceRecord;
+}
+
+static bool pool_merge_chain_heap_less(const uint64_t *heap, size_t a, size_t b,
+		const PoolMergeChain *chains) {
+	uint64_t x = heap[a], y = heap[b];
+	return chains[x].last < chains[y].last
+			|| (chains[x].last == chains[y].last && x < y);
+}
+
+static void pool_merge_chain_heap_push(uint64_t *heap, size_t *used,
+		uint64_t chain, const PoolMergeChain *chains) {
+	size_t at = (*used)++;
+	heap[at] = chain;
+	while (at) {
+		size_t parent = (at - 1u) / 2u;
+		if (!pool_merge_chain_heap_less(heap, at, parent, chains)) break;
+		uint64_t swap = heap[parent]; heap[parent] = heap[at]; heap[at] = swap;
+		at = parent;
+	}
+}
+
+static uint64_t pool_merge_chain_heap_pop(uint64_t *heap, size_t *used,
+		const PoolMergeChain *chains) {
+	uint64_t result = heap[0];
+	heap[0] = heap[--*used];
+	size_t at = 0;
+	for (;;) {
+		size_t left = at * 2u + 1u;
+		if (left >= *used) break;
+		size_t best = left, right = left + 1u;
+		if (right < *used
+				&& pool_merge_chain_heap_less(heap, right, left, chains))
+			best = right;
+		if (!pool_merge_chain_heap_less(heap, best, at, chains)) break;
+		uint64_t swap = heap[at]; heap[at] = heap[best]; heap[best] = swap;
+		at = best;
+	}
+	return result;
+}
+
+/* Turn arbitrarily ordered, individually sorted historical blocks into the
+ * minimum number of rank-ascending block streams. Greedy interval
+ * partitioning is sufficient: the earliest-ending stream can accept the next
+ * block exactly when any stream can. */
+static bool pool_merge_make_chains(const PoolMergePart *part,
+		PoolMergeBlockRef **refsOut, PoolMergeChain **chainsOut,
+		size_t *nchainsOut, char *err, size_t errsz) {
+	uint64_t nblocks = part->reader.nblocks;
+	if (!nblocks) {
+		*refsOut = NULL; *chainsOut = NULL; *nchainsOut = 0;
+		return true;
+	}
+	if (nblocks > SIZE_MAX / sizeof(PoolMergeBlockRef)
+			|| nblocks > SIZE_MAX / sizeof(PoolMergeChain)
+			|| nblocks > SIZE_MAX / sizeof(uint64_t)) {
+		snprintf(err, errsz, "historical event block table is too large");
+		return false;
+	}
+	PoolMergeBlockRef *refs =
+			malloc((size_t)nblocks * sizeof *refs);
+	PoolMergeChain *chains =
+			malloc((size_t)nblocks * sizeof *chains);
+	uint64_t *heap = malloc((size_t)nblocks * sizeof *heap);
+	if (!refs || !chains || !heap) {
+		free(refs); free(chains); free(heap);
+		snprintf(err, errsz,
+				"cannot allocate historical event ordering table");
+		return false;
+	}
+	for (uint64_t b = 0; b < nblocks; b++) {
+		const BspoolBlockIndex *entry = &part->reader.blocks[b];
+		BspoolBlockInfo info;
+		if (!bspool_block_header(part->reader.fd, entry->offset,
+					part->reader.encoding, &info)
+				|| info.count != entry->count
+				|| info.rankBytes != entry->rankBytes
+				|| info.metadataBytes != entry->metadataBytes
+				|| info.associations != entry->associations
+				|| info.first > info.last
+				|| info.first < part->header.rangeStart
+				|| info.last >= part->header.rangeEnd) {
+			free(refs); free(chains); free(heap);
+			snprintf(err, errsz,
+					"cannot verify historical event block %" PRIu64
+					" in %s", b, part->path);
+			return false;
+		}
+		refs[b] = (PoolMergeBlockRef) {
+			.block = b, .first = info.first, .last = info.last,
+			.next = UINT64_MAX,
+		};
+	}
+	qsort(refs, (size_t)nblocks, sizeof *refs,
+			pool_merge_block_ref_compare);
+	size_t nchains = 0, heapUsed = 0;
+	for (uint64_t i = 0; i < nblocks; i++) {
+		uint64_t chain;
+		if (heapUsed && chains[heap[0]].last < refs[i].first) {
+			chain = pool_merge_chain_heap_pop(
+					heap, &heapUsed, chains);
+			refs[chains[chain].tail].next = i;
+			chains[chain].tail = i;
+			chains[chain].last = refs[i].last;
+		} else {
+			chain = (uint64_t)nchains++;
+			chains[chain] = (PoolMergeChain) {
+				.head = i, .tail = i, .last = refs[i].last,
+			};
+		}
+		pool_merge_chain_heap_push(
+				heap, &heapUsed, chain, chains);
+	}
+	free(heap);
+	*refsOut = refs; *chainsOut = chains; *nchainsOut = nchains;
+	return true;
+}
+
+static bool pool_merge_cursor_load(const PoolMergePart *part,
+		const PoolMergeBlockRef *refs, PoolMergeCursor *cursor, uint64_t ref,
+		BspoolScratch *scratch, size_t *rankCacheBytes,
+		char *err, size_t errsz) {
+	const BspoolBlockIndex *entry =
+			&part->reader.blocks[refs[ref].block];
+	if (!bspool_decode_block(
+			&part->reader, refs[ref].block, scratch)) {
+		snprintf(err, errsz,
+				"cannot decode or verify %s block %" PRIu64,
+				part->path, refs[ref].block);
+		return false;
+	}
+	if (!entry->count || scratch->ranks[0] != refs[ref].first
+			|| scratch->ranks[entry->count - 1u] != refs[ref].last) {
+		snprintf(err, errsz,
+				"historical event block bounds changed while reading %s",
+				part->path);
+		return false;
+	}
+	if (entry->count > cursor->rankCap) {
+		size_t newBytes = (size_t)entry->count * sizeof *cursor->ranks;
+		size_t oldBytes = cursor->rankCap * sizeof *cursor->ranks;
+		if (newBytes < oldBytes
+				|| newBytes - oldBytes
+					> POOL_ORDERED_MERGE_RANK_CACHE_MAX
+						- *rankCacheBytes) {
+			snprintf(err, errsz,
+					"historical event overlap needs more than %u MiB"
+					" of rank cache",
+					(unsigned)(POOL_ORDERED_MERGE_RANK_CACHE_MAX
+						/ (1024u * 1024u)));
+			return false;
+		}
+		uint64_t *ranks = realloc(cursor->ranks, newBytes);
+		if (!ranks) {
+			snprintf(err, errsz,
+					"cannot allocate historical event rank cache");
+			return false;
+		}
+		cursor->ranks = ranks;
+		cursor->rankCap = entry->count;
+		*rankCacheBytes += newBytes - oldBytes;
+	}
+	memcpy(cursor->ranks, scratch->ranks,
+			(size_t)entry->count * sizeof *cursor->ranks);
+	cursor->ref = ref;
+	cursor->record = 0;
+	cursor->count = entry->count;
+	return true;
+}
+
+static bool pool_merge_cursor_heap_less(const uint64_t *heap,
+		size_t a, size_t b, const PoolMergeCursor *cursors) {
+	const PoolMergeCursor *x = &cursors[heap[a]];
+	const PoolMergeCursor *y = &cursors[heap[b]];
+	uint64_t xr = x->ranks[x->record], yr = y->ranks[y->record];
+	return xr < yr || (xr == yr && heap[a] < heap[b]);
+}
+
+static void pool_merge_cursor_heap_push(uint64_t *heap, size_t *used,
+		uint64_t cursor, const PoolMergeCursor *cursors) {
+	size_t at = (*used)++;
+	heap[at] = cursor;
+	while (at) {
+		size_t parent = (at - 1u) / 2u;
+		if (!pool_merge_cursor_heap_less(
+				heap, at, parent, cursors)) break;
+		uint64_t swap = heap[parent]; heap[parent] = heap[at]; heap[at] = swap;
+		at = parent;
+	}
+}
+
+static uint64_t pool_merge_cursor_heap_pop(uint64_t *heap, size_t *used,
+		const PoolMergeCursor *cursors) {
+	uint64_t result = heap[0];
+	heap[0] = heap[--*used];
+	size_t at = 0;
+	for (;;) {
+		size_t left = at * 2u + 1u;
+		if (left >= *used) break;
+		size_t best = left, right = left + 1u;
+		if (right < *used
+				&& pool_merge_cursor_heap_less(
+					heap, right, left, cursors))
+			best = right;
+		if (!pool_merge_cursor_heap_less(
+				heap, best, at, cursors)) break;
+		uint64_t swap = heap[at]; heap[at] = heap[best]; heap[best] = swap;
+		at = best;
+	}
+	return result;
+}
+
+/* Copy only descriptors associated with records selected into the current
+ * output batch. The mapping transposes BSP3's descriptor-major payload
+ * without expanding metadata for every active overlapping source block. */
+static bool pool_merge_selected_bsp3_metadata(
+		PoolMergeEventBlock *block,
+		const unsigned char *metadata, size_t metadataBytes,
+		uint32_t sourceRecords, uint32_t expectedAssociations,
+		const uint16_t *selected, uint32_t *records,
+		char *err, size_t errsz) {
+	size_t at = 0;
+	uint64_t descriptors = 0, associations = 0;
+	if (!bspool_varint_read(
+			metadata, metadataBytes, &at, &descriptors)
+			|| descriptors > expectedAssociations)
+		goto malformed;
+	for (uint64_t d = 0; d < descriptors; d++) {
+		uint64_t len = 0, matches = 0, record = 0;
+		if (!bspool_varint_read(metadata, metadataBytes, &at, &len)
+				|| !len || len > metadataBytes - at)
+			goto malformed;
+		const unsigned char *raw = metadata + at;
+		at += (size_t)len;
+		if (!bspool_varint_read(
+				metadata, metadataBytes, &at, &matches)
+				|| !matches || matches > sourceRecords
+				|| associations > UINT32_MAX - matches)
+			goto malformed;
+		for (uint32_t i = 0; i < (uint32_t)matches; i++) {
+			uint64_t value = 0;
+			if (!bspool_varint_read(
+					metadata, metadataBytes, &at, &value)
+					|| (i && (!value
+						|| record > UINT64_MAX - value)))
+				goto malformed;
+			record = i ? record + value : value;
+			if (record >= sourceRecords) goto malformed;
+			records[i] = (uint32_t)record;
+		}
+		associations += matches;
+		for (uint32_t i = 0; i < (uint32_t)matches; i++) {
+			uint16_t output = selected[records[i]];
+			if (output == UINT16_MAX) continue;
+			if (!pool_raw_descriptor_record(
+					&block->descriptors, &block->ndescriptors,
+					&block->descriptorCap, &block->associations,
+					raw, (size_t)len, output)) {
+				snprintf(err, errsz,
+						"cannot allocate canonical merged event metadata");
+				return false;
+			}
+		}
+	}
+	if (at != metadataBytes
+			|| associations != expectedAssociations)
+		goto malformed;
+	return true;
+malformed:
+	snprintf(err, errsz,
+			"cannot decode verified historical event metadata");
+	return false;
+}
+
+/* Historical parallel BSP3 writers could publish independently sorted blocks
+ * in worker-completion order. Rebuild a globally ordered logical stream while
+ * keeping only one decoded rank block per overlapping chain and one metadata
+ * payload at a time. */
+static bool pool_merge_write_ordered_event_part(FILE *out,
+		PoolMergePart *part, PoolMergeEventBlock *eventBlock,
+		int outputSchema, uint64_t *written,
+		uint64_t *membershipDigest, uint64_t *metadataDigest,
+		char *err, size_t errsz) {
+	if (part->header.encoding != BSPOOL_ENCODING_DELTA_EVENTS) {
+		snprintf(err, errsz,
+				"historical ordering fallback supports BSP3 event pools");
+		return false;
+	}
+	PoolMergeBlockRef *refs = NULL;
+	PoolMergeChain *chains = NULL;
+	PoolMergeCursor *cursors = NULL;
+	uint64_t *heap = NULL;
+	PoolMergeRecordRef *batch = NULL;
+	uint16_t *selected = NULL;
+	uint32_t *records = NULL;
+	BspoolScratch decode = { .cachedBlock = UINT64_MAX };
+	BspoolScratch metadata = { .cachedBlock = UINT64_MAX };
+	size_t nchains = 0, heapUsed = 0, rankCacheBytes = 0;
+	bool ok = false;
+	if (!pool_merge_make_chains(
+			part, &refs, &chains, &nchains, err, errsz))
+		goto done;
+	if (!nchains) { ok = true; goto done; }
+	/* The historical native writer used non-overlapping 1K BSP3 blocks. Once
+	 * their interval table has been sorted, that common case is already one
+	 * canonical stream: decode each source block once and reuse the normal
+	 * append path. Keep the general bounded k-way transpose for overlapping
+	 * intervals and unusually large forward-compatible source blocks. */
+	if (nchains == 1) {
+		size_t outputBlockRecords = pool_event_block_records(outputSchema);
+		bool appendable = true;
+		for (uint64_t ref = chains[0].head; ref != UINT64_MAX;
+				ref = refs[ref].next) {
+			if (part->reader.blocks[refs[ref].block].count
+					> outputBlockRecords) {
+				appendable = false;
+				break;
+			}
+		}
+		if (appendable) {
+			for (uint64_t ref = chains[0].head; ref != UINT64_MAX;
+					ref = refs[ref].next) {
+				const BspoolBlockIndex *entry =
+						&part->reader.blocks[refs[ref].block];
+				if (!bspool_decode_block(
+						&part->reader, refs[ref].block, &decode)) {
+					snprintf(err, errsz,
+							"cannot decode or verify %s block %" PRIu64,
+							part->path, refs[ref].block);
+					goto done;
+				}
+				if (!entry->count
+						|| decode.ranks[0] != refs[ref].first
+						|| decode.ranks[entry->count - 1u]
+							!= refs[ref].last) {
+					snprintf(err, errsz,
+							"historical event block bounds changed"
+							" while reading %s", part->path);
+					goto done;
+				}
+				if (!pool_merge_append_event_block(out, eventBlock,
+							decode.ranks, entry->count,
+							decode.bytes + entry->rankBytes,
+							entry->metadataBytes,
+							BSPOOL_ENCODING_DELTA_EVENTS,
+							outputSchema, membershipDigest,
+							metadataDigest, err, errsz))
+					goto done;
+				*written += entry->count;
+			}
+			ok = true;
+			goto done;
+		}
+	}
+	if (nchains > SIZE_MAX / sizeof *cursors
+			|| nchains > SIZE_MAX / sizeof *heap) {
+		snprintf(err, errsz,
+				"historical event overlap table is too large");
+		goto done;
+	}
+	cursors = calloc(nchains, sizeof *cursors);
+	heap = malloc(nchains * sizeof *heap);
+	size_t blockRecords = pool_event_block_records(outputSchema);
+	batch = malloc(blockRecords * sizeof *batch);
+	selected = malloc(
+			BSPOOL_BLOCK_MAX_RECORDS * sizeof *selected);
+	records = malloc(
+			BSPOOL_BLOCK_MAX_RECORDS * sizeof *records);
+	if (!cursors || !heap || !batch || !selected || !records) {
+		snprintf(err, errsz,
+				"cannot allocate historical event merge workspace");
+		goto done;
+	}
+	for (size_t c = 0; c < nchains; c++) {
+		if (!pool_merge_cursor_load(part, refs, &cursors[c],
+					chains[c].head, &decode, &rankCacheBytes,
+					err, errsz))
+			goto done;
+		pool_merge_cursor_heap_push(
+				heap, &heapUsed, (uint64_t)c, cursors);
+	}
+	while (heapUsed) {
+		size_t oldUsed = eventBlock->used;
+		size_t room = blockRecords - oldUsed;
+		size_t used = 0;
+		while (used < room && heapUsed) {
+			uint64_t c = pool_merge_cursor_heap_pop(
+					heap, &heapUsed, cursors);
+			PoolMergeCursor *cursor = &cursors[c];
+			uint64_t rank = cursor->ranks[cursor->record];
+			if (eventBlock->hasPriorRank
+					&& rank <= eventBlock->priorRank) {
+				snprintf(err, errsz,
+						"historical event ranks contain a duplicate"
+						" or are not globally ascending");
+				goto done;
+			}
+			eventBlock->priorRank = rank;
+			eventBlock->hasPriorRank = true;
+			eventBlock->ranks[oldUsed + used] = rank;
+			batch[used] = (PoolMergeRecordRef) {
+				.block = refs[cursor->ref].block,
+				.sourceRecord = cursor->record,
+				.outputRecord = (uint16_t)(oldUsed + used),
+			};
+			used++;
+			cursor->record++;
+			if (cursor->record == cursor->count) {
+				uint64_t next = refs[cursor->ref].next;
+				if (next == UINT64_MAX) continue;
+				if (!pool_merge_cursor_load(part, refs, cursor,
+							next, &decode, &rankCacheBytes,
+							err, errsz))
+					goto done;
+			}
+			pool_merge_cursor_heap_push(
+					heap, &heapUsed, c, cursors);
+		}
+		qsort(batch, used, sizeof *batch,
+				pool_merge_record_ref_compare);
+		eventBlock->metadataNeedsSort = true;
+		for (size_t first = 0; first < used;) {
+			size_t end = first + 1u;
+			while (end < used
+					&& batch[end].block == batch[first].block)
+				end++;
+			const BspoolBlockIndex *entry =
+					&part->reader.blocks[batch[first].block];
+			memset(selected, 0xff,
+					(size_t)entry->count * sizeof *selected);
+			for (size_t i = first; i < end; i++) {
+				if (batch[i].sourceRecord >= entry->count
+						|| selected[batch[i].sourceRecord]
+							!= UINT16_MAX) {
+					snprintf(err, errsz,
+							"historical event source mapping is inconsistent");
+					goto done;
+				}
+				selected[batch[i].sourceRecord] =
+						batch[i].outputRecord;
+			}
+			if (!bspool_decode_block(&part->reader,
+						batch[first].block, &metadata)) {
+				snprintf(err, errsz,
+						"cannot decode or verify %s block %" PRIu64,
+						part->path, batch[first].block);
+				goto done;
+			}
+			for (size_t i = first; i < end; i++) {
+				if (metadata.ranks[batch[i].sourceRecord]
+						!= eventBlock->ranks[batch[i].outputRecord]) {
+					snprintf(err, errsz,
+							"historical event block changed while reading %s",
+							part->path);
+					goto done;
+				}
+			}
+			if (!pool_merge_selected_bsp3_metadata(eventBlock,
+						metadata.bytes + entry->rankBytes,
+						entry->metadataBytes, entry->count,
+						entry->associations, selected, records,
+						err, errsz))
+				goto done;
+			first = end;
+		}
+		eventBlock->used += used;
+		*written += used;
+		if (eventBlock->used == blockRecords
+				&& !pool_merge_write_event_block(out, eventBlock,
+						outputSchema, membershipDigest,
+						metadataDigest, err, errsz))
+			goto done;
+	}
+	ok = true;
+done:
+	bspool_scratch_destroy(&decode);
+	bspool_scratch_destroy(&metadata);
+	if (cursors)
+		for (size_t c = 0; c < nchains; c++)
+			free(cursors[c].ranks);
+	free(cursors);
+	free(heap);
+	free(batch);
+	free(selected);
+	free(records);
+	free(refs);
+	free(chains);
+	return ok;
+}
+
 static int pool_merge_part_compare(const void *a, const void *b) {
 	const PoolMergePart *x = a, *y = b;
 	return x->header.rangeStart < y->header.rangeStart ? -1
@@ -7526,6 +8279,12 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 		bool canonical, int outputSchema,
 		uint64_t *written, uint64_t *membershipDigest, uint64_t *metadataDigest,
 		char *err, size_t errsz) {
+	if (!canonical
+			&& part->header.encoding
+				== BSPOOL_ENCODING_DELTA_EVENTS)
+		return pool_merge_write_ordered_event_part(out, part, eventBlock,
+				outputSchema, written, membershipDigest, metadataDigest,
+				err, errsz);
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
 	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS
 			|| part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
@@ -7736,8 +8495,11 @@ static int pool_mode_merge(
 	}
 	qsort(parts, (size_t)ninputs, sizeof *parts, pool_merge_part_compare);
 	bool canonicalMerge = true;
-	for (int i = 0; i < ninputs; i++)
-		if (!pool_reader_blocks_ascending(&parts[i].reader)) canonicalMerge = false;
+	for (int i = 0; i < ninputs; i++) {
+		parts[i].blocksAscending =
+				pool_reader_blocks_ascending(&parts[i].reader);
+		if (!parts[i].blocksAscending) canonicalMerge = false;
+	}
 	bool eventInputs = parts[0].header.encoding
 				== BSPOOL_ENCODING_DELTA_EVENTS
 			|| parts[0].header.encoding
@@ -7752,13 +8514,12 @@ static int pool_mode_merge(
 				"BSP4 upgrade requires a complete BSP3/BSP4 event pool");
 		goto done;
 	}
-	if (!canonicalMerge && (anyAdaptive || forceAdaptive)) {
-		snprintf(err, sizeof err,
-				"adaptive event merge requires globally rank-ascending inputs");
-		goto done;
-	}
-	if (!canonicalMerge)
-		fprintf(stderr, "merge: preserving legacy block order because an input is not globally rank-ascending\n");
+	if (!canonicalMerge && eventInputs)
+		fprintf(stderr,
+				"merge: normalizing historical event block order\n");
+	else if (!canonicalMerge)
+		fprintf(stderr,
+				"merge: preserving legacy block order because an input is not globally rank-ascending\n");
 	int outputSchema = eventInputs
 			? anyAdaptive || forceAdaptive
 				? BSPOOL_SCHEMA_ADAPTIVE : BSPOOL_SCHEMA_EVENTS
@@ -7849,7 +8610,8 @@ static int pool_mode_merge(
 	PoolMergeRankBlock rankBlock = { 0 };
 	for (int i = 0; i < ninputs; i++) {
 		if (!pool_merge_write_part(out, &parts[i], &eventBlock, &rankBlock,
-				canonicalMerge, outputSchema, &written,
+				eventInputs ? parts[i].blocksAscending : canonicalMerge,
+				outputSchema, &written,
 				&membershipDigest, &metadataDigest, err, sizeof err)) {
 			pool_merge_event_reset(&eventBlock);
 			fclose(out); remove(output); goto done;

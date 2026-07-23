@@ -5186,8 +5186,10 @@ static bool bspool_reader_init(BspoolReader *r, int fd, const BspoolHeader *h,
 		uint64_t footerMetadata = events ? bspool_get_u64le(footer + 48) : 0;
 		if (indexOff != r->dataOff + r->dataBytes || indexRecords != r->records
 				|| footerDataBytes != r->dataBytes || r->nblocks > r->records
-				|| (h->membershipDigest && footerMembership != h->membershipDigest)
-				|| (h->metadataDigest && footerMetadata != h->metadataDigest)
+				|| (events && h->membershipDigest
+					&& footerMembership != h->membershipDigest)
+				|| (events && h->metadataDigest
+					&& footerMetadata != h->metadataDigest)
 				|| r->nblocks > SIZE_MAX / sizeof *r->blocks
 				|| r->nblocks > (UINT64_MAX - indexOff - footerBytes) / indexEntryBytes
 				|| indexOff + r->nblocks * indexEntryBytes + footerBytes != fileBytes) {

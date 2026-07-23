@@ -287,22 +287,42 @@ rescanning, use a different output filename:
   seed_pools/output-bsp4.bspool
 ```
 
+Windows Command Prompt:
+
+```bat
+native\brainstorm_seed_pool.exe upgrade seed_pools\input-bsp3.bspool seed_pools\output-bsp4.bspool
+```
+
 The operation refuses to overwrite an existing output, preserves source
 identity, criteria, lineage, and provenance, and recomputes the encoding-
 dependent snapshot and logical digests. The source is never modified.
+Historical BSP3 files with physically shuffled blocks or overlapping block-rank
+ranges are canonicalized into globally rank-ascending BSP4 output during the
+upgrade. This ordering repair is also non-destructive to the source.
 
 #### Filtering an existing pool again
 
-The builder can use any finished `.bspool` as its input instead of scanning
-an entire seed space. Under **Input seeds**, choose a pool, set the next
-requirements, and build with a new name. Every result satisfies both the
-source pool's guarantees and the new criteria; the process can be repeated
-to make progressively smaller pools before applying aggressive in-game
-filters such as exact joker positions.
+The builder can use any compatible `.bspool`, including valid BSP3 pools, as
+its input instead of scanning an entire seed space. Under **Input seeds**,
+choose a pool, set the next requirements, and build with a new name. Every
+result satisfies both the source pool's guarantees and the new criteria; the
+process can be repeated to make progressively smaller pools before applying
+aggressive in-game filters such as exact joker positions. Incompatible pools
+remain visible but disabled, with a specific no-record, format/encoding, RNG
+model, or catalog/profile mismatch reason instead of silently disappearing.
+For a historical BSP3 whose blocks were published out of rank order, run the
+non-destructive `upgrade` command above first and use its BSP4 output; refilter
+resume cursors intentionally follow the source file's physical record order.
 
 ```sh
 ./native/brainstorm_seed_pool refilter native_search.cfg \
   next-filter.cfg seed_pools/input.bspool seed_pools/refined.bspool
+```
+
+Windows Command Prompt:
+
+```bat
+native\brainstorm_seed_pool.exe refilter native_search.cfg next-filter.cfg seed_pools\input.bspool seed_pools\refined.bspool
 ```
 
 Pools with checksummed committed seeds from the same model and unlock/pool
@@ -508,9 +528,14 @@ constraints; the builder's own executables no longer mix with the game helper.
 Launch the regular Seed Pool Builder and select **Organize / Combine** to work
 with existing files. The older **`Seed Pool Organizer.command`** (macOS) and
 **`Seed Pool Organizer.bat`** (Windows) entry points remain as compatible direct
-shortcuts. Exact-location splits show ambiguous seeds for an explicit category
-choice; incomplete sources use only their committed checkpoint; and every
-derivative records the source snapshot and lineage.
+shortcuts. Inspector recommends a named recorded filter to organize by and lets
+you switch to another recorded filter. Locations use friendly labels such as
+**Perkeo Ante 1 Big**. Source, occurrence, flag, and other technical variants
+at the same location are collapsed in the display while their complete metadata
+is retained in every derivative. Inspector asks for a destination choice only
+when the selected filter occurs at multiple locations in the same seed.
+Incomplete sources use only their committed checkpoint, and every derivative
+records the source snapshot and lineage.
 
 Large ambiguity sets are grouped by their exact candidate-category set, so one
 reviewed destination rule can resolve every seed with the same choices. The

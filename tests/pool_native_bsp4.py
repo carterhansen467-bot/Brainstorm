@@ -2,6 +2,7 @@
 """Native BSP4 writer/resume/refilter/oracle/corruption regression."""
 
 import argparse
+import importlib.util
 import os
 import re
 import shutil
@@ -14,6 +15,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import brainstorm_pool_organizer as organizer
+
+
+def organizer_fixture_module():
+    path = os.path.join(ROOT, "tests", "pool_organizer.py")
+    spec = importlib.util.spec_from_file_location(
+        "brainstorm_pool_organizer_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run(scanner, *args, expect=True):
@@ -385,6 +395,35 @@ def main():
         if clean_data != merged4_data or clean_data != mixed_data:
             raise AssertionError(
                 "all-BSP4/mixed shard merge differs from clean BSP4 data")
+
+        # A noncanonical rank-only input makes the entire legacy BSP2 merge
+        # preserve physical block order. Canonical neighbors must not remain
+        # buffered and get emitted after that middle shard.
+        fixtures = organizer_fixture_module()
+        rank_first = os.path.join(temp, "rank-first.bspool")
+        rank_middle = os.path.join(temp, "rank-middle.bspool")
+        rank_last = os.path.join(temp, "rank-last.bspool")
+        rank_merged = os.path.join(temp, "rank-merged.bspool")
+        fixtures.write_rank_bsp2_shard(
+            rank_first, [[1, 2]], 0, 10)
+        fixtures.write_rank_bsp2_shard(
+            rank_middle, [[15, 16], [11, 12]], 10, 20)
+        fixtures.write_rank_bsp2_shard(
+            rank_last, [[21, 22]], 20, 30)
+        run(scanner, "merge", rank_merged,
+            rank_last, rank_first, rank_middle)
+        rank_export = os.path.join(temp, "rank-merged.txt")
+        run(scanner, "export", rank_merged, rank_export)
+        with open(rank_export, encoding="ascii") as handle:
+            rank_order = [line.strip() for line in handle if line.strip()]
+        expected_rank_order = [
+            organizer.rank_to_seed(rank, organizer.NATURAL_CHARSET)
+            for rank in (1, 2, 15, 16, 11, 12, 21, 22)
+        ]
+        if rank_order != expected_rank_order:
+            raise AssertionError(
+                "mixed canonical/noncanonical BSP2 shards changed part order")
+
         upgraded = os.path.join(temp, "upgraded-v3.bspool")
         run(scanner, "upgrade", v3, upgraded)
         upgraded_reader = organizer.BSPoolReader(upgraded)
@@ -394,6 +433,110 @@ def main():
         if upgraded_reader.schema != 4 or upgraded_data != clean_data:
             raise AssertionError(
                 "streaming BSP3 upgrade differs from canonical BSP4 data")
+
+        # Historical multi-thread BSP3 writers could commit individually
+        # sorted blocks in worker-completion order. Upgrade must normalize
+        # both disjoint and overlapping intervals without losing metadata.
+        historical_overlap = os.path.join(
+            temp, "historical-overlap.bspool")
+        historical_disjoint = os.path.join(
+            temp, "historical-disjoint.bspool")
+        historical_boundary = os.path.join(
+            temp, "historical-boundary.bspool")
+        fixtures.write_out_of_order_bsp3(
+            historical_overlap, True, long_opaque=True)
+        fixtures.write_out_of_order_bsp3(
+            historical_disjoint, False, long_opaque=True)
+        fixtures.write_out_of_order_bsp3(
+            historical_boundary, boundary=True)
+        for source, stem in (
+                (historical_overlap, "historical-overlap-v4"),
+                (historical_disjoint, "historical-disjoint-v4"),
+                (historical_boundary, "historical-boundary-v4")):
+            target = os.path.join(temp, stem + ".bspool")
+            result = run(scanner, "upgrade", source, target)
+            if "normalizing historical event block order" not in result.stderr:
+                raise AssertionError(
+                    "historical upgrade did not report normalization")
+            source_records = list(
+                organizer.BSPoolReader(source).iter_records())
+            records = list(organizer.BSPoolReader(target).iter_records())
+            if [record.rank for record in records] != [
+                    record.rank for record in source_records]:
+                raise AssertionError(
+                    "historical BSP3 upgrade did not globally order ranks")
+            if [[occurrence.raw for occurrence in record.occurrences]
+                    for record in records] != [
+                    [occurrence.raw for occurrence in record.occurrences]
+                    for record in source_records]:
+                raise AssertionError(
+                    "historical BSP3 upgrade changed event metadata")
+
+        # The same per-input fallback must work in a mixed BSP3/BSP4 shard
+        # merge, not only through the one-input ``upgrade`` alias.
+        historical_second = os.path.join(
+            temp, "historical-second-shard.bspool")
+        canonical_second = os.path.join(
+            temp, "historical-second-shard-v4.bspool")
+        historical_merged = os.path.join(
+            temp, "historical-mixed-merge.bspool")
+        historical_reversed = os.path.join(
+            temp, "historical-reversed-merge.bspool")
+        fixtures.write_out_of_order_bsp3(
+            historical_second, True, range_start=100, range_end=200)
+        run(scanner, "upgrade", historical_second, canonical_second)
+        run(scanner, "merge", historical_merged,
+            historical_overlap, canonical_second)
+        expected_records = list(
+            organizer.BSPoolReader(historical_overlap).iter_records())
+        expected_records.extend(
+            organizer.BSPoolReader(canonical_second).iter_records())
+        mixed_records = list(
+            organizer.BSPoolReader(historical_merged).iter_records())
+        if [(record.rank, [item.raw for item in record.occurrences])
+                for record in mixed_records] != [
+                (record.rank, [item.raw for item in record.occurrences])
+                for record in expected_records]:
+            raise AssertionError(
+                "mixed historical BSP3/BSP4 merge changed ordered records")
+        canonical_first = os.path.join(
+            temp, "historical-overlap-v4.bspool")
+        run(scanner, "merge", historical_reversed,
+            canonical_first, historical_second)
+        reversed_records = list(
+            organizer.BSPoolReader(historical_reversed).iter_records())
+        if [(record.rank, [item.raw for item in record.occurrences])
+                for record in reversed_records] != [
+                (record.rank, [item.raw for item in record.occurrences])
+                for record in expected_records]:
+            raise AssertionError(
+                "canonical-first historical merge changed ordered records")
+
+        duplicate = os.path.join(temp, "historical-duplicate.bspool")
+        duplicate_output = os.path.join(
+            temp, "historical-duplicate-v4.bspool")
+        fixtures.write_out_of_order_bsp3(
+            duplicate, overlapping=True, duplicate=True)
+        duplicate_result = run(
+            scanner, "upgrade", duplicate, duplicate_output, expect=False)
+        if "duplicate" not in duplicate_result.stderr \
+                or os.path.exists(duplicate_output):
+            raise AssertionError(
+                "duplicate historical ranks did not fail atomically")
+
+        damaged = os.path.join(temp, "historical-damaged.bspool")
+        damaged_output = os.path.join(
+            temp, "historical-damaged-v4.bspool")
+        shutil.copyfile(historical_overlap, damaged)
+        with open(damaged, "r+b") as handle:
+            handle.seek(8192 + 48)
+            value = handle.read(1)
+            handle.seek(8192 + 48)
+            handle.write(bytes((value[0] ^ 1,)))
+        run(scanner, "upgrade", damaged, damaged_output, expect=False)
+        if os.path.exists(damaged_output):
+            raise AssertionError(
+                "corrupt historical upgrade did not fail atomically")
 
         v3_txt = os.path.join(temp, "v3.txt")
         v4_txt = os.path.join(temp, "v4.txt")
