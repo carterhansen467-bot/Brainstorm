@@ -2103,6 +2103,43 @@ class OrganizerWebRegression(unittest.TestCase):
             web._verify_upgrade_record_equivalence(
                 source_reader, staged_reader)
 
+    def test_format_upgrade_record_comparison_closes_streams_on_mismatch(
+            self):
+        closed = []
+
+        class TrackedRecords:
+            def __init__(self, label, records):
+                self.label = label
+                self.records = iter(records)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.records)
+
+            def close(self):
+                closed.append(self.label)
+
+        class TrackedReader:
+            def __init__(self, label, records):
+                self.label = label
+                self.items = records
+                self.records = len(records)
+
+            def iter_records(self, cancel_check=None):
+                return TrackedRecords(self.label, self.items)
+
+        occurrence = organizer.Occurrence.decode(fixture.TAG)
+        source = TrackedReader(
+            "source", [organizer.Record(1, (occurrence,))])
+        staged = TrackedReader(
+            "staged", [organizer.Record(2, (occurrence,))])
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed a seed rank"):
+            web._verify_upgrade_record_equivalence(source, staged)
+        self.assertCountEqual(closed, ["source", "staged"])
+
     def test_format_upgrade_cancellation_never_publishes_partial_output(self):
         name = "cancel-source.bspool"
         source = os.path.join(self.temp.name, name)

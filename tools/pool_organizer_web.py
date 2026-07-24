@@ -420,39 +420,45 @@ def _verify_upgrade_record_equivalence(
     records = 0
     source_records = source_reader.iter_records(cancel_check=cancel_check)
     staged_records = staged_reader.iter_records(cancel_check=cancel_check)
-    while True:
-        source_record = next(source_records, None)
-        staged_record = next(staged_records, None)
-        if source_record is None or staged_record is None:
-            if source_record is not staged_record:
+    with ExitStack() as streams:
+        streams.callback(source_records.close)
+        streams.callback(staged_records.close)
+        while True:
+            source_record = next(source_records, None)
+            staged_record = next(staged_records, None)
+            if source_record is None or staged_record is None:
+                if source_record is not staged_record:
+                    raise organizer.PoolError(
+                        "native BSP4 update changed the number of seed records")
+                break
+            if not records % 4096:
+                _operation_cancelled(cancel_check)
+            source_occurrences = source_record.occurrences
+            staged_occurrences = staged_record.occurrences
+            if (source_record.rank != staged_record.rank
+                    or len(source_occurrences) != len(staged_occurrences)
+                    or any(source_item.raw != staged_item.raw
+                           for source_item, staged_item in zip(
+                               source_occurrences, staged_occurrences))):
                 raise organizer.PoolError(
-                    "native BSP4 update changed the number of seed records")
-            break
-        if not records % 4096:
-            _operation_cancelled(cancel_check)
-        source_occurrences = source_record.occurrences
-        staged_occurrences = staged_record.occurrences
-        if (source_record.rank != staged_record.rank
-                or len(source_occurrences) != len(staged_occurrences)
-                or any(source_item.raw != staged_item.raw
-                       for source_item, staged_item in zip(
-                           source_occurrences, staged_occurrences))):
-            raise organizer.PoolError(
-                "native BSP4 update changed a seed rank or its recorded "
-                "filter metadata")
-        descriptor_digest = descriptor_start
-        for occurrence in staged_occurrences:
-            raw = occurrence.raw
-            descriptor_digest = organizer.fnv64(
-                struct.pack("<I", len(raw)), descriptor_digest)
-            descriptor_digest = organizer.fnv64(
-                raw, descriptor_digest)
-        digest = organizer.fnv64(
-            struct.pack(
-                "<QIQ", staged_record.rank, len(staged_occurrences),
-                descriptor_digest),
-            digest)
-        records += 1
+                    "native BSP4 update changed a seed rank or its recorded "
+                    "filter metadata")
+            descriptor_digest = descriptor_start
+            for occurrence in staged_occurrences:
+                raw = occurrence.raw
+                descriptor_digest = organizer.fnv64(
+                    struct.pack("<I", len(raw)), descriptor_digest)
+                descriptor_digest = organizer.fnv64(
+                    raw, descriptor_digest)
+            digest = organizer.fnv64(
+                struct.pack(
+                    "<QIQ", staged_record.rank, len(staged_occurrences),
+                    descriptor_digest),
+                digest)
+            records += 1
+        # A generator owns its pool file while yielding. POSIX permits
+        # unlinking that open file, but Windows does not; ExitStack closes both
+        # streams before private-stage cleanup on every early mismatch.
     _operation_cancelled(cancel_check)
     if (records != source_reader.records
             or records != staged_reader.records):
