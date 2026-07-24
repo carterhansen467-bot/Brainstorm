@@ -10,19 +10,23 @@ Both event schemas are accepted by the native scanner/searcher.
 
 from __future__ import print_function
 
+import atexit
 import collections
 import copy
+import errno
 import json
 import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -73,6 +77,9 @@ SPLIT_LOCK = threading.Lock()
 COMBINE_LOCK = threading.Lock()
 ACTIVE_OPERATION_LOCK = threading.Lock()
 ACTIVE_OPERATIONS = {}
+ACTIVE_OPERATIONS_CLOSING = False
+ACTIVE_UPGRADE_PROCESS_LOCK = threading.Lock()
+ACTIVE_UPGRADE_PROCESSES = set()
 READER_CACHE_LOCK = threading.Lock()
 READER_CACHE = collections.OrderedDict()
 MAX_COMBINE_INPUTS = organizer.COMPOSITE_MAX_INPUTS
@@ -96,9 +103,17 @@ _POOL_BINARY_CANDIDATES = [
 ]
 
 
+class OperationCancelled(organizer.PoolError):
+    """A user-requested cancellation that the HTTP UI can classify safely."""
+
+
+class FormatPlanStale(organizer.PoolError):
+    """The checked source/output contract changed before publication."""
+
+
 def _operation_cancelled(cancel_check):
     if cancel_check is not None and cancel_check():
-        raise organizer.PoolError("operation cancelled")
+        raise OperationCancelled("operation cancelled")
 
 
 def _plan_token(kind, value):
@@ -207,8 +222,13 @@ def _reviewed_split_preflight(reader, selected_ids, choices, ambiguity_rules,
 
 def _begin_operation(kind):
     """Register one cancellable local mutation and return its Event."""
+    global ACTIVE_OPERATIONS_CLOSING
     event = threading.Event()
     with ACTIVE_OPERATION_LOCK:
+        if ACTIVE_OPERATIONS_CLOSING:
+            raise organizer.PoolError(
+                "the local Organizer is closing; reopen it before starting "
+                "another operation")
         if kind in ACTIVE_OPERATIONS:
             raise organizer.PoolError("another organizer %s is still running" % kind)
         ACTIVE_OPERATIONS[kind] = event
@@ -222,14 +242,54 @@ def _finish_operation(kind, event):
 
 
 def cancel_operation(kind):
-    if kind not in ("analysis", "split", "combine"):
-        raise organizer.PoolError("choose analysis, split, or combine to cancel")
+    if kind not in ("analysis", "split", "combine", "upgrade"):
+        raise organizer.PoolError(
+            "choose analysis, split, combine, or upgrade to cancel")
     with ACTIVE_OPERATION_LOCK:
         event = ACTIVE_OPERATIONS.get(kind)
         if event is None:
             return {"ok": True, "operation": kind, "state": "idle"}
         event.set()
     return {"ok": True, "operation": kind, "state": "cancelling"}
+
+
+def cancel_active_operations():
+    """Signal every Organizer worker during application shutdown."""
+    with ACTIVE_OPERATION_LOCK:
+        kinds = tuple(ACTIVE_OPERATIONS)
+        for event in ACTIVE_OPERATIONS.values():
+            event.set()
+    return kinds
+
+
+def begin_operation_shutdown():
+    """Atomically block new Organizer work and cancel registered workers."""
+    global ACTIVE_OPERATIONS_CLOSING
+    with ACTIVE_OPERATION_LOCK:
+        ACTIVE_OPERATIONS_CLOSING = True
+        kinds = tuple(ACTIVE_OPERATIONS)
+        for event in ACTIVE_OPERATIONS.values():
+            event.set()
+    return kinds
+
+
+def allow_active_operations():
+    """Open the operation registry when a local application starts."""
+    global ACTIVE_OPERATIONS_CLOSING
+    with ACTIVE_OPERATION_LOCK:
+        if ACTIVE_OPERATIONS:
+            raise organizer.PoolError(
+                "cannot reopen the Organizer while an operation is active")
+        ACTIVE_OPERATIONS_CLOSING = False
+
+
+def wait_for_active_operations(poll_seconds=0.05):
+    """Wait until cancellable Organizer request workers have cleaned up."""
+    while True:
+        with ACTIVE_OPERATION_LOCK:
+            if not ACTIVE_OPERATIONS:
+                return
+        time.sleep(poll_seconds)
 
 
 def _pool_root(pool_dir=None):
@@ -352,6 +412,55 @@ def _bounded_header(path):
     return organizer.PoolHeader(text)
 
 
+def _verify_upgrade_record_equivalence(
+        source_reader, staged_reader, cancel_check=None):
+    """Compare exact BSP3/BSP4 records and hash the verified staged stream."""
+    digest = organizer.fnv64(b"BSPRECM1")
+    descriptor_start = organizer.fnv64(b"BSPRECD1")
+    records = 0
+    source_records = source_reader.iter_records(cancel_check=cancel_check)
+    staged_records = staged_reader.iter_records(cancel_check=cancel_check)
+    while True:
+        source_record = next(source_records, None)
+        staged_record = next(staged_records, None)
+        if source_record is None or staged_record is None:
+            if source_record is not staged_record:
+                raise organizer.PoolError(
+                    "native BSP4 update changed the number of seed records")
+            break
+        if not records % 4096:
+            _operation_cancelled(cancel_check)
+        source_occurrences = source_record.occurrences
+        staged_occurrences = staged_record.occurrences
+        if (source_record.rank != staged_record.rank
+                or len(source_occurrences) != len(staged_occurrences)
+                or any(source_item.raw != staged_item.raw
+                       for source_item, staged_item in zip(
+                           source_occurrences, staged_occurrences))):
+            raise organizer.PoolError(
+                "native BSP4 update changed a seed rank or its recorded "
+                "filter metadata")
+        descriptor_digest = descriptor_start
+        for occurrence in staged_occurrences:
+            raw = occurrence.raw
+            descriptor_digest = organizer.fnv64(
+                struct.pack("<I", len(raw)), descriptor_digest)
+            descriptor_digest = organizer.fnv64(
+                raw, descriptor_digest)
+        digest = organizer.fnv64(
+            struct.pack(
+                "<QIQ", staged_record.rank, len(staged_occurrences),
+                descriptor_digest),
+            digest)
+        records += 1
+    _operation_cancelled(cancel_check)
+    if (records != source_reader.records
+            or records != staged_reader.records):
+        raise organizer.PoolError(
+            "record metadata digest count differs from the pool header")
+    return digest
+
+
 def list_sources(pool_dir=None):
     """Return cheap header-only rows; full checksum verification is inspect."""
     root = _pool_root(pool_dir)
@@ -459,9 +568,569 @@ def _summary_identity(path):
         "device": int(status.st_dev),
         "inode": int(status.st_ino),
         "bytes": int(status.st_size),
+        "links": int(status.st_nlink),
+        "symlink": bool(os.path.islink(path)),
         "mtime_ns": int(getattr(
             status, "st_mtime_ns", int(status.st_mtime * 1000000000))),
     }
+
+
+FORMAT_UPGRADE_PROTECTED_SUFFIXES = (
+    "", ".manifest", ".state", ".criteria.cfg", ".attached",
+    ".organizer-summary.json")
+FORMAT_UPGRADE_PRESERVED_HEADER_FIELDS = (
+    "family_id", "segment_id", "stage_hash", "lineage_id", "scan_cursor",
+    "refilter_depth", "source_criteria_hash", "source_records",
+    "source_pool_id", "source_complete", "source_coverage_complete",
+    "source_range_start", "source_range_end", "source_data_bytes",
+    "source_membership_digest", "source_snapshot_id", "source_family_id",
+    "source_segment_id", "source_lineage_id", "input_cursor",
+    "input_record_start", "input_record_end", "parent_snapshot_id",
+    "parent_segment_id", "parent_records", "parent_data_bytes",
+    "parent_coverage_complete", "shard_index", "shard_total")
+
+
+def _format_upgrade_output_name(source_name, root):
+    """Choose a readable BSP4 filename without overwriting pool artifacts."""
+    source_stem = os.path.splitext(source_name)[0]
+    match = re.search(r"bsp3$", source_stem, re.IGNORECASE)
+    if match:
+        base = source_stem[:match.start()]
+        marker = "BSP4"
+    else:
+        base = source_stem
+        marker = "-BSP4"
+    if not base:
+        base = "upgraded-pool" if marker.startswith("-") else ""
+    max_stem = 160
+    if os.name == "nt":
+        # Native helper paths use the traditional Windows CRT.  Account for
+        # seed_pools\\.u-XXXXXXXX\\<name>.manifest and retain extra headroom
+        # below MAX_PATH rather than merely capping the basename.
+        max_filename = (
+            240 - len(os.path.abspath(root)) - 1 - len(".u-XXXXXXXX")
+            - 1 - max(len(".manifest"), len(".writer.lock")))
+        max_stem = min(max_stem, max_filename - len(".bspool"))
+        if max_stem < len("BSP4-9999"):
+            raise organizer.PoolError(
+                "The Seed Pool folder path is too long for a safe BSP4 update "
+                "on Windows. Move the mod to a shorter folder first.")
+    # Truncate only the source-derived portion so every automatic filename
+    # retains its BSP4 marker and collision suffix.
+    for number in range(1, 10000):
+        suffix = "" if number == 1 else "-%d" % number
+        stem = base[:max(0, max_stem - len(marker) - len(suffix))]
+        stem = (stem + marker).rstrip(" .")
+        name = stem + suffix + ".bspool"
+        path = os.path.join(root, name)
+        if not any(os.path.lexists(path + extra)
+                   for extra in FORMAT_UPGRADE_PROTECTED_SUFFIXES):
+            return name
+    raise organizer.PoolError(
+        "could not choose an unused automatic BSP4 filename")
+
+
+def plan_format_upgrade(name, pool_dir=None):
+    """Inspect one bounded header and plan a non-destructive BSP3 upgrade."""
+    root = _pool_root(pool_dir)
+    path = resolve_source(name, root)
+    identity = _summary_identity(path)
+    header = _bounded_header(path)
+    try:
+        schema = int(header.one("BRAINSTORM_SEED_POOL"))
+    except ValueError:
+        raise organizer.PoolError("invalid Brainstorm pool schema")
+    encoding = header.one("encoding", required=False, default="")
+    records = header.integer("records")
+    complete = header.integer("complete")
+    coverage_complete = header.integer(
+        "coverage_complete", required=False, default=complete)
+    if complete not in (0, 1) or coverage_complete not in (0, 1):
+        raise organizer.PoolError("complete flags must be 0 or 1")
+    source_contract = {
+        "modelver": header.integer("modelver"),
+        "header_bytes": header.integer("header_bytes"),
+        "catalog_hash": header.one("catalog_hash").lower(),
+        "criteria_hash": header.one("criteria_hash").lower(),
+        "space": header.one("space", required=False, default="natural"),
+        "seedspace": header.integer("seedspace"),
+        "range_start": header.integer("range_start"),
+        "range_end": header.integer("range_end"),
+        "merged_parts": header.integer(
+            "merged_parts", required=False, default=0),
+        "derivation_id": header.integer(
+            "derivation_id", 16, required=False, default=0),
+        "snapshot_id": header.integer(
+            "snapshot_id", 16, required=False, default=0),
+        "membership_digest": header.integer(
+            "membership_digest", 16, required=False, default=0),
+        "metadata_digest": header.integer(
+            "metadata_digest", 16, required=False, default=0),
+        "pool_id": header.one(
+            "pool_id", required=False, default="-"),
+        "preserved_header_fields": {
+            key: header.one(key)
+            for key in FORMAT_UPGRADE_PRESERVED_HEADER_FIELDS
+            if header.values.get(key)
+        },
+    }
+
+    blockers = []
+    output_name = ""
+    status = "blocked"
+    if schema == 4 and encoding == organizer.POOL_ENCODINGS[4]:
+        status = "current"
+    elif schema == 3:
+        output_name = _format_upgrade_output_name(name, root)
+        if encoding != organizer.POOL_ENCODINGS[3]:
+            blockers.append(
+                "This BSP3 pool has incompatible encoding %s."
+                % (encoding or "(missing)"))
+        if not complete:
+            blockers.append(
+                "Finish or resume this pool first; format updates require a completed BSP3 pool.")
+        elif not coverage_complete:
+            blockers.append(
+                "This pool has provisional search coverage and cannot be losslessly updated yet.")
+        if identity["symlink"] or identity["links"] != 1:
+            blockers.append(
+                "This pool is a filesystem link. Select its original one-link "
+                "file so the Organizer can lock it safely during the update.")
+        if not _native_pool_binary():
+            blockers.append(
+                "The native seed-pool helper is missing; reinstall the latest full Windows package.")
+        if not blockers:
+            status = "upgrade_available"
+    elif schema in (1, 2):
+        blockers.append(
+            "BSP%d does not contain BSP3 per-seed event metadata and cannot be losslessly updated to BSP4; refilter or rescan it in Build / Search."
+            % schema)
+    elif schema > 4:
+        blockers.append(
+            "This pool uses newer BSP%d data; this version of Brainstorm will not downgrade it."
+            % schema)
+    else:
+        blockers.append("This pool schema cannot be updated to BSP4.")
+
+    token_fields = {
+        "source": name,
+        "identity": identity,
+        "schema": schema,
+        "encoding": encoding,
+        "records": records,
+        "complete": complete,
+        "coverage_complete": coverage_complete,
+        "output_name": output_name,
+        "status": status,
+        "source_contract": source_contract,
+    }
+    return {
+        "source": name,
+        "source_schema": schema,
+        "source_format": "BSP%d" % schema,
+        "encoding": encoding,
+        "records": records,
+        "bytes": identity["bytes"],
+        "complete": bool(complete),
+        "coverage_complete": bool(coverage_complete),
+        "snapshot_id": header.one(
+            "snapshot_id", required=False, default=""),
+        "status": status,
+        "eligible": status == "upgrade_available",
+        "blockers": blockers,
+        "output_name": output_name,
+        "source_identity": identity,
+        "source_contract": source_contract,
+        "plan_token": _plan_token("format-upgrade", token_fields),
+    }
+
+
+def _terminate_upgrade_process(process):
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        process.wait(timeout=2.0)
+
+
+def _terminate_registered_upgrade_processes():
+    """Last-resort child cleanup if the local web application exits."""
+    with ACTIVE_UPGRADE_PROCESS_LOCK:
+        processes = tuple(ACTIVE_UPGRADE_PROCESSES)
+    for process in processes:
+        try:
+            _terminate_upgrade_process(process)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+atexit.register(_terminate_registered_upgrade_processes)
+
+
+def _run_native_upgrade(source, output, cancel_check=None):
+    """Run the native one-input adaptive merge while draining its stderr."""
+    binary = _native_pool_binary()
+    if not binary:
+        raise organizer.PoolError(
+            "native seed-pool helper is missing; reinstall the latest full package")
+    lines = collections.deque(maxlen=200)
+    process = subprocess.Popen(
+        [binary, "upgrade", source, output],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace")
+    with ACTIVE_UPGRADE_PROCESS_LOCK:
+        ACTIVE_UPGRADE_PROCESSES.add(process)
+
+    def pump():
+        try:
+            for line in process.stderr:
+                lines.append(line.rstrip("\r\n"))
+        finally:
+            process.stderr.close()
+
+    reader = None
+    cancelled = False
+    try:
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        while process.poll() is None:
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        termination_error = None
+        try:
+            if process.poll() is None:
+                _terminate_upgrade_process(process)
+        except (OSError, subprocess.SubprocessError) as exc:
+            termination_error = exc
+        finally:
+            if reader is not None:
+                reader.join(timeout=5.0)
+            with ACTIVE_UPGRADE_PROCESS_LOCK:
+                if process.poll() is not None:
+                    ACTIVE_UPGRADE_PROCESSES.discard(process)
+        if termination_error is not None:
+            raise organizer.PoolError(
+                "native BSP4 helper could not be stopped safely: %s"
+                % termination_error)
+    if cancelled:
+        raise OperationCancelled(
+            "format update cancelled safely; no new pool was published")
+    if process.returncode:
+        detail = next((line for line in reversed(lines) if line.strip()),
+                      "native helper exited with code %d" % process.returncode)
+        raise organizer.PoolError("BSP4 update failed: %s" % detail)
+    return {
+        "normalized_historical_order": any(
+            "normalizing historical event block order" in line
+            for line in lines),
+    }
+
+
+def _cleanup_upgrade_stage(stage_dir):
+    """Remove private upgrade data, retrying transient Windows/AV sharing."""
+    last_error = None
+    for delay in (0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+        if delay:
+            time.sleep(delay)
+        try:
+            shutil.rmtree(stage_dir)
+            return ""
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            last_error = exc
+    return (
+        "Brainstorm could not remove its private staging folder after "
+        "retries: %s (%s). It is safe to delete after closing the Builder."
+        % (stage_dir, last_error))
+
+
+def _publish_upgrade_file(staged_path, final_path):
+    """Atomically publish without overwriting on the current platform."""
+    if os.name == "nt":
+        # Windows rename is same-volume atomic and refuses an existing target,
+        # while FAT/exFAT may not support hard links.
+        os.rename(staged_path, final_path)
+    else:
+        # POSIX rename would overwrite. A hard link is the portable
+        # no-overwrite publication primitive for our same-filesystem stage.
+        os.link(staged_path, final_path)
+
+
+def _published_upgrade_identity(path, expected):
+    try:
+        actual = _summary_identity(path)
+        return all(actual[key] == expected[key] for key in (
+            "device", "inode", "bytes", "mtime_ns"))
+    except OSError:
+        return False
+
+
+@contextmanager
+def _format_upgrade_writer_guard(
+        path, committed_check, post_commit_warnings):
+    """Never turn a completed publication into a reported failure on unlock."""
+    try:
+        with organizer.pool_writer_guard(path):
+            yield
+    except Exception as exc:
+        if not committed_check():
+            raise
+        post_commit_warnings.append(
+            "The BSP4 pool is complete, but final publication cleanup for "
+            "%s reported: %s" % (os.path.basename(path), exc))
+
+
+def execute_format_upgrade(request, pool_dir=None, cancel_check=None):
+    """Create and atomically publish a verified BSP4 copy of one BSP3 pool."""
+    if not isinstance(request, dict):
+        raise organizer.PoolError("format update request must be an object")
+    name = request.get("source", "")
+    reviewed_token = str(request.get("planToken", ""))
+    if not reviewed_token:
+        raise organizer.PoolError(
+            "check the selected pool format before creating a BSP4 copy")
+    plan = plan_format_upgrade(name, pool_dir)
+    if reviewed_token != plan["plan_token"]:
+        raise FormatPlanStale(
+            "the source pool or automatic output changed; check its format again")
+    if not plan["eligible"]:
+        detail = " ".join(plan["blockers"]) or "No format update is needed."
+        raise organizer.PoolError(detail)
+
+    root = _pool_root(pool_dir)
+    source = resolve_source(name, root)
+    output_name = plan["output_name"]
+    output = os.path.abspath(os.path.join(root, output_name))
+    if os.path.commonpath((root, output)) != root:
+        raise organizer.PoolError(
+            "automatic BSP4 output escapes the Seed Pool folder")
+    stage_dir = tempfile.mkdtemp(prefix=".u-", dir=root)
+    staged_output = os.path.join(stage_dir, output_name)
+    result = None
+    committed = False
+    post_commit_warnings = []
+    try:
+        _operation_cancelled(cancel_check)
+        # Treat the source as immutable for the duration and share the same
+        # advisory lock contract as native writers and Builder deletion.
+        with _format_upgrade_writer_guard(
+                source, lambda: committed, post_commit_warnings):
+            if _summary_identity(source) != plan["source_identity"]:
+                raise FormatPlanStale(
+                    "the source pool changed after its format was checked")
+            native = _run_native_upgrade(
+                source, staged_output, cancel_check=cancel_check)
+            _operation_cancelled(cancel_check)
+            if _summary_identity(source) != plan["source_identity"]:
+                raise FormatPlanStale(
+                    "the source pool changed during its format update")
+
+            # Independently decode the locked BSP3 source and the staged BSP4
+            # stream in rank order. Exact rank/descriptor equality proves the
+            # format update preserved every logical record; hashing that same
+            # staged stream also checks the native pre-encoding manifest.
+            try:
+                verified_source = organizer.BSPoolReader(
+                    source, cancel_check=cancel_check,
+                    verify_payloads=False)
+                staged = organizer.BSPoolReader(
+                    staged_output, cancel_check=cancel_check,
+                    verify_payloads=False)
+                staged_record_metadata_digest = \
+                    _verify_upgrade_record_equivalence(
+                        verified_source, staged,
+                        cancel_check=cancel_check)
+            except organizer.PoolError:
+                _operation_cancelled(cancel_check)
+                raise
+            if _summary_identity(source) != plan["source_identity"]:
+                raise FormatPlanStale(
+                    "the source pool changed while its BSP4 records were "
+                    "being verified")
+            staged_manifest = staged_output + ".manifest"
+            if not os.path.isfile(staged_manifest):
+                raise organizer.PoolError(
+                    "native helper did not create its BSP4 verification "
+                    "manifest")
+            try:
+                with open(staged_manifest, "rb") as handle:
+                    manifest_bytes = handle.read(1024 * 1024 + 1)
+                if len(manifest_bytes) > 1024 * 1024:
+                    raise organizer.PoolError(
+                        "native BSP4 verification manifest is too large")
+                manifest = organizer.PoolHeader(
+                    manifest_bytes.decode("utf-8", errors="replace"))
+            except (OSError, UnicodeError) as exc:
+                raise organizer.PoolError(
+                    "cannot read native BSP4 verification manifest: %s"
+                    % exc)
+            staged_derivation = staged.header.integer(
+                "derivation_id", 16, required=False, default=0)
+            staged_snapshot = staged.header.integer(
+                "snapshot_id", 16, required=False, default=0)
+            preserved_fields = plan[
+                "source_contract"]["preserved_header_fields"]
+            if (staged.schema != 4
+                    or staged.encoding != organizer.POOL_ENCODINGS[4]
+                    or not staged.complete or not staged.coverage_complete
+                    or staged.records != plan["records"]
+                    or staged.modelver != plan["source_contract"]["modelver"]
+                    or staged.header_bytes
+                        != plan["source_contract"]["header_bytes"]
+                    or ("%016x" % staged.catalog_hash)
+                        != plan["source_contract"]["catalog_hash"]
+                    or ("%016x" % staged.criteria_hash)
+                        != plan["source_contract"]["criteria_hash"]
+                    or staged.space_name != plan["source_contract"]["space"]
+                    or staged.seedspace != plan["source_contract"]["seedspace"]
+                    or staged.range_start
+                        != plan["source_contract"]["range_start"]
+                    or staged.range_end
+                        != plan["source_contract"]["range_end"]
+                    or staged.header.integer(
+                        "merged_parts", required=False, default=0)
+                        != plan["source_contract"]["merged_parts"]
+                    or not staged_derivation
+                    or staged_derivation
+                        == plan["source_contract"]["derivation_id"]
+                    or not staged_snapshot
+                    or staged_snapshot
+                        == plan["source_contract"]["snapshot_id"]
+                    or manifest.integer(
+                        "BRAINSTORM_SEED_POOL_MERGE") != 4
+                    or manifest.integer(
+                        "upgrade_source_snapshot_id", 16)
+                        != plan["source_contract"]["snapshot_id"]
+                    or manifest.integer(
+                        "upgrade_source_membership_digest", 16)
+                        != plan["source_contract"]["membership_digest"]
+                    or manifest.integer(
+                        "upgrade_source_metadata_digest", 16)
+                        != plan["source_contract"]["metadata_digest"]
+                    or manifest.integer(
+                        "record_metadata_digest", 16)
+                        != staged_record_metadata_digest
+                    or manifest.one("upgrade_source_pool_id")
+                        != plan["source_contract"]["pool_id"]
+                    or any(staged.header.values.get(key, []) != [value]
+                           for key, value in preserved_fields.items())):
+                raise organizer.PoolError(
+                    "native helper did not create the expected complete BSP4 "
+                    "pool with preserved source metadata")
+
+            final_manifest = output + ".manifest"
+            staged_output_identity = _summary_identity(staged_output)
+            staged_manifest_identity = (
+                _summary_identity(staged_manifest)
+                if os.path.isfile(staged_manifest) else None)
+            source_bytes = plan["bytes"]
+            output_bytes = os.path.getsize(staged_output)
+            saved_bytes = max(0, source_bytes - output_bytes)
+            result = {
+                "source": name,
+                "source_schema": plan["source_schema"],
+                "source_bytes": source_bytes,
+                "source_retained": True,
+                "output": output_name,
+                "output_schema": 4,
+                "output_bytes": output_bytes,
+                "records": plan["records"],
+                "saved_bytes": saved_bytes,
+                "saved_percent": (
+                    (100.0 * saved_bytes / source_bytes)
+                    if source_bytes else 0.0),
+                "normalized_historical_order":
+                    native["normalized_historical_order"],
+            }
+            _operation_cancelled(cancel_check)
+            with _format_upgrade_writer_guard(
+                    output, lambda: committed, post_commit_warnings):
+                if any(os.path.lexists(
+                        output + suffix)
+                        for suffix in FORMAT_UPGRADE_PROTECTED_SUFFIXES):
+                    raise FormatPlanStale(
+                        "the automatic BSP4 output now exists; check the pool format again")
+                # This is the final cancellation boundary.  Once the pool
+                # link/rename exists it is a complete, verified publication;
+                # Windows readers may immediately open it with delete-denying
+                # sharing, so post-commit cancellation must not try to roll it
+                # back or claim that nothing was published.
+                _operation_cancelled(cancel_check)
+                try:
+                    _publish_upgrade_file(staged_output, output)
+                    committed = True
+                except BaseException as exc:
+                    committed = _published_upgrade_identity(
+                        output, staged_output_identity)
+                    if not committed:
+                        if os.path.lexists(output):
+                            raise FormatPlanStale(
+                                "the automatic BSP4 output now exists; check "
+                                "the pool format again") from exc
+                        if (isinstance(exc, OSError)
+                                and exc.errno in (
+                                    errno.EPERM, errno.EXDEV,
+                                    getattr(errno, "ENOTSUP", -1),
+                                    getattr(errno, "EOPNOTSUPP", -1))):
+                            raise organizer.PoolError(
+                                "This Seed Pool folder filesystem cannot "
+                                "safely publish a no-overwrite BSP4 copy. "
+                                "Use a local NTFS, APFS, or standard Linux "
+                                "filesystem folder.") from exc
+                        raise
+                if staged_manifest_identity is not None:
+                    try:
+                        _publish_upgrade_file(
+                            staged_manifest, final_manifest)
+                    except BaseException as exc:
+                        if not _published_upgrade_identity(
+                                final_manifest,
+                                staged_manifest_identity):
+                            result["publication_warning"] = (
+                                "The BSP4 pool is complete, but its optional "
+                                "manifest could not be published: %s" % exc)
+                organizer.fsync_directory(root)
+                if not os.path.isfile(final_manifest):
+                    result["publication_warning"] = (
+                        result.get("publication_warning")
+                        or "The BSP4 pool is complete, but its optional "
+                        "manifest was not created.")
+
+        try:
+            _evict_cached_reader_paths((output,))
+        except Exception as exc:
+            if not committed:
+                raise
+            post_commit_warnings.append(
+                "The BSP4 pool is complete, but its Organizer cache could "
+                "not be refreshed: %s" % exc)
+        if post_commit_warnings and result is not None:
+            prior = result.get("publication_warning", "")
+            result["publication_warning"] = " ".join(
+                item for item in [prior] + post_commit_warnings if item)
+    finally:
+        cleanup_warning = _cleanup_upgrade_stage(stage_dir)
+        if cleanup_warning:
+            print(cleanup_warning, file=sys.stderr)
+            if committed and result is not None:
+                result["cleanup_warning"] = cleanup_warning
+    return result
 
 
 def _summary_cache_path(path):
@@ -2045,7 +2714,8 @@ def run_split(name, request, pool_dir=None):
 def run_combine(request, pool_dir=None):
     """Run one combine under the shared library lock and cancellation registry."""
     if not COMBINE_LOCK.acquire(False):
-        raise organizer.PoolError("another pool combine is still running")
+        raise organizer.PoolError(
+            "another pool combine or format update is still running")
     event = None
     try:
         event = _begin_operation("combine")
@@ -2054,6 +2724,22 @@ def run_combine(request, pool_dir=None):
     finally:
         if event is not None:
             _finish_operation("combine", event)
+        COMBINE_LOCK.release()
+
+
+def run_format_upgrade(request, pool_dir=None):
+    """Serialize one native BSP3 upgrade with other pool-wide transforms."""
+    if not COMBINE_LOCK.acquire(False):
+        raise organizer.PoolError(
+            "another pool combine or format update is still running")
+    event = None
+    try:
+        event = _begin_operation("upgrade")
+        return execute_format_upgrade(
+            request, pool_dir, cancel_check=event.is_set)
+    finally:
+        if event is not None:
+            _finish_operation("upgrade", event)
         COMBINE_LOCK.release()
 
 
@@ -2122,10 +2808,10 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 .checkgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}.check{padding:10px;border:1px solid #30364b;border-radius:10px;background:#10131c;font-size:11px}.check b{display:block}.check.pass{border-color:#2d6845;color:#a8e7bf}.check.warning{border-color:#6a5726;color:#f2d67c}.check.fail{border-color:#74383e;color:#ffb5b5}.statehint{margin-top:10px;padding:9px 10px;border-left:3px solid #7361aa;background:#171426;color:#cfc6e7;font-size:12px}.source-retained{color:#a8e7bf}.reviewtitle{margin:18px 0 0;font-size:14px}.live{min-height:1px}
 [hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}}
 </style></head><body><main class="app">
-<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Turn one recorded pool into smaller category pools, or create a new pool by comparing the seeds in several pools.</p></div></div><div class="local">Running locally</div></header>
+<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Split, compare, or update recorded seed pools without changing the originals.</p></div></div><div class="local">Running locally</div></header>
 <nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
 <div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. New pools are saved in <code>seed_pools</code> so the mod can see them immediately.</div>
-<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button></div>
+<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
 <div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Finished and paused BSP3/BSP4 event pools are supported. Only the committed checkpoint is read, and both event schemas work with native search.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
@@ -2177,6 +2863,20 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 <aside class="side"><section class="card summary"><h2>Combine summary</h2><dl>
  <div><dt>Rule</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Selected pools</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Can combine?</dt><dd id="combineSumCompatibility">Not reviewed</dd></div><div><dt>Recorded filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Membership rule</dt><dd id="combineSumExpression">—</dd></div><div><dt>Search coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Match details</dt><dd id="combineSumMetadata">—</dd></div></dl>
  <div class="actions"><button class="go" id="combineCreateBtn" disabled>Create combined seed pool</button><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
+</section></aside></div>
+<div class="grid" id="formatWorkspace" role="tabpanel" aria-labelledby="formatModeBtn" hidden><div class="stack">
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Check or update a pool</h2><p class="copy">Choose a <code>.bspool</code> file from Brainstorm's <code>seed_pools</code> folder. Checking reads only its header. A supported update creates a separate BSP4 copy; the original file is never changed.</p></div></div>
+ <div class="field"><label for="formatSource">Seed pool</label><select id="formatSource"></select></div>
+ <div class="row"><button class="go" id="formatCheckBtn" disabled>Loading pools…</button><button class="ghost" id="formatRefreshBtn">Refresh list</button></div>
+ <div class="workstatus" id="formatStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="formatStatusTitle">Checking pool format…</b><span id="formatStatusDetail">Reading the saved pool header.</span></div></div>
+ <div class="hint" id="formatElapsed" aria-hidden="true" hidden></div>
+</section>
+<section class="card" id="formatPlanCard" hidden><div class="head"><span class="step">2</span><div><h2 id="formatPlanTitle">Pool format</h2><p class="copy" id="formatPlanCopy"></p></div></div>
+ <div class="source" id="formatMetrics"></div><div id="formatNotices"></div>
+</section></div>
+<aside class="side"><section class="card summary"><h2>Format summary</h2><dl>
+ <div><dt>Selected pool</dt><dd id="formatSumSource">Choose a pool</dd></div><div><dt>Current format</dt><dd id="formatSumCurrent">—</dd></div><div><dt>Recorded seeds</dt><dd id="formatSumRecords">—</dd></div><div><dt>Update status</dt><dd id="formatSumStatus">Not checked</dd></div><div><dt>New file</dt><dd id="formatSumOutput">—</dd></div></dl>
+ <div class="actions"><button class="go" id="formatUpdateBtn" disabled>Create BSP4 copy</button><button class="cancel" id="formatCancelBtn" hidden>Cancel update</button></div><div class="error" id="formatError" role="alert"></div><div class="result live" id="formatResult" aria-live="polite"></div>
 </section></aside></div></main>
 <script>
 const $=id=>document.getElementById(id);
@@ -2185,16 +2885,19 @@ const apiPath=path=>UNIFIED?"/organizer"+path:path;
 let inspected=null,inspectedName="",plan=null,choices={},rules={},poolRows=[];
 let splitReviewedFingerprint="",splitRunning=false;
 let combinePlan=null,combineReviewedFingerprint="",combineRunning=false;
+let formatPlan=null,formatRunning=false;
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
-async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error)throw Error(v.error||`Request failed (${r.status})`);return v}
+const fmtBytes=n=>{n=Number(n||0);if(n>=1073741824)return `${(n/1073741824).toFixed(2)} GiB`;if(n>=1048576)return `${(n/1048576).toFixed(2)} MiB`;if(n>=1024)return `${(n/1024).toFixed(1)} KiB`;return `${fmt(n)} bytes`};
+async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";throw error}return v}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
 function reviewState(kind,title,detail){const box=$("reviewStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("reviewTitle").textContent=title;$("reviewDetail").textContent=detail}
+function formatState(kind,title,detail){const box=$("formatStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("formatStatusTitle").textContent=title;$("formatStatusDetail").textContent=detail}
 function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
 function notices(rows){renderNoticeList("notices",rows)}
-function sourceMetrics(s){return `<div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div><div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
+function sourceMetrics(s){return `<div class="metric"><span>File format</span><b>BSP${fmt(s.schema)}</b></div><div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div><div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
 function categoryHTML(c,exact=false){const id=exact?c.category_id:c.location_id;const label=c.location_label||c.label;const details=exact?`<details><summary>Technical match details</summary>${esc(c.label)}<code>${esc(c.category_id)}</code></details>`:"";return `<label class="category"><input type="checkbox" class="cat" value="${esc(id)}" checked><span><b>${esc(label)}</b>${details}</span><span class="count">${fmt(c.records)} seeds</span></label>`}
 function selectedFilter(){if(!inspected)return null;const id=$("organizeBy").value;if(!id||id==="__exact__")return null;return (inspected.filters||[]).find(row=>row.filter_id===id)||null}
 function groupByFilter(){const row=selectedFilter();return row?row.filter_id:""}
@@ -2226,20 +2929,28 @@ function invalidateSplitReview(message="Selections changed — review the split 
  splitReviewedFingerprint="";$("splitPublication").hidden=true;$("reviewStatus").hidden=true;$("splitBtn").disabled=true;$("sumPublication").textContent=message;$("result").innerHTML="";
 }
 function invalidateSplitSelection(){plan=null;choices={};rules={};$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Category selection changed — review the split again")}
+function resetFormatPlan(message="Choose a pool and check its format"){
+ formatPlan=null;$("formatPlanCard").hidden=true;$("formatUpdateBtn").disabled=true;$("formatResult").innerHTML="";$("formatError").textContent="";
+ $("formatStatus").hidden=true;$("formatStatus").className="workstatus";
+ $("formatSumSource").textContent=message;$("formatSumCurrent").textContent="—";$("formatSumRecords").textContent="—";$("formatSumStatus").textContent="Not checked";$("formatSumOutput").textContent="—";
+}
 async function loadPools(preserve=false){
- if(!preserve){clear();resetSplitInspection();invalidateCombine()}
- const priorSource=$("source").value;const selectedCombine=new Set(combineSelected());
- const inspectButton=$("inspectBtn");inspectButton.disabled=true;inspectButton.textContent="Loading pools…";
+ if(!preserve){clear();resetSplitInspection();invalidateCombine();if(!formatRunning)resetFormatPlan()}
+ const priorSource=$("source").value,priorFormat=$("formatSource").value;const selectedCombine=new Set(combineSelected());
+ const inspectButton=$("inspectBtn"),formatButton=$("formatCheckBtn");inspectButton.disabled=true;inspectButton.textContent="Loading pools…";formatButton.disabled=true;formatButton.textContent="Loading pools…";
  try{
   const v=await api("/api/pools");poolRows=v.pools||[];
   $("source").innerHTML=poolRows.length?poolRows.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"} · ${p.coverage_complete?"complete":"provisional"} coverage`}</option>`).join(""):'<option value="">No .bspool files found</option>';
+  $("formatSource").innerHTML=poolRows.length?poolRows.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · BSP${p.schema} · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
+  if([...$("formatSource").options].some(o=>o.value===priorFormat))$("formatSource").value=priorFormat;
   renderCombineChoices(selectedCombine);
   inspectButton.disabled=!poolRows.some(p=>!p.error);inspectButton.textContent="Inspect pool";
+  $("formatSource").disabled=formatRunning;formatButton.disabled=formatRunning||!poolRows.some(p=>!p.error);formatButton.textContent="Check pool format";
  }catch(e){
-  poolRows=[];$("source").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);
-  inspectButton.disabled=true;inspectButton.textContent="Inspect unavailable";
-  inspectionState("error","Seed pool list failed to load",e.message||String(e));fail(e);throw e;
+  poolRows=[];$("source").innerHTML='<option value="">Pool list could not be loaded</option>';$("formatSource").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);
+  inspectButton.disabled=true;inspectButton.textContent="Inspect unavailable";$("formatSource").disabled=true;formatButton.disabled=true;formatButton.textContent="Check unavailable";
+  inspectionState("error","Seed pool list failed to load",e.message||String(e));if(!formatRunning){formatState("error","Seed pool list failed to load",e.message||String(e));fail(e)}throw e;
  }
 }
 async function inspect(){
@@ -2344,7 +3055,42 @@ async function createCombine(){
 }
 async function cancelCombine(){$("combineCancelBtn").disabled=true;$("combineCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"combine"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineCancelBtn").disabled=false;$("combineCancelBtn").textContent="Cancel file creation"}}
 async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel review"}}
-function showMode(mode){const combine=mode==="combine";$("splitWorkspace").hidden=combine;$("combineWorkspace").hidden=!combine;$("splitModeBtn").classList.toggle("active",!combine);$("combineModeBtn").classList.toggle("active",combine);$("splitModeBtn").setAttribute("aria-selected",String(!combine));$("combineModeBtn").setAttribute("aria-selected",String(combine))}
+function renderFormatPlan(v){
+ formatPlan=v;$("formatPlanCard").hidden=false;$("formatSumSource").textContent=v.source;$("formatSumCurrent").textContent=v.source_format;$("formatSumRecords").textContent=fmt(v.records);$("formatSumOutput").textContent=v.output_name||"No new file needed";
+ $("formatMetrics").innerHTML=`<div class="metric"><span>File format</span><b>${esc(v.source_format)}</b></div><div class="metric"><span>Encoding</span><b>${esc(v.encoding||"(missing)")}</b></div><div class="metric"><span>Recorded seeds</span><b>${fmt(v.records)}</b></div><div class="metric"><span>File size</span><b>${fmtBytes(v.bytes)}</b></div><div class="metric"><span>Pool state</span><b>${v.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${v.coverage_complete?"Complete":"Provisional"}</b></div>`;
+ if(v.status==="current"){
+  $("formatPlanTitle").textContent="Already current";$("formatPlanCopy").textContent=`${v.source} already uses BSP4. No format update is needed.`;$("formatNotices").innerHTML='<div class="notice"><strong>Current adaptive format</strong>This pool already has BSP4 rank and metadata compression and can be used directly.</div>';$("formatSumStatus").textContent="Already current";$("formatUpdateBtn").disabled=true;
+ }else if(v.eligible){
+  $("formatPlanTitle").textContent="BSP4 update available";$("formatPlanCopy").textContent=`This lossless update recompresses ${fmt(v.records)} recorded seeds without rescanning.`;$("formatNotices").innerHTML=`<div class="notice"><strong>${esc(v.source_format)} → BSP4</strong>Source data, criteria, family/lineage history, and per-seed match details are preserved. The copy receives its own derivative identity and will be named <b>${esc(v.output_name)}</b>.</div><div class="notice"><strong>Original BSP3 will be kept</strong>The update creates a separate file and never renames, replaces, or deletes the selected source.</div>`;$("formatSumStatus").textContent="Update available";$("formatUpdateBtn").disabled=formatRunning;
+ }else{
+  const detail=(v.blockers||[]).join(" ")||"This pool cannot be updated.";$("formatPlanTitle").textContent="Format update unavailable";$("formatPlanCopy").textContent=detail;$("formatNotices").innerHTML=`<div class="notice warning"><strong>Cannot create a BSP4 copy</strong>${esc(detail)}</div>`;$("formatSumStatus").textContent="Blocked";$("formatUpdateBtn").disabled=true;
+ }
+}
+async function checkFormat(){
+ if(formatRunning)return;
+ const source=$("formatSource").value;if(!source){formatState("error","No seed pool selected","Wait for the pool list to load, then choose a pool.");return}
+ resetFormatPlan(`Checking ${source}`);const button=$("formatCheckBtn"),refresh=$("formatRefreshBtn"),picker=$("formatSource");button.disabled=true;refresh.disabled=true;picker.disabled=true;button.textContent="Checking format…";formatState("",`Checking ${source}`,"Reading only the bounded pool header.");
+ try{const v=await api("/api/format/plan",{source});renderFormatPlan(v);if(v.status==="current")formatState("success","Already current",`${source} uses BSP4 (${v.encoding}). No update is needed.`);else if(v.eligible)formatState("success","BSP4 update available",`${fmt(v.records)} seeds can be recompressed into ${v.output_name} without rescanning.`);else formatState("error","Format update unavailable",(v.blockers||[]).join(" ")||"This pool cannot be updated.")}
+ catch(e){resetFormatPlan("Format check failed");formatState("error","Format check failed",e.message||String(e));$("formatError").textContent=e.message||String(e)}
+ finally{button.disabled=false;refresh.disabled=false;picker.disabled=false;button.textContent="Check pool format"}
+}
+async function updateFormat(){
+ if(!formatPlan||!formatPlan.eligible)return;const requested=formatPlan,button=$("formatUpdateBtn"),picker=$("formatSource"),refresh=$("formatRefreshBtn"),check=$("formatCheckBtn"),started=performance.now();let refreshFailed=false;formatRunning=true;$("formatError").textContent="";$("formatResult").innerHTML="";button.disabled=true;button.textContent="Updating to BSP4…";picker.disabled=true;refresh.disabled=true;check.disabled=true;$("formatCancelBtn").hidden=false;formatState("",`Creating ${requested.output_name}`,`Reading and recompressing ${fmt(requested.records)} seeds. Large pools may take several minutes. The original BSP3 is not being changed.`);
+ $("formatElapsed").hidden=false;const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("formatElapsed").textContent=`Still working — ${seconds}s elapsed. The original BSP3 is unchanged, and no partial output is visible.`},1000);
+ try{
+  const v=await api("/api/format/update",{source:requested.source,planToken:requested.plan_token});formatPlan=null;
+  const sizeChange=v.output_bytes<v.source_bytes?`${v.saved_percent.toFixed(1)}% smaller`:v.output_bytes===v.source_bytes?"the same size":"larger for this data";const repaired=v.normalized_historical_order?" Historical block order was repaired while updating.":"";const warnings=[v.publication_warning,v.cleanup_warning].filter(Boolean).map(text=>`<div class="notice warning"><strong>Cleanup note</strong>${esc(text)}</div>`).join("");
+  $("formatResult").innerHTML=`<div class="notice"><strong>BSP4 copy created</strong>${esc(v.output)} contains ${fmt(v.records)} seeds. ${fmtBytes(v.source_bytes)} → ${fmtBytes(v.output_bytes)} (${esc(sizeChange)}). The original ${esc(v.source)} was kept.${esc(repaired)}</div>${warnings}`;formatState("success","BSP4 copy created",`${v.output} is complete and ready in seed_pools.`);$("formatSumStatus").textContent="Created";$("formatSumOutput").textContent=v.output;
+  try{await loadPools(true)}catch(refreshError){refreshFailed=true;const detail=refreshError.message||String(refreshError);$("formatError").textContent=`The BSP4 copy was created, but the pool list could not refresh: ${detail}`;formatState("success","BSP4 copy created",`${v.output} is ready. Use Refresh list to reload the pool selector.`)}
+ }catch(e){
+  const message=e.message||String(e),cancelled=e.code==="operation_cancelled",stale=e.code==="format_plan_stale";
+  if(stale)resetFormatPlan("Check the selected pool again");
+  formatState(cancelled?"success":"error",cancelled?"Update cancelled safely":"Update result not confirmed",cancelled?"No new pool was published; the original BSP3 was not changed.":`The Organizer could not confirm whether a BSP4 copy was published. Refresh the pool list before trying again. The original pool was not changed. ${message}`);
+  $("formatError").textContent=cancelled?"":message;
+ }finally{clearInterval(timer);$("formatElapsed").hidden=true;$("formatElapsed").textContent="";formatRunning=false;$("formatCancelBtn").hidden=true;button.textContent="Create BSP4 copy";button.disabled=!formatPlan||!formatPlan.eligible;picker.disabled=refreshFailed;refresh.disabled=false;check.disabled=refreshFailed||!poolRows.some(p=>!p.error)}
+}
+async function cancelFormat(){$("formatCancelBtn").disabled=true;$("formatCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"upgrade"})}catch(e){$("formatError").textContent=e.message||String(e)}finally{$("formatCancelBtn").disabled=false;$("formatCancelBtn").textContent="Cancel update"}}
+function showMode(mode){const split=mode==="split",combine=mode==="combine",formatMode=mode==="format";$("splitWorkspace").hidden=!split;$("combineWorkspace").hidden=!combine;$("formatWorkspace").hidden=!formatMode;$("splitModeBtn").classList.toggle("active",split);$("combineModeBtn").classList.toggle("active",combine);$("formatModeBtn").classList.toggle("active",formatMode);$("splitModeBtn").setAttribute("aria-selected",String(split));$("combineModeBtn").setAttribute("aria-selected",String(combine));$("formatModeBtn").setAttribute("aria-selected",String(formatMode))}
 
 $("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
 $("organizeBy").onchange=()=>{plan=null;choices={};rules={};renderInspectLocations();$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Organizing filter changed — review the split again")};
@@ -2352,13 +3098,23 @@ $("allBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=
 $("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("clearRulesBtn").onclick=()=>clearDecisionSet("rules");$("clearChoicesBtn").onclick=()=>clearDecisionSet("choices");$("splitBtn").onclick=split;$("analysisCancelBtn").onclick=cancelAnalysis;$("splitCancelBtn").onclick=cancelSplit;
 $("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";invalidateSplitReview()};$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>invalidateSplitReview();
 $("exportBtn").onclick=()=>{if(!inspected)return;location.href=apiPath(`/api/export?source=${encodeURIComponent(inspectedName)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`)};
-$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
+$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("formatModeBtn").onclick=()=>showMode("format");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
+$("formatCheckBtn").onclick=checkFormat;$("formatUpdateBtn").onclick=updateFormat;$("formatCancelBtn").onclick=cancelFormat;$("formatRefreshBtn").onclick=()=>{if(formatRunning)return;resetFormatPlan();loadPools(false)};$("formatSource").onchange=()=>{if(!formatRunning)resetFormatPlan("Selection changed — check this pool")};
 $("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine("Selection changed")};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine("Selection changed")};
 $("combineOperation").onchange=()=>{updateCombineBase();invalidateCombine("Operation changed")};$("combineBase").onchange=()=>invalidateCombine("Base changed");$("combineName").oninput=()=>invalidateCombine("Output changed");$("combineLabel").oninput=()=>invalidateCombine("Output changed");
 document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection()});
 if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/";$("mergeLink").hidden=true;$("standaloneMerge").hidden=false}
-resetSplitInspection();invalidateCombine();loadPools(true).catch(()=>{});
+resetSplitInspection();invalidateCombine();resetFormatPlan();loadPools(true).catch(()=>{});
 </script></body></html>'''
+
+
+def error_payload(exc):
+    value = {"error": str(exc)}
+    if isinstance(exc, OperationCancelled):
+        value["error_code"] = "operation_cancelled"
+    elif isinstance(exc, FormatPlanStale):
+        value["error_code"] = "format_plan_stale"
+    return value
 
 
 class OrganizerHandler(BaseHTTPRequestHandler):
@@ -2442,7 +3198,7 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             # every other branch can return a regular JSON error.
             if response_started:
                 return
-            self._json({"error": str(exc)}, 400)
+            self._json(error_payload(exc), 400)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -2455,17 +3211,22 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 self._json(run_split_plan(data, self.pool_dir))
             elif parsed.path == "/api/combine/plan":
                 self._json(run_combine_plan(data, self.pool_dir))
+            elif parsed.path == "/api/format/plan":
+                self._json(plan_format_upgrade(
+                    data.get("source", ""), self.pool_dir))
             elif parsed.path == "/api/split":
                 self._json(run_split(
                     data.get("source", ""), data, self.pool_dir))
             elif parsed.path == "/api/combine":
                 self._json(run_combine(data, self.pool_dir))
+            elif parsed.path == "/api/format/update":
+                self._json(run_format_upgrade(data, self.pool_dir))
             elif parsed.path == "/api/cancel":
                 self._json(cancel_operation(str(data.get("operation", ""))))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError, organizer.PoolError) as exc:
-            self._json({"error": str(exc)}, 400)
+            self._json(error_payload(exc), 400)
 
 
 def make_handler(pool_dir):
@@ -2477,6 +3238,7 @@ def make_handler(pool_dir):
 
 def main():
     os.makedirs(POOL_DIR, exist_ok=True)
+    allow_active_operations()
     try:
         server = ThreadingHTTPServer(("127.0.0.1", DEFAULT_PORT), OrganizerHandler)
     except OSError:
@@ -2489,8 +3251,12 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        begin_operation_shutdown()
+        wait_for_active_operations()
         print("\nBye.")
     finally:
+        begin_operation_shutdown()
+        wait_for_active_operations()
         server.server_close()
     return 0
 

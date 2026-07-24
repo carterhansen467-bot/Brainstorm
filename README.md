@@ -269,7 +269,7 @@ filename:
 Windows Command Prompt uses the same operation from the Brainstorm folder:
 
 ```bat
-native\brainstorm_seed_pool.exe convert seed_pools\legacy.bspool seed_pools\legacy-compressed.bspool
+"Seed Pool Builder\brainstorm_seed_pool.exe" convert seed_pools\legacy.bspool seed_pools\legacy-compressed.bspool
 ```
 
 Conversion streams the old file, preserves its pool ID and embedded criteria,
@@ -280,7 +280,20 @@ Older Brainstorm helpers do not understand the current event-pool formats, so
 anyone receiving a newly generated pool must also update both native helpers.
 
 To upgrade a completed schema-3 event pool to adaptive schema 4 without
-rescanning, use a different output filename:
+rescanning, use the point-and-click Organizer:
+
+1. Put the pool in `seed_pools` and open **Seed Pool Organizer**.
+2. Choose **Update pool format**, select the pool, and click **Check pool
+   format**.
+3. If it is an eligible completed BSP3 pool, click **Create BSP4 copy**.
+
+The Organizer chooses an unused BSP4-marked filename automatically, stages
+and verifies the conversion before publishing it, and keeps the BSP3 source
+unchanged. BSP4 pools report that they are already current. Paused,
+provisional, BSP1, and BSP2 pools remain unchanged and show the specific reason
+they cannot use this lossless BSP3-to-BSP4 path.
+
+The equivalent command-line operation uses a different output filename:
 
 ```sh
 ./native/brainstorm_seed_pool upgrade seed_pools/input-bsp3.bspool \
@@ -290,15 +303,19 @@ rescanning, use a different output filename:
 Windows Command Prompt:
 
 ```bat
-native\brainstorm_seed_pool.exe upgrade seed_pools\input-bsp3.bspool seed_pools\output-bsp4.bspool
+"Seed Pool Builder\brainstorm_seed_pool.exe" upgrade seed_pools\input-bsp3.bspool seed_pools\output-bsp4.bspool
 ```
 
-The operation refuses to overwrite an existing output, preserves source
-identity, criteria, lineage, and provenance, and recomputes the encoding-
-dependent snapshot and logical digests. The source is never modified.
+The operation refuses to overwrite an existing output, preserves source data,
+criteria, family/lineage history, and provenance, and assigns the copy its own
+derivative identity while recomputing the encoding-dependent snapshot and
+logical digests. The source is never modified.
 Historical BSP3 files with physically shuffled blocks or overlapping block-rank
 ranges are canonicalized into globally rank-ascending BSP4 output during the
 upgrade. This ordering repair is also non-destructive to the source.
+Organizer split and combine publications already use BSP4, so every nonempty
+file created by splitting a BSP3 source is BSP4 while the original BSP3 remains
+unchanged.
 
 #### Filtering an existing pool again
 
@@ -528,7 +545,9 @@ constraints; the builder's own executables no longer mix with the game helper.
 Launch the regular Seed Pool Builder and select **Organize / Combine** to work
 with existing files. The older **`Seed Pool Organizer.command`** (macOS) and
 **`Seed Pool Organizer.bat`** (Windows) entry points remain as compatible direct
-shortcuts. Inspector recommends a named recorded filter to organize by and lets
+shortcuts. To update a completed BSP3 pool without command-line steps, choose
+**Update pool format**, check the file, and create its verified BSP4 copy.
+Inspector recommends a named recorded filter to organize by and lets
 you switch to another recorded filter. Locations use friendly labels such as
 **Perkeo Ante 1 Big**. Source, occurrence, flag, and other technical variants
 at the same location are collapsed in the display while their complete metadata

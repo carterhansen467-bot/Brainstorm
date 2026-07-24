@@ -257,7 +257,8 @@ def _with_delete_locks(callback):
             raise ValueError("An organizer split is using the pool library; wait for it to finish.")
         try:
             if not organizer_web.COMBINE_LOCK.acquire(False):
-                raise ValueError("An organizer combine is using the pool library; wait for it to finish.")
+                raise ValueError(
+                    "An organizer combine or format update is using the pool library; wait for it to finish.")
             try:
                 return callback(_active_pool_paths())
             finally:
@@ -448,11 +449,13 @@ def start_merge_job(data, pool_dir=None):
 def shutdown_when_safe(server):
     """Pause an active child at its next checkpoint, then stop the web server."""
     time.sleep(0.2)  # let the POST response reach the browser first
+    organizer_web.begin_operation_shutdown()
     r = JOB["runner"]
     if r is not None and not r.done():
         r.stop()
         while not r.done():
             time.sleep(0.1)
+    organizer_web.wait_for_active_operations()
     with LOCK:
         _cleanup_replaced_estimate_locked()
     server.shutdown()
@@ -463,6 +466,7 @@ def begin_shutdown(server):
         if JOB["closing"]:
             return
         JOB["closing"] = True
+    organizer_web.begin_operation_shutdown()
     threading.Thread(target=shutdown_when_safe, args=(server,), daemon=True).start()
 
 
@@ -1675,11 +1679,17 @@ class Handler(BaseHTTPRequestHandler):
                     value = organizer_web.run_split_plan(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/combine/plan":
                     value = organizer_web.run_combine_plan(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/format/plan":
+                    value = organizer_web.plan_format_upgrade(
+                        data.get("source", ""), self.pool_dir)
                 elif parsed.path == "/organizer/api/split":
                     value = organizer_web.run_split(
                         data.get("source", ""), data, self.pool_dir)
                 elif parsed.path == "/organizer/api/combine":
                     value = organizer_web.run_combine(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/format/update":
+                    value = organizer_web.run_format_upgrade(
+                        data, self.pool_dir)
                 elif parsed.path == "/organizer/api/cancel":
                     value = organizer_web.cancel_operation(
                         str(data.get("operation", "")))
@@ -1688,7 +1698,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(value)
             except (OSError, ValueError,
                     organizer_web.organizer.PoolError) as exc:
-                self._json({"error": str(exc)}, 400)
+                self._json(organizer_web.error_payload(exc), 400)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1724,6 +1734,7 @@ def main():
         return 1
     Handler.snap = core.Snapshot(core.SNAPSHOT)
     JOB["closing"] = False
+    organizer_web.allow_active_operations()
     port = DEFAULT_PORT
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -1745,16 +1756,20 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        organizer_web.begin_operation_shutdown()
         r = JOB["runner"]
         if r is not None and not r.done():
             print("\nPausing the scan at a checkpoint...")
             r.stop()
             while not r.done():
                 time.sleep(0.1)
+        organizer_web.wait_for_active_operations()
         with LOCK:
             _cleanup_replaced_estimate_locked()
         print("Bye.")
     finally:
+        organizer_web.begin_operation_shutdown()
+        organizer_web.wait_for_active_operations()
         server.server_close()
     return 0
 

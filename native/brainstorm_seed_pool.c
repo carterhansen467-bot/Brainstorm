@@ -7121,6 +7121,7 @@ static int pool_mode_export(const char *input, const char *output) {
 
 typedef struct {
 	int overrideRange;
+	int preserveInputTopology;
 	uint64_t rangeStart, rangeEnd;
 	const char *poolId, *label;
 	int mergedParts;
@@ -7132,25 +7133,34 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 		int originalHeaderBytes, int outputSchema, int outputHeaderBytes,
 		uint64_t records, uint64_t dataBytes, int complete, int coverageComplete,
 		const PoolHeaderRewrite *rewrite, char *err, size_t errsz) {
-	if ((originalHeaderBytes != BSPOOL_HEADER_SIZE
-			&& originalHeaderBytes != BSPOOL_HEADER_EVENTS_SIZE)
-				|| (outputHeaderBytes != BSPOOL_HEADER_SIZE
-					&& outputHeaderBytes != BSPOOL_HEADER_EVENTS_SIZE)
-				|| (outputSchema != BSPOOL_SCHEMA_BLOCKS
-					&& !pool_output_event_schema(outputSchema))) {
+	bool eventOutput = pool_output_event_schema(outputSchema);
+	if ((outputSchema != BSPOOL_SCHEMA_BLOCKS && !eventOutput)
+			|| (outputSchema == BSPOOL_SCHEMA_BLOCKS
+				&& (originalHeaderBytes != BSPOOL_HEADER_SIZE
+					|| outputHeaderBytes != BSPOOL_HEADER_SIZE))
+			|| (eventOutput
+				&& (originalHeaderBytes < BSPOOL_HEADER_SIZE
+					|| originalHeaderBytes > BSPOOL_HEADER_MAX_SIZE
+					|| outputHeaderBytes < BSPOOL_HEADER_SIZE
+					|| outputHeaderBytes > BSPOOL_HEADER_MAX_SIZE))) {
 		snprintf(err, errsz, "unsupported repacked pool format"); return false;
 	}
-	unsigned char out[BSPOOL_HEADER_EVENTS_SIZE];
-	char work[BSPOOL_HEADER_EVENTS_SIZE + 1];
+	unsigned char *out = calloc((size_t)outputHeaderBytes, 1);
+	char *work = malloc((size_t)originalHeaderBytes + 1u);
+	char *copy = malloc((size_t)originalHeaderBytes + 1u);
+	bool ok = false;
+	if (!out || !work || !copy) {
+		snprintf(err, errsz, "cannot allocate repacked pool header");
+		goto done;
+	}
 	memcpy(work, original, (size_t)originalHeaderBytes); work[originalHeaderBytes] = 0;
-	memset(out, 0, (size_t)outputHeaderBytes);
 	size_t used = 0;
 	char *line = work;
 	while (line && *line) {
 		char *nl = strchr(line, '\n');
 		if (nl) *nl = 0;
-		char copy[BSPOOL_HEADER_EVENTS_SIZE + 1];
-		snprintf(copy, sizeof copy, "%s", line);
+		size_t lineBytes = strlen(line);
+		memcpy(copy, line, lineBytes + 1u);
 		char *sp = copy;
 		char *d = pool_tok(&sp);
 		if (!d || !strcmp(d, "end")) break;
@@ -7176,16 +7186,25 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 					|| !strcmp(d, "lineage_id") || !strcmp(d, "derivation_id")
 					|| !strcmp(d, "snapshot_id") || !strcmp(d, "membership_digest")
 					|| !strcmp(d, "metadata_digest") || !strcmp(d, "scan_cursor")
-					|| !strcmp(d, "input_cursor") || !strcmp(d, "parent_snapshot_id")
-					|| !strcmp(d, "parent_segment_id") || !strcmp(d, "parent_records")
-					|| !strcmp(d, "parent_data_bytes")
-					|| !strcmp(d, "parent_coverage_complete")
-					|| !strcmp(d, "input_record_start") || !strcmp(d, "input_record_end")
-					|| !strcmp(d, "shard_index") || !strcmp(d, "shard_total"))) replacement = NULL;
+					|| (!rewrite->preserveInputTopology
+						&& (!strcmp(d, "input_cursor")
+							|| !strcmp(d, "parent_snapshot_id")
+							|| !strcmp(d, "parent_segment_id")
+							|| !strcmp(d, "parent_records")
+							|| !strcmp(d, "parent_data_bytes")
+							|| !strcmp(d, "parent_coverage_complete")
+							|| !strcmp(d, "input_record_start")
+							|| !strcmp(d, "input_record_end")
+							|| !strcmp(d, "shard_index")
+							|| !strcmp(d, "shard_total"))))) replacement = NULL;
 		else replacement = line;
 		if (replacement) {
 			size_t n = strlen(replacement);
-			if (n + 1 > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+			if (used > (size_t)outputHeaderBytes
+					|| n + 1 > (size_t)outputHeaderBytes - used) {
+				snprintf(err, errsz, "converted pool header overflow");
+				goto done;
+			}
 			memcpy(out + used, replacement, n); used += n; out[used++] = '\n';
 		}
 		line = nl ? nl + 1 : NULL;
@@ -7203,22 +7222,36 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 				rewrite->familyId, rewrite->segmentId, rewrite->stageHash,
 				rewrite->lineageId, rewrite->derivationId, rewrite->snapshotId,
 				rewrite->membershipDigest, rewrite->metadataDigest, rewrite->scanCursor);
-		if (m < 0 || (size_t)m > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "merged pool header overflow"); return false; }
+		if (m < 0 || used > (size_t)outputHeaderBytes
+				|| (size_t)m > (size_t)outputHeaderBytes - used) {
+			snprintf(err, errsz, "merged pool header overflow");
+			goto done;
+		}
 		memcpy(out + used, merged, (size_t)m); used += (size_t)m;
 	}
 	char tail[224];
 	int n = snprintf(tail, sizeof tail,
 			"records %" PRIu64 "\ndata_bytes %" PRIu64 "\ncomplete %d\ncoverage_complete %d\nend\n",
 			records, dataBytes, complete, coverageComplete);
-	if (n < 0 || (size_t)n > (size_t)outputHeaderBytes - used) { snprintf(err, errsz, "converted pool header overflow"); return false; }
+	if (n < 0 || used > (size_t)outputHeaderBytes
+			|| (size_t)n > (size_t)outputHeaderBytes - used) {
+		snprintf(err, errsz, "converted pool header overflow");
+		goto done;
+	}
 	memcpy(out + used, tail, (size_t)n);
 	int64_t at = bs_ftello(f);
 	if (bs_fseeko(f, 0, SEEK_SET) != 0
 			|| fwrite(out, 1, (size_t)outputHeaderBytes, f) != (size_t)outputHeaderBytes
 			|| fflush(f) != 0 || bs_fsync_file(f) != 0 || bs_fseeko(f, at, SEEK_SET) != 0) {
-		snprintf(err, errsz, "cannot update pool header: %s", strerror(errno)); return false;
+		snprintf(err, errsz, "cannot update pool header: %s", strerror(errno));
+		goto done;
 	}
-	return true;
+	ok = true;
+done:
+	free(out);
+	free(work);
+	free(copy);
+	return ok;
 }
 
 static int pool_mode_convert(const char *input, const char *output) {
@@ -7376,8 +7409,53 @@ static void pool_merge_event_reset(PoolMergeEventBlock *block) {
 	block->hasPriorRank = hasPriorRank;
 }
 
+static bool pool_merge_record_metadata_digest(
+		const PoolMergeEventBlock *block, uint64_t *digest,
+		char *err, size_t errsz) {
+	uint64_t descriptorDigests[POOL_EVENT_BLOCK_RECORDS];
+	uint32_t descriptorCounts[POOL_EVENT_BLOCK_RECORDS];
+	uint64_t descriptorStart = pool_hash_update(
+			POOL_HASH_INIT, POOL_RECORD_DESCRIPTOR_DOMAIN,
+			sizeof POOL_RECORD_DESCRIPTOR_DOMAIN - 1u);
+	for (size_t i = 0; i < block->used; i++) {
+		descriptorDigests[i] = descriptorStart;
+		descriptorCounts[i] = 0;
+	}
+	for (size_t d = 0; d < block->ndescriptors; d++) {
+		const PoolMetaDescriptor *entry = &block->descriptors[d];
+		unsigned char lengthFrame[4];
+		bspool_put_u32le(lengthFrame, entry->len);
+		for (uint32_t i = 0; i < entry->count; i++) {
+			uint16_t record = entry->records[i];
+			if (record >= block->used
+					|| descriptorCounts[record] == UINT32_MAX) {
+				snprintf(err, errsz,
+						"merged record metadata identity is malformed");
+				return false;
+			}
+			descriptorDigests[record] = pool_hash_update(
+					descriptorDigests[record],
+					lengthFrame, sizeof lengthFrame);
+			descriptorDigests[record] = pool_hash_update(
+					descriptorDigests[record],
+					pool_meta_descriptor_bytes(entry), entry->len);
+			descriptorCounts[record]++;
+		}
+	}
+	for (size_t i = 0; i < block->used; i++) {
+		unsigned char recordFrame[20];
+		bspool_put_u64le(recordFrame, block->ranks[i]);
+		bspool_put_u32le(recordFrame + 8, descriptorCounts[i]);
+		bspool_put_u64le(recordFrame + 12, descriptorDigests[i]);
+		*digest = pool_hash_update(
+				*digest, recordFrame, sizeof recordFrame);
+	}
+	return true;
+}
+
 static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
 		int schema, uint64_t *membershipDigest, uint64_t *metadataDigest,
+		uint64_t *recordMetadataDigest,
 		char *err, size_t errsz) {
 	if (!block->used) return true;
 	if (!pool_output_event_schema(schema)) {
@@ -7415,6 +7493,9 @@ static bool pool_merge_write_event_block(FILE *out, PoolMergeEventBlock *block,
 	}
 	qsort(block->descriptors, block->ndescriptors,
 			sizeof *block->descriptors, pool_meta_descriptor_compare);
+	if (!pool_merge_record_metadata_digest(
+			block, recordMetadataDigest, err, errsz))
+		return false;
 	PoolByteBuffer metadata = { 0 };
 	PoolByteBuffer canonicalMetadata = { 0 };
 	if (!pool_byte_varint(&metadata, block->ndescriptors)
@@ -7568,6 +7649,7 @@ static bool pool_merge_append_event_block(FILE *out, PoolMergeEventBlock *block,
 		const unsigned char *metadata, size_t metadataBytes,
 		int sourceEncoding, int outputSchema,
 		uint64_t *membershipDigest, uint64_t *metadataDigest,
+		uint64_t *recordMetadataDigest,
 		char *err, size_t errsz) {
 	size_t blockRecords = pool_event_block_records(outputSchema);
 	size_t first = count;
@@ -7643,7 +7725,8 @@ static bool pool_merge_append_event_block(FILE *out, PoolMergeEventBlock *block,
 	if (block->used == blockRecords
 			&& !pool_merge_write_event_block(out, block, outputSchema,
 					membershipDigest,
-					metadataDigest, err, errsz)) goto fail;
+					metadataDigest, recordMetadataDigest,
+					err, errsz)) goto fail;
 	if (second) {
 		memcpy(block->ranks, ranks + first, second * sizeof *ranks);
 		block->used = second;
@@ -8023,6 +8106,7 @@ static bool pool_merge_write_ordered_event_part(FILE *out,
 		PoolMergePart *part, PoolMergeEventBlock *eventBlock,
 		int outputSchema, uint64_t *written,
 		uint64_t *membershipDigest, uint64_t *metadataDigest,
+		uint64_t *recordMetadataDigest,
 		char *err, size_t errsz) {
 	if (part->header.encoding != BSPOOL_ENCODING_DELTA_EVENTS) {
 		snprintf(err, errsz,
@@ -8087,7 +8171,8 @@ static bool pool_merge_write_ordered_event_part(FILE *out,
 							entry->metadataBytes,
 							BSPOOL_ENCODING_DELTA_EVENTS,
 							outputSchema, membershipDigest,
-							metadataDigest, err, errsz))
+							metadataDigest, recordMetadataDigest,
+							err, errsz))
 					goto done;
 				*written += entry->count;
 			}
@@ -8211,7 +8296,8 @@ static bool pool_merge_write_ordered_event_part(FILE *out,
 		if (eventBlock->used == blockRecords
 				&& !pool_merge_write_event_block(out, eventBlock,
 						outputSchema, membershipDigest,
-						metadataDigest, err, errsz))
+						metadataDigest, recordMetadataDigest,
+						err, errsz))
 			goto done;
 	}
 	ok = true;
@@ -8278,13 +8364,14 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 		PoolMergeEventBlock *eventBlock, PoolMergeRankBlock *rankBlock,
 		bool canonical, int outputSchema,
 		uint64_t *written, uint64_t *membershipDigest, uint64_t *metadataDigest,
+		uint64_t *recordMetadataDigest,
 		char *err, size_t errsz) {
 	if (!canonical
 			&& part->header.encoding
 				== BSPOOL_ENCODING_DELTA_EVENTS)
 		return pool_merge_write_ordered_event_part(out, part, eventBlock,
 				outputSchema, written, membershipDigest, metadataDigest,
-				err, errsz);
+				recordMetadataDigest, err, errsz);
 	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
 	if (part->header.encoding == BSPOOL_ENCODING_DELTA_BLOCKS
 			|| part->header.encoding == BSPOOL_ENCODING_DELTA_EVENTS
@@ -8381,7 +8468,8 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 					? pool_merge_append_event_block(out, eventBlock, scratch.ranks,
 							e->count, metadata, e->metadataBytes,
 							part->header.encoding, outputSchema,
-							membershipDigest, metadataDigest, err, errsz)
+							membershipDigest, metadataDigest,
+							recordMetadataDigest, err, errsz)
 					: pool_merge_append_ranks(out, rankBlock, scratch.ranks, e->count,
 							membershipDigest, err, errsz);
 			if (!appended) goto fail;
@@ -8427,7 +8515,8 @@ fail:
 
 static bool pool_write_merge_manifest(const char *output, const PoolMergePart *parts,
 		int ninputs, int leafParts, uint64_t rangeStart, uint64_t rangeEnd, uint64_t records,
-		uint64_t fileBytes, int schema, const char *poolId, const char *label) {
+		uint64_t fileBytes, int schema, uint64_t recordMetadataDigest,
+		const char *poolId, const char *label) {
 	char path[1024];
 	if (snprintf(path, sizeof path, "%s.manifest", output) >= (int)sizeof path) return false;
 	FILE *f = fopen(path, "w");
@@ -8445,6 +8534,18 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 			"\nrange_end %" PRIu64 "\nrecords %" PRIu64 "\nmerged_parts %d\nfile_bytes %" PRIu64 "\n",
 			space_name(parts[0].header.space), parts[0].header.seedspace,
 			rangeStart, rangeEnd, records, leafParts, fileBytes);
+	if (pool_output_event_schema(schema))
+		fprintf(f, "record_metadata_digest %016" PRIx64 "\n",
+				recordMetadataDigest);
+	if (ninputs == 1) fprintf(f,
+			"upgrade_source_snapshot_id %016" PRIx64 "\n"
+			"upgrade_source_membership_digest %016" PRIx64 "\n"
+			"upgrade_source_metadata_digest %016" PRIx64 "\n"
+			"upgrade_source_pool_id %s\n",
+			parts[0].header.snapshotId,
+			parts[0].header.membershipDigest,
+			parts[0].header.metadataDigest,
+			parts[0].header.poolId[0] ? parts[0].header.poolId : "-");
 	for (int i = 0; i < ninputs; i++) fprintf(f,
 			"input %s %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
 			parts[i].header.poolId[0] ? parts[i].header.poolId : "-",
@@ -8465,6 +8566,7 @@ static int pool_mode_merge(
 	if (bs_file_exists(output)) { fprintf(stderr, "output already exists; choose a new filename\n"); return 1; }
 	PoolMergePart *parts = calloc((size_t)ninputs, sizeof *parts);
 	if (!parts) { fprintf(stderr, "cannot allocate merge input table\n"); return 1; }
+	unsigned char *original = NULL;
 	char err[256] = "";
 	int opened = 0, rc = 1;
 	uint64_t totalRecords = 0;
@@ -8525,7 +8627,7 @@ static int pool_mode_merge(
 				? BSPOOL_SCHEMA_ADAPTIVE : BSPOOL_SCHEMA_EVENTS
 			: BSPOOL_SCHEMA_BLOCKS;
 	int outputHeaderBytes = eventInputs
-			? BSPOOL_HEADER_EVENTS_SIZE : BSPOOL_HEADER_SIZE;
+			? parts[0].header.headerBytes : BSPOOL_HEADER_SIZE;
 	for (int i = 1; i < ninputs; i++) {
 		const BspoolHeader *a = &parts[0].header, *b = &parts[i].header;
 		if (b->modelver != a->modelver || b->catalogHash != a->catalogHash
@@ -8552,24 +8654,31 @@ static int pool_mode_merge(
 			goto done;
 		}
 	}
-	unsigned char original[BSPOOL_HEADER_EVENTS_SIZE];
-	if (parts[0].header.headerBytes != outputHeaderBytes
-			|| bs_pread(fileno(parts[0].file), original, (size_t)outputHeaderBytes, 0)
+	original = malloc((size_t)outputHeaderBytes);
+	if (!original
+			|| bs_pread(fileno(parts[0].file), original,
+					(size_t)outputHeaderBytes, 0)
 				!= (int64_t)outputHeaderBytes) {
-		snprintf(err, sizeof err, "cannot preserve source pool header"); goto done;
+		snprintf(err, sizeof err, "%s",
+				original ? "cannot preserve source pool header"
+					: "cannot allocate source pool header");
+		goto done;
 	}
 	uint64_t rangeStart = parts[0].header.rangeStart;
 	uint64_t rangeEnd = parts[ninputs - 1].header.rangeEnd;
 	char poolId[24], label[136];
 	pool_compute_merged_id(&parts[0].header, rangeStart, rangeEnd, totalRecords, poolId);
 	pool_output_label(output, label);
-	int mergedParts = 0;
-	for (int i = 0; i < ninputs; i++) {
-		int leaves = parts[i].header.mergedParts > 0 ? parts[i].header.mergedParts : 1;
-		if (leaves > INT_MAX - mergedParts) {
-			snprintf(err, sizeof err, "merged leaf-part count overflows"); goto done;
+	bool formatUpgrade = forceAdaptive && ninputs == 1;
+	int mergedParts = formatUpgrade ? parts[0].header.mergedParts : 0;
+	if (!formatUpgrade) {
+		for (int i = 0; i < ninputs; i++) {
+			int leaves = parts[i].header.mergedParts > 0 ? parts[i].header.mergedParts : 1;
+			if (leaves > INT_MAX - mergedParts) {
+				snprintf(err, sizeof err, "merged leaf-part count overflows"); goto done;
+			}
+			mergedParts += leaves;
 		}
-		mergedParts += leaves;
 	}
 	FILE *out = fopen(output, "w+b");
 	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
@@ -8582,19 +8691,27 @@ static int pool_mode_merge(
 	uint64_t lineageId = parts[0].header.lineageId ? parts[0].header.lineageId
 			: pool_hash_fields("lineage-fallback", familyId,
 					parts[0].header.criteriaHash, 0, 0);
-	uint64_t segmentId = pool_hash_fields("segment", lineageId, rangeStart,
-			rangeEnd, (uint64_t)parts[0].header.space);
+	uint64_t segmentId = formatUpgrade && parts[0].header.segmentId
+			? parts[0].header.segmentId
+			: pool_hash_fields("segment", lineageId, rangeStart,
+					rangeEnd, (uint64_t)parts[0].header.space);
 	PoolHeaderRewrite rewrite = {
-		.overrideRange = 1, .rangeStart = rangeStart, .rangeEnd = rangeEnd,
+		.overrideRange = 1, .preserveInputTopology = formatUpgrade,
+		.rangeStart = rangeStart, .rangeEnd = rangeEnd,
 		.poolId = poolId, .label = label, .mergedParts = mergedParts,
 		.familyId = familyId, .segmentId = segmentId, .stageHash = stageHash,
 		.lineageId = lineageId,
-		.derivationId = pool_hash_fields("derive-merge", lineageId, segmentId,
-				(uint64_t)mergedParts, totalRecords),
+		.derivationId = formatUpgrade
+				? pool_hash_fields("derive-upgrade",
+						parts[0].header.snapshotId, segmentId,
+						totalRecords, (uint64_t)outputSchema)
+				: pool_hash_fields("derive-merge", lineageId, segmentId,
+						(uint64_t)mergedParts, totalRecords),
 		.membershipDigest = pool_membership_digest_start(outputSchema),
 		.metadataDigest = eventInputs
 				? pool_metadata_digest_start(outputSchema) : 0,
-		.scanCursor = rangeEnd,
+		.scanCursor = formatUpgrade && parts[0].header.scanCursor
+				? parts[0].header.scanCursor : rangeEnd,
 	};
 	rewrite.snapshotId = pool_hash_fields("snapshot", segmentId, totalRecords, 0,
 			rewrite.membershipDigest);
@@ -8606,13 +8723,17 @@ static int pool_mode_merge(
 	uint64_t membershipDigest = pool_membership_digest_start(outputSchema);
 	uint64_t metadataDigest = eventInputs
 			? pool_metadata_digest_start(outputSchema) : 0;
+	uint64_t recordMetadataDigest = pool_hash_update(
+			POOL_HASH_INIT, POOL_RECORD_METADATA_DOMAIN,
+			sizeof POOL_RECORD_METADATA_DOMAIN - 1u);
 	PoolMergeEventBlock eventBlock = { 0 };
 	PoolMergeRankBlock rankBlock = { 0 };
 	for (int i = 0; i < ninputs; i++) {
 		if (!pool_merge_write_part(out, &parts[i], &eventBlock, &rankBlock,
 				eventInputs ? parts[i].blocksAscending : canonicalMerge,
 				outputSchema, &written,
-				&membershipDigest, &metadataDigest, err, sizeof err)) {
+				&membershipDigest, &metadataDigest,
+				&recordMetadataDigest, err, sizeof err)) {
 			pool_merge_event_reset(&eventBlock);
 			fclose(out); remove(output); goto done;
 		}
@@ -8622,7 +8743,8 @@ static int pool_mode_merge(
 	bool tailOk = eventInputs
 			? pool_merge_write_event_block(out, &eventBlock, outputSchema,
 					&membershipDigest,
-					&metadataDigest, err, sizeof err)
+					&metadataDigest, &recordMetadataDigest,
+					err, sizeof err)
 			: pool_merge_write_rank_block(out, &rankBlock, &membershipDigest,
 					err, sizeof err);
 	pool_merge_event_reset(&eventBlock);
@@ -8652,7 +8774,8 @@ static int pool_mode_merge(
 		remove(output); goto done;
 	}
 	if (!pool_write_merge_manifest(output, parts, ninputs, mergedParts, rangeStart, rangeEnd,
-			totalRecords, finalBytes, outputSchema, poolId, label))
+			totalRecords, finalBytes, outputSchema, recordMetadataDigest,
+			poolId, label))
 		fprintf(stderr, "warning: merged pool is complete but its optional manifest could not be written\n");
 	fprintf(stderr, "merged %d compatible shards: range=%" PRIu64 "-%" PRIu64
 			" records=%" PRIu64 " size=%.3f GB pool_id=%s\n",
@@ -8664,6 +8787,7 @@ done:
 		bspool_reader_destroy(&parts[i].reader);
 		if (parts[i].file) fclose(parts[i].file);
 	}
+	free(original);
 	free(parts);
 	return rc;
 }

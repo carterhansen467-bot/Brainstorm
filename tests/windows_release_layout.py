@@ -145,11 +145,16 @@ print(values['POOL_BIN'])
         self.assertEqual(lines[-2], str(app))
         self.assertEqual(lines[-1], str(app / scanner_name))
 
-    def test_frozen_organizer_finds_parent_pool_library(self):
+    def test_frozen_organizer_finds_parent_pool_library_and_scanner(self):
         mod = self.base / "installed" / "Renamed-Brainstorm"
         app = mod / "Seed Pool Builder"
         write(mod / "Brainstorm_main.lua")
         write(mod / "manifest.json")
+        scanner_name = "brainstorm_seed_pool.exe" if os.name == "nt" \
+            else "brainstorm_seed_pool"
+        scanner = app / scanner_name
+        write(scanner)
+        scanner.chmod(0o755)
         fake_exe = app / "Seed Pool Organizer.exe"
         write(fake_exe)
         probe = """
@@ -160,6 +165,7 @@ values = runpy.run_path({script!r}, run_name='organizer_layout_probe')
 print(values['MOD_DIR'])
 print(values['APP_DIR'])
 print(values['POOL_DIR'])
+print(values['_native_pool_binary']())
 """.format(executable=str(fake_exe),
            script=str(ROOT / "tools" / "pool_organizer_web.py"))
         env = dict(os.environ)
@@ -167,9 +173,10 @@ print(values['POOL_DIR'])
         result = subprocess.run([sys.executable, "-c", probe], env=env,
                                 check=True, text=True, capture_output=True)
         lines = result.stdout.splitlines()
-        self.assertEqual(lines[-3], str(mod))
-        self.assertEqual(lines[-2], str(app))
-        self.assertEqual(lines[-1], str(mod / "seed_pools"))
+        self.assertEqual(lines[-4], str(mod))
+        self.assertEqual(lines[-3], str(app))
+        self.assertEqual(lines[-2], str(mod / "seed_pools"))
+        self.assertEqual(lines[-1], str(scanner))
 
 
 if __name__ == "__main__":

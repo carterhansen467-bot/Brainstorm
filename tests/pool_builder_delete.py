@@ -119,6 +119,18 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
     finally:
         web.organizer_web.SPLIT_LOCK.release()
 
+    assert web.organizer_web.COMBINE_LOCK.acquire(False)
+    try:
+        try:
+            web.plan_pool_deletion(name, pool_dir)
+        except ValueError as exc:
+            assert "combine or format update" in str(exc)
+        else:
+            raise AssertionError(
+                "web deletion raced an organizer format update")
+    finally:
+        web.organizer_web.COMBINE_LOCK.release()
+
     # Deletion must contend on the same persistent lock as a native scanner.
     # Removing the lock file would split POSIX flock ownership across two
     # inodes and allow a writer/deleter race.

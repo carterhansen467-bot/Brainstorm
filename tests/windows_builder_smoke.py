@@ -59,6 +59,7 @@ def main():
     # must happen before convert/merge can inspect them.
     for command in (
             [core.POOL_BIN, "convert", out, out],
+            [core.POOL_BIN, "upgrade", out, out],
             [core.POOL_BIN, "merge", out, out, out]):
         blocked = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)

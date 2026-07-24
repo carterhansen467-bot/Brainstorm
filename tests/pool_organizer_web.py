@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused backend/API tests for the standalone organizer web UI."""
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -132,6 +133,112 @@ class OrganizerWebRegression(unittest.TestCase):
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def exercise_http_format_upgrade(
+            self, handler, plan_path, update_path, source_name):
+        source = os.path.join(self.temp.name, source_name)
+        fixture.write_bsp3(source, complete=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server_thread = threading.Thread(
+            target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        try:
+            plan = self.post_json(
+                base, plan_path, {"source": source_name})
+            self.assertTrue(plan["eligible"])
+            result = self.post_json(base, update_path, {
+                "source": source_name,
+                "planToken": plan["plan_token"],
+            })
+            output = os.path.join(self.temp.name, result["output"])
+            reader = organizer.BSPoolReader(output)
+            self.assertEqual(reader.schema, 4)
+            self.assertEqual(reader.records, 4)
+            self.assertTrue(os.path.isfile(source))
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def exercise_http_format_cancel(
+            self, handler, plan_path, update_path, cancel_path, source_name):
+        source = os.path.join(self.temp.name, source_name)
+        fixture.write_bsp3(source, complete=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server_thread = threading.Thread(
+            target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        entered = threading.Event()
+        cancel_seen = threading.Event()
+        tick = threading.Event()
+        responses = []
+        unexpected = []
+        original_execute = web.execute_format_upgrade
+
+        def blocked_execute(request, pool_dir=None, cancel_check=None):
+            if not callable(cancel_check):
+                raise AssertionError(
+                    "HTTP format runner did not supply cancel_check")
+            entered.set()
+            for _ in range(500):
+                if cancel_check():
+                    cancel_seen.set()
+                    raise web.OperationCancelled("operation cancelled")
+                tick.wait(0.01)
+            raise AssertionError("HTTP format cancellation was not delivered")
+
+        try:
+            plan = self.post_json(
+                base, plan_path, {"source": source_name})
+            output = os.path.join(self.temp.name, plan["output_name"])
+
+            def request_update():
+                try:
+                    responses.append(("ok", self.post_json(
+                        base, update_path, {
+                            "source": source_name,
+                            "planToken": plan["plan_token"],
+                        })))
+                except HTTPError as exc:
+                    responses.append((
+                        "error", json.loads(exc.read().decode("utf-8"))))
+                except BaseException as exc:
+                    unexpected.append(exc)
+
+            web.execute_format_upgrade = blocked_execute
+            update_thread = threading.Thread(target=request_update)
+            update_thread.start()
+            self.assertTrue(entered.wait(5),
+                            "HTTP format update never entered its worker")
+            cancelled = self.post_json(base, cancel_path, {
+                "operation": "upgrade",
+            })
+            self.assertEqual(cancelled["state"], "cancelling")
+            self.assertTrue(cancel_seen.wait(5),
+                            "format worker never observed HTTP cancellation")
+            update_thread.join(timeout=5)
+            self.assertFalse(update_thread.is_alive())
+            self.assertEqual(unexpected, [])
+            self.assertEqual(len(responses), 1)
+            state, response = responses[0]
+            self.assertEqual(state, "error")
+            self.assertEqual(
+                response["error_code"], "operation_cancelled")
+            self.assertIn("cancel", response["error"])
+            self.assertFalse(os.path.lexists(output))
+            self.assertFalse(os.path.lexists(output + ".manifest"))
+            self.assertEqual(
+                web.cancel_operation("upgrade")["state"], "idle")
+        finally:
+            web.cancel_operation("upgrade")
+            web.execute_format_upgrade = original_execute
+            if "update_thread" in locals():
+                update_thread.join(timeout=5)
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
     def exercise_http_split_cancel(self, handler, split_path, cancel_path):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         server_thread = threading.Thread(
@@ -155,7 +262,7 @@ class OrganizerWebRegression(unittest.TestCase):
                 polls.append(True)
                 if cancel_check():
                     cancel_seen.set()
-                    raise organizer.PoolError("operation cancelled")
+                    raise web.OperationCancelled("operation cancelled")
                 tick.wait(0.01)
             raise AssertionError("HTTP cancellation was not delivered")
 
@@ -192,6 +299,8 @@ class OrganizerWebRegression(unittest.TestCase):
             state, response = split_response[0]
             self.assertEqual(state, "error")
             self.assertIn("cancel", response["error"])
+            self.assertEqual(
+                response["error_code"], "operation_cancelled")
             self.assertNotIn("completed", response)
             self.assertGreater(len(polls), 0)
             self.assertEqual(web.cancel_operation("split")["state"], "idle")
@@ -1619,6 +1728,38 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn("Your selected pools are read-only", page)
         self.assertIn("The three combine rules", page)
         self.assertIn("Review the combined pool (no file created)", page)
+        self.assertIn("Update pool format", page)
+        self.assertIn("Check pool format", page)
+        self.assertIn("Create BSP4 copy", page)
+        self.assertIn("Original BSP3 will be kept", page)
+        self.assertIn("/api/format/plan", page)
+        self.assertIn("/api/format/update", page)
+        self.assertIn('error.code=v.error_code||""', page)
+        self.assertIn(
+            'cancelled=e.code==="operation_cancelled"', page)
+        self.assertNotIn("/cancel/i", page)
+        self.assertIn(
+            'id="formatElapsed" aria-hidden="true" hidden', page)
+        self.assertIn(
+            '$("formatElapsed").textContent=`Still working —', page)
+        self.assertIn(
+            'clearInterval(timer);$("formatElapsed").hidden=true;'
+            '$("formatElapsed").textContent=""', page)
+        self.assertIn(
+            '$("formatStatus").hidden=true;'
+            '$("formatStatus").className="workstatus"', page)
+        self.assertIn(
+            "could not confirm whether a BSP4 copy was published", page)
+        self.assertIn(
+            'check.disabled=refreshFailed||!poolRows.some(p=>!p.error)',
+            page)
+        self.assertIn(
+            '$("formatSource").disabled=formatRunning;'
+            'formatButton.disabled=formatRunning||!poolRows.some(p=>!p.error)',
+            page)
+        self.assertIn(
+            '$("formatSource").disabled=true;formatButton.disabled=true',
+            page)
         self.assertIn('id="reviewStatus"', page)
         self.assertIn("no full rescan was needed", page)
         self.assertIn('id="inspectionStatus"', page)
@@ -1641,6 +1782,638 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertGreaterEqual(len(re.findall(
             r'id="[^"]*[Cc]ancel[^"]*"', page)), 2)
 
+    def test_format_upgrade_plan_matrix_and_stale_collision(self):
+        complete_name = "Complete Pool BSP3.BSPOOL"
+        complete = os.path.join(self.temp.name, complete_name)
+        fixture.write_bsp3(complete, complete=True)
+        plan = web.plan_format_upgrade(complete_name, self.temp.name)
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["source_format"], "BSP3")
+        self.assertEqual(plan["output_name"], "Complete Pool BSP4.bspool")
+
+        # Automatic naming never overwrites either a pool or a stale sidecar.
+        collision = os.path.join(self.temp.name, plan["output_name"])
+        with open(collision, "wb") as handle:
+            handle.write(b"existing destination")
+        moved = web.plan_format_upgrade(complete_name, self.temp.name)
+        self.assertEqual(moved["output_name"], "Complete Pool BSP4-2.bspool")
+        with self.assertRaisesRegex(
+                organizer.PoolError, "automatic output changed"):
+            web.execute_format_upgrade({
+                "source": complete_name,
+                "planToken": plan["plan_token"],
+            }, self.temp.name)
+        with open(collision, "rb") as handle:
+            self.assertEqual(handle.read(), b"existing destination")
+
+        paused = web.plan_format_upgrade(self.source_name, self.temp.name)
+        self.assertFalse(paused["eligible"])
+        self.assertIn("Finish or resume", " ".join(paused["blockers"]))
+
+        provisional_name = "provisional.bspool"
+        fixture.write_custom_bsp3(
+            os.path.join(self.temp.name, provisional_name),
+            [1, 2], [[fixture.TAG], [fixture.TAG]],
+            "abababababababab", ["tag_route collect"],
+            complete=True, coverage_complete=False)
+        provisional = web.plan_format_upgrade(
+            provisional_name, self.temp.name)
+        self.assertFalse(provisional["eligible"])
+        self.assertIn("provisional", " ".join(
+            provisional["blockers"]).lower())
+
+        bsp2_name = "legacy-bsp2.bspool"
+        fixture.write_bsp2(
+            os.path.join(self.temp.name, bsp2_name), complete=True)
+        bsp2 = web.plan_format_upgrade(bsp2_name, self.temp.name)
+        self.assertFalse(bsp2["eligible"])
+        self.assertIn("cannot be losslessly updated", " ".join(
+            bsp2["blockers"]))
+
+        original_binary = web._native_pool_binary
+        web._native_pool_binary = lambda: ""
+        try:
+            missing = web.plan_format_upgrade(complete_name, self.temp.name)
+        finally:
+            web._native_pool_binary = original_binary
+        self.assertFalse(missing["eligible"])
+        self.assertIn("native seed-pool helper is missing",
+                      " ".join(missing["blockers"]))
+
+    def test_format_upgrade_automatic_name_reserves_every_pool_sidecar(self):
+        protected = (
+            "", ".manifest", ".state", ".criteria.cfg", ".attached",
+            ".organizer-summary.json",
+        )
+        for number, suffix in enumerate(protected):
+            with self.subTest(suffix=suffix or "(pool)"):
+                source_name = "Sidecar Collision %d BSP3.bspool" % number
+                fixture.write_bsp3(
+                    os.path.join(self.temp.name, source_name), complete=True)
+                expected = "Sidecar Collision %d BSP4.bspool" % number
+                with open(os.path.join(self.temp.name, expected) + suffix,
+                          "wb") as handle:
+                    handle.write(b"reserved pool artifact")
+                plan = web.plan_format_upgrade(source_name, self.temp.name)
+                self.assertEqual(
+                    plan["output_name"],
+                    "Sidecar Collision %d BSP4-2.bspool" % number)
+
+    def test_format_upgrade_long_name_keeps_marker_and_links_are_blocked(self):
+        long_name = ("%s BSP3.bspool" % ("a" * 170))
+        fixture.write_bsp3(
+            os.path.join(self.temp.name, long_name), complete=True)
+        long_plan = web.plan_format_upgrade(long_name, self.temp.name)
+        self.assertTrue(long_plan["eligible"])
+        self.assertTrue(
+            os.path.splitext(long_plan["output_name"])[0].endswith("BSP4"))
+        self.assertLessEqual(
+            len(os.path.splitext(long_plan["output_name"])[0]), 160)
+
+        source_name = "linked-original BSP3.bspool"
+        alias_name = "linked-alias BSP3.bspool"
+        source = os.path.join(self.temp.name, source_name)
+        alias = os.path.join(self.temp.name, alias_name)
+        fixture.write_bsp3(source, complete=True)
+        os.link(source, alias)
+        linked = web.plan_format_upgrade(alias_name, self.temp.name)
+        self.assertFalse(linked["eligible"])
+        self.assertIn(
+            "filesystem link", " ".join(linked["blockers"]).lower())
+
+    def test_format_upgrade_accepts_completed_zero_record_bsp3(self):
+        name = "No Matches BSP3.bspool"
+        source = os.path.join(self.temp.name, name)
+        identity = fixture.write_empty_bsp3(source)
+        source_bytes = self.read_bytes(source)
+        source_reader = organizer.BSPoolReader(source)
+        self.assertEqual(source_reader.records, 0)
+        self.assertEqual(list(source_reader.iter_records()), [])
+
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["records"], 0)
+        result = web.run_format_upgrade({
+            "source": name,
+            "planToken": plan["plan_token"],
+        }, self.temp.name)
+        output = os.path.join(self.temp.name, result["output"])
+        upgraded = organizer.BSPoolReader(output)
+        self.assertEqual(upgraded.schema, 4)
+        self.assertEqual(upgraded.encoding, "adaptive-events-v1")
+        self.assertTrue(upgraded.complete)
+        self.assertTrue(upgraded.coverage_complete)
+        self.assertEqual(upgraded.records, 0)
+        self.assertEqual(list(upgraded.iter_records()), [])
+        self.assertEqual("%016x" % upgraded.family_id, identity["family"])
+        self.assertEqual("%016x" % upgraded.lineage_id, identity["lineage"])
+        self.assertEqual(
+            "%016x" % upgraded.header.integer("stage_hash", 16),
+            identity["stage"])
+        self.assertEqual(self.read_bytes(source), source_bytes)
+        self.assertFalse(any(
+            item.startswith(".u-") for item in os.listdir(self.temp.name)))
+
+    def test_format_upgrade_accepts_extended_header_bsp3(self):
+        base = os.path.join(self.temp.name, "extended-base.bspool")
+        fixture.write_bsp3(base, complete=True)
+        for header_bytes in (16 * 1024, organizer.HEADER_MAX_BYTES):
+            with self.subTest(header_bytes=header_bytes):
+                name = "Extended Header %d BSP3.bspool" % header_bytes
+                source = os.path.join(self.temp.name, name)
+                fixture.expand_bsp3_header(
+                    base, source, header_bytes=header_bytes)
+                source_records = [
+                    (record.rank,
+                     tuple(item.raw for item in record.occurrences))
+                    for record in organizer.BSPoolReader(
+                        source).iter_records()
+                ]
+
+                plan = web.plan_format_upgrade(name, self.temp.name)
+                self.assertTrue(plan["eligible"])
+                result = web.run_format_upgrade({
+                    "source": name,
+                    "planToken": plan["plan_token"],
+                }, self.temp.name)
+                upgraded = organizer.BSPoolReader(
+                    os.path.join(self.temp.name, result["output"]))
+                self.assertEqual(upgraded.schema, 4)
+                self.assertEqual(upgraded.header_bytes, header_bytes)
+                self.assertEqual([
+                    (record.rank,
+                     tuple(item.raw for item in record.occurrences))
+                    for record in upgraded.iter_records()
+                ], source_records)
+
+    def test_format_upgrade_preserves_source_and_historical_metadata(self):
+        name = "Historical Pool BSP3.BSPOOL"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_out_of_order_bsp3(
+            source, overlapping=True, long_opaque=True)
+        with open(source, "rb") as handle:
+            source_bytes = handle.read()
+        source_reader = organizer.BSPoolReader(source)
+        source_records = {
+            record.rank: tuple(sorted(
+                occurrence.raw for occurrence in record.occurrences))
+            for record in source_reader.iter_records()
+        }
+        source_criteria = organizer._reader_criteria(source_reader)
+        source_stage = source_reader.header.integer("stage_hash", 16)
+
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        result = web.run_format_upgrade({
+            "source": name,
+            "planToken": plan["plan_token"],
+        }, self.temp.name)
+        output = os.path.join(self.temp.name, result["output"])
+        upgraded = organizer.BSPoolReader(output)
+        output_records = {
+            record.rank: tuple(sorted(
+                occurrence.raw for occurrence in record.occurrences))
+            for record in upgraded.iter_records()
+        }
+        with open(source, "rb") as handle:
+            self.assertEqual(handle.read(), source_bytes)
+        self.assertEqual(output_records, source_records)
+        self.assertEqual(upgraded.schema, 4)
+        self.assertEqual(upgraded.encoding, "adaptive-events-v1")
+        self.assertTrue(upgraded.complete)
+        self.assertTrue(upgraded.coverage_complete)
+        self.assertEqual(upgraded.records, len(source_records))
+        self.assertEqual(upgraded.family_id, source_reader.family_id)
+        self.assertEqual(upgraded.lineage_id, source_reader.lineage_id)
+        self.assertEqual(
+            upgraded.header.integer("stage_hash", 16), source_stage)
+        self.assertEqual(
+            organizer._reader_criteria(upgraded), source_criteria)
+        self.assertTrue(result["normalized_historical_order"])
+        self.assertTrue(os.path.isfile(output + ".manifest"))
+        self.assertFalse(any(
+            item.startswith(".u-")
+            for item in os.listdir(self.temp.name)))
+
+        current = web.plan_format_upgrade(
+            result["output"], self.temp.name)
+        self.assertEqual(current["status"], "current")
+        self.assertFalse(current["eligible"])
+        self.assertEqual(current["output_name"], "")
+
+    def test_format_upgrade_rejects_record_digest_mismatch(self):
+        name = "digest-mismatch BSP3.bspool"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(source, complete=True)
+        source_bytes = self.read_bytes(source)
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        output = os.path.join(self.temp.name, plan["output_name"])
+        original_upgrade = web._run_native_upgrade
+
+        def mismatched_digest(source_path, staged_path, cancel_check=None):
+            result = original_upgrade(
+                source_path, staged_path, cancel_check=cancel_check)
+            manifest_path = staged_path + ".manifest"
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = handle.read()
+            manifest, changed = re.subn(
+                r"(?m)^record_metadata_digest [0-9a-f]{16}$",
+                "record_metadata_digest 0000000000000000",
+                manifest, count=1)
+            self.assertEqual(changed, 1)
+            with open(manifest_path, "w", encoding="utf-8",
+                      newline="\n") as handle:
+                handle.write(manifest)
+            return result
+
+        web._run_native_upgrade = mismatched_digest
+        try:
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "expected complete BSP4"):
+                web.execute_format_upgrade({
+                    "source": name,
+                    "planToken": plan["plan_token"],
+                }, self.temp.name)
+        finally:
+            web._run_native_upgrade = original_upgrade
+        self.assertFalse(os.path.lexists(output))
+        self.assertFalse(os.path.lexists(output + ".manifest"))
+        self.assertEqual(self.read_bytes(source), source_bytes)
+        self.assertFalse(any(
+            item.startswith(".u-") for item in os.listdir(self.temp.name)))
+
+    def test_format_upgrade_rejects_valid_but_different_records(self):
+        name = "semantic-source BSP3.bspool"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(source, complete=True)
+        source_bytes = self.read_bytes(source)
+        alternate = os.path.join(
+            self.temp.name, "semantic-alternate BSP3.bspool")
+        fixture.write_custom_bsp3(
+            alternate, [11, 12, 13, 14],
+            [[fixture.TAG], [fixture.TAG], [fixture.TAG], [fixture.TAG]],
+            "bbbbbbbbbbbbbbbb",
+            ["tag_route collect",
+             "tag tag_negative 3 small 3 small 1"],
+            complete=True)
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        output = os.path.join(self.temp.name, plan["output_name"])
+        original_upgrade = web._run_native_upgrade
+
+        def different_upgrade(_source, staged_path, cancel_check=None):
+            return original_upgrade(
+                alternate, staged_path, cancel_check=cancel_check)
+
+        web._run_native_upgrade = different_upgrade
+        try:
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "changed a seed rank"):
+                web.execute_format_upgrade({
+                    "source": name,
+                    "planToken": plan["plan_token"],
+                }, self.temp.name)
+        finally:
+            web._run_native_upgrade = original_upgrade
+        self.assertFalse(os.path.lexists(output))
+        self.assertFalse(os.path.lexists(output + ".manifest"))
+        self.assertEqual(self.read_bytes(source), source_bytes)
+        self.assertFalse(any(
+            item.startswith(".u-") for item in os.listdir(self.temp.name)))
+
+    def test_format_upgrade_record_comparison_rejects_metadata_only_change(
+            self):
+        source = os.path.join(self.temp.name, "metadata-source.bspool")
+        alternate = os.path.join(
+            self.temp.name, "metadata-alternate.bspool")
+        staged = os.path.join(self.temp.name, "metadata-staged.bspool")
+        fixture.write_bsp3(source, complete=True)
+        fixture.write_custom_bsp3(
+            alternate, [0, 1, 2, 3],
+            [[fixture.TAG], [fixture.TAG], [fixture.VOUCHER],
+             [fixture.UNKNOWN]],
+            "bbbbbbbbbbbbbbbb",
+            ["tag_route collect",
+             "tag tag_negative 3 small 3 small 1"],
+            complete=True)
+        web._run_native_upgrade(alternate, staged)
+
+        source_reader = organizer.BSPoolReader(source)
+        staged_reader = organizer.BSPoolReader(staged)
+        with self.assertRaisesRegex(
+                organizer.PoolError, "rank or its recorded filter metadata"):
+            web._verify_upgrade_record_equivalence(
+                source_reader, staged_reader)
+
+    def test_format_upgrade_cancellation_never_publishes_partial_output(self):
+        name = "cancel-source.bspool"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(source, complete=True)
+        with open(source, "rb") as handle:
+            source_bytes = handle.read()
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        entered = threading.Event()
+        finished = []
+        original_upgrade = web._run_native_upgrade
+
+        def blocked_upgrade(_source, output, cancel_check=None):
+            with open(output, "wb") as handle:
+                handle.write(b"private partial output")
+            entered.set()
+            while not cancel_check():
+                threading.Event().wait(0.01)
+            raise web.OperationCancelled(
+                "format update cancelled safely; no new pool was published")
+
+        def run():
+            try:
+                web.run_format_upgrade({
+                    "source": name,
+                    "planToken": plan["plan_token"],
+                }, self.temp.name)
+            except organizer.PoolError as exc:
+                finished.append(str(exc))
+
+        web._run_native_upgrade = blocked_upgrade
+        thread = threading.Thread(target=run)
+        try:
+            thread.start()
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(
+                web.cancel_operation("upgrade")["state"], "cancelling")
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        finally:
+            web._run_native_upgrade = original_upgrade
+            web.cancel_operation("upgrade")
+            thread.join(timeout=5)
+        self.assertEqual(len(finished), 1)
+        self.assertIn("cancelled", finished[0])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.temp.name, plan["output_name"])))
+        self.assertFalse(any(
+            item.startswith(".u-")
+            for item in os.listdir(self.temp.name)))
+        with open(source, "rb") as handle:
+            self.assertEqual(handle.read(), source_bytes)
+        self.assertEqual(
+            web.cancel_operation("upgrade")["state"], "idle")
+
+    def test_format_upgrade_final_prelink_cancellation_publishes_nothing(self):
+        name = "prelink-cancel-source.bspool"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(source, complete=True)
+        source_bytes = self.read_bytes(source)
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        output = os.path.join(self.temp.name, plan["output_name"])
+        cancelled = threading.Event()
+        original_guard = organizer.pool_writer_guard
+
+        @contextlib.contextmanager
+        def cancel_when_output_lock_is_held(path):
+            with original_guard(path):
+                if os.path.abspath(path) == os.path.abspath(output):
+                    cancelled.set()
+                yield
+
+        organizer.pool_writer_guard = cancel_when_output_lock_is_held
+        try:
+            with self.assertRaises(web.OperationCancelled):
+                web.execute_format_upgrade({
+                    "source": name,
+                    "planToken": plan["plan_token"],
+                }, self.temp.name, cancel_check=cancelled.is_set)
+        finally:
+            organizer.pool_writer_guard = original_guard
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(os.path.lexists(output))
+        self.assertFalse(os.path.lexists(output + ".manifest"))
+        self.assertEqual(self.read_bytes(source), source_bytes)
+        self.assertFalse(any(
+            item.startswith(".u-") for item in os.listdir(self.temp.name)))
+
+    def test_format_upgrade_postlink_interruptions_return_committed_pool(self):
+        original_publish = web._publish_upgrade_file
+        for point in ("manifest", "pool"):
+            with self.subTest(point=point):
+                name = "postlink-%s BSP3.bspool" % point
+                source = os.path.join(self.temp.name, name)
+                fixture.write_bsp3(source, complete=True)
+                source_bytes = self.read_bytes(source)
+                plan = web.plan_format_upgrade(name, self.temp.name)
+                output = os.path.join(self.temp.name, plan["output_name"])
+                interrupted = []
+
+                def interrupt_after_successful_link(source_path, final_path):
+                    original_publish(source_path, final_path)
+                    is_target = (
+                        (point == "manifest"
+                         and final_path == output + ".manifest")
+                        or (point == "pool" and final_path == output))
+                    if is_target:
+                        interrupted.append(final_path)
+                        raise KeyboardInterrupt(
+                            "synthetic interruption after os.link committed")
+
+                web._publish_upgrade_file = interrupt_after_successful_link
+                try:
+                    result = web.execute_format_upgrade({
+                        "source": name,
+                        "planToken": plan["plan_token"],
+                    }, self.temp.name)
+                finally:
+                    web._publish_upgrade_file = original_publish
+                self.assertEqual(interrupted, [
+                    output + (".manifest" if point == "manifest" else "")])
+                self.assertEqual(result["output"], plan["output_name"])
+                upgraded = organizer.BSPoolReader(output)
+                self.assertEqual(upgraded.schema, 4)
+                self.assertTrue(upgraded.complete)
+                self.assertEqual(upgraded.records, 4)
+                self.assertTrue(os.path.isfile(output + ".manifest"))
+                self.assertEqual(self.read_bytes(source), source_bytes)
+                self.assertFalse(any(
+                    item.startswith(".u-")
+                    for item in os.listdir(self.temp.name)))
+
+    def test_format_upgrade_postcommit_lock_release_failure_is_success(self):
+        original_guard = organizer.pool_writer_guard
+        for point in ("output", "source"):
+            with self.subTest(point=point):
+                name = "unlock-%s BSP3.bspool" % point
+                source = os.path.join(self.temp.name, name)
+                fixture.write_bsp3(source, complete=True)
+                source_bytes = self.read_bytes(source)
+                plan = web.plan_format_upgrade(name, self.temp.name)
+                output = os.path.join(
+                    self.temp.name, plan["output_name"])
+
+                @contextlib.contextmanager
+                def failing_release(path):
+                    with original_guard(path):
+                        yield
+                    target = output if point == "output" else source
+                    if os.path.abspath(path) == os.path.abspath(target):
+                        raise OSError(
+                            "synthetic %s lock release failure" % point)
+
+                organizer.pool_writer_guard = failing_release
+                try:
+                    result = web.execute_format_upgrade({
+                        "source": name,
+                        "planToken": plan["plan_token"],
+                    }, self.temp.name)
+                finally:
+                    organizer.pool_writer_guard = original_guard
+                self.assertEqual(result["output"], plan["output_name"])
+                self.assertIn(
+                    "synthetic %s lock release failure" % point,
+                    result["publication_warning"])
+                upgraded = organizer.BSPoolReader(output)
+                self.assertEqual(upgraded.schema, 4)
+                self.assertTrue(upgraded.complete)
+                self.assertTrue(os.path.isfile(output + ".manifest"))
+                self.assertEqual(self.read_bytes(source), source_bytes)
+                self.assertFalse(any(
+                    item.startswith(".u-")
+                    for item in os.listdir(self.temp.name)))
+
+    def test_operation_cancellation_error_code_is_type_based(self):
+        cancelled = web.error_payload(
+            web.OperationCancelled("the user stopped this operation"))
+        stale = web.error_payload(
+            web.FormatPlanStale("the checked destination changed"))
+        ordinary = web.error_payload(
+            organizer.PoolError("a filter named cancellation-example failed"))
+        self.assertEqual(cancelled["error_code"], "operation_cancelled")
+        self.assertEqual(stale["error_code"], "format_plan_stale")
+        self.assertNotIn("error_code", ordinary)
+
+    def test_operation_shutdown_barrier_signals_drains_and_rejects_new_work(self):
+        web.allow_active_operations()
+        event = web._begin_operation("analysis")
+        drained = threading.Event()
+        waiter_started = threading.Event()
+
+        def wait_for_cleanup():
+            waiter_started.set()
+            web.wait_for_active_operations(poll_seconds=0.001)
+            drained.set()
+
+        waiter = threading.Thread(target=wait_for_cleanup)
+        try:
+            kinds = web.begin_operation_shutdown()
+            self.assertEqual(kinds, ("analysis",))
+            self.assertTrue(event.is_set())
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "Organizer is closing"):
+                web._begin_operation("split")
+
+            waiter.start()
+            self.assertTrue(waiter_started.wait(2))
+            self.assertFalse(drained.wait(0.05))
+            web._finish_operation("analysis", event)
+            self.assertTrue(drained.wait(2))
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+        finally:
+            web._finish_operation("analysis", event)
+            if waiter.ident is not None:
+                waiter.join(timeout=2)
+            web.allow_active_operations()
+
+    def test_builder_shutdown_waits_for_active_organizer_cleanup(self):
+        web.allow_active_operations()
+        event = web._begin_operation("upgrade")
+        server_called = threading.Event()
+        shutdown_returned = threading.Event()
+        registry_at_server_shutdown = []
+        with builder_web.LOCK:
+            saved_job = dict(builder_web.JOB)
+            builder_web.JOB.update({
+                "runner": None,
+                "kind": None,
+                "estimate_context": None,
+            })
+
+        class FakeServer:
+            @staticmethod
+            def shutdown():
+                with web.ACTIVE_OPERATION_LOCK:
+                    registry_at_server_shutdown.append(
+                        tuple(web.ACTIVE_OPERATIONS))
+                server_called.set()
+
+        def shutdown():
+            builder_web.shutdown_when_safe(FakeServer())
+            shutdown_returned.set()
+
+        thread = threading.Thread(target=shutdown)
+        try:
+            thread.start()
+            self.assertTrue(event.wait(2))
+            self.assertFalse(server_called.wait(0.05))
+            self.assertFalse(shutdown_returned.is_set())
+            self.assertTrue(thread.is_alive())
+
+            web._finish_operation("upgrade", event)
+            self.assertTrue(server_called.wait(2))
+            self.assertTrue(shutdown_returned.wait(2))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(registry_at_server_shutdown, [()])
+        finally:
+            web._finish_operation("upgrade", event)
+            if thread.ident is not None:
+                thread.join(timeout=2)
+            with builder_web.LOCK:
+                builder_web.JOB.clear()
+                builder_web.JOB.update(saved_job)
+            web.allow_active_operations()
+
+    def test_native_upgrade_cancellation_reaps_and_unregisters_child(self):
+        helper = os.path.join(self.temp.name, "fake_native_upgrade.py")
+        ready = os.path.join(self.temp.name, "native-upgrade-ready")
+        output = os.path.join(self.temp.name, "unused-output.bspool")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys, time\n"
+                "with open(sys.argv[1], 'w', encoding='utf-8') as marker:\n"
+                "    marker.write('ready')\n"
+                "sys.stderr.write('fake helper started\\n')\n"
+                "sys.stderr.flush()\n"
+                "while True:\n"
+                "    time.sleep(0.05)\n")
+
+        original_binary = web._native_pool_binary
+        original_popen = web.subprocess.Popen
+        children = []
+
+        def start_fake_helper(command, **kwargs):
+            self.assertEqual(command[1], "upgrade")
+            process = original_popen(
+                [sys.executable, "-u", helper, command[2]], **kwargs)
+            children.append(process)
+            return process
+
+        web._native_pool_binary = lambda: "fake-native-upgrade"
+        web.subprocess.Popen = start_fake_helper
+        try:
+            with self.assertRaises(web.OperationCancelled):
+                web._run_native_upgrade(
+                    ready, output, cancel_check=lambda: os.path.exists(ready))
+        finally:
+            web.subprocess.Popen = original_popen
+            web._native_pool_binary = original_binary
+            for process in children:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
+        with web.ACTIVE_UPGRADE_PROCESS_LOCK:
+            self.assertNotIn(children[0], web.ACTIVE_UPGRADE_PROCESSES)
+            self.assertFalse(web.ACTIVE_UPGRADE_PROCESSES)
+
     def test_standalone_http_cancel_interrupts_active_split(self):
         self.exercise_http_split_cancel(
             web.make_handler(self.temp.name), "/api/split", "/api/cancel")
@@ -1651,6 +2424,39 @@ class OrganizerWebRegression(unittest.TestCase):
         UnifiedHandler.pool_dir = self.temp.name
         self.exercise_http_split_cancel(
             UnifiedHandler, "/organizer/api/split", "/organizer/api/cancel")
+
+    def test_standalone_http_cancel_interrupts_format_update(self):
+        self.exercise_http_format_cancel(
+            web.make_handler(self.temp.name),
+            "/api/format/plan", "/api/format/update", "/api/cancel",
+            "Standalone HTTP Cancel BSP3.bspool")
+
+    def test_embedded_http_cancel_interrupts_format_update(self):
+        class UnifiedHandler(builder_web.Handler):
+            pass
+        UnifiedHandler.pool_dir = self.temp.name
+        self.exercise_http_format_cancel(
+            UnifiedHandler,
+            "/organizer/api/format/plan",
+            "/organizer/api/format/update",
+            "/organizer/api/cancel",
+            "Embedded HTTP Cancel BSP3.bspool")
+
+    def test_standalone_http_checks_and_updates_pool_format(self):
+        self.exercise_http_format_upgrade(
+            web.make_handler(self.temp.name),
+            "/api/format/plan", "/api/format/update",
+            "Standalone HTTP BSP3.bspool")
+
+    def test_embedded_builder_http_checks_and_updates_pool_format(self):
+        class UnifiedHandler(builder_web.Handler):
+            pass
+        UnifiedHandler.pool_dir = self.temp.name
+        self.exercise_http_format_upgrade(
+            UnifiedHandler,
+            "/organizer/api/format/plan",
+            "/organizer/api/format/update",
+            "Embedded HTTP BSP3.bspool")
 
     def test_local_http_inspect_and_snapshot_pinned_export(self):
         server = ThreadingHTTPServer(
@@ -1665,6 +2471,11 @@ class OrganizerWebRegression(unittest.TestCase):
             with urlopen(request, timeout=10) as response:
                 inspected = json.loads(response.read().decode("utf-8"))
             self.assertEqual(inspected["source"]["records"], 4)
+
+            format_plan = self.post_json(
+                base, "/api/format/plan", {"source": self.source_name})
+            self.assertEqual(format_plan["source_format"], "BSP3")
+            self.assertEqual(format_plan["status"], "blocked")
 
             export_url = "%s/api/export?source=%s&snapshot=%s" % (
                 base, quote(self.source_name), self.identity["snapshot"])
@@ -1699,9 +2510,21 @@ class OrganizerWebRegression(unittest.TestCase):
                 page = response.read().decode("utf-8")
             self.assertIn("Organize / Combine", page)
             self.assertIn("Combine pools", page)
+            self.assertIn("Update pool format", page)
             with urlopen(base + "/organizer/api/pools", timeout=10) as response:
                 pools = json.loads(response.read().decode("utf-8"))["pools"]
             self.assertIn(self.source_name, [row["name"] for row in pools])
+
+            format_body = json.dumps({
+                "source": self.source_name,
+            }).encode("utf-8")
+            format_request = Request(
+                base + "/organizer/api/format/plan", data=format_body,
+                headers={"Content-Type": "application/json"})
+            with urlopen(format_request, timeout=10) as response:
+                format_plan = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(format_plan["source_format"], "BSP3")
+            self.assertEqual(format_plan["status"], "blocked")
 
             body = json.dumps({
                 "sources": [self.source_name, self.second_name],

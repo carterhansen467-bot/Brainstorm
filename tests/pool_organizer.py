@@ -187,6 +187,108 @@ def write_bsp3(path, complete=False, charset=organizer.NATURAL_CHARSET,
     }
 
 
+def write_empty_bsp3(path):
+    """Write a completed BSP3 search that found no matching seeds."""
+    family = 0x1011222233334444
+    lineage = 0x2022333344445555
+    segment = 0x3033444455556666
+    stage = 0x4044555566667777
+    membership = FNV64_OFFSET
+    metadata_digest = FNV64_OFFSET
+    snapshot = hash_fields("snapshot", segment, 0, 0, membership)
+    lines = [
+        "BRAINSTORM_SEED_POOL 3",
+        "modelver 6",
+        "encoding delta-varint-events-v1",
+        "header_bytes 8192",
+        "charset %s" % organizer.NATURAL_CHARSET,
+        "seedspace %d" % organizer.NATURAL_SEEDSPACE,
+        "space natural",
+        "range_start 0",
+        "range_end 100",
+        "catalog_hash aaaaaaaaaaaaaaaa",
+        "criteria_hash bbbbbbbbbbbbbbbb",
+        "pool_id empty-source-pool",
+        "family_id %016x" % family,
+        "segment_id %016x" % segment,
+        "stage_hash %016x" % stage,
+        "lineage_id %016x" % lineage,
+        "derivation_id 5055666677778888",
+        "snapshot_id %016x" % snapshot,
+        "membership_digest %016x" % membership,
+        "metadata_digest %016x" % metadata_digest,
+        "scan_cursor 100",
+        "tag_route collect",
+        "tag tag_negative 3 small 3 small 1",
+        "records 0",
+        "data_bytes 0",
+        "complete 1",
+        "coverage_complete 1",
+        "end",
+    ]
+    header = ("\n".join(lines) + "\n").encode("ascii").ljust(8192, b"\0")
+    footer = bytearray(80)
+    footer[:8] = b"BSPIDX3\n"
+    struct.pack_into(
+        "<QQQQQQ", footer, 8, 8192, 0, 0, 0,
+        membership, metadata_digest)
+    struct.pack_into(
+        "<Q", footer, 72, independent_crc64(bytes(footer[:72])))
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(footer)
+    return {
+        "snapshot": "%016x" % snapshot,
+        "family": "%016x" % family,
+        "lineage": "%016x" % lineage,
+        "stage": "%016x" % stage,
+    }
+
+
+def expand_bsp3_header(source, target, header_bytes=16 * 1024):
+    """Copy a complete BSP3 pool into a valid larger event-header layout."""
+    reader = organizer.BSPoolReader(source)
+    if (reader.schema != 3 or not reader.complete
+            or header_bytes <= reader.header_bytes
+            or header_bytes > organizer.HEADER_MAX_BYTES):
+        raise ValueError("extended BSP3 fixture parameters are invalid")
+    with open(source, "rb") as handle:
+        raw = handle.read()
+    old_header_bytes = reader.header_bytes
+    header = raw[:old_header_bytes].split(b"\0", 1)[0].decode("ascii")
+    header, changed = re.subn(
+        r"(?m)^header_bytes \d+$",
+        "header_bytes %d" % header_bytes, header, count=1)
+    if changed != 1:
+        raise AssertionError("BSP3 fixture header_bytes did not rewrite")
+    encoded_header = header.encode("ascii")
+    if len(encoded_header) > header_bytes:
+        raise AssertionError("extended BSP3 fixture header overflowed")
+
+    data_end = old_header_bytes + reader.data_bytes
+    index_bytes = len(reader.blocks) * organizer.INDEX3_ENTRY_BYTES
+    raw_index = bytearray(raw[data_end:data_end + index_bytes])
+    shift = header_bytes - old_header_bytes
+    for number in range(len(reader.blocks)):
+        at = number * organizer.INDEX3_ENTRY_BYTES
+        offset = struct.unpack_from("<Q", raw_index, at)[0]
+        struct.pack_into("<Q", raw_index, at, offset + shift)
+    footer = bytearray(raw[data_end + index_bytes:])
+    if len(footer) != organizer.FOOTER3_BYTES \
+            or footer[:8] != b"BSPIDX3\n":
+        raise AssertionError("extended BSP3 fixture footer is invalid")
+    struct.pack_into("<Q", footer, 8, header_bytes + reader.data_bytes)
+    struct.pack_into(
+        "<Q", footer, 72, independent_crc64(bytes(footer[:72])))
+    with open(target, "wb") as handle:
+        handle.write(encoded_header.ljust(header_bytes, b"\0"))
+        handle.write(raw[old_header_bytes:data_end])
+        handle.write(raw_index)
+        handle.write(footer)
+    organizer.BSPoolReader(target)
+    return target
+
+
 def write_bsp2(path, complete=False):
     ranks = [5, 7]
     rank_payload = varint(2)
@@ -624,6 +726,11 @@ class OrganizerRegression(unittest.TestCase):
         by_category = {item["category_id"]: item for item in finished["outputs"]}
         self.assertEqual(sum(item["records"] for item in finished["outputs"]), 4)
         self.assertEqual(by_category[legendary_category]["records"], 1)
+        self.assertEqual(organizer.BSPoolReader(self.source).schema, 3)
+        for output in finished["outputs"]:
+            split_reader = organizer.BSPoolReader(output["path"])
+            self.assertEqual(split_reader.schema, 4)
+            self.assertEqual(split_reader.encoding, "adaptive-events-v1")
 
         legendary_reader = organizer.BSPoolReader(by_category[legendary_category]["path"])
         self.assertEqual(legendary_reader.schema, 4)

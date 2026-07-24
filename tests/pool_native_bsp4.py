@@ -75,6 +75,13 @@ def header_value(text, key, base=10):
     return int(re.search(pattern % re.escape(key), text).group(1), base)
 
 
+def header_field(text, key):
+    match = re.search(r"(?m)^%s (.+)$" % re.escape(key), text)
+    if not match:
+        raise AssertionError("pool header is missing %s" % key)
+    return match.group(1)
+
+
 def replace_one(text, pattern, replacement):
     text, changed = re.subn(pattern, replacement, text, count=1, flags=re.M)
     if changed != 1:
@@ -196,6 +203,18 @@ def normalized_summary(scanner, pool, path):
         line for line in result.stdout.splitlines()
         if not line.startswith(("membership_digest ",
                                 "metadata_digest ")))
+
+
+def assert_manifest_record_digest(scanner, pool):
+    with open(pool + ".manifest", encoding="utf-8") as handle:
+        manifest = handle.read()
+    summary = run(
+        scanner, "summarize", pool, "--record-digest").stdout
+    if header_field(
+            manifest, "record_metadata_digest") != header_field(
+                summary, "record_metadata_digest"):
+        raise AssertionError(
+            "upgrade manifest record digest differs from decoded output")
 
 
 def main():
@@ -433,6 +452,116 @@ def main():
         if upgraded_reader.schema != 4 or upgraded_data != clean_data:
             raise AssertionError(
                 "streaming BSP3 upgrade differs from canonical BSP4 data")
+        assert_manifest_record_digest(scanner, upgraded)
+
+        for header_bytes in (16 * 1024, organizer.HEADER_MAX_BYTES):
+            extended_v3 = os.path.join(
+                temp, "extended-%d-v3.bspool" % header_bytes)
+            extended_v4 = os.path.join(
+                temp, "extended-%d-v4.bspool" % header_bytes)
+            fixtures.expand_bsp3_header(
+                v3, extended_v3, header_bytes=header_bytes)
+            run(scanner, "upgrade", extended_v3, extended_v4)
+            extended_reader = organizer.BSPoolReader(extended_v4)
+            if (extended_reader.schema != 4
+                    or extended_reader.header_bytes != header_bytes
+                    or [(record.rank, tuple(
+                            item.raw for item in record.occurrences))
+                        for record in extended_reader.iter_records()]
+                    != logical3):
+                raise AssertionError(
+                    "extended-header BSP3 upgrade changed its logical pool")
+            assert_manifest_record_digest(scanner, extended_v4)
+
+        # A format-only upgrade keeps the derivative's logical position in its
+        # family/lineage tree. It must not flatten the parent/input fields as a
+        # real multi-input merge does, even though format-dependent identities
+        # and digests necessarily change.
+        refilter3_cfg = os.path.join(temp, "refilter-v3.cfg")
+        criteria(
+            refilter3_cfg, args.count, 3, 4, 0, refilter=True)
+        derivative3 = os.path.join(temp, "refilter-v3.bspool")
+        run(scanner, "refilter", snapshot, refilter3_cfg, v3, derivative3)
+
+        # Preserve legacy shard topology too. Current native headers identify
+        # the shard by range, while older shared derivatives may also carry
+        # these explicit fields.
+        derivative_raw = open(derivative3, "rb").read()
+        derivative_header_bytes, derivative_text = header_text(derivative_raw)
+        derivative_records = header_value(derivative_text, "records")
+        derivative_text = replace_one(
+            derivative_text, r"^records \d+$",
+            "shard_index 2\nshard_total 8\nrecords %d"
+            % derivative_records)
+        encoded_header = derivative_text.encode("ascii")
+        if len(encoded_header) > derivative_header_bytes:
+            raise AssertionError("BSP3 derivative topology overflowed its header")
+        derivative_raw = (
+            encoded_header.ljust(derivative_header_bytes, b"\0")
+            + derivative_raw[derivative_header_bytes:])
+        with open(derivative3, "wb") as handle:
+            handle.write(derivative_raw)
+
+        derivative4 = os.path.join(temp, "refilter-v3-upgraded.bspool")
+        run(scanner, "upgrade", derivative3, derivative4)
+        if open(derivative3, "rb").read() != derivative_raw:
+            raise AssertionError("BSP3 upgrade changed its derivative source")
+        upgraded_derivative_raw = open(derivative4, "rb").read()
+        _upgraded_header_bytes, upgraded_derivative_text = header_text(
+            upgraded_derivative_raw)
+        derivative_reader = organizer.BSPoolReader(derivative3)
+        upgraded_derivative_reader = organizer.BSPoolReader(derivative4)
+        derivative_logical = [
+            (record.rank, tuple(item.raw for item in record.occurrences))
+            for record in derivative_reader.iter_records()]
+        upgraded_derivative_logical = [
+            (record.rank, tuple(item.raw for item in record.occurrences))
+            for record in upgraded_derivative_reader.iter_records()]
+        if (upgraded_derivative_reader.schema != 4
+                or derivative_logical != upgraded_derivative_logical):
+            raise AssertionError(
+                "BSP3 derivative upgrade changed records or event metadata")
+        if organizer._reader_criteria(
+                derivative_reader) != organizer._reader_criteria(
+                    upgraded_derivative_reader):
+            raise AssertionError(
+                "BSP3 derivative upgrade changed recorded criteria")
+
+        preserved_fields = (
+            "family_id", "segment_id", "stage_hash", "lineage_id",
+            "scan_cursor", "refilter_depth", "source_criteria_hash",
+            "source_records", "source_pool_id", "source_complete",
+            "source_coverage_complete", "input_cursor",
+            "input_record_start", "input_record_end",
+            "parent_snapshot_id", "parent_segment_id", "parent_records",
+            "parent_data_bytes", "parent_coverage_complete",
+            "shard_index", "shard_total",
+        )
+        for field in preserved_fields:
+            if header_field(
+                    upgraded_derivative_text, field) != header_field(
+                        derivative_text, field):
+                raise AssertionError(
+                    "BSP3 derivative upgrade changed %s" % field)
+        for field in ("derivation_id", "snapshot_id"):
+            if header_field(
+                    upgraded_derivative_text, field) == header_field(
+                        derivative_text, field):
+                raise AssertionError(
+                    "BSP3 derivative upgrade reused %s" % field)
+        with open(derivative4 + ".manifest", encoding="utf-8") as handle:
+            upgrade_manifest = handle.read()
+        for manifest_field, source_field in (
+                ("upgrade_source_snapshot_id", "snapshot_id"),
+                ("upgrade_source_membership_digest", "membership_digest"),
+                ("upgrade_source_metadata_digest", "metadata_digest"),
+                ("upgrade_source_pool_id", "pool_id")):
+            if header_field(
+                    upgrade_manifest, manifest_field) != header_field(
+                        derivative_text, source_field):
+                raise AssertionError(
+                    "upgrade manifest changed source identity field %s"
+                    % source_field)
 
         # Historical multi-thread BSP3 writers could commit individually
         # sorted blocks in worker-completion order. Upgrade must normalize
@@ -458,6 +587,7 @@ def main():
             if "normalizing historical event block order" not in result.stderr:
                 raise AssertionError(
                     "historical upgrade did not report normalization")
+            assert_manifest_record_digest(scanner, target)
             source_records = list(
                 organizer.BSPoolReader(source).iter_records())
             records = list(organizer.BSPoolReader(target).iter_records())
