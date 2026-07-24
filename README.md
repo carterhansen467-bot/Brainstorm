@@ -310,6 +310,12 @@ The operation refuses to overwrite an existing output, preserves source data,
 criteria, family/lineage history, and provenance, and assigns the copy its own
 derivative identity while recomputing the encoding-dependent snapshot and
 logical digests. The source is never modified.
+For a completed checksum-protected BSP3 with exactly one damaged fixed
+eight-byte block-header prefix, the Organizer can reconstruct that prefix in
+memory only when the final index, block checksum, decoded ranks and metadata,
+and whole-pool identities all agree. A second damaged prefix or any broader
+corruption aborts without publishing an output; restore an undamaged backup or
+rescan in that case.
 Historical BSP3 files with physically shuffled blocks or overlapping block-rank
 ranges are canonicalized into globally rank-ascending BSP4 output during the
 upgrade. This ordering repair is also non-destructive to the source.

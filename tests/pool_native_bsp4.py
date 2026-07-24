@@ -602,6 +602,76 @@ def main():
                 raise AssertionError(
                     "historical BSP3 upgrade changed event metadata")
 
+        # A complete BSP3 footer/index plus the block CRC and whole-pool
+        # identities can prove the one reconstructible legacy failure: only
+        # bytes 0..7 of a block header were damaged. Upgrade substitutes that
+        # fixed prefix in memory, never writes the source, and still performs
+        # exact logical verification while producing BSP4.
+        repaired_v3 = os.path.join(temp, "repaired-prefix-v3.bspool")
+        repaired_output = os.path.join(
+            temp, "repaired-prefix-v3-v4.bspool")
+        shutil.copyfile(v3, repaired_v3)
+        with open(repaired_v3, "r+b") as handle:
+            handle.seek(reader3.blocks[0].offset)
+            handle.write(b"\0" * 8)
+        repaired_source = open(repaired_v3, "rb").read()
+        repaired = run(
+            scanner, "upgrade", repaired_v3, repaired_output)
+        if ("safely reconstructed 1 BSP3 block header prefix"
+                not in repaired.stderr):
+            raise AssertionError(
+                "safe BSP3 prefix recovery was not reported: %s"
+                % repaired.stderr)
+        if open(repaired_v3, "rb").read() != repaired_source:
+            raise AssertionError("BSP3 prefix recovery modified its source")
+        repaired_records = [
+            (record.rank, tuple(item.raw for item in record.occurrences))
+            for record in organizer.BSPoolReader(
+                repaired_output).iter_records()]
+        if repaired_records != logical3:
+            raise AssertionError(
+                "BSP3 prefix recovery changed ranks or event metadata")
+        assert_manifest_record_digest(scanner, repaired_output)
+
+        second_prefix_v3 = os.path.join(
+            temp, "two-damaged-prefixes-v3.bspool")
+        second_prefix_output = os.path.join(
+            temp, "two-damaged-prefixes-v3-v4.bspool")
+        shutil.copyfile(v3, second_prefix_v3)
+        with open(second_prefix_v3, "r+b") as handle:
+            for block in reader3.blocks[:2]:
+                handle.seek(block.offset)
+                handle.write(b"\0" * 8)
+        second_prefix = run(
+            scanner, "upgrade", second_prefix_v3,
+            second_prefix_output, expect=False)
+        if ("second damaged header prefix" not in second_prefix.stderr
+                or os.path.exists(second_prefix_output)):
+            raise AssertionError(
+                "multiple BSP3 header repairs were not refused atomically")
+
+        # Any damage outside that fixed prefix is not historical block
+        # disorder and is never guessed around. Report the exact block and
+        # 64-bit byte offset before creating an output or entering the
+        # normalization fallback.
+        damaged_v3 = os.path.join(temp, "damaged-v3.bspool")
+        damaged_output = os.path.join(temp, "damaged-v3-v4.bspool")
+        mutate(v3, damaged_v3, reader3.blocks[0].offset + 8)
+        damaged = run(
+            scanner, "upgrade", damaged_v3, damaged_output, expect=False)
+        expected_damage = (
+            "is damaged: BSP3 block 0 at byte %d "
+            "does not match its committed index" %
+            reader3.blocks[0].offset)
+        if expected_damage not in damaged.stderr:
+            raise AssertionError(
+                "damaged BSP3 upgrade lacks exact structural diagnostic: %s"
+                % damaged.stderr)
+        if ("normalizing historical event block order" in damaged.stderr
+                or os.path.exists(damaged_output)):
+            raise AssertionError(
+                "damaged BSP3 was treated as normalizable history")
+
         # The same per-input fallback must work in a mixed BSP3/BSP4 shard
         # merge, not only through the one-input ``upgrade`` alias.
         historical_second = os.path.join(

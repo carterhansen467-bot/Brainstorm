@@ -111,6 +111,14 @@ class FormatPlanStale(organizer.PoolError):
     """The checked source/output contract changed before publication."""
 
 
+class FormatUpdateFailedSafely(organizer.PoolError):
+    """A staged format update failed before any pool could be published."""
+
+
+class FormatSourceDamaged(FormatUpdateFailedSafely):
+    """The native verifier found inconsistent committed source bytes."""
+
+
 def _operation_cancelled(cancel_check):
     if cancel_check is not None and cancel_check():
         raise OperationCancelled("operation cancelled")
@@ -789,10 +797,14 @@ def _run_native_upgrade(source, output, cancel_check=None):
         raise organizer.PoolError(
             "native seed-pool helper is missing; reinstall the latest full package")
     lines = collections.deque(maxlen=200)
-    process = subprocess.Popen(
-        [binary, "upgrade", source, output],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace")
+    try:
+        process = subprocess.Popen(
+            [binary, "upgrade", source, output],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise FormatUpdateFailedSafely(
+            "BSP4 update could not start: %s" % exc) from exc
     with ACTIVE_UPGRADE_PROCESS_LOCK:
         ACTIVE_UPGRADE_PROCESSES.add(process)
 
@@ -839,11 +851,28 @@ def _run_native_upgrade(source, output, cancel_check=None):
     if process.returncode:
         detail = next((line for line in reversed(lines) if line.strip()),
                       "native helper exited with code %d" % process.returncode)
-        raise organizer.PoolError("BSP4 update failed: %s" % detail)
+        message = "BSP4 update failed: %s" % detail
+        if (" is damaged: BSP" in detail
+                or "cannot verify historical event block" in detail
+                or "malformed committed BSP3 block" in detail):
+            raise FormatSourceDamaged(
+                "%s The committed source bytes are inconsistent. "
+                "Brainstorm did not change the BSP3 and will not skip or "
+                "guess seeds; restore a known-good copy or rerun the exact "
+                "search if no backup is available." % message)
+        raise FormatUpdateFailedSafely(message)
+    repaired_headers = 0
+    for line in lines:
+        match = re.search(
+            r"safely reconstructed (\d+) BSP3 block header prefix",
+            line)
+        if match:
+            repaired_headers = int(match.group(1))
     return {
         "normalized_historical_order": any(
             "normalizing historical event block order" in line
             for line in lines),
+        "reconstructed_bsp3_header_prefixes": repaired_headers,
     }
 
 
@@ -986,6 +1015,46 @@ def execute_format_upgrade(request, pool_dir=None, cancel_check=None):
                 raise organizer.PoolError(
                     "cannot read native BSP4 verification manifest: %s"
                     % exc)
+            repaired_offsets = sorted(
+                verified_source._repaired_bsp3_headers)
+            manifest_repaired = manifest.integer(
+                "upgrade_reconstructed_bsp3_header_prefixes",
+                required=False, default=0)
+            if (native["reconstructed_bsp3_header_prefixes"]
+                    != len(repaired_offsets)
+                    or manifest_repaired != len(repaired_offsets)):
+                raise organizer.PoolError(
+                    "native BSP4 header-reconstruction audit count differs "
+                    "from the independently verified source")
+            if repaired_offsets:
+                repaired_offset = repaired_offsets[0]
+                repaired_block = next((
+                    number for number, block in enumerate(
+                        verified_source.blocks)
+                    if block.offset == repaired_offset), None)
+                with open(source, "rb") as handle:
+                    damaged_prefix = organizer.handle_read(
+                        handle, repaired_offset, 8).hex()
+                if (repaired_block is None
+                        or manifest.integer(
+                            "upgrade_first_reconstructed_block")
+                            != repaired_block
+                        or manifest.integer(
+                            "upgrade_first_reconstructed_byte")
+                            != repaired_offset
+                        or manifest.one(
+                            "upgrade_first_damaged_prefix")
+                            != damaged_prefix):
+                    raise organizer.PoolError(
+                        "native BSP4 header-reconstruction audit details "
+                        "differ from the independently verified source")
+            elif any(manifest.values.get(key) for key in (
+                    "upgrade_first_reconstructed_block",
+                    "upgrade_first_reconstructed_byte",
+                    "upgrade_first_damaged_prefix")):
+                raise organizer.PoolError(
+                    "native BSP4 manifest reports unexpected "
+                    "header-reconstruction details")
             staged_derivation = staged.header.integer(
                 "derivation_id", 16, required=False, default=0)
             staged_snapshot = staged.header.integer(
@@ -1063,6 +1132,8 @@ def execute_format_upgrade(request, pool_dir=None, cancel_check=None):
                     if source_bytes else 0.0),
                 "normalized_historical_order":
                     native["normalized_historical_order"],
+                "reconstructed_bsp3_header_prefixes":
+                    native["reconstructed_bsp3_header_prefixes"],
             }
             _operation_cancelled(cancel_check)
             with _format_upgrade_writer_guard(
@@ -1130,6 +1201,13 @@ def execute_format_upgrade(request, pool_dir=None, cancel_check=None):
             prior = result.get("publication_warning", "")
             result["publication_warning"] = " ".join(
                 item for item in [prior] + post_commit_warnings if item)
+    except (OperationCancelled, FormatPlanStale,
+            FormatUpdateFailedSafely):
+        raise
+    except (organizer.PoolError, OSError) as exc:
+        if not committed:
+            raise FormatUpdateFailedSafely(str(exc)) from exc
+        raise
     finally:
         cleanup_warning = _cleanup_upgrade_stage(stage_dir)
         if cleanup_warning:
@@ -1548,6 +1626,33 @@ def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
             raise organizer.PoolError(
                 "source changed while its committed snapshot was being "
                 "structurally opened; inspect it again")
+        if reader._repaired_bsp3_headers:
+            # The native summary intentionally remains byte-strict. Python
+            # has already completed the exceptional full CRC/rank/metadata
+            # and whole-pool identity pass, so use that verified reader
+            # directly instead of reopening the damaged physical prefix.
+            report = organizer.analyze(
+                reader, ambiguity_limit=ambiguity_limit,
+                cancel_check=cancel_check)
+            if _summary_identity(path) != identity:
+                raise organizer.PoolError(
+                    "source changed while its verified reconstructed view "
+                    "was being inspected; inspect it again")
+            repaired = len(reader._repaired_bsp3_headers)
+            report["source"][
+                "reconstructed_bsp3_header_prefixes"] = repaired
+            report["notices"] = [{
+                "kind": "warning",
+                "title": "The original BSP3 has a damaged block header",
+                "text": (
+                    "Brainstorm safely reconstructed %s fixed header prefix "
+                    "in memory after checking the committed index, block "
+                    "checksum, ranks, metadata, snapshot, and whole-pool "
+                    "identities. The original bytes remain damaged; create "
+                    "the BSP4 copy now because byte-strict tools can still "
+                    "reject this BSP3.") % format(repaired, ","),
+            }] + _notices(report["source"])
+            return report
         summary = _run_native_summary(path, cancel_check=cancel_check)
         _operation_cancelled(cancel_check)
         if summary is not None:
@@ -2895,7 +3000,7 @@ let formatPlan=null,formatRunning=false;
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
 const fmtBytes=n=>{n=Number(n||0);if(n>=1073741824)return `${(n/1073741824).toFixed(2)} GiB`;if(n>=1048576)return `${(n/1048576).toFixed(2)} MiB`;if(n>=1024)return `${(n/1024).toFixed(1)} KiB`;return `${fmt(n)} bytes`};
-async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";throw error}return v}
+async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";error.publicationState=v.publication_state||"";throw error}return v}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
@@ -3085,13 +3190,15 @@ async function updateFormat(){
  $("formatElapsed").hidden=false;const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("formatElapsed").textContent=`Still working — ${seconds}s elapsed. The original BSP3 is unchanged, and no partial output is visible.`},1000);
  try{
   const v=await api("/api/format/update",{source:requested.source,planToken:requested.plan_token});formatPlan=null;
-  const sizeChange=v.output_bytes<v.source_bytes?`${v.saved_percent.toFixed(1)}% smaller`:v.output_bytes===v.source_bytes?"the same size":"larger for this data";const repaired=v.normalized_historical_order?" Historical block order was repaired while updating.":"";const warnings=[v.publication_warning,v.cleanup_warning].filter(Boolean).map(text=>`<div class="notice warning"><strong>Cleanup note</strong>${esc(text)}</div>`).join("");
-  $("formatResult").innerHTML=`<div class="notice"><strong>BSP4 copy created</strong>${esc(v.output)} contains ${fmt(v.records)} seeds. ${fmtBytes(v.source_bytes)} → ${fmtBytes(v.output_bytes)} (${esc(sizeChange)}). The original ${esc(v.source)} was kept.${esc(repaired)}</div>${warnings}`;formatState("success","BSP4 copy created",`${v.output} is complete and ready in seed_pools.`);$("formatSumStatus").textContent="Created";$("formatSumOutput").textContent=v.output;
+  const sizeChange=v.output_bytes<v.source_bytes?`${v.saved_percent.toFixed(1)}% smaller`:v.output_bytes===v.source_bytes?"the same size":"larger for this data";const repairedOrder=v.normalized_historical_order?" Historical block order was repaired while updating.":"";const repairedHeaders=v.reconstructed_bsp3_header_prefixes?` ${fmt(v.reconstructed_bsp3_header_prefixes)} damaged BSP3 block header prefix${v.reconstructed_bsp3_header_prefixes===1?" was":"es were"} safely reconstructed from the committed index, checksums, and whole-pool identities; the source remains unchanged.`:"";const warnings=[v.publication_warning,v.cleanup_warning].filter(Boolean).map(text=>`<div class="notice warning"><strong>Cleanup note</strong>${esc(text)}</div>`).join("");
+  $("formatResult").innerHTML=`<div class="notice"><strong>BSP4 copy created</strong>${esc(v.output)} contains ${fmt(v.records)} seeds. ${fmtBytes(v.source_bytes)} → ${fmtBytes(v.output_bytes)} (${esc(sizeChange)}). The original ${esc(v.source)} was kept.${esc(repairedOrder)}${esc(repairedHeaders)}</div>${warnings}`;formatState("success","BSP4 copy created",`${v.output} is complete and ready in seed_pools.`);$("formatSumStatus").textContent="Created";$("formatSumOutput").textContent=v.output;
   try{await loadPools(true)}catch(refreshError){refreshFailed=true;const detail=refreshError.message||String(refreshError);$("formatError").textContent=`The BSP4 copy was created, but the pool list could not refresh: ${detail}`;formatState("success","BSP4 copy created",`${v.output} is ready. Use Refresh list to reload the pool selector.`)}
  }catch(e){
-  const message=e.message||String(e),cancelled=e.code==="operation_cancelled",stale=e.code==="format_plan_stale";
+  const message=e.message||String(e),cancelled=e.code==="operation_cancelled",stale=e.code==="format_plan_stale",failedSafely=e.publicationState==="not_published";
   if(stale)resetFormatPlan("Check the selected pool again");
-  formatState(cancelled?"success":"error",cancelled?"Update cancelled safely":"Update result not confirmed",cancelled?"No new pool was published; the original BSP3 was not changed.":`The Organizer could not confirm whether a BSP4 copy was published. Refresh the pool list before trying again. The original pool was not changed. ${message}`);
+  const title=cancelled?"Update cancelled safely":e.code==="format_source_damaged"?"Source pool is damaged":failedSafely?"Update failed safely":"Update result not confirmed";
+  const detail=cancelled?"No new pool was published; the original BSP3 was not changed.":failedSafely?`No BSP4 copy was published, and the original BSP3 was not changed. ${message}`:`The Organizer could not confirm whether a BSP4 copy was published. Refresh the pool list before trying again. The original pool was not changed. ${message}`;
+  formatState(cancelled?"success":"error",title,detail);
   $("formatError").textContent=cancelled?"":message;
  }finally{clearInterval(timer);$("formatElapsed").hidden=true;$("formatElapsed").textContent="";formatRunning=false;$("formatCancelBtn").hidden=true;button.textContent="Create BSP4 copy";button.disabled=!formatPlan||!formatPlan.eligible;picker.disabled=refreshFailed;refresh.disabled=false;check.disabled=refreshFailed||!poolRows.some(p=>!p.error)}
 }
@@ -3120,6 +3227,12 @@ def error_payload(exc):
         value["error_code"] = "operation_cancelled"
     elif isinstance(exc, FormatPlanStale):
         value["error_code"] = "format_plan_stale"
+    elif isinstance(exc, FormatSourceDamaged):
+        value["error_code"] = "format_source_damaged"
+        value["publication_state"] = "not_published"
+    elif isinstance(exc, FormatUpdateFailedSafely):
+        value["error_code"] = "format_update_failed"
+        value["publication_state"] = "not_published"
     return value
 
 

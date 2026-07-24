@@ -1137,6 +1137,122 @@ class OrganizerRegression(unittest.TestCase):
         result = self.run_tool("inspect", corrupt, expected=1)
         self.assertRegex(result.stderr, r"checksum|rank payload")
 
+    def test_damaged_bsp3_header_reports_block_offset_and_prefix(self):
+        corrupt = os.path.join(
+            self.temp.name, "corrupt-bsp3-header.bspool")
+        with open(self.source, "rb") as handle:
+            raw = bytearray(handle.read())
+        raw[8192] ^= 0x01
+        with open(corrupt, "wb") as handle:
+            handle.write(raw)
+        result = self.run_tool("inspect", corrupt, expected=1)
+        self.assertIn(
+            "source pool is damaged: BSP3 block 0 at byte 8192",
+            result.stderr)
+        self.assertRegex(
+            result.stderr, r"first 8 bytes: [0-9a-f]{16}")
+
+    def test_complete_bsp3_recovers_only_first_eight_header_bytes(self):
+        corrupt = os.path.join(
+            self.temp.name, "recoverable-complete-bsp3.bspool")
+        write_bsp3(corrupt, complete=True)
+        with open(corrupt, "rb") as handle:
+            raw = bytearray(handle.read())
+        raw[8192:8200] = b"DAMAGED!"
+        damaged_bytes = bytes(raw)
+        with open(corrupt, "wb") as handle:
+            handle.write(damaged_bytes)
+
+        # Recovery is allowed even for a lazy caller only because the reader
+        # forces the full CRC/rank/metadata/pool-digest pass first.
+        reader = organizer.BSPoolReader(corrupt, verify_payloads=False)
+        self.assertTrue(reader._payload_verified)
+        self.assertEqual(reader._repaired_bsp3_headers, {8192})
+        self.assertEqual(
+            [record.rank for record in reader.iter_records()],
+            [0, 1, 2, 3])
+        result = self.run_tool("inspect", corrupt, "--json")
+        self.assertEqual(json.loads(result.stdout)["source"]["records"], 4)
+        with open(corrupt, "rb") as handle:
+            self.assertEqual(handle.read(), damaged_bytes)
+
+    def test_complete_bsp3_rejects_damage_beyond_first_eight_bytes(self):
+        corrupt = os.path.join(
+            self.temp.name, "unrecoverable-complete-bsp3.bspool")
+        write_bsp3(corrupt, complete=True)
+        with open(corrupt, "rb") as handle:
+            raw = bytearray(handle.read())
+        raw[8192:8200] = b"DAMAGED!"
+        raw[8192 + organizer.BLOCK3_HEADER_BYTES] ^= 0x01
+        damaged_bytes = bytes(raw)
+        with open(corrupt, "wb") as handle:
+            handle.write(damaged_bytes)
+
+        result = self.run_tool("inspect", corrupt, expected=1)
+        self.assertIn("BSP3 block checksum differs at byte 8192",
+                      result.stderr)
+        with open(corrupt, "rb") as handle:
+            self.assertEqual(handle.read(), damaged_bytes)
+
+    def test_complete_bsp3_recovery_requires_whole_pool_digests(self):
+        corrupt = os.path.join(
+            self.temp.name, "digest-damaged-complete-bsp3.bspool")
+        write_bsp3(corrupt, complete=True)
+        with open(corrupt, "rb") as handle:
+            raw = bytearray(handle.read())
+        block_offset = 8192
+        raw[block_offset:block_offset + 8] = b"DAMAGED!"
+        rank_bytes, metadata_bytes = struct.unpack_from(
+            "<II", raw, block_offset + 12)
+        payload_offset = block_offset + organizer.BLOCK3_HEADER_BYTES
+        metadata_offset = payload_offset + rank_bytes
+        unknown_offset = raw.find(
+            UNKNOWN, metadata_offset, metadata_offset + metadata_bytes)
+        self.assertGreaterEqual(unknown_offset, metadata_offset)
+        raw[unknown_offset + len(UNKNOWN) - 1] ^= 0x01
+
+        # Make the local block CRC agree with the broader corruption. The
+        # reconstructed block must still be rejected by the independently
+        # committed whole-pool membership/metadata digests.
+        recovered_header = (
+            organizer.BSP3_HEADER_PREFIX
+            + bytes(raw[block_offset + 8:
+                        block_offset + organizer.BLOCK3_HEADER_BYTES]))
+        payload_bytes = bytes(
+            raw[payload_offset:
+                payload_offset + rank_bytes + metadata_bytes])
+        checksum = independent_crc64(recovered_header[4:40])
+        checksum = independent_crc64(payload_bytes, checksum)
+        struct.pack_into("<Q", raw, block_offset + 40, checksum)
+        damaged_bytes = bytes(raw)
+        with open(corrupt, "wb") as handle:
+            handle.write(damaged_bytes)
+
+        result = self.run_tool("inspect", corrupt, expected=1)
+        self.assertRegex(
+            result.stderr,
+            r"membership_digest differs|metadata_digest differs")
+        with open(corrupt, "rb") as handle:
+            self.assertEqual(handle.read(), damaged_bytes)
+
+    def test_complete_bsp3_recovers_at_most_one_header_prefix(self):
+        corrupt = os.path.join(
+            self.temp.name, "two-damaged-bsp3-headers.bspool")
+        write_out_of_order_bsp3(corrupt, overlapping=True)
+        clean = organizer.BSPoolReader(corrupt)
+        self.assertGreaterEqual(len(clean.blocks), 2)
+        with open(corrupt, "r+b") as handle:
+            for block in clean.blocks[:2]:
+                handle.seek(block.offset)
+                handle.write(b"DAMAGED!")
+        with open(corrupt, "rb") as handle:
+            damaged_bytes = handle.read()
+        result = self.run_tool("inspect", corrupt, expected=1)
+        self.assertIn(
+            "second invalid header prefix", result.stderr)
+        with open(corrupt, "rb") as handle:
+            self.assertEqual(handle.read(), damaged_bytes)
+
     def test_complete_bsp3_index_and_footer_are_verified(self):
         complete = os.path.join(self.temp.name, "complete.bspool")
         write_bsp3(complete, complete=True)

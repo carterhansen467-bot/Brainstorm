@@ -5144,50 +5144,129 @@ static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, u
 	if (schema == BSPOOL_SCHEMA_ADAPTIVE)
 		return pool_append_adaptive_index(f, headerBytes, records, dataBytes,
 				membershipDigest, metadataDigest, finalBytes, err, errsz);
-	BspoolHeader h;
-	memset(&h, 0, sizeof h);
-	h.headerBytes = headerBytes;
-	h.encoding = schema == BSPOOL_SCHEMA_EVENTS
-			? BSPOOL_ENCODING_DELTA_EVENTS : BSPOOL_ENCODING_DELTA_BLOCKS;
-	h.space = space; h.records = records; h.dataBytes = dataBytes;
-	BspoolReader r;
-	if (!bspool_reader_init(&r, fileno(f), &h, (uint64_t)headerBytes + dataBytes, err, errsz)) return false;
-	uint64_t indexOff = (uint64_t)headerBytes + dataBytes;
-	if (bs_fseeko(f, (int64_t)indexOff, SEEK_SET) != 0) {
-		snprintf(err, errsz, "cannot seek to compressed pool index"); bspool_reader_destroy(&r); return false;
+	(void)space;
+	if ((schema != BSPOOL_SCHEMA_BLOCKS
+				&& schema != BSPOOL_SCHEMA_EVENTS)
+			|| headerBytes < 0
+			|| (uint64_t)headerBytes > UINT64_MAX - dataBytes) {
+		snprintf(err, errsz, "compressed pool data boundary overflows");
+		return false;
 	}
+	int encoding = schema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL_ENCODING_DELTA_EVENTS
+			: BSPOOL_ENCODING_DELTA_BLOCKS;
+	uint32_t blockHeaderBytes = schema == BSPOOL_SCHEMA_EVENTS
+			? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
 	uint32_t entryBytes = schema == BSPOOL_SCHEMA_EVENTS
 			? BSPOOL3_INDEX_ENTRY_SIZE : BSPOOL_INDEX_ENTRY_SIZE;
-	unsigned char raw[BSPOOL3_INDEX_ENTRY_SIZE * 4096];
-	uint64_t done = 0;
-	while (done < r.nblocks) {
-		uint64_t n = r.nblocks - done;
-		if (n > 4096) n = 4096;
-		for (uint64_t i = 0; i < n; i++) {
-			const BspoolBlockIndex *e = &r.blocks[done + i];
-			unsigned char *q = raw + i * entryBytes;
-			bspool_put_u64le(q, e->offset);
-			bspool_put_u64le(q + 8, e->firstRecord);
-			bspool_put_u32le(q + 16, e->count);
-			bspool_put_u32le(q + 20, e->rankBytes);
-			if (schema == BSPOOL_SCHEMA_EVENTS) {
-				bspool_put_u32le(q + 24, e->metadataBytes);
-				bspool_put_u32le(q + 28, e->associations);
-			}
-		}
-		size_t bytes = (size_t)n * entryBytes;
-		if (fwrite(raw, 1, bytes, f) != bytes) {
-			snprintf(err, errsz, "cannot write compressed pool index"); bspool_reader_destroy(&r); return false;
-		}
-		done += n;
-	}
-	unsigned char footer[BSPOOL3_FOOTER_SIZE];
 	uint32_t footerBytes = schema == BSPOOL_SCHEMA_EVENTS
 			? BSPOOL3_FOOTER_SIZE : BSPOOL_FOOTER_SIZE;
+	uint64_t indexOff = (uint64_t)headerBytes + dataBytes;
+	uint64_t offset = (uint64_t)headerBytes;
+	uint64_t firstRecord = 0, blocks = 0;
+	/* Keep the data scan and index publication on this one stdio stream, but
+	 * batch index entries so a large Windows pool does not seek from its data
+	 * region to EOF for every block.  4K entries cap the stack buffer at
+	 * 128 KiB and reduce a 560K-block finalization to 137 batches, or only a
+	 * few hundred long seeks. */
+	unsigned char indexBatch[BSPOOL3_INDEX_ENTRY_SIZE * 4096];
+	uint64_t batchFirst = 0;
+	size_t batchEntries = 0;
+	while (offset < indexOff) {
+		unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE] = { 0 };
+		BspoolBlockInfo info;
+		if (offset > (uint64_t)INT64_MAX
+				|| blockHeaderBytes > indexOff - offset
+				|| bs_fseeko(f, (int64_t)offset, SEEK_SET) != 0
+				|| fread(header, 1, blockHeaderBytes, f)
+					!= blockHeaderBytes
+				|| !bspool_legacy_block_header_raw(
+					header, blockHeaderBytes, encoding, &info)
+				|| info.rankBytes > indexOff - offset
+					- blockHeaderBytes
+				|| info.metadataBytes > indexOff - offset
+					- blockHeaderBytes - info.rankBytes
+				|| firstRecord > records
+				|| info.count > records - firstRecord) {
+			snprintf(err, errsz,
+					"compressed pool has a malformed committed block"
+					" at byte %" PRIu64, offset);
+			return false;
+		}
+		unsigned char *entry = indexBatch
+				+ batchEntries * entryBytes;
+		memset(entry, 0, entryBytes);
+		bspool_put_u64le(entry, offset);
+		bspool_put_u64le(entry + 8, firstRecord);
+		bspool_put_u32le(entry + 16, info.count);
+		bspool_put_u32le(entry + 20, info.rankBytes);
+		if (schema == BSPOOL_SCHEMA_EVENTS) {
+			bspool_put_u32le(entry + 24, info.metadataBytes);
+			bspool_put_u32le(entry + 28, info.associations);
+		}
+		offset += blockHeaderBytes
+				+ (uint64_t)info.rankBytes + info.metadataBytes;
+		firstRecord += info.count;
+		blocks++;
+		batchEntries++;
+		if (batchEntries == 4096) {
+			if (batchFirst > (UINT64_MAX - indexOff) / entryBytes) {
+				snprintf(err, errsz,
+						"compressed pool index offset overflows");
+				return false;
+			}
+			uint64_t entryOff =
+					indexOff + batchFirst * entryBytes;
+			size_t batchBytes = batchEntries * entryBytes;
+			if (entryOff > (uint64_t)INT64_MAX
+					|| batchBytes
+						> (uint64_t)INT64_MAX - entryOff
+					|| bs_fseeko(f, (int64_t)entryOff, SEEK_SET) != 0
+					|| fwrite(indexBatch, 1, batchBytes, f)
+						!= batchBytes) {
+				snprintf(err, errsz,
+						"cannot write compressed pool index");
+				return false;
+			}
+			batchFirst += batchEntries;
+			batchEntries = 0;
+		}
+	}
+	if (offset != indexOff || firstRecord != records
+			|| ((records == 0) != (blocks == 0))) {
+		snprintf(err, errsz,
+				"compressed pool blocks do not match committed records");
+		return false;
+	}
+	if (batchEntries) {
+		if (batchFirst > (UINT64_MAX - indexOff) / entryBytes) {
+			snprintf(err, errsz,
+					"compressed pool index offset overflows");
+			return false;
+		}
+		uint64_t entryOff = indexOff + batchFirst * entryBytes;
+		size_t batchBytes = batchEntries * entryBytes;
+		if (entryOff > (uint64_t)INT64_MAX
+				|| batchBytes > (uint64_t)INT64_MAX - entryOff
+				|| bs_fseeko(f, (int64_t)entryOff, SEEK_SET) != 0
+				|| fwrite(indexBatch, 1, batchBytes, f)
+					!= batchBytes) {
+			snprintf(err, errsz,
+					"cannot write compressed pool index");
+			return false;
+		}
+		batchFirst += batchEntries;
+	}
+	if (batchFirst != blocks) {
+		snprintf(err, errsz,
+				"compressed pool index block count differs");
+		return false;
+	}
+	unsigned char footer[BSPOOL3_FOOTER_SIZE];
 	memset(footer, 0, footerBytes);
 	memcpy(footer, schema == BSPOOL_SCHEMA_EVENTS ? "BSPIDX3\n" : "BSPIDX2\n", 8);
 	bspool_put_u64le(footer + 8, indexOff);
-	bspool_put_u64le(footer + 16, r.nblocks);
+	bspool_put_u64le(footer + 16, blocks);
 	bspool_put_u64le(footer + 24, records);
 	bspool_put_u64le(footer + 32, dataBytes);
 	if (schema == BSPOOL_SCHEMA_EVENTS) {
@@ -5195,9 +5274,17 @@ static bool pool_append_index(FILE *f, int schema, int headerBytes, int space, u
 		bspool_put_u64le(footer + 48, metadataDigest);
 		bspool_put_u64le(footer + 72, bspool_crc64_update(0, footer, 72));
 	}
-	uint64_t blocks = r.nblocks;
-	bspool_reader_destroy(&r);
-	if (fwrite(footer, 1, footerBytes, f) != footerBytes || fflush(f) != 0 || bs_fsync_file(f) != 0) {
+	if (indexOff > UINT64_MAX - footerBytes
+			|| blocks > (UINT64_MAX - indexOff - footerBytes) / entryBytes) {
+		snprintf(err, errsz, "compressed pool footer offset overflows");
+		return false;
+	}
+	uint64_t footerOff = indexOff + blocks * entryBytes;
+	if (footerOff > (uint64_t)INT64_MAX
+			|| footerBytes > (uint64_t)INT64_MAX - footerOff
+			|| bs_fseeko(f, (int64_t)footerOff, SEEK_SET) != 0
+			|| fwrite(footer, 1, footerBytes, f) != footerBytes
+			|| fflush(f) != 0 || bs_fsync_file(f) != 0) {
 		snprintf(err, errsz, "cannot commit compressed pool index"); return false;
 	}
 	int64_t pos = bs_ftello(f);
@@ -6604,7 +6691,8 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 		BspoolBlockInfo info;
 		const uint64_t *summaryRanks = NULL;
 		unsigned char rawHeader[BSPOOL4_BLOCK_HEADER_SIZE];
-		if (!bspool_block_header(reader.fd, block->offset, reader.encoding, &info)
+		if (!bspool_reader_block_header(
+					&reader, b, &info, rawHeader)
 				|| info.count != block->count
 				|| info.rankBytes != block->rankBytes
 				|| info.metadataBytes != block->metadataBytes
@@ -6654,11 +6742,7 @@ static int pool_mode_summarize(const char *input, bool wantRecordDigest) {
 					|| bs_pread(reader.fd, scratch.bytes,
 						block->payloadBytes,
 						(int64_t)(block->offset + info.headerBytes))
-						!= (int64_t)block->payloadBytes
-					|| bs_pread(reader.fd, rawHeader,
-						BSPOOL3_BLOCK_HEADER_SIZE,
-						(int64_t)block->offset)
-						!= BSPOOL3_BLOCK_HEADER_SIZE) {
+						!= (int64_t)block->payloadBytes) {
 				snprintf(err, sizeof err,
 						"cannot read pool block %" PRIu64, b);
 				goto fail;
@@ -7291,7 +7375,8 @@ static int pool_mode_convert(const char *input, const char *output) {
 			|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
 					BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE,
 					h.records, 0, 0, 0, NULL, err, sizeof err)) {
-		fprintf(stderr, "%s\n", err); fclose(out); bspool_reader_destroy(&reader); fclose(in); return 1;
+		fprintf(stderr, "%s\n", err); fclose(out); remove(output);
+		bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
 	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
 	unsigned char encoded[POOL_OUTPUT_BUFFER], header[BSPOOL_BLOCK_HEADER_SIZE];
@@ -7336,6 +7421,7 @@ static int pool_mode_convert(const char *input, const char *output) {
 fail:
 	if (out) fclose(out);
 fail_no_out:
+	remove(output);
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 	return 1;
 }
@@ -7347,6 +7433,9 @@ typedef struct {
 	BspoolReader reader;
 	uint64_t fileBytes;
 	bool blocksAscending;
+	uint64_t repairedHeaders;
+	uint64_t firstRepairedBlock, firstRepairedOffset;
+	unsigned char firstRepairedBytes[8];
 } PoolMergePart;
 
 typedef struct {
@@ -7897,8 +7986,8 @@ static bool pool_merge_make_chains(const PoolMergePart *part,
 	for (uint64_t b = 0; b < nblocks; b++) {
 		const BspoolBlockIndex *entry = &part->reader.blocks[b];
 		BspoolBlockInfo info;
-		if (!bspool_block_header(part->reader.fd, entry->offset,
-					part->reader.encoding, &info)
+		if (!bspool_reader_block_header(
+					&part->reader, b, &info, NULL)
 				|| info.count != entry->count
 				|| info.rankBytes != entry->rankBytes
 				|| info.metadataBytes != entry->metadataBytes
@@ -8323,17 +8412,205 @@ static int pool_merge_part_compare(const void *a, const void *b) {
 			: x->header.rangeStart > y->header.rangeStart;
 }
 
-static bool pool_reader_blocks_ascending(const BspoolReader *reader) {
-	if (reader->encoding == BSPOOL_ENCODING_U64) return false;
-	uint64_t prior = 0;
-	for (uint64_t b = 0; b < reader->nblocks; b++) {
-		BspoolBlockInfo info;
-		if (!bspool_block_header(reader->fd, reader->blocks[b].offset,
-				reader->encoding, &info)) return false;
-		if (b && info.first <= prior) return false;
-		prior = info.last;
+typedef enum {
+	POOL_BLOCK_ORDER_INVALID = -1,
+	POOL_BLOCK_ORDER_NONCANONICAL = 0,
+	POOL_BLOCK_ORDER_ASCENDING = 1,
+} PoolBlockOrder;
+
+static bool pool_reader_hash_region(const BspoolReader *reader,
+		uint64_t offset, uint64_t bytes, uint64_t *primary,
+		uint64_t *secondary) {
+	unsigned char buffer[64 * 1024];
+	while (bytes) {
+		size_t count = bytes < sizeof buffer ? (size_t)bytes : sizeof buffer;
+		if (offset > (uint64_t)INT64_MAX
+				|| bs_pread(reader->fd, buffer, count, (int64_t)offset)
+					!= (int64_t)count)
+			return false;
+		*primary = pool_hash_update(*primary, buffer, count);
+		if (secondary)
+			*secondary = pool_hash_update(*secondary, buffer, count);
+		offset += count;
+		bytes -= count;
 	}
 	return true;
+}
+
+/* A repaired prefix is accepted only if substituting the fixed BSP3 bytes
+ * restores both identities committed in the checksum-protected final footer.
+ * This proves the reconstructed view of the complete source without writing
+ * a byte back to it. Per-block CRC/rank/metadata validation is performed
+ * before this whole-pool pass. */
+static bool pool_reader_verify_repaired_bsp3_identity(
+		const PoolMergePart *part, char *err, size_t errsz) {
+	const BspoolReader *reader = &part->reader;
+	uint64_t expectedSnapshot = part->header.segmentId
+			? pool_hash_fields("snapshot", part->header.segmentId,
+				part->header.records, part->header.dataBytes,
+				reader->membershipDigest)
+			: 0;
+	if (!part->header.membershipDigest
+			|| !part->header.metadataDigest
+			|| part->header.membershipDigest
+				!= reader->membershipDigest
+			|| part->header.metadataDigest != reader->metadataDigest
+			|| !part->header.snapshotId || !expectedSnapshot
+			|| part->header.snapshotId != expectedSnapshot) {
+		snprintf(err, errsz,
+				"%s is damaged: BSP3 header/footer identities cannot"
+				" authorize reconstruction of block %" PRIu64
+				" at byte %" PRIu64,
+				part->path, part->firstRepairedBlock,
+				part->firstRepairedOffset);
+		return false;
+	}
+	uint64_t membership = POOL_HASH_INIT;
+	uint64_t metadata = POOL_HASH_INIT;
+	for (uint64_t b = 0; b < reader->nblocks; b++) {
+		const BspoolBlockIndex *entry = &reader->blocks[b];
+		BspoolBlockInfo info;
+		unsigned char raw[BSPOOL4_BLOCK_HEADER_SIZE];
+		if (!bspool_reader_block_header(reader, b, &info, raw)) {
+			snprintf(err, errsz,
+					"%s is damaged: BSP3 block %" PRIu64
+					" at byte %" PRIu64
+					" cannot be read while verifying a reconstructed prefix",
+					part->path, b, entry->offset);
+			return false;
+		}
+		membership = pool_hash_update(
+				membership, raw, BSPOOL3_BLOCK_HEADER_SIZE);
+		uint64_t payloadOffset =
+				entry->offset + BSPOOL3_BLOCK_HEADER_SIZE;
+		if (!pool_reader_hash_region(reader, payloadOffset,
+					info.rankBytes, &membership, NULL)
+				|| !pool_reader_hash_region(reader,
+					payloadOffset + info.rankBytes,
+					info.metadataBytes, &membership, &metadata)) {
+			snprintf(err, errsz,
+					"%s is damaged: BSP3 block %" PRIu64
+					" at byte %" PRIu64
+					" cannot be read while verifying whole-pool digests",
+					part->path, b, entry->offset);
+			return false;
+		}
+	}
+	if (membership != reader->membershipDigest
+			|| metadata != reader->metadataDigest) {
+		snprintf(err, errsz,
+				"%s is damaged: BSP3 reconstructed header prefix at"
+				" block %" PRIu64 " byte %" PRIu64
+				" does not match its committed whole-pool digests",
+				part->path, part->firstRepairedBlock,
+				part->firstRepairedOffset);
+		return false;
+	}
+	return true;
+}
+
+static bool pool_reader_block_info_matches(const PoolMergePart *part,
+		const BspoolBlockIndex *entry, const BspoolBlockInfo *info) {
+	const BspoolReader *reader = &part->reader;
+	return info->count == entry->count
+			&& info->rankBytes == entry->rankBytes
+			&& info->metadataBytes == entry->metadataBytes
+			&& info->associations == entry->associations
+			&& info->first <= info->last
+			&& info->first >= part->header.rangeStart
+			&& info->last < part->header.rangeEnd
+			&& (reader->encoding != BSPOOL_ENCODING_ADAPTIVE_EVENTS
+				|| (info->first == entry->firstRank
+					&& info->last == entry->lastRank
+					&& info->rankCodec == entry->rankCodec
+					&& info->metadataEncoding
+						== entry->metadataEncoding
+					&& info->flags == entry->flags));
+}
+
+static PoolBlockOrder pool_reader_block_order(PoolMergePart *part,
+		bool allowPrefixRepair, char *err, size_t errsz) {
+	BspoolReader *reader = &part->reader;
+	if (reader->encoding == BSPOOL_ENCODING_U64)
+		return POOL_BLOCK_ORDER_NONCANONICAL;
+	uint64_t prior = 0;
+	bool ascending = true;
+	BspoolScratch repairScratch = { .cachedBlock = UINT64_MAX };
+	static const unsigned char bsp3Prefix[8] = {
+		'B', 'S', 'P', '3', BSPOOL3_BLOCK_HEADER_SIZE, 0, 0, 0,
+	};
+	for (uint64_t b = 0; b < reader->nblocks; b++) {
+		BspoolBlockIndex *entry = &reader->blocks[b];
+		BspoolBlockInfo info;
+		bool valid = bspool_reader_block_header(
+				reader, b, &info, NULL);
+		bool repaired = false;
+		unsigned char physicalPrefix[sizeof bsp3Prefix] = { 0 };
+		if (!valid && allowPrefixRepair
+				&& reader->encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
+			if (entry->offset <= (uint64_t)INT64_MAX
+					&& bs_pread(reader->fd, physicalPrefix,
+						sizeof physicalPrefix,
+						(int64_t)entry->offset)
+						== (int64_t)sizeof physicalPrefix
+					&& memcmp(physicalPrefix, bsp3Prefix,
+						sizeof bsp3Prefix)) {
+				entry->repairedPrefix = 1;
+				valid = bspool_reader_block_header(
+						reader, b, &info, NULL);
+				repaired = valid;
+			}
+		}
+		if (!valid || !pool_reader_block_info_matches(
+					part, entry, &info)) {
+			entry->repairedPrefix = 0;
+			snprintf(err, errsz,
+					"%s is damaged: BSP%d block %" PRIu64
+					" at byte %" PRIu64
+					" does not match its committed index",
+					part->path, part->header.schema, b, entry->offset);
+			bspool_scratch_destroy(&repairScratch);
+			return POOL_BLOCK_ORDER_INVALID;
+		}
+		if (repaired) {
+			if (part->repairedHeaders) {
+				entry->repairedPrefix = 0;
+				snprintf(err, errsz,
+						"%s is damaged: BSP3 block %" PRIu64
+						" at byte %" PRIu64
+						" has a second damaged header prefix;"
+						" automatic recovery is limited to one block",
+						part->path, b, entry->offset);
+				bspool_scratch_destroy(&repairScratch);
+				return POOL_BLOCK_ORDER_INVALID;
+			}
+			if (!bspool_decode_block(reader, b, &repairScratch)) {
+				snprintf(err, errsz,
+						"%s is damaged: BSP3 block %" PRIu64
+						" at byte %" PRIu64
+						" has damage beyond its fixed header prefix",
+						part->path, b, entry->offset);
+				bspool_scratch_destroy(&repairScratch);
+				return POOL_BLOCK_ORDER_INVALID;
+			}
+			part->firstRepairedBlock = b;
+			part->firstRepairedOffset = entry->offset;
+			memcpy(part->firstRepairedBytes,
+					physicalPrefix,
+					sizeof part->firstRepairedBytes);
+			part->repairedHeaders++;
+		}
+		if (b && info.first <= prior) ascending = false;
+		prior = info.last;
+	}
+	bspool_scratch_destroy(&repairScratch);
+	if (part->repairedHeaders) {
+		if (!pool_reader_verify_repaired_bsp3_identity(
+					part, err, errsz))
+			return POOL_BLOCK_ORDER_INVALID;
+	}
+	return ascending ? POOL_BLOCK_ORDER_ASCENDING
+			: POOL_BLOCK_ORDER_NONCANONICAL;
 }
 
 static void pool_compute_merged_id(const BspoolHeader *h, uint64_t rangeStart,
@@ -8389,8 +8666,8 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 			if (part->header.encoding
 					== BSPOOL_ENCODING_ADAPTIVE_EVENTS) {
 				BspoolBlockInfo info;
-				if (!bspool_block_header(part->reader.fd, e->offset,
-							part->reader.encoding, &info)
+				if (!bspool_reader_block_header(
+							&part->reader, b, &info, NULL)
 						|| info.count != e->count
 						|| info.rankBytes != e->rankBytes
 						|| info.metadataBytes != e->metadataBytes
@@ -8440,12 +8717,13 @@ static bool pool_merge_write_part(FILE *out, PoolMergePart *part,
 							"adaptive event merge requires canonical block order");
 					goto fail;
 				}
-				unsigned char header[BSPOOL3_BLOCK_HEADER_SIZE];
+				unsigned char header[BSPOOL4_BLOCK_HEADER_SIZE];
+				BspoolBlockInfo copiedInfo;
 				size_t headerBytes = part->header.encoding
 						== BSPOOL_ENCODING_DELTA_EVENTS
 						? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
-				if (bs_pread(part->reader.fd, header, headerBytes,
-						(int64_t)e->offset) != (int64_t)headerBytes
+				if (!bspool_reader_block_header(
+							&part->reader, b, &copiedInfo, header)
 						|| fwrite(header, 1, headerBytes, out) != headerBytes
 						|| (e->payloadBytes && fwrite(scratch.bytes, 1,
 							e->payloadBytes, out) != e->payloadBytes)) {
@@ -8546,6 +8824,19 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 			parts[0].header.membershipDigest,
 			parts[0].header.metadataDigest,
 			parts[0].header.poolId[0] ? parts[0].header.poolId : "-");
+	if (ninputs == 1 && parts[0].repairedHeaders) {
+		fprintf(f,
+				"upgrade_reconstructed_bsp3_header_prefixes %" PRIu64 "\n"
+				"upgrade_first_reconstructed_block %" PRIu64 "\n"
+				"upgrade_first_reconstructed_byte %" PRIu64 "\n"
+				"upgrade_first_damaged_prefix ",
+				parts[0].repairedHeaders,
+				parts[0].firstRepairedBlock,
+				parts[0].firstRepairedOffset);
+		for (size_t i = 0; i < sizeof parts[0].firstRepairedBytes; i++)
+			fprintf(f, "%02x", parts[0].firstRepairedBytes[i]);
+		fputc('\n', f);
+	}
 	for (int i = 0; i < ninputs; i++) fprintf(f,
 			"input %s %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n",
 			parts[i].header.poolId[0] ? parts[i].header.poolId : "-",
@@ -8598,8 +8889,11 @@ static int pool_mode_merge(
 	qsort(parts, (size_t)ninputs, sizeof *parts, pool_merge_part_compare);
 	bool canonicalMerge = true;
 	for (int i = 0; i < ninputs; i++) {
-		parts[i].blocksAscending =
-				pool_reader_blocks_ascending(&parts[i].reader);
+		PoolBlockOrder order = pool_reader_block_order(
+				&parts[i], forceAdaptive && ninputs == 1,
+				err, sizeof err);
+		if (order == POOL_BLOCK_ORDER_INVALID) goto done;
+		parts[i].blocksAscending = order == POOL_BLOCK_ORDER_ASCENDING;
 		if (!parts[i].blocksAscending) canonicalMerge = false;
 	}
 	bool eventInputs = parts[0].header.encoding
@@ -8777,6 +9071,16 @@ static int pool_mode_merge(
 			totalRecords, finalBytes, outputSchema, recordMetadataDigest,
 			poolId, label))
 		fprintf(stderr, "warning: merged pool is complete but its optional manifest could not be written\n");
+	if (parts[0].repairedHeaders)
+		fprintf(stderr,
+				"upgrade: safely reconstructed %" PRIu64
+				" BSP3 block header prefix%s in memory"
+				" (first block=%" PRIu64 " byte=%" PRIu64
+				"); source unchanged\n",
+				parts[0].repairedHeaders,
+				parts[0].repairedHeaders == 1 ? "" : "es",
+				parts[0].firstRepairedBlock,
+				parts[0].firstRepairedOffset);
 	fprintf(stderr, "merged %d compatible shards: range=%" PRIu64 "-%" PRIu64
 			" records=%" PRIu64 " size=%.3f GB pool_id=%s\n",
 			ninputs, rangeStart, rangeEnd, totalRecords, (double)finalBytes / 1e9, poolId);

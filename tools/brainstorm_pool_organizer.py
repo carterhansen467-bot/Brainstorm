@@ -73,6 +73,7 @@ EVENT_WRITE_RECORDS = BSP3_WRITE_RECORDS
 BLOCK2_HEADER_BYTES = 32
 BLOCK3_HEADER_BYTES = 48
 BLOCK4_HEADER_BYTES = 64
+BSP3_HEADER_PREFIX = b"BSP3" + bytes((BLOCK3_HEADER_BYTES, 0, 0, 0))
 INDEX2_ENTRY_BYTES = 24
 INDEX3_ENTRY_BYTES = 32
 INDEX4_ENTRY_BYTES = 56
@@ -1392,6 +1393,9 @@ class BSPoolReader:
         if self.file_bytes < self.data_end:
             raise PoolError("pool is shorter than its committed data boundary")
         self.blocks = []  # type: List[Block]
+        self._trusted_bsp3_index = b""
+        self._trusted_bsp3_recovery_identity = False
+        self._repaired_bsp3_headers = set()  # type: set
         self._payload_verified = False
         self._verification_lock = threading.RLock()
         self._declared_membership_digest = self.header.integer(
@@ -1410,9 +1414,15 @@ class BSPoolReader:
         if index_loaded:
             self._load_complete_bsp4_index()
         else:
+            if self.complete and self.schema == 3:
+                self._load_trusted_complete_bsp3_index()
             self._scan_committed_blocks()
+            # The trusted index is needed only while resolving physical BSP3
+            # block boundaries. Do not retain tens of megabytes of duplicate
+            # index bytes for very large completed pools.
+            self._trusted_bsp3_index = b""
         _check_cancel(cancel_check)
-        if verify_payloads:
+        if verify_payloads or self._repaired_bsp3_headers:
             self._verify_all_payloads()
         if self.complete and not index_loaded:
             self._validate_final_index()
@@ -1711,6 +1721,112 @@ class BSPoolReader:
             raise PoolError(
                 "complete BSP4 index does not cover its committed snapshot")
 
+    def _load_trusted_complete_bsp3_index(self) -> None:
+        """Preflight the final BSP3 index used for narrow header recovery.
+
+        A completed BSP3 footer authenticates its snapshot digests and fixes
+        the location and size of the final index.  The index then fixes every
+        physical block boundary and the structural fields duplicated after
+        the first eight header bytes.  Keep the raw index only after all of
+        those bounds are self-consistent; payload CRCs, decoded ranks and
+        metadata, and the whole-pool digests are still checked separately.
+        """
+        if self.file_bytes < self.data_end + FOOTER3_BYTES:
+            raise PoolError("complete pool has a truncated BSP3 index")
+        with open(self.path, "rb") as handle:
+            footer = handle_read(
+                handle, self.file_bytes - FOOTER3_BYTES, FOOTER3_BYTES)
+            if footer[:8] != b"BSPIDX3\n":
+                raise PoolError("complete pool index footer is missing")
+            if (any(footer[56:72])
+                    or crc64(footer[:72])
+                    != struct.unpack_from("<Q", footer, 72)[0]):
+                raise PoolError("complete BSP3 footer checksum differs")
+            index_offset, block_count, records, data_bytes = \
+                struct.unpack_from("<QQQQ", footer, 8)
+            if (index_offset != self.data_end or records != self.records
+                    or data_bytes != self.data_bytes):
+                raise PoolError(
+                    "complete pool index footer disagrees with committed data")
+            if (block_count > records
+                    or bool(records) != bool(block_count)):
+                raise PoolError(
+                    "complete BSP3 index has an invalid block count")
+            expected_size = (
+                self.data_end + block_count * INDEX3_ENTRY_BYTES
+                + FOOTER3_BYTES)
+            if self.file_bytes != expected_size:
+                raise PoolError(
+                    "complete pool has trailing or missing index bytes")
+            member, metadata = struct.unpack_from("<QQ", footer, 40)
+            if ((self._declared_membership_digest
+                 and member != self._declared_membership_digest)
+                    or (self._declared_metadata_digest
+                        and metadata != self._declared_metadata_digest)):
+                raise PoolError(
+                    "complete pool footer digest differs from header")
+            raw_index = handle_read(
+                handle, index_offset,
+                block_count * INDEX3_ENTRY_BYTES)
+
+        segment = self.header.integer(
+            "segment_id", 16, required=False, default=0)
+        snapshot = self.header.integer(
+            "snapshot_id", 16, required=False, default=0)
+        expected_snapshot = hash_fields(
+            "snapshot", segment, self.records, self.data_bytes, member)
+        self._trusted_bsp3_recovery_identity = bool(
+            member and metadata and segment and snapshot
+            and self._declared_membership_digest == member
+            and self._declared_metadata_digest == metadata
+            and snapshot == expected_snapshot)
+
+        expected_offset = self.header_bytes
+        expected_first_record = 0
+        for number, fields in enumerate(
+                struct.iter_unpack("<QQIIII", raw_index)):
+            if number % CANCEL_CHECK_RECORDS == 0:
+                _check_cancel(self.cancel_check)
+            offset, first_record, count, rank_bytes, metadata_bytes, \
+                _associations = fields
+            if (offset != expected_offset
+                    or first_record != expected_first_record):
+                raise PoolError(
+                    "complete BSP3 index entry %d is not contiguous" %
+                    number)
+            if (not count or count > BLOCK_MAX_RECORDS
+                    or rank_bytes > (count - 1) * 6
+                    or not metadata_bytes
+                    or metadata_bytes > MAX_METADATA_BYTES):
+                raise PoolError(
+                    "complete BSP3 index entry %d has invalid bounds" %
+                    number)
+            expected_offset += (
+                BLOCK3_HEADER_BYTES + rank_bytes + metadata_bytes)
+            expected_first_record += count
+            if expected_offset > self.data_end \
+                    or expected_first_record > self.records:
+                raise PoolError(
+                    "complete BSP3 index entry %d exceeds committed data" %
+                    number)
+        _check_cancel(self.cancel_check)
+        if (expected_offset != self.data_end
+                or expected_first_record != self.records):
+            raise PoolError(
+                "complete BSP3 index does not cover its committed snapshot")
+        self._footer_membership_digest = member
+        self._footer_metadata_digest = metadata
+        self._trusted_bsp3_index = raw_index
+
+    def _trusted_bsp3_entry(
+            self, number: int
+            ) -> Optional[Tuple[int, int, int, int, int, int]]:
+        at = number * INDEX3_ENTRY_BYTES
+        if at + INDEX3_ENTRY_BYTES > len(self._trusted_bsp3_index):
+            return None
+        return struct.unpack_from(
+            "<QQIIII", self._trusted_bsp3_index, at)
+
     def _scan_committed_blocks(self) -> None:
         total_records = 0
         offset = self.header_bytes
@@ -1743,12 +1859,43 @@ class BSPoolReader:
                         raise PoolError("BSP4 block metadata size is invalid")
                     block_header_bytes = BLOCK4_HEADER_BYTES
                 elif self.schema == 3:
-                    header_bytes = handle_read(handle, offset, BLOCK3_HEADER_BYTES)
+                    header_bytes = handle_read(
+                        handle, offset, BLOCK3_HEADER_BYTES)
                     fields = struct.unpack("<4sBBBBIIIIQQQ", header_bytes)
                     magic, size, z1, z2, z3, count, rank_bytes, meta_bytes, \
                         associations, first, last, checksum = fields
-                    if magic != b"BSP3" or size != BLOCK3_HEADER_BYTES or z1 or z2 or z3:
-                        raise PoolError("malformed committed BSP3 block at byte %d" % offset)
+                    if (magic != b"BSP3"
+                            or size != BLOCK3_HEADER_BYTES
+                            or z1 or z2 or z3):
+                        number = len(self.blocks)
+                        index_entry = self._trusted_bsp3_entry(number)
+                        reconstructed = (
+                            BSP3_HEADER_PREFIX + header_bytes[8:])
+                        fields = struct.unpack(
+                            "<4sBBBBIIIIQQQ", reconstructed)
+                        magic, size, z1, z2, z3, count, rank_bytes, \
+                            meta_bytes, associations, first, last, checksum = \
+                        fields
+                        if (index_entry is None
+                                or not self._trusted_bsp3_recovery_identity
+                                or index_entry != (
+                                    offset, total_records, count, rank_bytes,
+                                    meta_bytes, associations)):
+                            raise PoolError(
+                                "source pool is damaged: BSP3 block %d at "
+                                "byte %d has an invalid header (first 8 "
+                                "bytes: %s); its committed index and digests "
+                                "cannot safely reconstruct it" % (
+                                    number, offset,
+                                    header_bytes[:8].hex()))
+                        if self._repaired_bsp3_headers:
+                            raise PoolError(
+                                "source pool is damaged: BSP3 block %d at "
+                                "byte %d has a second invalid header prefix; "
+                                "automatic recovery is limited to one block" %
+                                (number, offset))
+                        header_bytes = reconstructed
+                        self._repaired_bsp3_headers.add(offset)
                     if not meta_bytes or meta_bytes > MAX_METADATA_BYTES:
                         raise PoolError("BSP3 block metadata size is invalid")
                     block_header_bytes = BLOCK3_HEADER_BYTES
@@ -2023,6 +2170,9 @@ class BSPoolReader:
             self, handle, block: Block, membership: int, metadata: int
             ) -> Tuple[Tuple[Record, ...], int, int]:
         header = handle_read(handle, block.offset, block.header_bytes)
+        if (self.schema == 3
+                and block.offset in self._repaired_bsp3_headers):
+            header = BSP3_HEADER_PREFIX + header[8:]
         payload = handle_read(
             handle, block.offset + block.header_bytes, block.payload_bytes)
         if self.schema == 4:

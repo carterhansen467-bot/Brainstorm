@@ -792,6 +792,79 @@ class OrganizerWebRegression(unittest.TestCase):
             web._run_native_summary = original_runner
             web.NATIVE_SUMMARY_MIN_BYTES = original_minimum
 
+    def test_large_inspection_uses_verified_python_for_repaired_bsp3(self):
+        name = "large-path-repaired-header.bspool"
+        path = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(path, complete=True)
+        clean = organizer.BSPoolReader(path)
+        expected = organizer.analyze(clean)
+        with open(path, "r+b") as handle:
+            handle.seek(clean.blocks[0].offset)
+            handle.write(b"DAMAGED!")
+
+        original_minimum = web.NATIVE_SUMMARY_MIN_BYTES
+        original_binary = web._native_pool_binary
+        original_runner = web._run_native_summary
+        web.NATIVE_SUMMARY_MIN_BYTES = 0
+        web._native_pool_binary = lambda: "available-native-helper"
+
+        def unexpected_native_summary(*_args, **_kwargs):
+            raise AssertionError(
+                "repaired BSP3 was reopened by byte-strict native summary")
+
+        web._run_native_summary = unexpected_native_summary
+        try:
+            actual = web.inspect_source(name, self.temp.name)
+        finally:
+            web._run_native_summary = original_runner
+            web._native_pool_binary = original_binary
+            web.NATIVE_SUMMARY_MIN_BYTES = original_minimum
+        self.assertEqual(actual["source"]["records"],
+                         expected["source"]["records"])
+        self.assertEqual(actual["categories"], expected["categories"])
+        self.assertEqual(actual["filters"], expected["filters"])
+        self.assertEqual(
+            actual["source"]["reconstructed_bsp3_header_prefixes"], 1)
+        self.assertIn(
+            "The original BSP3 has a damaged block header",
+            [notice["title"] for notice in actual["notices"]])
+
+    def test_repaired_large_inspection_rechecks_source_identity(self):
+        name = "changing-repaired-header.bspool"
+        path = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(path, complete=True)
+        clean = organizer.BSPoolReader(path)
+        with open(path, "r+b") as handle:
+            handle.seek(clean.blocks[0].offset)
+            handle.write(b"DAMAGED!")
+
+        original_minimum = web.NATIVE_SUMMARY_MIN_BYTES
+        original_binary = web._native_pool_binary
+        original_identity = web._summary_identity
+        calls = []
+
+        def changing_identity(source):
+            value = original_identity(source)
+            calls.append(source)
+            if len(calls) >= 3:
+                value = dict(value)
+                value["mtime_ns"] += 1
+            return value
+
+        web.NATIVE_SUMMARY_MIN_BYTES = 0
+        web._native_pool_binary = lambda: "available-native-helper"
+        web._summary_identity = changing_identity
+        try:
+            with self.assertRaisesRegex(
+                    organizer.PoolError,
+                    "source changed while its verified reconstructed view"):
+                web.inspect_source(name, self.temp.name)
+        finally:
+            web._summary_identity = original_identity
+            web._native_pool_binary = original_binary
+            web.NATIVE_SUMMARY_MIN_BYTES = original_minimum
+        self.assertGreaterEqual(len(calls), 3)
+
     def test_native_summary_rejects_missing_friendly_group_rows(self):
         if not web._native_pool_binary():
             self.skipTest("native pool helper is not built")
@@ -1736,7 +1809,19 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn("/api/format/update", page)
         self.assertIn('error.code=v.error_code||""', page)
         self.assertIn(
+            'error.publicationState=v.publication_state||""', page)
+        self.assertIn(
             'cancelled=e.code==="operation_cancelled"', page)
+        self.assertIn(
+            'failedSafely=e.publicationState==="not_published"', page)
+        self.assertIn('"Source pool is damaged"', page)
+        self.assertIn(
+            "No BSP4 copy was published, and the original BSP3 was not changed.",
+            page)
+        self.assertIn(
+            "safely reconstructed from the committed index, checksums, "
+            "and whole-pool identities",
+            page)
         self.assertNotIn("/cancel/i", page)
         self.assertIn(
             'id="formatElapsed" aria-hidden="true" hidden', page)
@@ -2000,6 +2085,48 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertFalse(current["eligible"])
         self.assertEqual(current["output_name"], "")
 
+    def test_format_upgrade_recovers_only_a_proven_bsp3_header_prefix(self):
+        name = "Recoverable Header BSP3.bspool"
+        source = os.path.join(self.temp.name, name)
+        fixture.write_bsp3(source, complete=True)
+        clean = organizer.BSPoolReader(source)
+        expected = [
+            (record.rank, tuple(item.raw for item in record.occurrences))
+            for record in clean.iter_records()
+        ]
+        block_offset = clean.blocks[0].offset
+        with open(source, "r+b") as handle:
+            handle.seek(block_offset)
+            handle.write(b"DAMAGED!")
+        source_bytes = self.read_bytes(source)
+
+        plan = web.plan_format_upgrade(name, self.temp.name)
+        result = web.run_format_upgrade({
+            "source": name,
+            "planToken": plan["plan_token"],
+        }, self.temp.name)
+        output = os.path.join(self.temp.name, result["output"])
+        actual = [
+            (record.rank, tuple(item.raw for item in record.occurrences))
+            for record in organizer.BSPoolReader(output).iter_records()
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            result["reconstructed_bsp3_header_prefixes"], 1)
+        self.assertEqual(self.read_bytes(source), source_bytes)
+        with open(output + ".manifest", encoding="utf-8") as handle:
+            manifest = handle.read()
+        self.assertIn(
+            "upgrade_reconstructed_bsp3_header_prefixes 1", manifest)
+        self.assertIn(
+            "upgrade_first_reconstructed_block 0", manifest)
+        self.assertIn(
+            "upgrade_first_reconstructed_byte %d" % block_offset,
+            manifest)
+        self.assertIn(
+            "upgrade_first_damaged_prefix 44414d4147454421",
+            manifest)
+
     def test_format_upgrade_rejects_record_digest_mismatch(self):
         name = "digest-mismatch BSP3.bspool"
         source = os.path.join(self.temp.name, name)
@@ -2028,13 +2155,17 @@ class OrganizerWebRegression(unittest.TestCase):
         web._run_native_upgrade = mismatched_digest
         try:
             with self.assertRaisesRegex(
-                    organizer.PoolError, "expected complete BSP4"):
+                    web.FormatUpdateFailedSafely,
+                    "expected complete BSP4") as caught:
                 web.execute_format_upgrade({
                     "source": name,
                     "planToken": plan["plan_token"],
                 }, self.temp.name)
         finally:
             web._run_native_upgrade = original_upgrade
+        payload = web.error_payload(caught.exception)
+        self.assertEqual(payload["publication_state"], "not_published")
+        self.assertEqual(payload["error_code"], "format_update_failed")
         self.assertFalse(os.path.lexists(output))
         self.assertFalse(os.path.lexists(output + ".manifest"))
         self.assertEqual(self.read_bytes(source), source_bytes)
@@ -2320,8 +2451,16 @@ class OrganizerWebRegression(unittest.TestCase):
             web.FormatPlanStale("the checked destination changed"))
         ordinary = web.error_payload(
             organizer.PoolError("a filter named cancellation-example failed"))
+        failed = web.error_payload(
+            web.FormatUpdateFailedSafely("native helper rejected the source"))
+        damaged = web.error_payload(
+            web.FormatSourceDamaged("BSP3 block differs"))
         self.assertEqual(cancelled["error_code"], "operation_cancelled")
         self.assertEqual(stale["error_code"], "format_plan_stale")
+        self.assertEqual(failed["error_code"], "format_update_failed")
+        self.assertEqual(failed["publication_state"], "not_published")
+        self.assertEqual(damaged["error_code"], "format_source_damaged")
+        self.assertEqual(damaged["publication_state"], "not_published")
         self.assertNotIn("error_code", ordinary)
 
     def test_operation_shutdown_barrier_signals_drains_and_rejects_new_work(self):
@@ -2450,6 +2589,61 @@ class OrganizerWebRegression(unittest.TestCase):
         with web.ACTIVE_UPGRADE_PROCESS_LOCK:
             self.assertNotIn(children[0], web.ACTIVE_UPGRADE_PROCESSES)
             self.assertFalse(web.ACTIVE_UPGRADE_PROCESSES)
+
+    def test_native_upgrade_classifies_committed_block_damage_before_publish(
+            self):
+        helper = os.path.join(self.temp.name, "fake_damaged_upgrade.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys\n"
+                "sys.stderr.write("
+                "'merge error: source.bspool is damaged: BSP3 block 560764 "
+                "at byte 3725692195 does not match its committed index\\n')\n"
+                "raise SystemExit(1)\n")
+        original_binary = web._native_pool_binary
+        original_popen = web.subprocess.Popen
+
+        def start_fake_helper(_command, **kwargs):
+            return original_popen(
+                [sys.executable, "-u", helper], **kwargs)
+
+        web._native_pool_binary = lambda: "fake-native-upgrade"
+        web.subprocess.Popen = start_fake_helper
+        try:
+            with self.assertRaisesRegex(
+                    web.FormatSourceDamaged, "block 560764"):
+                web._run_native_upgrade(
+                    "source.bspool", "staged.bspool")
+        finally:
+            web.subprocess.Popen = original_popen
+            web._native_pool_binary = original_binary
+
+    def test_native_upgrade_reports_verified_header_reconstruction(self):
+        helper = os.path.join(self.temp.name, "fake_repaired_upgrade.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys\n"
+                "sys.stderr.write("
+                "'upgrade: safely reconstructed 1 BSP3 block header "
+                "prefix in memory (first block=7 byte=9000); "
+                "source unchanged\\n')\n")
+        original_binary = web._native_pool_binary
+        original_popen = web.subprocess.Popen
+
+        def start_fake_helper(_command, **kwargs):
+            return original_popen(
+                [sys.executable, "-u", helper], **kwargs)
+
+        web._native_pool_binary = lambda: "fake-native-upgrade"
+        web.subprocess.Popen = start_fake_helper
+        try:
+            result = web._run_native_upgrade(
+                "source.bspool", "staged.bspool")
+        finally:
+            web.subprocess.Popen = original_popen
+            web._native_pool_binary = original_binary
+        self.assertEqual(
+            result["reconstructed_bsp3_header_prefixes"], 1)
 
     def test_standalone_http_cancel_interrupts_active_split(self):
         self.exercise_http_split_cancel(

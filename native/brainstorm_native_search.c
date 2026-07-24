@@ -4829,6 +4829,9 @@ typedef struct {
 	uint32_t count, payloadBytes;
 	uint32_t rankBytes, metadataBytes, associations;
 	uint8_t rankCodec, metadataEncoding, flags;
+	/* A complete BSP3 index can authorize a narrowly scoped, in-memory
+	 * reconstruction of bytes 0..7. The source file is never changed. */
+	uint8_t repairedPrefix;
 } BspoolBlockIndex;
 
 typedef struct {
@@ -5033,20 +5036,15 @@ static bool bspool4_block_header_raw(
 			&& info->rankBytes <= UINT32_MAX - info->metadataBytes;
 }
 
-static bool bspool_block_header(int fd, uint64_t off, int encoding,
-		BspoolBlockInfo *info) {
-	if (encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS) {
-		unsigned char raw[BSPOOL4_BLOCK_HEADER_SIZE];
-		return bs_pread(fd, raw, sizeof raw, (int64_t)off)
-					== (int64_t)sizeof raw
-				&& bspool4_block_header_raw(raw, info);
-	}
+static bool bspool_legacy_block_header_raw(const unsigned char *raw,
+		size_t rawBytes, int encoding, BspoolBlockInfo *info) {
 	memset(info, 0, sizeof *info);
 	if (encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
-		unsigned char raw[BSPOOL3_BLOCK_HEADER_SIZE];
-		if (bs_pread(fd, raw, sizeof raw, (int64_t)off) != (int64_t)sizeof raw
-				|| memcmp(raw, "BSP3", 4) || raw[4] != BSPOOL3_BLOCK_HEADER_SIZE
-				|| raw[5] != 0 || raw[6] != 0 || raw[7] != 0) return false;
+		if (rawBytes != BSPOOL3_BLOCK_HEADER_SIZE
+				|| memcmp(raw, "BSP3", 4)
+				|| raw[4] != BSPOOL3_BLOCK_HEADER_SIZE
+				|| raw[5] != 0 || raw[6] != 0 || raw[7] != 0)
+			return false;
 		info->headerBytes = BSPOOL3_BLOCK_HEADER_SIZE;
 		info->count = bspool_get_u32le(raw + 8);
 		info->rankBytes = bspool_get_u32le(raw + 12);
@@ -5055,15 +5053,19 @@ static bool bspool_block_header(int fd, uint64_t off, int encoding,
 		info->first = bspool_get_u64le(raw + 24);
 		info->last = bspool_get_u64le(raw + 32);
 		info->crc64 = bspool_get_u64le(raw + 40);
-		return info->count > 0 && info->count <= BSPOOL_BLOCK_MAX_RECORDS
-				&& info->rankBytes <= (uint32_t)((info->count - 1u) * 6u)
+		return info->count > 0
+				&& info->count <= BSPOOL_BLOCK_MAX_RECORDS
+				&& info->rankBytes
+					<= (uint32_t)((info->count - 1u) * 6u)
 				&& info->metadataBytes > 0
 				&& info->metadataBytes <= BSPOOL3_BLOCK_MAX_METADATA
-				&& info->rankBytes <= UINT32_MAX - info->metadataBytes;
+				&& info->rankBytes
+					<= UINT32_MAX - info->metadataBytes;
 	}
-	unsigned char raw[BSPOOL_BLOCK_HEADER_SIZE];
-	if (bs_pread(fd, raw, sizeof raw, (int64_t)off) != (int64_t)sizeof raw
-			|| memcmp(raw, "BSP2", 4)) return false;
+	if (encoding != BSPOOL_ENCODING_DELTA_BLOCKS
+			|| rawBytes != BSPOOL_BLOCK_HEADER_SIZE
+			|| memcmp(raw, "BSP2", 4))
+		return false;
 	info->headerBytes = BSPOOL_BLOCK_HEADER_SIZE;
 	info->count = bspool_get_u32le(raw + 4);
 	info->rankBytes = bspool_get_u32le(raw + 8);
@@ -5071,7 +5073,61 @@ static bool bspool_block_header(int fd, uint64_t off, int encoding,
 	info->first = bspool_get_u64le(raw + 16);
 	info->last = bspool_get_u64le(raw + 24);
 	return info->count > 0 && info->count <= BSPOOL_BLOCK_MAX_RECORDS
-			&& info->rankBytes <= (uint32_t)((info->count - 1u) * 6u);
+			&& info->rankBytes
+				<= (uint32_t)((info->count - 1u) * 6u);
+}
+
+static bool bspool_block_header(int fd, uint64_t off, int encoding,
+		BspoolBlockInfo *info) {
+	if (encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS) {
+		unsigned char raw[BSPOOL4_BLOCK_HEADER_SIZE];
+		return bs_pread(fd, raw, sizeof raw, (int64_t)off)
+					== (int64_t)sizeof raw
+				&& bspool4_block_header_raw(raw, info);
+	}
+	if (encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
+		unsigned char raw[BSPOOL3_BLOCK_HEADER_SIZE];
+		return bs_pread(fd, raw, sizeof raw, (int64_t)off)
+					== (int64_t)sizeof raw
+				&& bspool_legacy_block_header_raw(
+					raw, sizeof raw, encoding, info);
+	}
+	unsigned char raw[BSPOOL_BLOCK_HEADER_SIZE];
+	return bs_pread(fd, raw, sizeof raw, (int64_t)off)
+				== (int64_t)sizeof raw
+			&& bspool_legacy_block_header_raw(
+				raw, sizeof raw, encoding, info);
+}
+
+/* Read a block through its owning reader so a separately verified complete
+ * BSP3 pool can substitute only its fixed eight-byte header prefix in memory.
+ * Incomplete readers and ordinary reads remain byte-strict because their
+ * index entries never set repairedPrefix. */
+static bool bspool_reader_block_header(const BspoolReader *r, uint64_t block,
+		BspoolBlockInfo *info,
+		unsigned char rawOut[BSPOOL4_BLOCK_HEADER_SIZE]) {
+	if (!r || block >= r->nblocks) return false;
+	const BspoolBlockIndex *entry = &r->blocks[block];
+	size_t rawBytes = r->encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS
+			? BSPOOL4_BLOCK_HEADER_SIZE
+			: r->encoding == BSPOOL_ENCODING_DELTA_EVENTS
+				? BSPOOL3_BLOCK_HEADER_SIZE : BSPOOL_BLOCK_HEADER_SIZE;
+	unsigned char local[BSPOOL4_BLOCK_HEADER_SIZE];
+	unsigned char *raw = rawOut ? rawOut : local;
+	if (entry->offset > (uint64_t)INT64_MAX
+			|| bs_pread(r->fd, raw, rawBytes, (int64_t)entry->offset)
+				!= (int64_t)rawBytes)
+		return false;
+	if (entry->repairedPrefix) {
+		if (r->encoding != BSPOOL_ENCODING_DELTA_EVENTS) return false;
+		memcpy(raw, "BSP3", 4);
+		raw[4] = BSPOOL3_BLOCK_HEADER_SIZE;
+		raw[5] = raw[6] = raw[7] = 0;
+	}
+	return r->encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS
+			? bspool4_block_header_raw(raw, info)
+			: bspool_legacy_block_header_raw(
+				raw, rawBytes, r->encoding, info);
 }
 
 #define BSPOOL4_HEADER_WINDOW_BYTES (1024u * 1024u)
@@ -5346,7 +5402,8 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 	s->cachedBlock = UINT64_MAX;
 	const BspoolBlockIndex *e = &r->blocks[block];
 	BspoolBlockInfo bi;
-	if (!bspool_block_header(r->fd, e->offset, r->encoding, &bi)
+	unsigned char rawHeader[BSPOOL4_BLOCK_HEADER_SIZE];
+	if (!bspool_reader_block_header(r, block, &bi, rawHeader)
 			|| bi.count != e->count || bi.rankBytes != e->rankBytes
 			|| bi.metadataBytes != e->metadataBytes || bi.associations != e->associations
 			|| bi.first < r->rangeStart || bi.last >= r->rangeEnd || bi.first > bi.last
@@ -5499,9 +5556,7 @@ static bool bspool_decode_block(const BspoolReader *r, uint64_t block,
 	if (payload && bs_pread(r->fd, s->bytes, payload,
 			(int64_t)(e->offset + bi.headerBytes)) != (int64_t)payload) return false;
 	if (r->encoding == BSPOOL_ENCODING_DELTA_EVENTS) {
-		unsigned char raw[BSPOOL3_BLOCK_HEADER_SIZE];
-		if (bs_pread(r->fd, raw, sizeof raw, (int64_t)e->offset) != (int64_t)sizeof raw) return false;
-		uint64_t crc = bspool_crc64_update(0, raw + 4, 36);
+		uint64_t crc = bspool_crc64_update(0, rawHeader + 4, 36);
 		crc = bspool_crc64_update(crc, s->bytes, payload);
 		if (crc != bi.crc64 || !bspool_validate_metadata(s->bytes + bi.rankBytes,
 				bi.metadataBytes, bi.count, bi.associations)) return false;
@@ -5743,7 +5798,7 @@ BS_MAYBE_UNUSED static bool bspool_reader_recompute_digests(
 			goto fail;
 		if (wantMetadata) {
 			BspoolBlockInfo bi;
-			if (!bspool_block_header(r->fd, e->offset, r->encoding, &bi)
+			if (!bspool_reader_block_header(r, block, &bi, NULL)
 					|| bi.count != e->count
 					|| bi.rankBytes != e->rankBytes
 					|| bi.metadataBytes != e->metadataBytes
