@@ -245,10 +245,20 @@ def _source_identity(status) -> _SourceIdentity:
             return int(direct)
         return int(float(getattr(status, name, 0.0)) * 1000000000)
 
+    birthtime_ns = nanoseconds("st_birthtime")
+    ctime_ns = nanoseconds("st_ctime")
+    if os.name == "nt" and birthtime_ns:
+        # CPython's Windows path stat still maps deprecated st_ctime to the
+        # creation time, while handle fstat can expose the metadata-change
+        # time.  Use the explicit creation timestamp so the two views of one
+        # unchanged file have a comparable identity.  File replacement and
+        # mutation remain covered by volume/file ID, size, and mtime, and
+        # traversal handles additionally deny write/delete sharing.
+        ctime_ns = birthtime_ns
     return _SourceIdentity(
         int(status.st_dev), int(status.st_ino), int(status.st_mode),
-        int(status.st_size), nanoseconds("st_mtime"), nanoseconds("st_ctime"),
-        nanoseconds("st_birthtime"))
+        int(status.st_size), nanoseconds("st_mtime"), ctime_ns,
+        birthtime_ns)
 
 
 def _check_cancel(cancel_check: Optional[Callable[[], bool]]) -> None:

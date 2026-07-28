@@ -771,6 +771,28 @@ class OrganizerRegression(unittest.TestCase):
         crt.open_osfhandle.assert_not_called()
         kernel32.CloseHandle.assert_not_called()
 
+    def test_windows_source_identity_normalizes_stat_ctime_contract(self):
+        common = {
+            "st_dev": 7,
+            "st_ino": 123456789,
+            "st_mode": 0o100666,
+            "st_size": 4096,
+            "st_mtime_ns": 1700000000000000000,
+            "st_birthtime_ns": 1600000000000000000,
+        }
+        handle_status = SimpleNamespace(
+            **common, st_ctime_ns=1750000000000000000)
+        path_status = SimpleNamespace(
+            **common, st_ctime_ns=1600000000000000000)
+
+        with mock.patch.object(organizer.os, "name", "nt"):
+            handle_identity = organizer._source_identity(handle_status)
+            path_identity = organizer._source_identity(path_status)
+
+        self.assertEqual(handle_identity, path_identity)
+        self.assertEqual(
+            handle_identity.ctime_ns, common["st_birthtime_ns"])
+
     @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
     def test_windows_snapshot_denies_write_and_delete_until_closed(self):
         import ctypes
