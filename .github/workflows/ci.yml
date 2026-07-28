@@ -38,6 +38,8 @@ jobs:
         run: luajit tests/nativefs_bounded_read.lua nativefs.lua
       - name: Native filesystem module isolation
         run: luajit tests/nativefs_module_isolation.lua
+      - name: Brainstorm hotkey consumption
+        run: luajit tests/keyhandler_consumption.lua
       - name: Bounded variable pool headers
         run: python3 tests/pool_variable_header.py
       - name: Representative disposable BSP4 Builder estimate
@@ -141,6 +143,9 @@ jobs:
       - name: Native filesystem module isolation
         run: |
           "$LUAJIT" tests/nativefs_module_isolation.lua
+      - name: Brainstorm hotkey consumption
+        run: |
+          "$LUAJIT" tests/keyhandler_consumption.lua
       - name: Bounded variable pool headers
         run: python tests/pool_variable_header.py
       - name: Representative disposable BSP4 Builder estimate
@@ -240,4 +245,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             out/brainstorm-windows-full.zip \
             --title "Brainstorm Windows $GITHUB_REF_NAME" \
-            --notes "Brainstorm 1.2.0-alpha for Windows x64. This release fixes BSP3-to-BSP4 updates for very large completed seed pools. The Seed Pool Organizer can safely reconstruct one damaged eight-byte BSP3 block-header prefix only when the committed index, block checksum, decoded ranks and metadata, and whole-pool identities independently prove the exact contents. The original BSP3 is never changed; broader or ambiguous damage is refused without publishing a partial BSP4 file. Update failures now distinguish a damaged source from a safely aborted update, and BSP3 index finalization uses verified 64-bit Windows positioning beyond both 2 GiB and 4 GiB. Extract the full ZIP and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. To update an old completed pool, open Seed Pool Organizer, choose 'Update pool format', check the pool, and create its BSP4 copy. Built from $GITHUB_SHA after the full Lua/native, large-offset, BSP4 corruption, Organizer, Builder-source, shard/merge, pause/resume, installer, and Windows/macOS equivalence suites passed."
+            --notes "Brainstorm 1.2.0-alpha for Windows x64. This release redesigns the Seed Pool Organizer split/combine workflow, restores the safe Ctrl+J shop-location overlay, substantially reduces very-large-pool reader memory, and makes full-record downloads batched, cancellable, and completion-verified. Windows source traversals now deny concurrent writes and replacement, while scan, convert, merge, upgrade, record export, and manifest publication use identity checks or private no-overwrite staging so failed work cannot replace a source or publish a plausible partial result. Split output counts respect operating-system descriptor limits, native refilter reads reuse adjacent blocks, and BSP3 index finalization remains verified beyond both 2 GiB and 4 GiB. The Organizer can reconstruct one damaged eight-byte BSP3 block-header prefix only when independent index, checksum, decoded-record, and whole-pool identities prove the exact contents; it intentionally refuses broader or ambiguous pre-existing damage, which still requires a known-good backup or rerunning the exact search. Extract the full ZIP and run 'Install or Update Brainstorm.bat'; seed pools, settings, snapshots, and checkpoints are preserved. Built from $GITHUB_SHA after the full Lua/native, large-offset, BSP4 corruption, Organizer, Builder, export, shard/merge, refilter, installer, hotkey, and Windows/macOS equivalence suites passed."

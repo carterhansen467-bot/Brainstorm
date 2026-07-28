@@ -38,6 +38,30 @@ for i in 1 2 3 4; do
 done
 [ "$prev" -eq "$COUNT" ]
 
+# Merge uses the same no-overwrite publication contract as conversion and
+# format upgrade. Preserve a target created outside Brainstorm byte-for-byte.
+printf 'pre-existing merge target\r\n' > "$OUT/pre-existing.expected"
+cp "$OUT/pre-existing.expected" "$OUT/pre-existing-merge.bspool"
+if "./native/brainstorm_seed_pool$EXE" merge \
+    "$OUT/pre-existing-merge.bspool" \
+    "$OUT/part-1.bspool" "$OUT/part-2.bspool" \
+    2>"$OUT/pre-existing-merge.log"; then
+  echo "FAIL: merge overwrote a pre-existing target"; exit 1
+fi
+cmp "$OUT/pre-existing.expected" "$OUT/pre-existing-merge.bspool"
+grep -q 'output already exists' "$OUT/pre-existing-merge.log"
+
+# An orphan manifest is user data too. Native CLI may still publish the pool,
+# but must preserve that sidecar and report that its optional manifest was
+# skipped instead of truncating it.
+cp "$OUT/pre-existing.expected" "$OUT/sidecar-safe.bspool.manifest"
+"./native/brainstorm_seed_pool$EXE" merge \
+  "$OUT/sidecar-safe.bspool" \
+  "$OUT/part-1.bspool" "$OUT/part-2.bspool" \
+  2>"$OUT/sidecar-safe.log"
+cmp "$OUT/pre-existing.expected" "$OUT/sidecar-safe.bspool.manifest"
+grep -q 'optional manifest could not be written' "$OUT/sidecar-safe.log"
+
 "./native/brainstorm_seed_pool$EXE" merge "$OUT/merged.bspool" \
   "$OUT/part-4.bspool" "$OUT/part-2.bspool" "$OUT/part-1.bspool" "$OUT/part-3.bspool"
 "./native/brainstorm_seed_pool$EXE" export "$OUT/mono.bspool" "$OUT/mono.txt"

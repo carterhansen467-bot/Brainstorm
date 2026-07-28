@@ -5810,8 +5810,21 @@ static int pool_mode_scan(const Config *g, PoolPlan *p, const char *output) {
 	} else {
 		if (stateExists && p->resume) { fprintf(stderr, "existing state could not be resumed\n"); return 1; }
 		if (p->format != POOL_COUNT) {
-			out = fopen(output, "w+b");
-			if (!out) { fprintf(stderr, "cannot create output: %s\n", strerror(errno)); return 1; }
+			/* resume 0 is the explicit replace/restart operation. With resume
+			 * enabled, close the gap between the no-state check and creation
+			 * so an unrelated program cannot have its new file truncated. */
+			out = p->resume
+					? bs_fopen_exclusive_binary_update(output)
+					: fopen(output, "w+b");
+			if (!out) {
+				if (p->resume && errno == EEXIST)
+					fprintf(stderr,
+							"output exists without resumable state; set 'resume 0' to replace it\n");
+				else
+					fprintf(stderr, "cannot create output: %s\n",
+							strerror(errno));
+				return 1;
+			}
 			if (p->format == POOL_BINARY) {
 				state.outputBytes = (uint64_t)p->headerBytes;
 				if (bs_fseeko(out, p->headerBytes, SEEK_SET) != 0
@@ -7338,9 +7351,72 @@ done:
 	return ok;
 }
 
+static FILE *pool_open_staged_transform(
+		const char *output, char **staged, char *err, size_t errsz) {
+	*staged = NULL;
+	size_t outputBytes = strlen(output);
+	if (outputBytes > SIZE_MAX - 80u) {
+		snprintf(err, errsz, "output path is too long");
+		return NULL;
+	}
+	char *path = malloc(outputBytes + 80u);
+	if (!path) {
+		snprintf(err, errsz, "cannot allocate temporary output path");
+		return NULL;
+	}
+	for (unsigned attempt = 0; attempt < 10000u; attempt++) {
+		snprintf(path, outputBytes + 80u, "%s.partial.%lu.%u",
+				output, bs_process_id(), attempt);
+		FILE *out = bs_fopen_exclusive_binary_update(path);
+		if (out) {
+			*staged = path;
+			return out;
+		}
+		if (errno != EEXIST) {
+			snprintf(err, errsz, "cannot create temporary output: %s",
+					strerror(errno));
+			free(path);
+			return NULL;
+		}
+	}
+	snprintf(err, errsz, "cannot reserve a unique temporary output");
+	free(path);
+	return NULL;
+}
+
+static bool pool_publish_staged_transform(
+		char **staged, const char *output, char *err, size_t errsz) {
+	if (!staged || !*staged) {
+		snprintf(err, errsz, "temporary output identity is missing");
+		return false;
+	}
+	if (bs_rename_noreplace(*staged, output) != 0) {
+		snprintf(err, errsz, "%s",
+				errno == EEXIST
+					? "output already exists; choose a new filename"
+					: "cannot publish completed output");
+		return false;
+	}
+	free(*staged);
+	*staged = NULL;
+	return true;
+}
+
+static void pool_release_failed_transform(char **staged) {
+	if (!staged || !*staged) return;
+	if (bs_file_exists(*staged))
+		fprintf(stderr, "incomplete temporary output retained at %s\n",
+				*staged);
+	free(*staged);
+	*staged = NULL;
+}
+
 static int pool_mode_convert(const char *input, const char *output) {
 	FILE *in = fopen(input, "rb");
 	if (!in) { fprintf(stderr, "cannot open %s: %s\n", input, strerror(errno)); return 1; }
+	/* Preserve the cheap same-file/existing-target diagnostic. Final
+	 * no-replace publication remains authoritative if the name appears after
+	 * this advisory check. */
 	FILE *existing = fopen(output, "rb");
 	if (existing) {
 		bool same = bs_same_file(in, existing);
@@ -7369,13 +7445,24 @@ static int pool_mode_convert(const char *input, const char *output) {
 	if (bs_fseeko(in, 0, SEEK_SET) != 0 || fread(original, 1, sizeof original, in) != sizeof original) {
 		fprintf(stderr, "cannot preserve input pool header\n"); bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
-	FILE *out = fopen(output, "w+b");
-	if (!out) { fprintf(stderr, "cannot create %s: %s\n", output, strerror(errno)); bspool_reader_destroy(&reader); fclose(in); return 1; }
+	char *stagedOutput = NULL;
+	FILE *out = pool_open_staged_transform(
+			output, &stagedOutput, err, sizeof err);
+	if (!out) {
+		int createErr = errno;
+		fprintf(stderr, "%s%s%s\n",
+				err[0] ? err : "cannot create temporary output",
+				err[0] ? "" : ": ",
+				err[0] ? "" : strerror(createErr));
+		bspool_reader_destroy(&reader); fclose(in); return 1;
+	}
 	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
 			|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
 					BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE,
 					h.records, 0, 0, 0, NULL, err, sizeof err)) {
-		fprintf(stderr, "%s\n", err); fclose(out); remove(output);
+		fprintf(stderr, "%s\n", err);
+		bs_fclose_discard_owned(out, stagedOutput);
+		pool_release_failed_transform(&stagedOutput);
 		bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
 	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
@@ -7410,8 +7497,18 @@ static int pool_mode_convert(const char *input, const char *output) {
 						NULL, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); goto fail;
 		}
-		if (fclose(out) != 0) { out = NULL; fprintf(stderr, "cannot close converted pool\n"); goto fail_no_out; }
+		if (fclose(out) != 0) {
+			out = NULL;
+			fprintf(stderr,
+					"cannot close converted pool; failed output was retained\n");
+			goto fail_no_out;
+		}
 		out = NULL;
+		if (!pool_publish_staged_transform(
+				&stagedOutput, output, err, sizeof err)) {
+			fprintf(stderr, "%s\n", err);
+			goto fail_no_out;
+		}
 		bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 		fprintf(stderr, "compressed %" PRIu64 " records: %.3f GB -> %.3f GB (%.1f%% smaller)\n",
 				h.records, (double)inputBytes / 1e9, (double)finalBytes / 1e9,
@@ -7419,9 +7516,9 @@ static int pool_mode_convert(const char *input, const char *output) {
 		return 0;
 	}
 fail:
-	if (out) fclose(out);
+	if (out) bs_fclose_discard_owned(out, stagedOutput);
 fail_no_out:
-	remove(output);
+	pool_release_failed_transform(&stagedOutput);
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 	return 1;
 }
@@ -8797,7 +8894,10 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 		const char *poolId, const char *label) {
 	char path[1024];
 	if (snprintf(path, sizeof path, "%s.manifest", output) >= (int)sizeof path) return false;
-	FILE *f = fopen(path, "w");
+	if (bs_file_exists(path)) return false;
+	char err[256] = "", *staged = NULL;
+	FILE *f = pool_open_staged_transform(
+			path, &staged, err, sizeof err);
 	if (!f) return false;
 	fprintf(f, "BRAINSTORM_SEED_POOL_MERGE %d\nmodelver %d\nencoding %s\n",
 			schema, parts[0].header.modelver,
@@ -8843,7 +8943,21 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 			parts[i].header.rangeStart, parts[i].header.rangeEnd,
 			parts[i].header.records, parts[i].path);
 	fprintf(f, "complete 1\ncoverage_complete 1\nend\n");
-	return fclose(f) == 0;
+	if (ferror(f) || fflush(f) != 0 || bs_fsync_file(f) != 0) {
+		bs_fclose_discard_owned(f, staged);
+		pool_release_failed_transform(&staged);
+		return false;
+	}
+	if (fclose(f) != 0) {
+		pool_release_failed_transform(&staged);
+		return false;
+	}
+	if (!pool_publish_staged_transform(
+			&staged, path, err, sizeof err)) {
+		pool_release_failed_transform(&staged);
+		return false;
+	}
+	return true;
 }
 
 static int pool_mode_merge(
@@ -8854,10 +8968,14 @@ static int pool_mode_merge(
 				forceAdaptive ? 1 : 2, forceAdaptive ? "" : "s");
 		return 2;
 	}
+	/* Fast rejection avoids validating multi-gigabyte inputs unnecessarily.
+	 * Final no-replace publication remains authoritative if another process
+	 * publishes this name after the check. */
 	if (bs_file_exists(output)) { fprintf(stderr, "output already exists; choose a new filename\n"); return 1; }
 	PoolMergePart *parts = calloc((size_t)ninputs, sizeof *parts);
 	if (!parts) { fprintf(stderr, "cannot allocate merge input table\n"); return 1; }
 	unsigned char *original = NULL;
+	char *stagedOutput = NULL;
 	char err[256] = "";
 	int opened = 0, rc = 1;
 	uint64_t totalRecords = 0;
@@ -8974,8 +9092,11 @@ static int pool_mode_merge(
 			mergedParts += leaves;
 		}
 	}
-	FILE *out = fopen(output, "w+b");
-	if (!out) { snprintf(err, sizeof err, "cannot create %s: %s", output, strerror(errno)); goto done; }
+	FILE *out = pool_open_staged_transform(
+			output, &stagedOutput, err, sizeof err);
+	if (!out) {
+		goto done;
+	}
 	uint64_t familyId = parts[0].header.familyId ? parts[0].header.familyId
 			: pool_hash_fields("family-fallback", parts[0].header.catalogHash,
 					parts[0].header.criteriaHash, (uint64_t)parts[0].header.space,
@@ -9012,7 +9133,10 @@ static int pool_mode_merge(
 	if (bs_fseeko(out, outputHeaderBytes, SEEK_SET) != 0
 			|| !pool_write_repacked_header(out, original, outputHeaderBytes,
 					outputSchema, outputHeaderBytes, totalRecords, 0, 0, 0,
-					&rewrite, err, sizeof err)) { fclose(out); remove(output); goto done; }
+					&rewrite, err, sizeof err)) {
+		bs_fclose_discard_owned(out, stagedOutput);
+		goto done;
+	}
 	uint64_t written = 0;
 	uint64_t membershipDigest = pool_membership_digest_start(outputSchema);
 	uint64_t metadataDigest = eventInputs
@@ -9029,7 +9153,8 @@ static int pool_mode_merge(
 				&membershipDigest, &metadataDigest,
 				&recordMetadataDigest, err, sizeof err)) {
 			pool_merge_event_reset(&eventBlock);
-			fclose(out); remove(output); goto done;
+			bs_fclose_discard_owned(out, stagedOutput);
+			goto done;
 		}
 		fprintf(stderr, "merged=%d/%d records=%" PRIu64 "/%" PRIu64 "\n",
 				i + 1, ninputs, written, totalRecords);
@@ -9042,7 +9167,10 @@ static int pool_mode_merge(
 			: pool_merge_write_rank_block(out, &rankBlock, &membershipDigest,
 					err, sizeof err);
 	pool_merge_event_reset(&eventBlock);
-	if (!tailOk) { fclose(out); remove(output); goto done; }
+	if (!tailOk) {
+		bs_fclose_discard_owned(out, stagedOutput);
+		goto done;
+	}
 	int64_t dataEnd = bs_ftello(out);
 	uint64_t finalBytes = 0;
 	uint64_t mergedDataBytes = dataEnd >= outputHeaderBytes
@@ -9051,8 +9179,8 @@ static int pool_mode_merge(
 	rewrite.metadataDigest = metadataDigest;
 	rewrite.snapshotId = pool_hash_fields("snapshot", segmentId, totalRecords,
 			mergedDataBytes, membershipDigest);
-	/* Do not allow short-circuiting to skip fclose: Windows cannot remove a
-	 * failed output while it is open. */
+	/* Keep the private stream open until final validation decides whether to
+	 * publish it or apply platform-safe failure cleanup. */
 	bool finalOk = written == totalRecords && dataEnd >= outputHeaderBytes;
 	if (finalOk) finalOk = pool_append_index(out, outputSchema,
 			outputHeaderBytes, parts[0].header.space, totalRecords,
@@ -9062,11 +9190,20 @@ static int pool_mode_merge(
 			outputSchema, outputHeaderBytes, totalRecords,
 			(uint64_t)dataEnd - (uint64_t)outputHeaderBytes, 1, 1,
 			&rewrite, err, sizeof err);
-	int closeRc = fclose(out);
-	if (!finalOk || closeRc != 0) {
+	if (!finalOk) {
 		if (!err[0]) snprintf(err, sizeof err, "cannot finalize merged pool");
-		remove(output); goto done;
+		bs_fclose_discard_owned(out, stagedOutput);
+		goto done;
 	}
+	if (fclose(out) != 0) {
+		if (!err[0])
+			snprintf(err, sizeof err,
+					"cannot close merged pool; failed output was retained");
+		goto done;
+	}
+	if (!pool_publish_staged_transform(
+			&stagedOutput, output, err, sizeof err))
+		goto done;
 	if (!pool_write_merge_manifest(output, parts, ninputs, mergedParts, rangeStart, rangeEnd,
 			totalRecords, finalBytes, outputSchema, recordMetadataDigest,
 			poolId, label))
@@ -9087,6 +9224,7 @@ static int pool_mode_merge(
 	rc = 0;
 done:
 	if (rc && err[0]) fprintf(stderr, "merge error: %s\n", err);
+	pool_release_failed_transform(&stagedOutput);
 	for (int i = 0; i < opened; i++) {
 		bspool_reader_destroy(&parts[i].reader);
 		if (parts[i].file) fclose(parts[i].file);

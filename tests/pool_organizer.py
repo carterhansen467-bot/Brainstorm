@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused regression tests for the no-rescan BSP3 organizer."""
 
+import io
 import json
 import os
 import re
@@ -9,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -604,6 +608,318 @@ class OrganizerRegression(unittest.TestCase):
                          ["11111111", "21111111", "31111111", "41111111"])
         self.assertEqual(len(decoded[1]["occurrences"]), 3)
         self.assertFalse(decoded[3]["occurrences"][0]["known"])
+
+    def test_cli_traversals_validate_and_consume_without_constructor_pass(self):
+        source_path = os.path.abspath(self.source)
+        original_validated = (
+            organizer.BSPoolReader._read_validated_block_records)
+        original_plain = organizer.BSPoolReader._read_block_records
+
+        def command_reads(command):
+            reads = []
+
+            def validated(reader, handle, block, membership, metadata):
+                reads.append(reader.path)
+                return original_validated(
+                    reader, handle, block, membership, metadata)
+
+            def plain(reader, handle, block):
+                reads.append(reader.path)
+                return original_plain(reader, handle, block)
+
+            with mock.patch.object(
+                    organizer.BSPoolReader, "_read_validated_block_records",
+                    validated), mock.patch.object(
+                        organizer.BSPoolReader, "_read_block_records", plain):
+                command()
+            return reads
+
+        def inspect():
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(organizer.command_inspect(SimpleNamespace(
+                    input=self.source, ambiguity_limit=0, json=True)), 0)
+
+        self.assertEqual(command_reads(inspect).count(source_path), 1)
+
+        def records():
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(organizer.command_records(SimpleNamespace(
+                    input=self.source, output="-")), 0)
+
+        self.assertEqual(command_reads(records).count(source_path), 1)
+
+        second = os.path.join(self.temp.name, "single-pass-second.bspool")
+        write_custom_bsp3(
+            second, [4], [[TAG]], "cccccccccccccccc", [
+                "tag_route collect",
+                "tag tag_negative 1 small 4 big 1",
+            ])
+        combined = os.path.join(self.temp.name, "single-pass-union.bspool")
+
+        def combine():
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(organizer.command_combine(SimpleNamespace(
+                    inputs=[self.source, second], output=combined,
+                    operation="union", label="Single pass union")), 0)
+
+        combine_reads = command_reads(combine)
+        self.assertEqual(combine_reads.count(source_path), 1)
+        self.assertEqual(combine_reads.count(os.path.abspath(second)), 1)
+
+        category = organizer.Occurrence.decode(TAG).category_id
+        split_dir = os.path.join(self.temp.name, "single-pass-split")
+        report_path = os.path.join(self.temp.name, "single-pass-plan.json")
+
+        def split():
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(organizer.command_split(SimpleNamespace(
+                    input=self.source, output_dir=split_dir,
+                    category=[category], choices=None, report=report_path,
+                    remainder=None, omit_unmatched=True)), 0)
+
+        # Split necessarily plans and stages separately. Its inspect traversal
+        # now performs validation, so no fourth constructor payload pass occurs.
+        self.assertEqual(command_reads(split).count(source_path), 3)
+
+    def test_source_replacement_and_inflight_mutation_are_rejected(self):
+        stale = organizer.BSPoolReader(
+            self.source, verify_payloads=False)
+        replacement = os.path.join(self.temp.name, "replacement.bspool")
+        write_bsp3(replacement, complete=False)
+        os.replace(replacement, self.source)
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed or was replaced"):
+            list(stale.iter_records())
+
+        current = organizer.BSPoolReader(self.source)
+        records = current.iter_records()
+        self.assertEqual(next(records).rank, 0)
+        status = os.stat(self.source)
+        os.utime(
+            self.source,
+            ns=(status.st_atime_ns, status.st_mtime_ns + 2000000000))
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed or was replaced"):
+            list(records)
+
+    def test_windows_snapshot_wrapper_transfers_ownership_exactly_once(self):
+        import ctypes
+
+        def dependencies(create_result=1234):
+            kernel32 = SimpleNamespace(
+                CreateFileW=mock.Mock(return_value=create_result),
+                CloseHandle=mock.Mock(return_value=1),
+            )
+            ctypes_api = SimpleNamespace(
+                WinDLL=mock.Mock(return_value=kernel32),
+                c_wchar_p=ctypes.c_wchar_p,
+                c_uint32=ctypes.c_uint32,
+                c_void_p=ctypes.c_void_p,
+                c_int=ctypes.c_int,
+                get_last_error=mock.Mock(return_value=32),
+                WinError=lambda code: OSError(code, "sharing violation"),
+            )
+            crt = SimpleNamespace(
+                open_osfhandle=mock.Mock(return_value=17))
+            return ctypes_api, crt, kernel32
+
+        ctypes_api, crt, kernel32 = dependencies()
+        stream = object()
+        fdopen = mock.Mock(return_value=stream)
+        close_fd = mock.Mock()
+        opened = organizer._open_windows_read_snapshot(
+            "C:\\fixture\\pool.bspool", _ctypes=ctypes_api, _msvcrt=crt,
+            _fdopen=fdopen, _close_fd=close_fd)
+        self.assertIs(opened, stream)
+        ctypes_api.WinDLL.assert_called_once_with(
+            "kernel32", use_last_error=True)
+        kernel32.CreateFileW.assert_called_once_with(
+            "C:\\fixture\\pool.bspool",
+            0x80000000, 0x00000001, None, 3, 0x00000080, None)
+        crt.open_osfhandle.assert_called_once_with(
+            1234, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        fdopen.assert_called_once_with(17, "rb", closefd=True)
+        kernel32.CloseHandle.assert_not_called()
+        close_fd.assert_not_called()
+
+        ctypes_api, crt, kernel32 = dependencies()
+        crt.open_osfhandle.side_effect = OSError("CRT adoption failed")
+        close_fd = mock.Mock()
+        with self.assertRaisesRegex(OSError, "CRT adoption failed"):
+            organizer._open_windows_read_snapshot(
+                "C:\\fixture\\pool.bspool", _ctypes=ctypes_api,
+                _msvcrt=crt, _fdopen=mock.Mock(), _close_fd=close_fd)
+        kernel32.CloseHandle.assert_called_once_with(1234)
+        close_fd.assert_not_called()
+
+        ctypes_api, crt, kernel32 = dependencies()
+        fdopen = mock.Mock(side_effect=OSError("stream adoption failed"))
+        close_fd = mock.Mock()
+        with self.assertRaisesRegex(OSError, "stream adoption failed"):
+            organizer._open_windows_read_snapshot(
+                "C:\\fixture\\pool.bspool", _ctypes=ctypes_api,
+                _msvcrt=crt, _fdopen=fdopen, _close_fd=close_fd)
+        kernel32.CloseHandle.assert_not_called()
+        close_fd.assert_called_once_with(17)
+
+        ctypes_api, crt, kernel32 = dependencies(
+            ctypes.c_void_p(-1).value)
+        with self.assertRaisesRegex(OSError, "sharing violation"):
+            organizer._open_windows_read_snapshot(
+                "C:\\fixture\\pool.bspool", _ctypes=ctypes_api,
+                _msvcrt=crt)
+        crt.open_osfhandle.assert_not_called()
+        kernel32.CloseHandle.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
+    def test_windows_snapshot_denies_write_and_delete_until_closed(self):
+        import ctypes
+
+        reader = organizer.BSPoolReader(
+            self.source, verify_payloads=False)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        invalid = ctypes.c_void_p(-1).value
+        share_all = 0x00000001 | 0x00000002 | 0x00000004
+
+        replacement = os.path.join(
+            self.temp.name, "sharing-replacement.bspool")
+        write_bsp3(replacement, complete=False)
+        with reader._open_source_snapshot() as snapshot:
+            self.assertFalse(snapshot.closed)
+            writer = kernel32.CreateFileW(
+                self.source, 0x40000000, share_all, None, 3, 0x80, None)
+            self.assertEqual(writer, invalid)
+            self.assertEqual(ctypes.get_last_error(), 32)
+            with self.assertRaises(OSError):
+                os.replace(replacement, self.source)
+
+        writer = kernel32.CreateFileW(
+            self.source, 0x40000000, share_all, None, 3, 0x80, None)
+        self.assertNotIn(writer, (None, invalid))
+        self.assertTrue(kernel32.CloseHandle(writer))
+
+    def test_replaced_sources_cannot_feed_records_split_or_combine_outputs(self):
+        records_source = os.path.join(self.temp.name, "stale-records.bspool")
+        records_replacement = os.path.join(
+            self.temp.name, "stale-records-replacement.bspool")
+        write_bsp3(records_source, complete=False)
+        write_bsp3(records_replacement, complete=False)
+        real_reader = organizer.BSPoolReader
+
+        def replace_after_inspect(path, *args, **kwargs):
+            reader = real_reader(path, *args, **kwargs)
+            os.replace(records_replacement, records_source)
+            return reader
+
+        record_output = os.path.join(self.temp.name, "stale-records.ndjson")
+        with mock.patch.object(
+                organizer, "BSPoolReader", replace_after_inspect):
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "changed or was replaced"):
+                organizer.command_records(SimpleNamespace(
+                    input=records_source, output=record_output))
+        self.assertFalse(os.path.exists(record_output))
+
+        split_source = os.path.join(self.temp.name, "stale-split.bspool")
+        write_bsp3(split_source, complete=False)
+        split_reader = organizer.BSPoolReader(
+            split_source, verify_payloads=False)
+        replacement = os.path.join(
+            self.temp.name, "stale-split-replacement.bspool")
+        write_bsp3(replacement, complete=False)
+        os.replace(replacement, split_source)
+        split_dir = os.path.join(self.temp.name, "stale-split-output")
+        split_report = os.path.join(self.temp.name, "stale-split-plan.json")
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed or was replaced"):
+            organizer.split_pool(
+                split_reader, split_dir, None, None, split_report, None, True)
+        self.assertFalse(os.path.exists(split_report))
+        self.assertFalse([
+            name for name in os.listdir(split_dir)
+            if name.endswith(".bspool")
+        ])
+
+        first = os.path.join(self.temp.name, "stale-combine.bspool")
+        second = os.path.join(self.temp.name, "stable-combine.bspool")
+        write_custom_bsp3(
+            first, [1], [[TAG]], "1111111111111111", [
+                "tag_route collect", "tag tag_negative 1 small 1 small 1",
+            ])
+        write_custom_bsp3(
+            second, [2], [[TAG]], "2222222222222222", [
+                "tag_route collect", "tag tag_negative 1 small 1 small 1",
+            ])
+        stale_reader = organizer.BSPoolReader(
+            first, verify_payloads=False)
+        stable_reader = organizer.BSPoolReader(
+            second, verify_payloads=False)
+        replacement = os.path.join(
+            self.temp.name, "stale-combine-replacement.bspool")
+        write_custom_bsp3(
+            replacement, [1], [[TAG]], "1111111111111111", [
+                "tag_route collect", "tag tag_negative 1 small 1 small 1",
+            ])
+        os.replace(replacement, first)
+        combined = os.path.join(self.temp.name, "stale-union.bspool")
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed or was replaced"):
+            organizer.combine_pools(
+                [stale_reader, stable_reader], combined, "union",
+                "Must not publish")
+        self.assertFalse(os.path.exists(combined))
+
+    def test_prepared_split_caps_simultaneous_output_streams(self):
+        class Reader:
+            metadata_capable = True
+            records = organizer.MAX_SPLIT_OUTPUTS + 1
+
+        categories = [
+            "tag:fixture-%03d" % index
+            for index in range(organizer.MAX_SPLIT_OUTPUTS + 1)
+        ]
+        rows = [{
+            "category_id": category,
+            "label": "Fixture %d" % index,
+            "records": 1,
+        } for index, category in enumerate(categories)]
+        output_dir = os.path.join(self.temp.name, "too-many-split-outputs")
+        with self.assertRaisesRegex(
+                organizer.PoolError,
+                r"%d non-empty pools.*maximum %d outputs" % (
+                    organizer.MAX_SPLIT_OUTPUTS + 1,
+                    organizer.MAX_SPLIT_OUTPUTS)):
+            organizer.write_prepared_split(
+                Reader(), output_dir, categories, {}, rows, {},
+                os.path.join(self.temp.name, "too-many-plan.json"))
+        self.assertEqual(os.listdir(output_dir), [])
+
+    def test_split_output_limit_reserves_two_posix_descriptors_per_pool(self):
+        fake_resource = SimpleNamespace(
+            RLIMIT_NOFILE=7,
+            RLIM_INFINITY=-1,
+            getrlimit=lambda _kind: (256, 256),
+        )
+        with mock.patch.object(organizer.os, "name", "posix"), \
+                mock.patch.dict(sys.modules, {"resource": fake_resource}):
+            self.assertEqual(organizer._safe_split_output_limit(), 112)
+            fake_resource.getrlimit = lambda _kind: (-1, -1)
+            self.assertEqual(organizer._safe_split_output_limit(), 256)
+
+        fake_resource.getrlimit = mock.Mock(side_effect=OSError("unavailable"))
+        with mock.patch.object(organizer.os, "name", "posix"), \
+                mock.patch.dict(sys.modules, {"resource": fake_resource}):
+            self.assertEqual(organizer._safe_split_output_limit(), 96)
+        with mock.patch.object(organizer.os, "name", "nt"):
+            self.assertEqual(organizer._safe_split_output_limit(), 256)
 
     def test_inspect_groups_exact_variants_into_friendly_ordered_locations(self):
         perkeo_a2_small_shop = descriptor(

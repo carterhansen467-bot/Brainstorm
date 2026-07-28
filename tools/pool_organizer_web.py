@@ -73,11 +73,21 @@ DEFAULT_PORT = 8918
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 AMBIGUITY_SAMPLE_LIMIT = 500
 AMBIGUITY_GROUP_LIMIT = 100
+RECORD_EXPORT_CHUNK_BYTES = 1024 * 1024
+# NDJSON repeats field names and human-readable occurrence labels that are
+# compactly encoded in a pool.  This projection is intentionally approximate:
+# a record has about 96 bytes of fixed JSON/seed/rank framing and committed
+# block data commonly expands by roughly 16x when rendered as text.
+RECORD_EXPORT_BASE_BYTES = 96
+RECORD_EXPORT_DATA_EXPANSION = 16
+RECORD_EXPORT_HUGE_BYTES = 1024 * 1024 * 1024
 SPLIT_LOCK = threading.Lock()
 COMBINE_LOCK = threading.Lock()
 ACTIVE_OPERATION_LOCK = threading.Lock()
 ACTIVE_OPERATIONS = {}
 ACTIVE_OPERATIONS_CLOSING = False
+RECORD_EXPORT_STATUS = collections.OrderedDict()
+RECORD_EXPORT_STATUS_LIMIT = 32
 ACTIVE_UPGRADE_PROCESS_LOCK = threading.Lock()
 ACTIVE_UPGRADE_PROCESSES = set()
 READER_CACHE_LOCK = threading.Lock()
@@ -250,15 +260,57 @@ def _finish_operation(kind, event):
 
 
 def cancel_operation(kind):
-    if kind not in ("analysis", "split", "combine", "upgrade"):
+    if kind not in ("analysis", "export", "split", "combine", "upgrade"):
         raise organizer.PoolError(
-            "choose analysis, split, combine, or upgrade to cancel")
+            "choose analysis, export, split, combine, or upgrade to cancel")
     with ACTIVE_OPERATION_LOCK:
         event = ACTIVE_OPERATIONS.get(kind)
         if event is None:
             return {"ok": True, "operation": kind, "state": "idle"}
         event.set()
     return {"ok": True, "operation": kind, "state": "cancelling"}
+
+
+def _record_export_request_id(value, required=False):
+    value = str(value or "")
+    if not value:
+        if required:
+            raise organizer.PoolError("record export request id is required")
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", value):
+        raise organizer.PoolError("record export request id is invalid")
+    return value
+
+
+def _set_record_export_status(request_id, state, error=""):
+    if not request_id:
+        return
+    value = {
+        "ok": True,
+        "request_id": request_id,
+        "state": state,
+        "error": str(error or ""),
+    }
+    with ACTIVE_OPERATION_LOCK:
+        RECORD_EXPORT_STATUS[request_id] = value
+        RECORD_EXPORT_STATUS.move_to_end(request_id)
+        while len(RECORD_EXPORT_STATUS) > RECORD_EXPORT_STATUS_LIMIT:
+            RECORD_EXPORT_STATUS.popitem(last=False)
+
+
+def record_export_status(request_id):
+    """Return lifecycle state for the UI's hidden download request."""
+    request_id = _record_export_request_id(request_id, required=True)
+    with ACTIVE_OPERATION_LOCK:
+        value = RECORD_EXPORT_STATUS.get(request_id)
+        if value is None:
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "state": "pending",
+                "error": "",
+            }
+        return dict(value)
 
 
 def cancel_active_operations():
@@ -334,7 +386,14 @@ def _reader_cache_weight(reader):
     if cached is not None:
         return cached
     blocks = reader.blocks
-    if blocks:
+    # PackedBlockSequence owns its complete 56-byte-per-entry buffer and
+    # includes that storage in __sizeof__. Charging a transient materialized
+    # Block view for every packed entry would overstate a production legacy
+    # index by hundreds of megabytes and immediately evict it from this cache.
+    packed_bytes = getattr(blocks, "packed_bytes", None)
+    if isinstance(packed_bytes, int) and packed_bytes >= 0:
+        per_block = 0
+    elif blocks:
         field_names = (
             "offset", "first_record", "count", "rank_bytes",
             "metadata_bytes", "associations", "first_rank", "last_rank",
@@ -618,12 +677,14 @@ def _format_upgrade_output_name(source_name, root):
         base = "upgraded-pool" if marker.startswith("-") else ""
     max_stem = 160
     if os.name == "nt":
-        # Native helper paths use the traditional Windows CRT.  Account for
-        # seed_pools\\.u-XXXXXXXX\\<name>.manifest and retain extra headroom
-        # below MAX_PATH rather than merely capping the basename.
+        # Native helper paths use the traditional Windows CRT. Account for
+        # seed_pools\\.u-XXXXXXXX\\<name>.manifest.partial.<pid>.<attempt>
+        # and retain headroom below MAX_PATH rather than merely capping the
+        # visible basename.
+        native_stage_suffix = ".manifest.partial.4294967295.9999"
         max_filename = (
             240 - len(os.path.abspath(root)) - 1 - len(".u-XXXXXXXX")
-            - 1 - max(len(".manifest"), len(".writer.lock")))
+            - 1 - max(len(native_stage_suffix), len(".writer.lock")))
         max_stem = min(max_stem, max_filename - len(".bspool"))
         if max_stem < len("BSP4-9999"):
             raise organizer.PoolError(
@@ -2078,6 +2139,11 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
             os.path.join(publication_dir, output["name"]))
         output["collision_status"] = "exists" if output["exists"] else "available"
     blockers = []
+    if len(outputs) > organizer.MAX_SPLIT_OUTPUTS:
+        blockers.append(
+            "Split would create %d non-empty pools; choose fewer categories "
+            "or run separate splits (maximum %d outputs per publication)." %
+            (len(outputs), organizer.MAX_SPLIT_OUTPUTS))
     if unresolved_count:
         blockers.append(
             "Choose one destination for %s seed(s) with multiple %s." % (
@@ -2749,9 +2815,34 @@ def _run_analysis(callback):
         _finish_operation("analysis", event)
 
 
+def record_export_projection(records, committed_data_bytes):
+    """Return a deliberately approximate full-record NDJSON size projection."""
+    records = max(0, int(records or 0))
+    committed_data_bytes = max(0, int(committed_data_bytes or 0))
+    estimated = (
+        records * RECORD_EXPORT_BASE_BYTES
+        + committed_data_bytes * RECORD_EXPORT_DATA_EXPANSION)
+    return {
+        "estimated_bytes": estimated,
+        "huge": estimated >= RECORD_EXPORT_HUGE_BYTES,
+        "estimate": True,
+    }
+
+
+def _with_record_export_projection(report):
+    """Attach export guidance to an inspection without changing its cache."""
+    source = report.get("source") if isinstance(report, dict) else None
+    if isinstance(source, dict):
+        source["record_export"] = record_export_projection(
+            source.get("records", 0),
+            source.get("committed_data_bytes", 0))
+    return report
+
+
 def run_inspect(name, pool_dir=None, ambiguity_limit=100):
-    return _run_analysis(lambda cancelled: inspect_source(
-        name, pool_dir, ambiguity_limit, cancel_check=cancelled))
+    return _run_analysis(lambda cancelled: _with_record_export_projection(
+        inspect_source(
+            name, pool_dir, ambiguity_limit, cancel_check=cancelled)))
 
 
 def _cached_split_plan(request, pool_dir, cancel_check):
@@ -2854,14 +2945,153 @@ def run_format_upgrade(request, pool_dir=None):
         COMBINE_LOCK.release()
 
 
-def iter_record_export(reader):
-    for record in reader.iter_records():
-        value = {
-            "seed": reader.seed(record.rank),
-            "rank": record.rank,
-            "occurrences": [item.as_dict() for item in record.occurrences],
-        }
-        yield (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
+def _record_export_line(reader, record):
+    value = {
+        "seed": reader.seed(record.rank),
+        "rank": record.rank,
+        "occurrences": [item.as_dict() for item in record.occurrences],
+    }
+    return (json.dumps(
+        value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def iter_record_export(reader, cancel_check=None,
+                       chunk_bytes=RECORD_EXPORT_CHUNK_BYTES):
+    """Yield compact NDJSON in bounded batches instead of per-record writes."""
+    try:
+        chunk_bytes = int(chunk_bytes)
+    except (TypeError, ValueError):
+        raise ValueError("record export chunk size must be an integer")
+    if chunk_bytes <= 0:
+        raise ValueError("record export chunk size must be positive")
+    _operation_cancelled(cancel_check)
+    records = reader.iter_records(cancel_check=cancel_check)
+    with ExitStack() as resources:
+        close_records = getattr(records, "close", None)
+        if close_records is not None:
+            resources.callback(close_records)
+        batch = bytearray()
+        for record in records:
+            _operation_cancelled(cancel_check)
+            line = _record_export_line(reader, record)
+            if batch and len(batch) + len(line) > chunk_bytes:
+                _operation_cancelled(cancel_check)
+                yield bytes(batch)
+                batch.clear()
+            if len(line) > chunk_bytes:
+                # A pathological single occurrence record remains one complete
+                # NDJSON line rather than being split into invalid JSON.
+                _operation_cancelled(cancel_check)
+                yield line
+            else:
+                batch.extend(line)
+        _operation_cancelled(cancel_check)
+        if batch:
+            yield bytes(batch)
+
+
+def _write_http_chunk(handler, payload):
+    """Write one HTTP/1.1 chunk without materializing another payload copy."""
+    handler.wfile.write(("%x\r\n" % len(payload)).encode("ascii"))
+    if payload:
+        handler.wfile.write(payload)
+    handler.wfile.write(b"\r\n")
+
+
+def serve_record_export(handler, parsed, pool_dir=None):
+    """Validate, register, and stream one snapshot-pinned local download.
+
+    The first batch is prepared before committing HTTP headers.  A validation
+    or cancellation failure can therefore still return normal JSON.  The body
+    uses HTTP/1.1 chunked framing and writes its terminating chunk only after a
+    fully validated traversal.  A late checksum, identity, cancellation, or
+    I/O failure therefore becomes an incomplete download instead of a
+    plausible-looking truncated NDJSON file.
+    """
+    query = parse_qs(parsed.query)
+    name = query.get("source", [""])[0]
+    request_id = _record_export_request_id(
+        query.get("request_id", [""])[0])
+    event = None
+    chunks = None
+    response_started = False
+    try:
+        _set_record_export_status(request_id, "running")
+        event = _begin_operation("export")
+        reader = verified_source_reader(
+            name, pool_dir, cancel_check=event.is_set)
+        expected = query.get("snapshot", [""])[0].lower()
+        if expected != reader.snapshot_token:
+            raise organizer.PoolError(
+                "source snapshot changed; inspect before exporting")
+        projection = record_export_projection(
+            reader.records, reader.data_bytes)
+        chunks = iter_record_export(
+            reader, cancel_check=event.is_set)
+        first_chunk = next(chunks, None)
+        _operation_cancelled(event.is_set)
+
+        filename = "%s-%s-records.ndjson" % (
+            os.path.splitext(name)[0], reader.snapshot_token[:8])
+        filename = re.sub(r"[^A-Za-z0-9._+-]+", "-", filename)
+        handler.send_response(200)
+        # From this point onward a second status line would corrupt the
+        # download, even if end_headers itself encounters a disconnected peer.
+        response_started = True
+        handler.send_header(
+            "Content-Type", "application/x-ndjson; charset=utf-8")
+        handler.send_header(
+            "Content-Disposition",
+            "attachment; filename=%s" % quote(filename))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header(
+            "X-Brainstorm-Record-Count", str(reader.records))
+        handler.send_header(
+            "X-Brainstorm-Estimated-Bytes",
+            str(projection["estimated_bytes"]))
+        handler.send_header(
+            "X-Brainstorm-Export-Warning",
+            "huge" if projection["huge"] else "none")
+        handler.send_header("Transfer-Encoding", "chunked")
+        # Downloads are deliberately one request per connection. Chunked
+        # framing—not EOF—still determines whether the body completed.
+        handler.send_header("Connection", "close")
+        handler.close_connection = True
+        handler.end_headers()
+        if first_chunk is not None:
+            _operation_cancelled(event.is_set)
+            _write_http_chunk(handler, first_chunk)
+        for chunk in chunks:
+            _operation_cancelled(event.is_set)
+            _write_http_chunk(handler, chunk)
+        _write_http_chunk(handler, b"")
+        flush = getattr(handler.wfile, "flush", None)
+        if flush is not None:
+            flush()
+        _set_record_export_status(request_id, "completed")
+        return projection
+    except Exception as exc:
+        state = "cancelled" if isinstance(exc, OperationCancelled) else "failed"
+        _set_record_export_status(request_id, state, str(exc))
+        if response_started:
+            # Do not write the terminating zero chunk. HTTP clients can then
+            # distinguish this failure from a complete close-delimited file.
+            handler.close_connection = True
+            return None
+        raise
+    finally:
+        try:
+            if chunks is not None:
+                close_chunks = getattr(chunks, "close", None)
+                if close_chunks is not None:
+                    close_chunks()
+        except Exception:
+            # Iterator teardown is best-effort, but it must never strand the
+            # cancellation registry or provoke a second HTTP response.
+            handler.close_connection = True
+        finally:
+            if event is not None:
+                _finish_operation("export", event)
 
 
 PAGE = r'''<!doctype html>
@@ -2917,63 +3147,93 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 .workstatus{display:grid;grid-template-columns:auto 1fr;gap:11px;align-items:center;margin-top:12px;padding:12px 13px;border:1px solid #44527a;border-radius:11px;background:#141b2c;color:#dbe5ff}.workstatus b,.workstatus span{display:block}.workstatus span{margin-top:3px;color:#a9b4ce;font-size:12px;line-height:1.4}.workstatus.success{border-color:#39704d;background:#13241a;color:#bdecca}.workstatus.error{border-color:#7b3d45;background:#2a171b;color:#ffc0c5}.spinner{width:20px;height:20px;border:3px solid #536181;border-top-color:#9cc7ff;border-radius:50%;animation:spin .8s linear infinite}.workstatus.success .spinner,.workstatus.error .spinner{display:none}@keyframes spin{to{transform:rotate(360deg)}}
 .manifest{display:grid;gap:7px;margin-top:12px}.manifestrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:10px;border:1px solid #30364b;border-radius:10px;background:#10131c;font-size:12px}.manifestrow b,.manifestrow span{overflow-wrap:anywhere}.manifestrow small{display:block;color:var(--faint)}.manifestrow .count{text-align:right}
 .checkgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px}.check{padding:10px;border:1px solid #30364b;border-radius:10px;background:#10131c;font-size:11px}.check b{display:block}.check.pass{border-color:#2d6845;color:#a8e7bf}.check.warning{border-color:#6a5726;color:#f2d67c}.check.fail{border-color:#74383e;color:#ffb5b5}.statehint{margin-top:10px;padding:9px 10px;border-left:3px solid #7361aa;background:#171426;color:#cfc6e7;font-size:12px}.source-retained{color:#a8e7bf}.reviewtitle{margin:18px 0 0;font-size:14px}.live{min-height:1px}
-[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}}
+.sectionbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:17px}.sectionbar h3{margin:0;font-size:14px}.sectionbar .row{margin:0}.subsection{margin-top:18px}.subsection h3{margin:0;font-size:14px}.subsection>p{margin:4px 0 0;color:var(--muted);font-size:12px}
+.exporthint{margin-top:7px;text-align:right}.exporthint.warning{padding:9px 10px;border:1px solid #6a5726;border-radius:9px;background:#29230f;color:#f2d67c}
+.inventory{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.inventoryitem{padding:10px;border:1px solid #2d3245;border-radius:10px;background:#11141d}.inventoryitem b,.inventoryitem span{display:block}.inventoryitem b{font-size:12px}.inventoryitem span{margin-top:2px;color:var(--faint);font-size:11px}.inventoryitem.empty{opacity:.55}
+.choicecards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.choicecard{position:relative;display:flex;gap:9px;align-items:flex-start;padding:11px;border:1px solid #30364b;border-radius:11px;background:#10131c;cursor:pointer}.choicecard:hover{border-color:#4a526f}.choicecard:has(input:checked){border-color:#8c77d4;background:#241e36;box-shadow:inset 0 0 0 1px #8c77d4}.choicecard:has(input:disabled){opacity:.48;cursor:not-allowed}.choicecard input{flex:0 0 auto;width:17px;height:17px;margin:2px 0 0;accent-color:var(--purple)}.choicecard b,.choicecard small{display:block}.choicecard b{font-size:12px}.choicecard small{margin-top:2px;color:var(--faint);font-size:10px;line-height:1.4}
+.selection-summary{margin-top:10px;padding:10px 12px;border-left:3px solid #7361aa;background:#171426;color:#cfc6e7;font-size:12px}.selection-summary strong{color:#f0ebfa}
+.choicegroup{min-width:0;margin:18px 0 0;padding:0;border:0}.choicegroup legend{padding:0;color:#eee9f5;font-size:14px;font-weight:800}.choicegroup>p{margin:4px 0 0;color:var(--muted);font-size:12px}.policycards{grid-template-columns:repeat(3,minmax(0,1fr))}
+.advanced{margin-top:13px;border:1px solid #30364b;border-radius:11px;background:#11141d}.advanced summary{cursor:pointer;padding:11px 12px;color:#c9c5d3;font-size:12px;font-weight:750}.advanced summary:after{content:"＋";float:right;color:var(--faint)}.advanced[open] summary:after{content:"−"}.advancedbody{padding:0 12px 12px}.advancedbody .row:first-child{margin-top:0}
+.filename-preview{margin-top:8px;padding:9px 11px;border:1px dashed #3b4159;border-radius:9px;background:#0f1119;color:#bdb7ca;font-size:11px;overflow-wrap:anywhere}.filename-preview b{color:#ebe5f5}
+.review-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.review-actions .go{min-width:230px}.secondary-link{min-height:33px!important;padding:5px 9px!important}
+[hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:680px){.choicecards,.inventory,.policycards{grid-template-columns:1fr}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}.sectionbar{align-items:flex-start;flex-direction:column}}
 </style></head><body><main class="app">
 <header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Split, compare, or update recorded seed pools without changing the originals.</p></div></div><div class="local">Running locally</div></header>
 <nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
 <div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. New pools are saved in <code>seed_pools</code> so the mod can see them immediately.</div>
-<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
+<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine seed lists</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
 <div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Finished and paused BSP3/BSP4 event pools are supported. Only the committed checkpoint is read, and both event schemas work with native search.</p></div></div>
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool to see what it contains. Inspection is read-only.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
  <div class="row"><button class="go" id="inspectBtn" disabled>Loading pools…</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
  <div class="workstatus" id="inspectionStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="inspectionTitle">Inspecting pool…</b><span id="inspectionDetail">Reading the committed snapshot.</span></div></div>
- <div id="sourceInfo" hidden><div class="source" id="sourceMetrics"></div><div id="notices"></div></div>
+ <div id="sourceInfo" hidden>
+  <div class="sectionbar"><h3>Pool overview</h3><button class="ghost small secondary-link" id="exportBtn">Export all records (.ndjson)</button></div>
+  <div class="hint exporthint" id="exportHint"></div>
+  <div class="source" id="sourceMetrics"></div>
+  <div class="subsection"><h3>Recorded data</h3><p>The types of search results available for splitting this pool.</p><div class="inventory" id="filterInventory"></div></div>
+  <details class="advanced"><summary>Technical pool details</summary><div class="advancedbody source" id="sourceTechnical"></div></details>
+  <div id="notices"></div>
+ </div>
 </section>
-<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose how to divide the pool</h2><p class="copy">Pick one recorded filter, then choose the Ante and blind locations that should become new pools.</p></div></div>
- <div class="field"><label for="organizeBy">Organize seeds by</label><select id="organizeBy"></select><span class="hint">Brainstorm recommends the filter that gives the simplest complete location split. You can switch to any other recorded filter.</span></div>
- <div class="explain" id="organizeByInfo"><strong>Choose a recorded filter</strong>The Organizer will show its Ante and blind locations in play order.</div>
- <div class="explain"><strong>What these checkboxes control</strong>Each checked location will become a separate new seed pool. A label such as “Perkeo Ante 1 Big” includes every matching source and technical metadata variant at that location. All other recorded filter details stay attached to the output seeds.</div>
- <div class="row"><button class="small" id="allBtn">Check all shown locations</button><button class="small" id="noneBtn">Clear location selection</button><button class="ghost" id="exportBtn">Download full record list (.ndjson)</button></div>
- <div class="explain"><strong>Optional advanced download</strong>The NDJSON download contains one JSON line for every seed, including its numeric rank and every recorded match. It is for analysis in scripts or data tools; it does not create a seed pool or change the source. For a very large pool, this download can be much larger than the compressed <code>.bspool</code> file and may take a long time.</div>
+<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose the new pools</h2><p class="copy">Choose a result type, a recorded target, and the locations that should each become a new pool.</p></div></div>
+ <fieldset class="choicegroup"><legend>What do you want to split by?</legend><div class="choicecards" id="filterKinds"></div>
+  <details class="advanced" id="exactDetails"><summary>Advanced: split by exact recorded event metadata</summary><div class="advancedbody"><label class="choicecard" for="exactKind"><input type="radio" name="filterKind" class="filterKind" id="exactKind" value="exact"><span><b>Exact technical metadata</b><small>Separates source, occurrence number, flags, Ante, and blind. Usually unnecessary.</small></span></label></div></details>
+ </fieldset>
+ <div class="field" id="targetField"><label for="organizeBy" id="targetLabel">Choose a recorded target</label><select id="organizeBy"></select></div>
+ <div class="selection-summary" id="organizeByInfo"><strong>Choose a recorded target.</strong></div>
+ <div class="sectionbar"><div><h3 id="locationQuestion">Choose locations to create pools for</h3><div class="hint" id="locationHelp">Select all that apply. Every checked location creates one new pool.</div></div><div class="row"><button class="small" id="allBtn">Select all</button><button class="small" id="noneBtn">Clear</button></div></div>
+ <div class="hint" id="selectedLocationCount" aria-live="polite"></div>
  <div class="categories" id="categories"></div>
-</section>
-<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Review how seeds will be divided</h2><p class="copy">This step calculates the new files and asks for any decisions it needs. Nothing is written until you press the final Create button, and the original pool is always kept unchanged.</p></div></div>
- <div class="explain"><strong>How assignment works</strong>A seed at exactly one checked location goes there automatically. If the chosen filter appears at several checked locations in one seed, choose one destination for that group. Seeds outside the checked locations follow the option below.</div>
- <div class="two"><div class="field"><label for="policy">Seeds outside the checked locations</label><select id="policy"><option value="stop">Do not decide yet · block file creation</option><option value="keep">Create an extra pool named “Unmatched seeds”</option><option value="remainder">Create an extra pool with a name I choose</option><option value="omit">Leave them out of the new pools</option></select></div>
- <div class="field" id="remainderField" hidden><label for="remainder">Name for the extra pool</label><input type="text" id="remainder" value="Needs review"></div></div>
- <div class="field"><label for="prefix">Beginning of each new filename</label><input type="text" id="prefix"><span class="hint">The Organizer adds the selected location to this prefix. Existing files are never overwritten, so use a different prefix when making another split.</span></div>
- <div class="row"><button id="planBtn">Review the split (no files created)</button><button class="ghost" id="saveBtn" disabled>Save decisions (.json)</button><button class="ghost" id="loadBtn">Load saved decisions</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div>
+ </section>
+<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Name and preview new pools</h2><p class="copy">Choose what to do with other seeds, then preview exact filenames and counts. Previewing does not create files.</p></div></div>
+ <fieldset class="choicegroup"><legend id="unmatchedQuestion">What should happen to other seeds?</legend><p id="unmatchedHelp">Every seed remains in the original pool. Choose whether other seeds should also be copied to a new file.</p>
+  <input type="hidden" id="policy" value="keep">
+  <div class="choicecards policycards">
+   <label class="choicecard"><input type="radio" name="policyChoice" class="policyChoice" value="keep" checked><span><b>Put them in an extra pool</b><small>Recommended. Brainstorm names it “Unmatched seeds.”</small></span></label>
+   <label class="choicecard"><input type="radio" name="policyChoice" class="policyChoice" value="remainder"><span><b>Put them in a named extra pool</b><small>Choose a more specific label for these seeds.</small></span></label>
+   <label class="choicecard"><input type="radio" name="policyChoice" class="policyChoice" value="omit"><span><b>Do not copy them</b><small>They stay only in the unchanged source pool.</small></span></label>
+  </div>
+ </fieldset>
+ <div class="field" id="remainderField" hidden><label for="remainder">Extra pool name</label><input type="text" id="remainder" value="Needs review"></div>
+ <div class="field"><label for="prefix">New file name</label><input type="text" id="prefix"><span class="hint">This is the shared name. Brainstorm appends each selected location and a unique ID; existing files are never overwritten.</span><div class="filename-preview" id="filenamePreview"></div></div>
+ <div class="row"><button id="planBtn">Preview new pools</button></div>
  <div class="workstatus" id="reviewStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="reviewTitle">Reviewing seed assignments…</b><span id="reviewDetail">Calculating destinations from the checked locations.</span></div></div>
- <div class="explain"><strong>Review and saved decisions</strong>Review reads the source and shows the exact filenames and seed counts before creating anything. Saving decisions creates a small JSON file—not a seed pool—so the same choices can be loaded again for this exact unchanged source snapshot.</div>
+ </section>
+<section class="card" id="reviewCard" hidden><div class="head"><span class="step">4</span><div><h2>Review new seed pools</h2><p class="copy">Resolve overlaps if any are found, then check every output before creating it. The original pool remains unchanged.</p></div></div>
+ <div class="workstatus" id="updateStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="updateTitle">Updating preview…</b><span id="updateDetail">Applying the selected destinations.</span></div></div>
  <div class="plan" id="plan" hidden><div class="planbar"><div><b id="planTitle">Seeds that fit more than one checked category</b><div class="hint" id="planHint"></div></div><span class="pill" id="choicePill" role="status" aria-live="polite">Choose destinations</span></div><div class="row"><button class="ghost small" id="clearRulesBtn" hidden>Clear shared decisions</button><button class="ghost small" id="clearChoicesBtn" hidden>Clear individual seed decisions</button></div><div class="amb" id="ambiguities"></div><div class="pager" id="pager"></div></div>
+ <div class="review-actions"><button class="ghost" id="applyDecisionsBtn" hidden>Update preview</button></div>
  <div id="splitPublication" hidden><h3 class="reviewtitle">Files that will be created</h3><div class="statehint" id="splitPublicationState"></div><div class="manifest" id="splitManifest"></div><div class="hint" id="splitReport"></div></div>
+ <div class="review-actions"><button class="go" id="splitBtn" disabled>Create these seed pools</button></div>
+ <details class="advanced"><summary>Advanced: save or load destination decisions</summary><div class="advancedbody"><p class="hint">Decision files are small JSON files tied to this exact unchanged source snapshot; they are not seed pools.</p><div class="row"><button class="ghost" id="saveBtn" disabled>Save decisions (.json)</button><button class="ghost" id="loadBtn">Load saved decisions</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div></div></details>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Organizer summary</h2><dl>
- <div><dt>Source pool</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Snapshot ID</dt><dd id="sumSnapshot">—</dd></div><div><dt>Recorded seeds</dt><dd id="sumRecords">—</dd></div><div><dt>Shown locations</dt><dd id="sumCategories">—</dd></div><div><dt>Multiple locations</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Outside selection</dt><dd id="sumUnmatched">—</dd></div><div><dt>New files</dt><dd id="sumPublication">Not reviewed</dd></div></dl>
- <div class="actions"><button class="go" id="splitBtn" disabled>Create these seed pools</button><button class="cancel" id="analysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="splitCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="error" role="alert"></div><div class="result live" id="result" aria-live="polite"></div>
+ <div><dt>Source pool</dt><dd id="sumSource">Choose a pool</dd></div><div><dt>Recorded seeds</dt><dd id="sumRecords">—</dd></div><div><dt>Selected locations</dt><dd id="sumCategories">—</dd></div><div><dt>Needs a destination</dt><dd id="sumAmbiguous">—</dd></div><div><dt>Other seeds</dt><dd id="sumUnmatched">—</dd></div><div><dt>New files</dt><dd id="sumPublication">Not previewed</dd></div></dl>
+ <div class="actions"><button class="cancel" id="analysisCancelBtn" hidden>Cancel preview</button><button class="cancel" id="exportCancelBtn" hidden>Cancel record export</button><button class="cancel" id="splitCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="error" role="alert"></div><div class="result live" id="result" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="combineWorkspace" role="tabpanel" aria-labelledby="combineModeBtn" hidden><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Choose two or more pools to compare</h2><p class="copy">Combine works with the seeds already recorded in each pool. The same seed appearing in several inputs is counted once. Finished, paused, and previously combined pools are supported.</p></div></div>
- <div class="explain"><strong>Your selected pools are read-only</strong>The organizer reads each pool’s committed records and creates one separate output. It does not edit, rename, or delete any selected input pool.</div>
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Choose two or more seed lists</h2><p class="copy">Select the pools to compare. They stay unchanged; Brainstorm creates one separate result.</p></div></div>
  <div class="row"><button class="small" id="combineAllBtn">Select all readable pools</button><button class="small" id="combineNoneBtn">Clear pool selection</button><button class="ghost" id="combineRefreshBtn">Refresh list</button></div>
  <div class="poolchoices" id="combineChoices"><div class="hint">Loading seed pools…</div></div>
 </section>
-<section class="card"><div class="head"><span class="step">2</span><div><h2>Choose which seeds the new pool should contain</h2><p class="copy">Choose one rule below, then review the result before creating the new pool. The review checks whether the selected pools can be compared safely; it does not write a file.</p></div></div>
- <div class="explain"><strong>The three combine rules</strong><ul><li><b>Union:</b> keep a seed if it appears in at least one selected pool.</li><li><b>Intersection:</b> keep a seed only if it appears in every selected pool.</li><li><b>Difference:</b> start with one base pool, then remove seeds that also appear in any other selected pool.</li></ul></div>
- <div class="notice warning"><strong>Combining different pools is not the same as merging scan parts</strong>Use this tab when you want to compare the contents of separate pools. If these files are numbered parts of one distributed build, use <b>Merge distributed pool parts</b> instead; Merge checks that the parts are from the same search and have no gaps or overlaps. <a id="mergeLink" href="/">Open Build / Search</a><span id="standaloneMerge" hidden> Launch the Seed Pool Builder to merge parts.</span></div>
- <div class="combine-settings"><div class="field"><label for="combineOperation">How should the seed lists be combined?</label><select id="combineOperation"><option value="union">Union · seeds found in any selected pool</option><option value="intersection">Intersection · only seeds found in every selected pool</option><option value="difference">Difference · base pool minus all other selected pools</option></select></div>
- <div class="field" id="combineBaseField" hidden><label for="combineBase">Start with seeds from this base pool</label><select id="combineBase"></select><span class="hint">Seeds that also appear in any other selected pool will be removed from the new pool.</span></div>
+<section class="card"><div class="head"><span class="step">2</span><div><h2>Choose a rule and name the result</h2><p class="copy">The compatibility check is read-only and runs before file creation.</p></div></div>
+ <div class="hint">Numbered pieces of one distributed build use <a id="mergeLink" href="/">Merge distributed build parts</a><span id="standaloneMerge" hidden> the Seed Pool Builder instead.</span></div>
+ <fieldset class="choicegroup"><legend>Which seeds should the new pool keep?</legend><input type="hidden" id="combineOperation" value="union"><div class="choicecards" id="combineRules">
+  <label class="choicecard"><input type="radio" name="combineRule" class="combineOp" value="union" checked><span><b>Any selected pool</b><small>Union · keep a seed found in at least one selected pool.</small></span></label>
+  <label class="choicecard"><input type="radio" name="combineRule" class="combineOp" value="intersection"><span><b>Every selected pool</b><small>Intersection · keep a seed only when every pool contains it.</small></span></label>
+  <label class="choicecard"><input type="radio" name="combineRule" class="combineOp" value="difference"><span><b>First pool, minus the others</b><small>Difference · remove seeds also found in another selected pool.</small></span></label>
+ </div></fieldset>
+ <div class="combine-settings"><div class="field" id="combineBaseField" hidden><label for="combineBase">Start with this pool</label><select id="combineBase"></select><span class="hint">Seeds also present in another selected pool are removed.</span></div>
  <div class="field"><label for="combineName">New pool filename</label><input type="text" id="combineName" value="combined-pool"><span class="hint">The organizer adds <code>.bspool</code>. An existing file with the same name will not be overwritten.</span></div>
  <div class="field"><label for="combineLabel">Name shown inside Brainstorm</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
- <div class="row"><button id="combinePlanBtn">Review the combined pool (no file created)</button></div><div id="combineNotices"></div>
- <div class="checkgrid" id="combineChecks"></div>
- <div id="combineBranches" class="branchlist"></div>
- <div id="combinePublication" hidden><h3 class="reviewtitle">File that will be created</h3><div class="manifest" id="combineManifest"></div><div class="hint" id="combineReport"></div></div>
+ <div class="row"><button id="combinePlanBtn">Check compatibility and preview file</button></div><div id="combineNotices"></div>
+ <details class="advanced" id="combineTechnical" hidden><summary>Technical compatibility and source history</summary><div class="advancedbody"><div class="checkgrid" id="combineChecks"></div><div id="combineBranches" class="branchlist"></div></div></details>
+ <div id="combinePublication" hidden><h3 class="reviewtitle">File that will be created</h3><div class="manifest" id="combineManifest"></div><div class="hint" id="combineReport"></div><div class="review-actions"><button class="go" id="combineCreateBtn" disabled>Create combined seed pool</button></div></div>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Combine summary</h2><dl>
  <div><dt>Rule</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Selected pools</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Can combine?</dt><dd id="combineSumCompatibility">Not reviewed</dd></div><div><dt>Recorded filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Membership rule</dt><dd id="combineSumExpression">—</dd></div><div><dt>Search coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Match details</dt><dd id="combineSumMetadata">—</dd></div></dl>
- <div class="actions"><button class="go" id="combineCreateBtn" disabled>Create combined seed pool</button><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel review</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
+ <div class="actions"><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel compatibility check</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="formatWorkspace" role="tabpanel" aria-labelledby="formatModeBtn" hidden><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Check or update a pool</h2><p class="copy">Choose a <code>.bspool</code> file from Brainstorm's <code>seed_pools</code> folder. Checking reads only its header. A supported update creates a separate BSP4 copy; the original file is never changed.</p></div></div>
@@ -2989,6 +3249,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  <div><dt>Selected pool</dt><dd id="formatSumSource">Choose a pool</dd></div><div><dt>Current format</dt><dd id="formatSumCurrent">—</dd></div><div><dt>Recorded seeds</dt><dd id="formatSumRecords">—</dd></div><div><dt>Update status</dt><dd id="formatSumStatus">Not checked</dd></div><div><dt>New file</dt><dd id="formatSumOutput">—</dd></div></dl>
  <div class="actions"><button class="go" id="formatUpdateBtn" disabled>Create BSP4 copy</button><button class="cancel" id="formatCancelBtn" hidden>Cancel update</button></div><div class="error" id="formatError" role="alert"></div><div class="result live" id="formatResult" aria-live="polite"></div>
 </section></aside></div></main>
+<iframe id="recordExportFrame" title="Record export download" hidden></iframe>
 <script>
 const $=id=>document.getElementById(id);
 const UNIFIED=location.pathname.startsWith("/organize");
@@ -2997,6 +3258,12 @@ let inspected=null,inspectedName="",plan=null,choices={},rules={},poolRows=[];
 let splitReviewedFingerprint="",splitRunning=false;
 let combinePlan=null,combineReviewedFingerprint="",combineRunning=false;
 let formatPlan=null,formatRunning=false;
+let recordExportRequest="",recordExportTimer=0;
+const FILTER_KINDS=[
+ {id:"legendary",label:"Legendary",plural:"Legendaries"},
+ {id:"tag",label:"Tag",plural:"Tags"},
+ {id:"voucher",label:"Voucher",plural:"Vouchers"},
+];
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
 const fmtBytes=n=>{n=Number(n||0);if(n>=1073741824)return `${(n/1073741824).toFixed(2)} GiB`;if(n>=1048576)return `${(n/1048576).toFixed(2)} MiB`;if(n>=1024)return `${(n/1024).toFixed(1)} KiB`;return `${fmt(n)} bytes`};
@@ -3005,41 +3272,82 @@ function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
 function reviewState(kind,title,detail){const box=$("reviewStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("reviewTitle").textContent=title;$("reviewDetail").textContent=detail}
+function updateState(kind,title,detail){const box=$("updateStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("updateTitle").textContent=title;$("updateDetail").textContent=detail}
 function formatState(kind,title,detail){const box=$("formatStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("formatStatusTitle").textContent=title;$("formatStatusDetail").textContent=detail}
 function renderNoticeList(id,rows){$(id).innerHTML=(rows||[]).map(n=>`<div class="notice ${esc(n.kind)}"><strong>${esc(n.title)}</strong>${esc(n.text)}</div>`).join("")}
 function notices(rows){renderNoticeList("notices",rows)}
-function sourceMetrics(s){return `<div class="metric"><span>File format</span><b>BSP${fmt(s.schema)}</b></div><div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div><div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div>`}
+function sourceMetrics(s){return `<div class="metric"><span>File format</span><b>BSP${fmt(s.schema)}</b></div><div class="metric"><span>Recorded seeds</span><b>${fmt(s.records)}</b></div><div class="metric"><span>Pool state</span><b>${s.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${s.coverage_complete?"Complete":"Provisional"}</b></div><div class="metric"><span>Per-seed details</span><b>${s.metadata_capable?"Exact match details recorded":"Seed membership only"}</b></div>`}
+function sourceTechnical(s){const range=Number(s.range_end)>Number(s.range_start)?`${fmt(s.range_start)}–${fmt(Number(s.range_end)-1)}`:"Not recorded";return `<div class="metric"><span>Snapshot ID</span><b class="mono">${esc(s.snapshot_id)}</b></div><div class="metric"><span>Source history ID</span><b class="mono">${esc(s.lineage_id||"legacy / unrecorded")}</b></div><div class="metric"><span>Pool / family ID</span><b class="mono">${esc(s.pool_id||"—")} / ${esc(s.family_id||"—")}</b></div><div class="metric"><span>Recorded byte size</span><b>${fmtBytes(s.committed_data_bytes)}</b></div><div class="metric"><span>Seed space / rank range</span><b>${esc(s.space||"unknown")} · ${range}</b></div><div class="metric"><span>Search model</span><b>Model ${fmt(s.modelver)} · catalog ${esc(s.catalog_hash||"—")}</b></div>`}
+function recordExportInfo(s){return s&&s.record_export?s.record_export:{estimated_bytes:0,huge:false}}
+function renderRecordExport(s){const info=recordExportInfo(s),size=fmtBytes(info.estimated_bytes);$("exportHint").className=`hint exporthint${info.huge?" warning":""}`;$("exportHint").textContent=info.huge?`Huge export: about ${size} for ${fmt(s.records)} records. This text download may take a long time and needs substantial free disk space.`:`Projected full-record download: about ${size}. Actual size varies with the number of recorded matches.`}
+function finishRecordExport(state,error){clearTimeout(recordExportTimer);recordExportTimer=0;recordExportRequest="";$("exportBtn").disabled=false;$("exportCancelBtn").hidden=true;$("exportCancelBtn").disabled=false;$("exportCancelBtn").textContent="Cancel record export";if(state==="completed")$("result").textContent="Record export completed and was fully verified.";else if(state==="cancelled")$("result").textContent="Record export cancelled. Discard any partial browser download.";else{fail(Error(error||"Record export failed. Discard any partial browser download."));$("result").textContent="Record export did not complete; no complete download was reported."}}
+async function pollRecordExport(id){if(id!==recordExportRequest)return;try{const value=await api(`/api/export/status?request_id=${encodeURIComponent(id)}`);if(id!==recordExportRequest)return;if(["completed","cancelled","failed"].includes(value.state)){finishRecordExport(value.state,value.error);return}}catch(e){if(id===recordExportRequest){finishRecordExport("failed",e.message);return}}recordExportTimer=setTimeout(()=>pollRecordExport(id),400)}
+function startRecordExport(){if(!inspected||recordExportRequest)return;const info=recordExportInfo(inspected.source),size=fmtBytes(info.estimated_bytes);if(info.huge&&!confirm(`This full record export is projected to be about ${size}. It may take a long time and use substantial disk space. Continue?`))return;clear();const id=(globalThis.crypto&&crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,"");recordExportRequest=id;$("exportBtn").disabled=true;$("exportCancelBtn").hidden=false;$("result").textContent=`Record export started (projected size about ${size}). Your pool remains unchanged.`;$("recordExportFrame").src=apiPath(`/api/export?source=${encodeURIComponent(inspectedName)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}&request_id=${encodeURIComponent(id)}`);recordExportTimer=setTimeout(()=>pollRecordExport(id),200)}
+async function cancelRecordExport(){$("exportCancelBtn").disabled=true;$("exportCancelBtn").textContent="Cancelling…";try{const value=await api("/api/cancel",{operation:"export"});$("result").textContent=value.state==="idle"?"The record export had already finished; checking its final status…":"Record export cancellation requested. Any partial browser download must be discarded."}catch(e){fail(e);$("exportCancelBtn").disabled=false;$("exportCancelBtn").textContent="Cancel record export"}}
+function kindInfo(kind){return FILTER_KINDS.find(row=>row.id===kind)||{id:kind,label:"Result",plural:"Results"}}
+function filterInventoryHTML(filters){return FILTER_KINDS.map(kind=>{const rows=(filters||[]).filter(row=>row.kind===kind.id),names=rows.map(row=>row.label).join(", ");return `<div class="inventoryitem${rows.length?"":" empty"}"><b>${esc(kind.plural)} · ${fmt(rows.length)}</b><span>${rows.length?esc(names):"Not recorded in this pool"}</span></div>`}).join("")}
 function categoryHTML(c,exact=false){const id=exact?c.category_id:c.location_id;const label=c.location_label||c.label;const details=exact?`<details><summary>Technical match details</summary>${esc(c.label)}<code>${esc(c.category_id)}</code></details>`:"";return `<label class="category"><input type="checkbox" class="cat" value="${esc(id)}" checked><span><b>${esc(label)}</b>${details}</span><span class="count">${fmt(c.records)} seeds</span></label>`}
+function selectedKind(){return document.querySelector('input[name="filterKind"]:checked')?.value||""}
 function selectedFilter(){if(!inspected)return null;const id=$("organizeBy").value;if(!id||id==="__exact__")return null;return (inspected.filters||[]).find(row=>row.filter_id===id)||null}
 function groupByFilter(){const row=selectedFilter();return row?row.filter_id:""}
+function renderFilterKinds(){
+ if(!inspected)return;const filters=inspected.filters||[],recommended=filters.find(row=>row.filter_id===inspected.recommended_filter_id),firstAvailable=FILTER_KINDS.find(kind=>filters.some(row=>row.kind===kind.id)),initialKind=recommended?.kind||firstAvailable?.id||((inspected.categories||[]).length?"exact":"");
+ $("filterKinds").innerHTML=FILTER_KINDS.map(kind=>{const count=filters.filter(row=>row.kind===kind.id).length,checked=initialKind===kind.id;return `<label class="choicecard"><input type="radio" name="filterKind" class="filterKind" value="${kind.id}" ${checked?"checked":""} ${count?"":"disabled"}><span><b>${kind.label}</b><small>${count?`${fmt(count)} recorded ${count===1?"target":"targets"}`:"Not recorded in this pool"}</small></span></label>`}).join("");
+ $("exactKind").disabled=!(inspected.categories||[]).length;$("exactKind").checked=initialKind==="exact";renderFilterOptions();
+}
+function renderFilterOptions(){
+ if(!inspected)return;const kind=selectedKind(),exact=kind==="exact",previous=$("organizeBy").value,rows=(inspected.filters||[]).filter(row=>row.kind===kind),recommended=rows.find(row=>row.filter_id===inspected.recommended_filter_id);
+ $("targetField").hidden=exact;
+ if(exact){$("organizeBy").innerHTML='<option value="__exact__">Exact technical metadata</option>';$("organizeBy").value="__exact__";$("exactDetails").open=true}
+ else{
+  const info=kindInfo(kind);$("targetLabel").textContent=`Choose a ${info.label.toLowerCase()}`;
+  $("organizeBy").innerHTML=rows.length?rows.map(row=>`<option value="${esc(row.filter_id)}">${esc(row.label)} · ${fmt(row.location_count)} location${row.location_count===1?"":"s"}${row.filter_id===inspected.recommended_filter_id?" · recommended":""}</option>`).join(""):'<option value="">No recorded targets</option>';
+  if(rows.some(row=>row.filter_id===previous))$("organizeBy").value=previous;else if(recommended)$("organizeBy").value=recommended.filter_id;
+ }
+ plan=null;choices={};rules={};$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;renderInspectLocations();invalidateSplitReview("Selection changed — preview the new pools");
+}
+function updateUnmatchedCopy(){
+ const filter=selectedFilter(),exact=selectedKind()==="exact",name=filter?.label||"the chosen exact event";
+ $("unmatchedQuestion").textContent=exact?"What should happen to seeds outside the selected exact events?":`What should happen to seeds without ${name} at a selected location?`;
+ $("unmatchedHelp").textContent=exact?"These seeds do not match any checked exact event. They remain in the original pool whether or not you copy them to an extra pool.":`This includes seeds where ${name} appears only at an unchecked location and seeds with no recorded ${name}. Every seed remains in the original pool.`;
+}
+function updateFilenamePreview(){
+ const raw=$("prefix").value||"new-pool",prefix=raw.replace(/[^A-Za-z0-9._+-]+/g,"-").replace(/^[-.]+|[-.]+$/g,"").slice(0,64)||"new-pool",category=document.querySelector(".cat:checked")?.value||selectedFilter()?.filter_id||"selected-location",suffix=category.replace(/[^A-Za-z0-9._+-]+/g,"-").replace(/^[-.]+|[-.]+$/g,"").slice(0,42)||"selected-location";
+ $("filenamePreview").innerHTML=`<b>Filename pattern:</b> ${esc(prefix)}--${esc(suffix)}-<span aria-label="unique ID">[unique-id]</span>.bspool`;
+}
+function updateLocationSelectionSummary(){
+ const boxes=[...document.querySelectorAll(".cat")],checked=boxes.filter(box=>box.checked).length;$("selectedLocationCount").textContent=boxes.length?`${fmt(checked)} of ${fmt(boxes.length)} locations selected · ${fmt(checked)} new location pool${checked===1?"":"s"}`:"No locations available";$("sumCategories").textContent=boxes.length?`${fmt(checked)} of ${fmt(boxes.length)}`:"—";$("planBtn").disabled=!checked;updateFilenamePreview();
+}
 function renderInspectLocations(){
  if(!inspected)return;const value=$("organizeBy").value,exact=value==="__exact__",filter=selectedFilter();let rows=[];
  if(exact)rows=inspected.categories||[];else if(filter)rows=filter.locations||[];
  $("categories").innerHTML=rows.length?rows.map(row=>categoryHTML(row,exact)).join(""):'<div class="hint">Choose a recorded filter to see its Ante and blind locations.</div>';
- $("planBtn").disabled=!rows.length;
  if(filter){
-  const repeated=filter.multiple_location_records?`${fmt(filter.multiple_location_records)} seeds contain this filter at more than one shown location; Step 3 will ask where those seeds should go.`:"Every covered seed has one recorded location for this filter, so checking all locations produces a direct split.";
-  $("organizeByInfo").innerHTML=`<strong>${esc(filter.label)} · ${fmt(filter.location_count)} location${filter.location_count===1?"":"s"}</strong>${fmt(filter.covered_records)} of ${fmt(inspected.source.records)} seeds contain this filter. ${esc(repeated)}`;
-  $("sumCategories").textContent=fmt(filter.location_count);$("sumAmbiguous").textContent=fmt(filter.multiple_location_records);$("sumUnmatched").textContent=fmt(filter.unmatched_records);
+  const repeated=filter.multiple_location_records?`${fmt(filter.multiple_location_records)} seeds appear at more than one recorded location; the preview will ask for their destination.`:"No seeds overlap when every location is selected.";
+  $("organizeByInfo").innerHTML=`<strong>${esc(filter.label)}</strong> is recorded in ${fmt(filter.covered_records)} of ${fmt(inspected.source.records)} seeds across ${fmt(filter.location_count)} location${filter.location_count===1?"":"s"}. ${esc(repeated)}`;
+  $("sumAmbiguous").textContent=fmt(filter.multiple_location_records);$("sumUnmatched").textContent=fmt(filter.unmatched_records);
+  $("locationQuestion").textContent=`Choose ${filter.label} locations to create pools for`;
  }else if(exact){
-  $("organizeByInfo").innerHTML=`<strong>Advanced exact metadata</strong>This compatibility view separates source, occurrence number, and flags. Most users should organize by one named filter instead.`;
-  $("sumCategories").textContent=fmt(rows.length);$("sumAmbiguous").textContent=fmt(inspected.ambiguous_count);$("sumUnmatched").textContent=fmt(inspected.unmatched_count);
+  $("organizeByInfo").innerHTML=`<strong>Exact technical metadata</strong> Each distinct source, occurrence, flags, Ante, and blind combination is shown separately.`;
+  $("sumAmbiguous").textContent=fmt(inspected.ambiguous_count);$("sumUnmatched").textContent=fmt(inspected.unmatched_count);$("locationQuestion").textContent="Choose exact events to create pools for";
  }else{
-  $("organizeByInfo").innerHTML="<strong>Choose a recorded filter</strong>The Organizer will show its Ante and blind locations in play order.";
-  $("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";
+  $("organizeByInfo").innerHTML="<strong>No target selected.</strong> Choose a recorded result type and target.";
+  $("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";$("locationQuestion").textContent="Choose locations to create pools for";
  }
+ updateUnmatchedCopy();updateLocationSelectionSummary();
 }
 
 function resetSplitInspection(message="Choose and inspect a pool"){
  inspected=null;inspectedName="";plan=null;choices={};rules={};splitReviewedFingerprint="";
- $("sourceInfo").hidden=true;$("categoryCard").hidden=true;$("planCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("reviewStatus").hidden=true;
- $("categories").innerHTML="";$("organizeBy").innerHTML="";$("saveBtn").disabled=true;$("splitBtn").disabled=true;
- $("sumSource").textContent=message;$("sumSnapshot").textContent="—";$("sumRecords").textContent="—";$("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";$("sumPublication").textContent="Not reviewed";
+ $("sourceInfo").hidden=true;$("categoryCard").hidden=true;$("planCard").hidden=true;$("reviewCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("reviewStatus").hidden=true;$("updateStatus").hidden=true;
+ $("categories").innerHTML="";$("filterKinds").innerHTML="";$("organizeBy").innerHTML="";$("filterInventory").innerHTML="";$("sourceTechnical").innerHTML="";$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+ $("sumSource").textContent=message;$("sumRecords").textContent="—";$("sumCategories").textContent="—";$("sumAmbiguous").textContent="—";$("sumUnmatched").textContent="—";$("sumPublication").textContent="Not previewed";
 }
-function invalidateSplitReview(message="Selections changed — review the split again"){
- splitReviewedFingerprint="";$("splitPublication").hidden=true;$("reviewStatus").hidden=true;$("splitBtn").disabled=true;$("sumPublication").textContent=message;$("result").innerHTML="";
+function invalidateSplitReview(message="Selections changed — preview the new pools again"){
+ splitReviewedFingerprint="";$("splitPublication").hidden=true;$("reviewStatus").hidden=true;$("updateStatus").hidden=true;$("splitBtn").disabled=true;$("sumPublication").textContent=message;$("result").innerHTML="";
+ if(plan)$("applyDecisionsBtn").hidden=false;
 }
-function invalidateSplitSelection(){plan=null;choices={};rules={};$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Category selection changed — review the split again")}
+function invalidateSplitSelection(){plan=null;choices={};rules={};$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;$("sumAmbiguous").textContent="Preview to calculate";$("sumUnmatched").textContent="Preview to calculate";updateLocationSelectionSummary();invalidateSplitReview("Location selection changed — preview the new pools")}
 function resetFormatPlan(message="Choose a pool and check its format"){
  formatPlan=null;$("formatPlanCard").hidden=true;$("formatUpdateBtn").disabled=true;$("formatResult").innerHTML="";$("formatError").textContent="";
  $("formatStatus").hidden=true;$("formatStatus").className="workstatus";
@@ -3077,15 +3385,10 @@ async function inspect(){
  await new Promise(resolve=>setTimeout(resolve,40));
  try{
  const v=await api("/api/inspect",{source});inspected=v;inspectedName=source;choices={};rules={};
-  $("sourceInfo").hidden=false;$("sourceMetrics").innerHTML=sourceMetrics(v.source);notices(v.notices);$("categoryCard").hidden=false;$("planCard").hidden=!v.source.metadata_capable;
-  const filterOptions=(v.filters||[]).map(f=>`<option value="${esc(f.filter_id)}" ${f.filter_id===v.recommended_filter_id?"selected":""}>${esc(f.label)} · ${fmt(f.location_count)} location${f.location_count===1?"":"s"}${f.filter_id===v.recommended_filter_id?" · recommended":""}</option>`).join("");
-  const needsChoice=v.source.composite&&!v.recommended_filter_id&&filterOptions?'<option value="" selected>Choose a recorded filter…</option>':"";
-  const advanced=(v.categories||[]).length?'<option value="__exact__">Advanced · exact technical metadata</option>':"";
-  $("organizeBy").innerHTML=needsChoice+filterOptions+advanced||'<option value="">No recorded filters found</option>';
-  if(!needsChoice&&v.recommended_filter_id)$("organizeBy").value=v.recommended_filter_id;
-  renderInspectLocations();
-  $("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";$("sumSource").textContent=source;$("sumSnapshot").textContent=v.source.snapshot_id;$("sumRecords").textContent=fmt(v.source.records);$("sumPublication").textContent="Review needed";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;
-  const elapsed=(performance.now()-started)/1000;inspectionState("success","Inspection complete",`${fmt(v.source.records)} seeds across ${fmt((v.filters||[]).length)} recorded filter${(v.filters||[]).length===1?"":"s"} loaded in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s. Results are shown below.`);
+  $("sourceInfo").hidden=false;$("sourceMetrics").innerHTML=sourceMetrics(v.source);$("sourceTechnical").innerHTML=sourceTechnical(v.source);$("filterInventory").innerHTML=filterInventoryHTML(v.filters);renderRecordExport(v.source);notices(v.notices);$("categoryCard").hidden=false;$("planCard").hidden=!v.source.metadata_capable;
+  $("prefix").value=source.replace(/\.bspool$/i,"")+"-organized";renderFilterKinds();
+  $("sumSource").textContent=source;$("sumRecords").textContent=fmt(v.source.records);$("sumPublication").textContent="Preview needed";$("reviewCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;
+  const elapsed=(performance.now()-started)/1000,typeCount=FILTER_KINDS.filter(kind=>(v.filters||[]).some(row=>row.kind===kind.id)).length;inspectionState("success","Inspection complete",`${fmt(v.source.records)} seeds with ${fmt((v.filters||[]).length)} recorded target${(v.filters||[]).length===1?"":"s"} across ${fmt(typeCount)} result type${typeCount===1?"":"s"} loaded in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`);
   $("categoryCard").scrollIntoView({behavior:"smooth",block:"start"});$("categoryCard").focus({preventScroll:true});
  }catch(e){resetSplitInspection();inspectionState("error","Inspection failed",e.message||String(e));fail(e)
  }finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;refresh.disabled=false;picker.disabled=false;button.textContent="Inspect pool"}
@@ -3095,63 +3398,64 @@ function cleanChoiceMap(value){return Object.fromEntries(Object.entries(value||{
 function choiceDoc(){return {source_snapshot_id:inspected.source.snapshot_id,group_by_filter:groupByFilter(),choices:cleanChoiceMap(choices),ambiguity_rules:{...rules},selected_categories:selected()}}
 function splitRequest(){return {source:inspectedName,snapshot:inspected.source.snapshot_id,groupByFilter:groupByFilter(),selectedCategories:selected(),choicePlan:choiceDoc(),unmatchedPolicy:$("policy").value,remainderName:$("remainder").value,prefix:$("prefix").value}}
 function splitFingerprint(){if(!inspected)return "";const request=splitRequest();return JSON.stringify({source:request.source,snapshot:request.snapshot,groupByFilter:request.groupByFilter,categories:request.selectedCategories,choices:Object.entries(request.choicePlan.choices).sort(),rules:Object.entries(request.choicePlan.ambiguity_rules).sort(),policy:request.unmatchedPolicy,remainder:request.remainderName,prefix:request.prefix})}
-async function prepare(){
- clear();if(!inspected)return;const button=$("planBtn"),request=splitRequest(),fingerprint=splitFingerprint(),row=poolRows.find(p=>p.name===inspectedName),started=performance.now();button.disabled=true;$("analysisCancelBtn").hidden=false;button.textContent="Reviewing seed assignments…";reviewState("","Reviewing seed assignments",row?`Calculating destinations for ${fmt(row.records)} recorded seeds. The source pool is not being changed.`:"Calculating destinations from the selected categories.");
- const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("reviewDetail").textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`},1000);
+async function prepare(fromReview=false){
+ clear();if(!inspected)return;const button=$("planBtn"),applyButton=$("applyDecisionsBtn"),activeButton=fromReview?applyButton:button,request=splitRequest(),fingerprint=splitFingerprint(),row=poolRows.find(p=>p.name===inspectedName),started=performance.now(),setState=fromReview?updateState:reviewState,detailNode=fromReview?$("updateDetail"):$("reviewDetail");button.disabled=true;applyButton.disabled=true;$("analysisCancelBtn").hidden=false;activeButton.textContent=fromReview?"Updating preview…":"Building preview…";if(fromReview)$("reviewStatus").hidden=true;else $("updateStatus").hidden=true;setState("","Building output preview",row?`Calculating destinations for ${fmt(row.records)} recorded seeds. The source pool is not being changed.`:"Calculating destinations from the selected locations.");
+ const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);detailNode.textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`},1000);
  await new Promise(resolve=>setTimeout(resolve,40));
- try{const v=await api("/api/plan",request);if(fingerprint!==splitFingerprint())throw Error("Selections changed while the review was running. Review the current choices again.");plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=fingerprint;renderPlan();renderSplitPublication();$("saveBtn").disabled=false;const elapsed=(performance.now()-started)/1000;reviewState("success","Seed assignments reviewed",v.planning_mode==="summary_projection"?`Reused the verified inspection totals; no full rescan was needed. Finished in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`:`Finished the exact record review in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`)}catch(e){invalidateSplitReview();reviewState("error","Seed assignment review failed",e.message||String(e));fail(e)}finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;button.textContent="Review the split (no files created)"}
+ try{const v=await api("/api/plan",request);if(fingerprint!==splitFingerprint())throw Error("Selections changed while the preview was running. Preview the current choices again.");plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=fingerprint;renderPlan();renderSplitPublication();$("saveBtn").disabled=false;const elapsed=(performance.now()-started)/1000;setState("success",fromReview?"Preview updated":"Preview ready",v.planning_mode==="summary_projection"?`Reused the verified inspection totals; no full rescan was needed. Finished in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`:`Finished the exact record preview in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`);$("reviewCard").scrollIntoView({behavior:"smooth",block:"start"})}catch(e){invalidateSplitReview();setState("error","Preview failed",e.message||String(e));fail(e)}finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;applyButton.disabled=false;button.textContent="Preview new pools";applyButton.textContent="Update preview"}
 }
 function unresolved(){if(!plan)return 0;const newlyResolved=(plan.ambiguity_groups||[]).reduce((total,g)=>total+(rules[g.rule_key]?g.unresolved_records:0),0);return Math.max(0,plan.unresolved_ambiguities-newlyResolved)}
 function categoryName(id){const rows=plan?plan.categories:(inspected?inspected.categories:[]);const c=rows.find(x=>x.category_id===id);return c?c.label:id}
 function renderPlan(){
- if(!plan)return;$("plan").hidden=false;const groups=plan.ambiguity_groups||[];
+ if(!plan)return;$("reviewCard").hidden=false;$("plan").hidden=false;const groups=plan.ambiguity_groups||[];
  const noun=plan.group_by_filter?"locations":"exact categories";
- const groupRows=groups.map(g=>{const id=`rule-${g.rule_key}`,description=`${id}-description`,examples=(g.samples||[]).length?`<br>Example seeds: ${esc(g.samples.join(", "))}.`:"";return `<div class="ambrow"><b>${fmt(g.unresolved_records)} seed${g.unresolved_records===1?"":"s"}</b><div><label for="${id}">Choose the one output pool that should receive these seeds</label><span class="hint" id="${description}">Every seed in this group matched all of these checked ${noun}: ${esc(g.candidates.map(categoryName).join(" · "))}.${examples} A previously saved individual-seed decision, if present, takes priority.</span><select id="${id}" aria-describedby="${description}" data-rule="${esc(g.rule_key)}"><option value="">Choose an output pool for this group…</option>${g.candidates.map(c=>`<option value="${esc(c)}" ${rules[g.rule_key]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div></div>`}).join("");
- $("ambiguities").innerHTML=groupRows||'<div class="notice"><strong>No destination decisions are currently needed</strong>Each seed now has one destination. If additional category combinations remain, review the split again after applying the displayed decisions.</div>';
- document.querySelectorAll("[data-rule]").forEach(s=>s.onchange=()=>{if(s.value)rules[s.dataset.rule]=s.value;else delete rules[s.dataset.rule];invalidateSplitReview("Destinations changed — review the split again");renderStatus()});
-  const overflow=plan.unrepresented_ambiguities||0;$("pager").innerHTML=overflow?`The groups above cover ${fmt(plan.unresolved_ambiguities-overflow)} seeds. ${fmt(overflow)} more seeds have different combinations of matching ${noun}; choose the displayed destinations, then review again to see the next groups.`:plan.ambiguities_truncated?`All combinations of matching ${noun} fit on this page. The examples are only a small sample; each choice applies to the full seed count shown for its group.`:"";
+ const groupRows=groups.map(g=>{const id=`rule-${g.rule_key}`,description=`${id}-description`,examples=(g.samples||[]).length?` Example seeds: ${esc(g.samples.join(", "))}.`:"";return `<div class="ambrow"><b>${fmt(g.unresolved_records)} seed${g.unresolved_records===1?"":"s"}</b><div><label for="${id}">Which new pool should contain these seeds?</label><span class="hint" id="${description}">They contain the chosen result at ${esc(g.candidates.map(categoryName).join(" and "))}.${examples}</span><select id="${id}" aria-describedby="${description}" data-rule="${esc(g.rule_key)}"><option value="">Choose a destination…</option>${g.candidates.map(c=>`<option value="${esc(c)}" ${rules[g.rule_key]===c?"selected":""}>${esc(categoryName(c))}</option>`).join("")}</select></div></div>`}).join("");
+ $("ambiguities").innerHTML=groupRows||'<div class="notice"><strong>No overlap decisions needed</strong>Every seed has one destination under the current choices.</div>';
+ document.querySelectorAll("[data-rule]").forEach(s=>s.onchange=()=>{if(s.value)rules[s.dataset.rule]=s.value;else delete rules[s.dataset.rule];invalidateSplitReview("Destinations changed — update the preview");renderStatus()});
+  const overflow=plan.unrepresented_ambiguities||0;$("pager").innerHTML=overflow?`The choices above cover ${fmt(plan.unresolved_ambiguities-overflow)} seeds. ${fmt(overflow)} more seeds have another combination of matching ${noun}; apply these destinations to see the next group.`:plan.ambiguities_truncated?`Each choice applies to the full seed count shown; example seeds are only a sample.`:"";
  $("clearRulesBtn").hidden=!Object.keys(rules).length;$("clearChoicesBtn").hidden=!Object.keys(choices).length;
  renderStatus();
 }
 function renderStatus(){
  if(!plan)return;const left=unresolved(),reviewed=splitReviewedFingerprint===splitFingerprint();
- $("planTitle").textContent=`${fmt(plan.ambiguous_count)} seed${plan.ambiguous_count===1?"":"s"} fit more than one checked ${plan.group_by_filter?"location":"category"}`;
- const noun=plan.group_by_filter?"location":"exact category",plural=plan.group_by_filter?"locations":"exact categories";const overrideText=Object.keys(choices).length?` ${fmt(Object.keys(choices).length)} saved individual-seed decision(s) are active.`:"";const ruleText=Object.keys(rules).length?` ${fmt(Object.keys(rules).length)} shared destination decision(s) are active.`:"";$("planHint").textContent=(plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) fit none of the checked ${plural} and will follow the unmatched-seed option above. The original source still keeps every seed.`:`Every source seed fits at least one checked ${noun}.`)+overrideText+ruleText;
- $("choicePill").textContent=left?`${fmt(left)} destinations needed`:(reviewed?"Split reviewed":"Review changes");$("choicePill").className="pill"+(!left&&reviewed?" ok":"");
+ $("planTitle").textContent=plan.ambiguous_count?`Seeds found at more than one selected ${plan.group_by_filter?"location":"exact event"}`:"Seed destinations";
+ const noun=plan.group_by_filter?"location":"exact event",plural=plan.group_by_filter?"locations":"exact events";const overrideText=Object.keys(choices).length?` ${fmt(Object.keys(choices).length)} saved individual-seed decision(s) are active.`:"";const ruleText=Object.keys(rules).length?` ${fmt(Object.keys(rules).length)} shared destination decision(s) are active.`:"";$("planHint").textContent=(plan.unmatched_count?`${fmt(plan.unmatched_count)} seed(s) do not match a selected ${noun}; the option in Step 3 decides whether they are copied to an extra pool. Every seed stays in the original.`:`Every source seed matches at least one selected ${noun}.`)+overrideText+ruleText;
+ $("choicePill").textContent=left?`${fmt(left)} destinations needed`:(reviewed?"Preview current":"Update preview");$("choicePill").className="pill"+(!left&&reviewed?" ok":"");$("applyDecisionsBtn").hidden=reviewed;
  $("sumAmbiguous").textContent=fmt(plan.ambiguous_count);$("sumUnmatched").textContent=fmt(plan.unmatched_count);
- const ready=reviewed&&plan.publication&&plan.publication.ready;$("splitBtn").disabled=splitRunning||!ready;$("sumPublication").textContent=ready?`${fmt(plan.publication.output_count)} files ready`:reviewed?(plan.publication.blockers[0]||"Blocked"):"Review needed";
+ const ready=reviewed&&plan.publication&&plan.publication.ready,count=plan.publication?.output_count||0;$("splitBtn").disabled=splitRunning||!ready;$("splitBtn").textContent=ready?`Create ${fmt(count)} seed pool${count===1?"":"s"}`:"Create these seed pools";$("sumPublication").textContent=ready?`${fmt(count)} file${count===1?"":"s"} ready`:reviewed?(plan.publication.blockers[0]||"Blocked"):"Preview needed";
 }
 function renderSplitPublication(){
  if(!plan||splitReviewedFingerprint!==splitFingerprint())return;const publication=plan.publication;$("splitPublication").hidden=false;
- const blockers=publication.blockers||[];$("splitPublicationState").innerHTML=publication.ready?`<strong>Ready to create ${fmt(publication.output_count)} new pool file(s).</strong> <span class="source-retained">The original source pool will remain unchanged.</span> Existing files will not be overwritten. If creation reports an error or you cancel it, unfinished new files are removed.`:`<strong>More decisions are needed before files can be created.</strong> ${blockers.map(esc).join(" ")}`;
- $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for seeds outside the selection":plan.group_by_filter?"one checked location":"one exact metadata category"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
+ const blockers=publication.blockers||[];$("splitPublicationState").innerHTML=publication.ready?`<strong>Ready to create ${fmt(publication.output_count)} new pool file${publication.output_count===1?"":"s"}.</strong> <span class="source-retained">The original source pool will remain unchanged.</span> Existing files will not be overwritten. If creation reports an error or you cancel it, unfinished new files are removed.`:`<strong>More decisions are needed before files can be created.</strong> ${blockers.map(esc).join(" ")}`;
+ $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for other seeds":plan.group_by_filter?"one selected location":"one exact event"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
  $("splitReport").textContent=`A small audit report named ${publication.report_name} will also record the choices and source snapshot. The new pools will have ${publication.coverage_complete?"complete":"provisional"} search coverage. ${publication.omitted_records?fmt(publication.omitted_records)+" seed(s) will be left out of the new files but remain in the source pool.":"No seeds will be deliberately left out."}`;
  renderStatus();
 }
 function download(name,type,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},0)}
 function savePlan(){if(!plan)return;download(`${$("prefix").value||"seed-pool"}-choices.json`,"application/json",JSON.stringify(choiceDoc(),null,2)+"\n")}
-function clearDecisionSet(kind){if(kind==="rules")rules={};else choices={};plan=null;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview(kind==="rules"?"Shared destinations cleared — review the split again":"Individual seed decisions cleared — review the split again")}
+function clearDecisionSet(kind){if(kind==="rules")rules={};else choices={};plan=null;$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview(kind==="rules"?"Shared destinations cleared — preview again":"Individual seed decisions cleared — preview again")}
 function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result);if(!inspected)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==inspected.source.snapshot_id)throw Error("Those saved decisions belong to a different version of this source pool.");if(String(v.group_by_filter||"")!==groupByFilter())throw Error("Those saved decisions use a different organizing filter.");choices={...(v.choices||{})};rules={...(v.ambiguity_rules||{})};invalidateSplitReview("Saved decisions loaded — reviewing the split");prepare()}catch(e){fail(e)}};r.readAsText(file)}
 async function split(){
  if(!plan||splitReviewedFingerprint!==splitFingerprint()||!plan.publication.ready)return;clear();splitRunning=true;$("splitBtn").disabled=true;$("splitBtn").textContent="Creating new seed pools…";$("splitCancelBtn").hidden=false;
- try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=splitFingerprint();renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");plan=null;choices={};rules={};splitReviewedFingerprint="";$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — review again to make another split";await loadPools(true)}catch(e){fail(e)}finally{splitRunning=false;$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
+ try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){plan=v;choices={...v.choices};rules={...(v.ambiguity_rules||{})};splitReviewedFingerprint=splitFingerprint();renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");plan=null;choices={};rules={};splitReviewedFingerprint="";$("reviewCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — preview again to make another split";await loadPools(true)}catch(e){fail(e)}finally{splitRunning=false;$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
 }
 async function cancelSplit(){$("splitCancelBtn").disabled=true;$("splitCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"split"})}catch(e){fail(e)}finally{$("splitCancelBtn").disabled=false;$("splitCancelBtn").textContent="Cancel file creation"}}
-async function cancelAnalysis(){$("analysisCancelBtn").disabled=true;$("analysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){fail(e)}finally{$("analysisCancelBtn").disabled=false;$("analysisCancelBtn").textContent="Cancel review"}}
+async function cancelAnalysis(){$("analysisCancelBtn").disabled=true;$("analysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){fail(e)}finally{$("analysisCancelBtn").disabled=false;$("analysisCancelBtn").textContent="Cancel preview"}}
 
 function combineSelected(){return [...document.querySelectorAll(".combinePick:checked")].map(x=>x.value)}
 function renderCombineChoices(selectedValues=new Set(combineSelected())){
  $("combineChoices").innerHTML=poolRows.length?poolRows.map(p=>{const state=p.error?"Unreadable":p.complete?(p.coverage_complete?"Finished · complete search coverage":"Finished · provisional search coverage"):"Paused · committed seeds only";const extra=p.composite?` · already combined from ${fmt(p.composite_operand_count||p.composite_branch_count)} input pools · ${fmt(p.composite_branch_count)} recorded filters`:p.criteria_hash?` · filter ID ${esc(p.criteria_hash.slice(0,8))}`:"";return `<label class="poolchoice"><input type="checkbox" class="combinePick" value="${esc(p.name)}" ${selectedValues.has(p.name)?"checked":""} ${p.error?"disabled":""}><span><b>${esc(p.name)}</b><small>${esc(state)} · ${esc(p.space||"?")} seed space${extra}</small></span><span class="count">${p.error?"—":fmt(p.records)} seeds</span></label>`}).join(""):'<div class="hint">No .bspool files found.</div>';
  document.querySelectorAll(".combinePick").forEach(input=>input.onchange=()=>{updateCombineBase();invalidateCombine()});updateCombineBase();
 }
-function updateCombineBase(){const names=combineSelected(),old=$("combineBase").value;$("combineBase").innerHTML=names.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");if(names.includes(old))$("combineBase").value=old;$("combineBaseField").hidden=$("combineOperation").value!=="difference";$("combineSumInputs").textContent=names.length?`${fmt(names.length)} selected`:"Choose at least two";$("combineSumOperation").textContent=$("combineOperation").selectedOptions[0].textContent.split(" · ")[0]}
+function updateCombineBase(){const names=combineSelected(),old=$("combineBase").value,operation=$("combineOperation").value,labels={union:"Any selected pool",intersection:"Every selected pool",difference:"First pool minus others"};$("combineBase").innerHTML=names.map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");if(names.includes(old))$("combineBase").value=old;$("combineBaseField").hidden=operation!=="difference";$("combineSumInputs").textContent=names.length?`${fmt(names.length)} selected`:"Choose at least two";$("combineSumOperation").textContent=labels[operation]||operation;$("combinePlanBtn").disabled=combineRunning||names.length<2||!$("combineName").value.trim()}
 function invalidateCombine(message="Not reviewed"){
- combinePlan=null;combineReviewedFingerprint="";$("combineCreateBtn").disabled=true;$("combineBranches").innerHTML="";$("combineChecks").innerHTML="";$("combinePublication").hidden=true;$("combineNotices").innerHTML="";$("combineSumCompatibility").textContent=message;$("combineSumBranches").textContent="—";$("combineSumExpression").textContent="—";$("combineSumCoverage").textContent="—";$("combineSumMetadata").textContent="—";$("combineResult").innerHTML="";
+ combinePlan=null;combineReviewedFingerprint="";$("combineCreateBtn").disabled=true;$("combineBranches").innerHTML="";$("combineChecks").innerHTML="";$("combineTechnical").hidden=true;$("combinePublication").hidden=true;$("combineNotices").innerHTML="";$("combineSumCompatibility").textContent=message;$("combineSumBranches").textContent="—";$("combineSumExpression").textContent="—";$("combineSumCoverage").textContent="—";$("combineSumMetadata").textContent="—";$("combineResult").innerHTML="";
 }
 function combineRequest(withPins){const value={sources:combineSelected(),operation:$("combineOperation").value,base:$("combineBase").value,name:$("combineName").value,label:$("combineLabel").value};if(withPins&&combinePlan){value.snapshots=combinePlan.snapshots;value.reviewedPublication=combinePlan.publication}return value}
 function combineFingerprint(){return JSON.stringify(combineRequest(false))}
 function renderCombinePlan(v,fingerprint=combineFingerprint()){
  combinePlan=v;combineReviewedFingerprint=fingerprint;renderNoticeList("combineNotices",v.notices);$("combineSumInputs").textContent=`${fmt(v.input_count)} selected`;$("combineSumCompatibility").textContent=v.compatible?"Yes":"No · see explanation";$("combineSumBranches").textContent=`${fmt(v.branch_count)} retained`;$("combineSumExpression").textContent=v.expression_text;$("combineSumCoverage").textContent=v.coverage_complete?"Complete":"Provisional";$("combineSumMetadata").textContent=v.metadata_complete?"Exact details retained":"Some inputs have seeds only";
+ $("combineTechnical").hidden=false;
  $("combineChecks").innerHTML=v.compatibility.checks.map(c=>`<div class="check ${esc(c.status)}"><b>${esc(c.label)} · ${esc(c.status)}</b>${esc(c.detail)}</div>`).join("");
  const inputs=v.compatibility.inputs.map(o=>{const role=o.role==="base"?"START WITH":o.role==="subtract"?"REMOVE MATCHES FROM":"INPUT";return `<div class="branch"><b>${role} · ${esc(o.name)}</b><span>${fmt(o.records)} seeds · ${esc(o.state)} pool · ${esc(o.coverage)} search coverage · ${esc(o.metadata)} · ${esc(o.space)} seed space · snapshot ID ${esc(o.snapshot_id.slice(0,8))}${o.composite?` · prior rule ${esc(o.composite_expression_text||o.composite_operation)}`:""}</span></div>`}).join("");
  const sources=(v.branches||[]).map(b=>`<div class="branch"><b>Recorded source filter · ${esc(b.label||b.pool_id||b.branch_id)}</b><span>${b.criteria.length?`Original requirements: ${b.criteria.map(esc).join(" · ")}`:"This older pool does not contain a readable description of its original requirements."}</span></div>`).join("");
@@ -3159,13 +3463,13 @@ function renderCombinePlan(v,fingerprint=combineFingerprint()){
  const publication=v.publication;$("combinePublication").hidden=false;$("combineManifest").innerHTML=`<div class="manifestrow"><span><b>${esc(publication.name)}</b><small>${esc(publication.label)} · ${esc(v.operation.toUpperCase())} · ${publication.output_exists?"filename already exists":"filename available"}</small></span><span class="count">Seed count calculated while the file is created</span></div>`;$("combineReport").textContent=`A small audit report named ${publication.report_name} will record the selected input versions and the membership rule. The input pools remain unchanged, and an existing output file is never overwritten.`;
  $("combineCreateBtn").disabled=combineRunning||!publication.ready||combineReviewedFingerprint!==combineFingerprint();
 }
-async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Reviewing selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed while the review was running. Review them again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Review failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.disabled=false;button.textContent="Review the combined pool (no file created)"}}
+async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Checking selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed during the check. Check the current choices again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Compatibility check failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.textContent="Check compatibility and preview file";updateCombineBase()}}
 async function createCombine(){
  if(!combinePlan||combineReviewedFingerprint!==combineFingerprint()||!combinePlan.publication.ready)return;$("combineError").textContent="";combineRunning=true;$("combineCreateBtn").disabled=true;$("combineCreateBtn").textContent="Creating combined seed pool…";$("combineCancelBtn").hidden=false;
- try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);combinePlan=null;combineReviewedFingerprint=""}catch(e){$("combineError").textContent=e.message||String(e);invalidateCombine("Review again after this failure")}finally{combineRunning=false;$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool"}
+ try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);combinePlan=null;combineReviewedFingerprint="";$("combinePublication").hidden=true;$("combineTechnical").hidden=true;$("combineCreateBtn").disabled=true;$("combineSumCompatibility").textContent="Created"}catch(e){$("combineError").textContent=e.message||String(e);invalidateCombine("Check again after this failure")}finally{combineRunning=false;$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool";updateCombineBase()}
 }
 async function cancelCombine(){$("combineCancelBtn").disabled=true;$("combineCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"combine"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineCancelBtn").disabled=false;$("combineCancelBtn").textContent="Cancel file creation"}}
-async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel review"}}
+async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel compatibility check"}}
 function renderFormatPlan(v){
  formatPlan=v;$("formatPlanCard").hidden=false;$("formatSumSource").textContent=v.source;$("formatSumCurrent").textContent=v.source_format;$("formatSumRecords").textContent=fmt(v.records);$("formatSumOutput").textContent=v.output_name||"No new file needed";
  $("formatMetrics").innerHTML=`<div class="metric"><span>File format</span><b>${esc(v.source_format)}</b></div><div class="metric"><span>Encoding</span><b>${esc(v.encoding||"(missing)")}</b></div><div class="metric"><span>Recorded seeds</span><b>${fmt(v.records)}</b></div><div class="metric"><span>File size</span><b>${fmtBytes(v.bytes)}</b></div><div class="metric"><span>Pool state</span><b>${v.complete?"Finished":"Paused / incomplete"}</b></div><div class="metric"><span>Search coverage</span><b>${v.coverage_complete?"Complete":"Provisional"}</b></div>`;
@@ -3206,16 +3510,16 @@ async function cancelFormat(){$("formatCancelBtn").disabled=true;$("formatCancel
 function showMode(mode){const split=mode==="split",combine=mode==="combine",formatMode=mode==="format";$("splitWorkspace").hidden=!split;$("combineWorkspace").hidden=!combine;$("formatWorkspace").hidden=!formatMode;$("splitModeBtn").classList.toggle("active",split);$("combineModeBtn").classList.toggle("active",combine);$("formatModeBtn").classList.toggle("active",formatMode);$("splitModeBtn").setAttribute("aria-selected",String(split));$("combineModeBtn").setAttribute("aria-selected",String(combine));$("formatModeBtn").setAttribute("aria-selected",String(formatMode))}
 
 $("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
-$("organizeBy").onchange=()=>{plan=null;choices={};rules={};renderInspectLocations();$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Organizing filter changed — review the split again")};
+$("organizeBy").onchange=()=>{plan=null;choices={};rules={};renderInspectLocations();$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Recorded target changed — preview the new pools")};
 $("allBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=true);invalidateSplitSelection()};$("noneBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=false);invalidateSplitSelection()};
-$("planBtn").onclick=prepare;$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("clearRulesBtn").onclick=()=>clearDecisionSet("rules");$("clearChoicesBtn").onclick=()=>clearDecisionSet("choices");$("splitBtn").onclick=split;$("analysisCancelBtn").onclick=cancelAnalysis;$("splitCancelBtn").onclick=cancelSplit;
-$("policy").onchange=()=>{$("remainderField").hidden=$("policy").value!=="remainder";invalidateSplitReview()};$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>invalidateSplitReview();
-$("exportBtn").onclick=()=>{if(!inspected)return;location.href=apiPath(`/api/export?source=${encodeURIComponent(inspectedName)}&snapshot=${encodeURIComponent(inspected.source.snapshot_id)}`)};
+$("planBtn").onclick=()=>prepare(false);$("applyDecisionsBtn").onclick=()=>prepare(true);$("saveBtn").onclick=savePlan;$("loadBtn").onclick=()=>$("loadFile").click();$("loadFile").onchange=e=>e.target.files[0]&&loadPlanFile(e.target.files[0]);$("clearRulesBtn").onclick=()=>clearDecisionSet("rules");$("clearChoicesBtn").onclick=()=>clearDecisionSet("choices");$("splitBtn").onclick=split;$("analysisCancelBtn").onclick=cancelAnalysis;$("splitCancelBtn").onclick=cancelSplit;
+document.querySelectorAll(".policyChoice").forEach(input=>input.onchange=()=>{$("policy").value=input.value;$("remainderField").hidden=input.value!=="remainder";invalidateSplitReview()});$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>{updateFilenamePreview();invalidateSplitReview()};
+$("exportBtn").onclick=startRecordExport;$("exportCancelBtn").onclick=cancelRecordExport;
 $("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("formatModeBtn").onclick=()=>showMode("format");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
 $("formatCheckBtn").onclick=checkFormat;$("formatUpdateBtn").onclick=updateFormat;$("formatCancelBtn").onclick=cancelFormat;$("formatRefreshBtn").onclick=()=>{if(formatRunning)return;resetFormatPlan();loadPools(false)};$("formatSource").onchange=()=>{if(!formatRunning)resetFormatPlan("Selection changed — check this pool")};
 $("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine("Selection changed")};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine("Selection changed")};
-$("combineOperation").onchange=()=>{updateCombineBase();invalidateCombine("Operation changed")};$("combineBase").onchange=()=>invalidateCombine("Base changed");$("combineName").oninput=()=>invalidateCombine("Output changed");$("combineLabel").oninput=()=>invalidateCombine("Output changed");
-document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection()});
+document.querySelectorAll(".combineOp").forEach(input=>input.onchange=()=>{$("combineOperation").value=input.value;updateCombineBase();invalidateCombine("Rule changed")});$("combineBase").onchange=()=>invalidateCombine("Base changed");$("combineName").oninput=()=>{updateCombineBase();invalidateCombine("Output changed")};$("combineLabel").oninput=()=>invalidateCombine("Output changed");
+document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection();else if(e.target.classList.contains("filterKind"))renderFilterOptions()});
 if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/";$("mergeLink").hidden=true;$("standaloneMerge").hidden=false}
 resetSplitInspection();invalidateCombine();resetFormatPlan();loadPools(true).catch(()=>{});
 </script></body></html>'''
@@ -3238,6 +3542,7 @@ def error_payload(exc):
 
 class OrganizerHandler(BaseHTTPRequestHandler):
     pool_dir = POOL_DIR
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
         pass
@@ -3292,24 +3597,11 @@ class OrganizerHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/pools":
                 self._json({"pools": list_sources(self.pool_dir)})
             elif parsed.path == "/api/export":
+                serve_record_export(self, parsed, self.pool_dir)
+            elif parsed.path == "/api/export/status":
                 query = parse_qs(parsed.query)
-                name = query.get("source", [""])[0]
-                reader = verified_source_reader(name, self.pool_dir)
-                expected = query.get("snapshot", [""])[0].lower()
-                if expected != reader.snapshot_token:
-                    raise organizer.PoolError(
-                        "source snapshot changed; inspect before exporting")
-                filename = "%s-%s-records.ndjson" % (
-                    os.path.splitext(name)[0], reader.snapshot_token[:8])
-                filename = re.sub(r"[^A-Za-z0-9._+-]+", "-", filename)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-                self.send_header("Content-Disposition", "attachment; filename=%s" % quote(filename))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                response_started = True
-                for line in iter_record_export(reader):
-                    self.wfile.write(line)
+                self._json(record_export_status(
+                    query.get("request_id", [""])[0]))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError, organizer.PoolError) as exc:

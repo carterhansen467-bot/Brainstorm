@@ -176,6 +176,70 @@ static inline void bs_set_errno_from_win32(DWORD code) {
 	}
 }
 
+/* Create a brand-new binary update stream without ever opening an existing
+ * path for truncation.  The cooperative writer lock serializes Brainstorm
+ * processes; CREATE_NEW also protects the publication name from unrelated
+ * programs that create it after the lock is acquired. */
+#ifndef BS_PLATFORM_OPEN_OSFHANDLE
+#define BS_PLATFORM_OPEN_OSFHANDLE _open_osfhandle
+#endif
+#ifndef BS_PLATFORM_FDOPEN
+#define BS_PLATFORM_FDOPEN _fdopen
+#endif
+static inline FILE *bs_fopen_exclusive_binary_update(const char *path) {
+	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE | DELETE,
+			FILE_SHARE_READ, NULL, CREATE_NEW,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		bs_set_errno_from_win32(GetLastError());
+		return NULL;
+	}
+	int fd = BS_PLATFORM_OPEN_OSFHANDLE((intptr_t)h, _O_RDWR | _O_BINARY);
+	if (fd < 0) {
+		int saved = errno ? errno : EIO;
+		CloseHandle(h);
+		/* Keep the uniquely created placeholder.  Once our handle is closed,
+		 * path-based deletion cannot prove that the name still denotes our
+		 * file and could remove another process's replacement instead. */
+		errno = saved;
+		return NULL;
+	}
+	FILE *f = BS_PLATFORM_FDOPEN(fd, "r+b");
+	if (!f) {
+		int saved = errno ? errno : EIO;
+		_close(fd);
+		/* As above, deliberately leave the empty placeholder rather than
+		 * performing racy cleanup by name after releasing the handle. */
+		errno = saved;
+		return NULL;
+	}
+	return f;
+}
+
+/* Discard a failed exclusive output while its owned identity is still pinned.
+ * Windows deletes by handle, so a pathname replacement can never be removed.
+ * Failure to mark the owned handle leaves the partial file in place instead
+ * of falling back to an unsafe path-based delete. */
+static inline int bs_fclose_discard_owned(FILE *f, const char *path) {
+	(void)path;
+	DWORD markError = ERROR_SUCCESS;
+	HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+	FILE_DISPOSITION_INFO disposition;
+	disposition.DeleteFile = TRUE;
+	if (h == INVALID_HANDLE_VALUE
+			|| !SetFileInformationByHandle(
+					h, FileDispositionInfo,
+					&disposition, sizeof disposition))
+		markError = h == INVALID_HANDLE_VALUE
+				? ERROR_INVALID_HANDLE : GetLastError();
+	int closeRc = fclose(f);
+	if (markError != ERROR_SUCCESS) {
+		bs_set_errno_from_win32(markError);
+		return -1;
+	}
+	return closeRc;
+}
+
 static inline int bs_fsync_file(FILE *f) {
 	HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
 	if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
@@ -230,6 +294,12 @@ static inline int bs_rename_overwrite(const char *from, const char *to) {
 		waited += delay;
 	}
 	bs_set_errno_from_win32(saved);
+	return -1;
+}
+
+static inline int bs_rename_noreplace(const char *from, const char *to) {
+	if (MoveFileExA(from, to, MOVEFILE_WRITE_THROUGH)) return 0;
+	bs_set_errno_from_win32(GetLastError());
 	return -1;
 }
 
@@ -380,6 +450,33 @@ static inline void bs_file_lock_release(bs_file_lock_t lock) {
 	if (lock >= 0) close(lock);
 }
 
+/* O_EXCL is the POSIX half of the same publication contract as CREATE_NEW:
+ * fdopen only wraps the already-exclusive descriptor and cannot truncate a
+ * target that appeared after an advisory existence check. */
+static inline FILE *bs_fopen_exclusive_binary_update(const char *path) {
+	int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0666);
+	if (fd < 0) return NULL;
+	FILE *f = fdopen(fd, "r+b");
+	if (!f) {
+		int saved = errno ? errno : EIO;
+		close(fd);
+		/* Retain the uniquely created placeholder. POSIX has no portable
+		 * unlink-by-handle operation, and unlink(path) after a rename race
+		 * could remove another process's replacement. */
+		errno = saved;
+		return NULL;
+	}
+	return f;
+}
+
+static inline int bs_fclose_discard_owned(FILE *f, const char *path) {
+	/* There is no portable POSIX unlink-by-open-file identity. Transform
+	 * writers use a private partial pathname, so retain it on failure rather
+	 * than risk unlinking a replacement installed by another process. */
+	(void)path;
+	return fclose(f);
+}
+
 static inline int bs_fsync_file(FILE *f) { return fsync(fileno(f)); }
 
 static inline int bs_fseeko(FILE *f, int64_t off, int whence) { return fseeko(f, (off_t)off, whence); }
@@ -391,6 +488,20 @@ static inline int bs_ftruncate_file(FILE *f, int64_t size) {
 }
 
 static inline int bs_rename_overwrite(const char *from, const char *to) { return rename(from, to); }
+
+static inline int bs_rename_noreplace(const char *from, const char *to) {
+#if defined(__APPLE__)
+	/* Darwin provides an atomic exclusive rename, including on filesystems
+	 * where hard links are unavailable. */
+	return renamex_np(from, to, RENAME_EXCL);
+#else
+	if (link(from, to) != 0) return -1;
+	/* The output hard link is already a complete no-overwrite publication.
+	 * Failure to remove the private staging name only leaves harmless debris. */
+	(void)unlink(from);
+	return 0;
+#endif
+}
 
 static inline bool bs_file_exists(const char *path) { return access(path, F_OK) == 0; }
 

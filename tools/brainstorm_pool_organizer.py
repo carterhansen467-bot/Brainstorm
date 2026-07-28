@@ -40,15 +40,17 @@ import collections
 import functools
 import heapq
 import json
+import operator
 import os
 import re
 import struct
 import sys
 import tempfile
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import (Callable, Dict, Iterable, Iterator, List, NamedTuple,
+                    Optional, Sequence, Tuple)
 from urllib.parse import quote
 
 try:
@@ -180,6 +182,29 @@ OPERAND_DESCRIPTOR_BYTES = 9
 COMPOSITE_SCHEMA = 1
 COMPOSITE_OPERATIONS = ("union", "intersection", "difference")
 COMPOSITE_MAX_INPUTS = 64
+
+
+def _safe_split_output_limit() -> int:
+    """Bound simultaneous writer locks/staging streams for this process."""
+    absolute_limit = 256
+    if os.name == "nt":
+        # Lock files use Win32 HANDLEs while staging pools use CRT streams.
+        # 256 writers remain below the common 512-stream CRT ceiling.
+        return absolute_limit
+    try:
+        import resource
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit == resource.RLIM_INFINITY:
+            return absolute_limit
+        soft_limit = int(soft_limit)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return 96
+    # A POSIX split holds approximately one lock descriptor and one staging
+    # stream per output. Reserve descriptors for sources, reports and runtime.
+    return max(1, min(absolute_limit, (soft_limit - 32) // 2))
+
+
+MAX_SPLIT_OUTPUTS = _safe_split_output_limit()
 COMPOSITE_HEADER_SIZES = (HEADER_EVENTS_BYTES, 16 * 1024, 32 * 1024,
                           64 * 1024, 128 * 1024, HEADER_MAX_BYTES)
 COMPOSITE_HEADER_SPARE_BYTES = 4 * 1024
@@ -200,10 +225,101 @@ class PoolError(ValueError):
     """Raised when a pool cannot be trusted or organized safely."""
 
 
+@dataclass(frozen=True)
+class _SourceIdentity:
+    """Stable attributes used to reject a changed/replaced pool pathname."""
+
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    birthtime_ns: int
+
+
+def _source_identity(status) -> _SourceIdentity:
+    def nanoseconds(name):
+        direct = getattr(status, name + "_ns", None)
+        if direct is not None:
+            return int(direct)
+        return int(float(getattr(status, name, 0.0)) * 1000000000)
+
+    return _SourceIdentity(
+        int(status.st_dev), int(status.st_ino), int(status.st_mode),
+        int(status.st_size), nanoseconds("st_mtime"), nanoseconds("st_ctime"),
+        nanoseconds("st_birthtime"))
+
+
 def _check_cancel(cancel_check: Optional[Callable[[], bool]]) -> None:
     """Raise the organizer's stable cancellation error when requested."""
     if cancel_check is not None and cancel_check():
         raise PoolError("operation cancelled")
+
+
+def _open_windows_read_snapshot(path: str, *, _ctypes=None, _msvcrt=None,
+                                _fdopen=None, _close_fd=None):
+    """Open one Windows reader that excludes concurrent writes/replacement.
+
+    Ownership moves from the raw Win32 HANDLE to the CRT descriptor and then
+    to the returned Python stream. Each failure path closes only the resource
+    whose ownership was successfully acquired at that point.
+
+    The private dependency hooks keep those ownership transitions testable on
+    non-Windows CI hosts; normal callers should pass only ``path``.
+    """
+    if _ctypes is None:
+        import ctypes as _ctypes
+    if _msvcrt is None:
+        import msvcrt as _msvcrt
+    if _fdopen is None:
+        _fdopen = os.fdopen
+    if _close_fd is None:
+        _close_fd = os.close
+
+    kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        _ctypes.c_wchar_p, _ctypes.c_uint32, _ctypes.c_uint32,
+        _ctypes.c_void_p, _ctypes.c_uint32, _ctypes.c_uint32,
+        _ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = _ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [_ctypes.c_void_p]
+    kernel32.CloseHandle.restype = _ctypes.c_int
+
+    # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL.
+    # Omitting FILE_SHARE_WRITE and FILE_SHARE_DELETE pins the inspected object
+    # against both mutation and pathname replacement for the full traversal.
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path), 0x80000000, 0x00000001, None, 3, 0x00000080, None)
+    handle = getattr(raw_handle, "value", raw_handle)
+    invalid_handle = _ctypes.c_void_p(-1).value
+    if handle is None or handle == invalid_handle:
+        raise _ctypes.WinError(_ctypes.get_last_error())
+
+    try:
+        descriptor = _msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        try:
+            kernel32.CloseHandle(handle)
+        finally:
+            raise
+
+    try:
+        return _fdopen(descriptor, "rb", closefd=True)
+    except BaseException:
+        try:
+            _close_fd(descriptor)
+        finally:
+            raise
+
+
+def _open_source_snapshot_handle(path: str):
+    """Open a traversal stream, adding a Windows deny-write/delete share."""
+    if os.name == "nt":
+        return _open_windows_read_snapshot(path)
+    return open(path, "rb")
 
 
 def fsync_directory(path: str) -> None:
@@ -1240,12 +1356,8 @@ def expression_text(value: Dict[str, object], labels=None) -> str:
                               for item in value["inputs"]) + ")"
 
 
-@dataclass(frozen=True)
-class Block:
-    __slots__ = (
-        "offset", "first_record", "count", "rank_bytes", "metadata_bytes",
-        "associations", "first_rank", "last_rank", "header_bytes",
-        "rank_codec", "metadata_encoding", "flags")
+class Block(NamedTuple):
+    """Immutable public view of one committed pool block."""
 
     offset: int
     first_record: int
@@ -1263,6 +1375,83 @@ class Block:
     @property
     def payload_bytes(self) -> int:
         return self.rank_bytes + self.metadata_bytes
+
+
+_PACKED_BLOCK = struct.Struct("<QQIIIIQQIBBBx")
+
+
+class PackedBlockSequence(Sequence[Block]):
+    """Compact random-access block descriptors for read-only pool readers.
+
+    A large legacy BSP3 can contain hundreds of thousands of blocks. Keeping
+    twelve Python integers plus one object per block costs several hundred
+    bytes per entry. This sequence retains the same immutable fields in one
+    56-byte packed buffer and materializes a ``Block`` only while a caller is
+    accessing it. Integer indexing, slicing, iteration, ``len`` and truth
+    testing retain the former list-like reader API.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self) -> None:
+        self._data = bytearray()
+
+    def __len__(self) -> int:
+        return len(self._data) // _PACKED_BLOCK.size
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        item = operator.index(index)
+        if item < 0:
+            item += len(self)
+        if item < 0 or item >= len(self):
+            raise IndexError("block index out of range")
+        return Block(*_PACKED_BLOCK.unpack_from(
+            self._data, item * _PACKED_BLOCK.size))
+
+    def __iter__(self) -> Iterator[Block]:
+        for fields in _PACKED_BLOCK.iter_unpack(self._data):
+            yield Block(*fields)
+
+    def physical_rank_order(self) -> Tuple[bool, bool]:
+        """Return (rank-ordered, disjoint) without materializing Block views."""
+        fields = iter(_PACKED_BLOCK.iter_unpack(self._data))
+        try:
+            prior = next(fields)
+        except StopIteration:
+            return True, True
+        rank_ordered = True
+        disjoint = True
+        for current in fields:
+            if (prior[6], prior[7]) > (current[6], current[7]):
+                rank_ordered = False
+            if prior[7] >= current[6]:
+                disjoint = False
+            prior = current
+        return rank_ordered, disjoint
+
+    def __sizeof__(self) -> int:
+        # Include the owned bytearray storage in cache/memory accounting.
+        return object.__sizeof__(self) + sys.getsizeof(self._data)
+
+    @property
+    def packed_bytes(self) -> int:
+        """Exact descriptor payload bytes retained by this sequence."""
+        return len(self._data)
+
+    def append(self, block: Block) -> None:
+        self.append_fields(*block)
+
+    def append_fields(
+            self, offset: int, first_record: int, count: int,
+            rank_bytes: int, metadata_bytes: int, associations: int,
+            first_rank: int, last_rank: int, header_bytes: int,
+            rank_codec: int, metadata_encoding: int, flags: int) -> None:
+        self._data.extend(_PACKED_BLOCK.pack(
+            offset, first_record, count, rank_bytes, metadata_bytes,
+            associations, first_rank, last_rank, header_bytes, rank_codec,
+            metadata_encoding, flags))
 
 
 class PoolHeader:
@@ -1316,7 +1505,17 @@ class BSPoolReader:
         _check_cancel(cancel_check)
         self.cancel_check = cancel_check
         self.path = os.path.abspath(path)
-        text = read_pool_header_text(self.path)
+        try:
+            source_handle = open(self.path, "rb")
+        except OSError as exc:
+            raise PoolError("cannot open Brainstorm pool: %s" % exc)
+        try:
+            self._source_identity = _source_identity(
+                os.fstat(source_handle.fileno()))
+            text = _read_pool_header_text_from_handle(source_handle)
+            self._assert_source_unchanged(source_handle)
+        finally:
+            source_handle.close()
         if not text:
             raise PoolError("cannot read a bounded Brainstorm pool header")
         self.header = PoolHeader(text)
@@ -1388,11 +1587,11 @@ class BSPoolReader:
         self.composite_expression = None
         self.composite_operands = {}  # type: Dict[int, CompositeOperand]
         self.composite_branches = self._parse_composite_header()
-        self.file_bytes = os.path.getsize(self.path)
+        self.file_bytes = self._source_identity.size
         self.data_end = self.header_bytes + self.data_bytes
         if self.file_bytes < self.data_end:
             raise PoolError("pool is shorter than its committed data boundary")
-        self.blocks = []  # type: List[Block]
+        self.blocks = PackedBlockSequence()
         self._trusted_bsp3_index = b""
         self._trusted_bsp3_recovery_identity = False
         self._repaired_bsp3_headers = set()  # type: set
@@ -1445,6 +1644,39 @@ class BSPoolReader:
                     if self.schema == 4
                     else (FNV64_OFFSET if self.schema == 3 else 0))
         _check_cancel(cancel_check)
+
+    def _source_changed_error(self) -> PoolError:
+        return PoolError(
+            "pool source changed or was replaced after inspection began; "
+            "inspect the current file again: %s" % self.path)
+
+    def _assert_source_unchanged(self, handle) -> None:
+        try:
+            opened_identity = _source_identity(os.fstat(handle.fileno()))
+            path_identity = _source_identity(os.stat(self.path))
+        except OSError:
+            raise self._source_changed_error()
+        if (opened_identity != self._source_identity
+                or path_identity != self._source_identity):
+            raise self._source_changed_error()
+
+    @contextmanager
+    def _open_source_snapshot(
+            self,
+            cancel_check: Optional[Callable[[], bool]] = None):
+        """Pin one traversal handle and reject pathname/object changes."""
+        _check_cancel(cancel_check)
+        try:
+            handle = _open_source_snapshot_handle(self.path)
+        except OSError:
+            raise self._source_changed_error()
+        try:
+            self._assert_source_unchanged(handle)
+            yield handle
+            _check_cancel(cancel_check)
+            self._assert_source_unchanged(handle)
+        finally:
+            handle.close()
 
     @property
     def metadata_capable(self) -> bool:
@@ -1636,7 +1868,7 @@ class BSPoolReader:
         footer_bytes = FOOTER4_BYTES
         if self.file_bytes < self.data_end + footer_bytes:
             raise PoolError("complete pool has a truncated BSP4 index")
-        with open(self.path, "rb") as handle:
+        with self._open_source_snapshot(self.cancel_check) as handle:
             footer = handle_read(
                 handle, self.file_bytes - footer_bytes, footer_bytes)
             if footer[:8] != b"BSPIDX4\n":
@@ -1707,10 +1939,10 @@ class BSPoolReader:
                 raise PoolError(
                     "complete BSP4 index entry %d exceeds committed data" %
                     number)
-            self.blocks.append(Block(
+            self.blocks.append_fields(
                 offset, first_record, count, rank_bytes, metadata_bytes,
                 associations, first_rank, last_rank, BLOCK4_HEADER_BYTES,
-                rank_codec, metadata_encoding, flags))
+                rank_codec, metadata_encoding, flags)
             expected_offset += BLOCK4_HEADER_BYTES + payload_bytes
             expected_first_record += count
         _check_cancel(self.cancel_check)
@@ -1733,7 +1965,7 @@ class BSPoolReader:
         """
         if self.file_bytes < self.data_end + FOOTER3_BYTES:
             raise PoolError("complete pool has a truncated BSP3 index")
-        with open(self.path, "rb") as handle:
+        with self._open_source_snapshot(self.cancel_check) as handle:
             footer = handle_read(
                 handle, self.file_bytes - FOOTER3_BYTES, FOOTER3_BYTES)
             if footer[:8] != b"BSPIDX3\n":
@@ -1830,7 +2062,7 @@ class BSPoolReader:
     def _scan_committed_blocks(self) -> None:
         total_records = 0
         offset = self.header_bytes
-        with open(self.path, "rb") as handle:
+        with self._open_source_snapshot(self.cancel_check) as handle:
             while offset < self.data_end:
                 _check_cancel(self.cancel_check)
                 rank_codec = BSP4_RANK_POSITIVE
@@ -1915,11 +2147,10 @@ class BSPoolReader:
                 payload_bytes = rank_bytes + meta_bytes
                 if offset + block_header_bytes + payload_bytes > self.data_end:
                     raise PoolError("committed pool boundary cuts through a block")
-                self.blocks.append(Block(
+                self.blocks.append_fields(
                     offset, total_records, count, rank_bytes, meta_bytes,
                     associations, first, last, block_header_bytes, rank_codec,
-                    metadata_encoding, flags,
-                ))
+                    metadata_encoding, flags)
                 total_records += count
                 offset += block_header_bytes + payload_bytes
         _check_cancel(self.cancel_check)
@@ -1977,7 +2208,7 @@ class BSPoolReader:
         expected_size = self.data_end + len(self.blocks) * entry_bytes + footer_bytes
         if self.file_bytes != expected_size:
             raise PoolError("complete pool has trailing or missing index bytes")
-        with open(self.path, "rb") as handle:
+        with self._open_source_snapshot(self.cancel_check) as handle:
             footer = handle_read(handle, self.file_bytes - footer_bytes, footer_bytes)
             magic = {
                 2: b"BSPIDX2\n",
@@ -2282,7 +2513,7 @@ class BSPoolReader:
             if self._payload_verified:
                 return
             membership, metadata = self._digest_starts()
-            with open(self.path, "rb") as handle:
+            with self._open_source_snapshot(current_cancel) as handle:
                 for block in self.blocks:
                     _check_cancel(current_cancel)
                     _records, membership, metadata = \
@@ -2314,12 +2545,21 @@ class BSPoolReader:
             return
         current_cancel = cancel_check \
             if cancel_check is not None else self.cancel_check
-        ordered_blocks = sorted(
-            self.blocks, key=lambda block: (block.first_rank, block.last_rank))
-        disjoint_intervals = all(
-            ordered_blocks[index - 1].last_rank
-            < ordered_blocks[index].first_rank
-            for index in range(1, len(ordered_blocks)))
+        physically_rank_ordered, disjoint_intervals = \
+            self.blocks.physical_rank_order()
+        if physically_rank_ordered:
+            ordered_blocks = self.blocks
+        else:
+            # Historical multi-threaded writers may have committed otherwise
+            # valid blocks out of rank order. Materialize only that uncommon
+            # case because sorting necessarily needs random descriptor access.
+            ordered_blocks = sorted(
+                self.blocks,
+                key=lambda block: (block.first_rank, block.last_rank))
+            disjoint_intervals = all(
+                ordered_blocks[index - 1].last_rank
+                < ordered_blocks[index].first_rank
+                for index in range(1, len(ordered_blocks)))
         if not self._payload_verified:
             with self._verification_lock:
                 if not self._payload_verified:
@@ -2328,10 +2568,11 @@ class BSPoolReader:
                     # and yield each payload exactly once. Shuffled/overlapping
                     # files take the conservative physical verification pass
                     # first, then use the bounded ordered traversal below.
-                    if disjoint_intervals and ordered_blocks == self.blocks:
+                    if disjoint_intervals and physically_rank_ordered:
                         membership, metadata = self._digest_starts()
                         prior = None
-                        with open(self.path, "rb") as handle:
+                        with self._open_source_snapshot(
+                                current_cancel) as handle:
                             for block in self.blocks:
                                 _check_cancel(current_cancel)
                                 records, membership, metadata = \
@@ -2350,10 +2591,11 @@ class BSPoolReader:
                             membership, metadata)
                         return
                     self._verify_all_payloads(current_cancel)
-        with open(self.path, "rb") as handle:
+        with self._open_source_snapshot(current_cancel) as handle:
             if disjoint_intervals:
                 prior = None
                 for block in ordered_blocks:
+                    _check_cancel(current_cancel)
                     for record in self._read_block_records(handle, block):
                         if prior is not None and record.rank <= prior:
                             raise PoolError("pool repeats or misorders a rank across blocks")
@@ -2389,6 +2631,7 @@ class BSPoolReader:
                     for index, block in enumerate(self.blocks)]
             heapq.heapify(heap)
             prior = None
+            processed = 0
             while heap:
                 expected_rank, block_index, record_index = heapq.heappop(heap)
                 records = records_for(block_index)
@@ -2399,6 +2642,9 @@ class BSPoolReader:
                     raise PoolError("pool repeats or misorders a rank across blocks")
                 prior = record.rank
                 yield record
+                processed += 1
+                if processed % CANCEL_CHECK_RECORDS == 0:
+                    _check_cancel(current_cancel)
                 record_index += 1
                 if record_index < len(records):
                     heapq.heappush(
@@ -2412,6 +2658,36 @@ def handle_read(handle, offset: int, count: int) -> bytes:
     if len(data) != count:
         raise PoolError("pool is truncated at byte %d" % offset)
     return data
+
+
+def _read_pool_header_text_from_handle(handle) -> str:
+    """Read the builder-compatible bounded header from one pinned file."""
+    prefix = handle_read(handle, 0, HEADER_PREFIX_BYTES)
+    raw = prefix
+    magic = re.match(
+        br"^BRAINSTORM_SEED_POOL[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
+        prefix)
+    schema = int(magic.group(1)) if magic else 0
+    if schema in EVENT_POOL_SCHEMAS:
+        size_line = re.search(
+            br"(?:^|\n)header_bytes[ \t]+([0-9]+)[ \t]*(?:\r?\n|\x00|$)",
+            prefix)
+        if not size_line:
+            return ""
+        header_bytes = int(size_line.group(1))
+        if not (HEADER_PREFIX_BYTES <= header_bytes <= HEADER_MAX_BYTES):
+            return ""
+        if header_bytes > len(prefix):
+            raw += handle_read(
+                handle, len(prefix), header_bytes - len(prefix))
+        else:
+            raw = raw[:header_bytes]
+    text = raw.split(b"\0", 1)[0].decode("latin-1")
+    if schema == 4 and not re.search(
+            r"(?:^|\n)encoding[ \t]+adaptive-events-v1"
+            r"[ \t]*(?:\r?\n|$)", text):
+        return ""
+    return text
 
 
 def record_categories(record: Record, selected: Optional[set] = None) -> List[str]:
@@ -3604,6 +3880,14 @@ def safe_filename(category_id: str) -> str:
     return "%s-%016x.bspool" % (stem, fnv64(category_id.encode("utf-8")))
 
 
+def _check_split_output_limit(output_count: int) -> None:
+    if output_count > MAX_SPLIT_OUTPUTS:
+        raise PoolError(
+            "split would create %d non-empty pools; choose fewer categories "
+            "or run separate splits (maximum %d outputs per publication)" %
+            (output_count, MAX_SPLIT_OUTPUTS))
+
+
 def atomic_json(path: str, value: object) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -3749,6 +4033,7 @@ def split_pool(reader: BSPoolReader, output_dir: str,
             "label": label,
             "records": category_counts[category],
         })
+    _check_split_output_limit(len(category_rows))
     report = {
         "organizer_schema": 1,
         "source": source_summary(reader),
@@ -3926,6 +4211,7 @@ def write_prepared_split(
         })
     if not destinations:
         raise PoolError("prepared split has no non-empty outputs")
+    _check_split_output_limit(len(destinations))
 
     if not isinstance(report, dict):
         raise PoolError("prepared split report must be an object")
@@ -4081,7 +4367,7 @@ def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
 
 
 def command_inspect(args) -> int:
-    reader = BSPoolReader(args.input)
+    reader = BSPoolReader(args.input, verify_payloads=False)
     limit = None if args.ambiguity_limit < 0 else args.ambiguity_limit
     report = analyze(reader, ambiguity_limit=limit)
     if args.json:
@@ -4109,25 +4395,69 @@ def command_inspect(args) -> int:
 
 
 def command_records(args) -> int:
-    reader = BSPoolReader(args.input)
-    output = sys.stdout if args.output == "-" else open(
-        args.output, "w", encoding="utf-8", newline="\n")
-    try:
+    reader = BSPoolReader(args.input, verify_payloads=False)
+
+    def write_records(output) -> None:
         for record in reader.iter_records():
             value = {
                 "seed": reader.seed(record.rank),
                 "rank": record.rank,
-                "occurrences": [item.as_dict() for item in record.occurrences],
+                "occurrences": [
+                    item.as_dict() for item in record.occurrences],
             }
             output.write(json.dumps(value, sort_keys=True) + "\n")
-    finally:
-        if output is not sys.stdout:
-            output.close()
+
+    if args.output == "-":
+        # Standard output intentionally remains streaming: callers may pipe a
+        # very large export without first staging another full-sized copy.
+        write_records(sys.stdout)
+        return 0
+
+    destination = os.path.abspath(args.output)
+    try:
+        replaces_source = os.path.samefile(destination, reader.path)
+    except FileNotFoundError:
+        # The destination does not exist yet, so inode identity is
+        # unavailable.  This fallback still catches a literal source path and
+        # Windows case aliases without weakening the existing-file check.
+        replaces_source = (
+            os.path.normcase(os.path.realpath(destination))
+            == os.path.normcase(os.path.realpath(reader.path)))
+    except OSError:
+        # Be conservative if the platform cannot stat an existing output.
+        replaces_source = (
+            os.path.normcase(os.path.realpath(destination))
+            == os.path.normcase(os.path.realpath(reader.path)))
+    if replaces_source:
+        raise PoolError("records output cannot replace its source pool")
+    directory = os.path.dirname(destination)
+    fd, staged = tempfile.mkstemp(
+        prefix=".organizer-records-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
+            write_records(output)
+            # Deferred verification completes only when iter_records() is
+            # exhausted. Sync the validated staging file before publishing it.
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(staged, destination)
+        staged = ""
+        fsync_directory(directory)
+    except BaseException:
+        if staged:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+        raise
     return 0
 
 
 def command_split(args) -> int:
-    reader = BSPoolReader(args.input)
+    # Split still needs a planning traversal and a staged-output traversal;
+    # defer validation so its initial inspect traversal validates while it
+    # consumes instead of adding a separate constructor pass.
+    reader = BSPoolReader(args.input, verify_payloads=False)
     report, completed = split_pool(
         reader, args.output_dir, args.category, args.choices, args.report,
         args.remainder, args.omit_unmatched)
@@ -4148,7 +4478,8 @@ def command_split(args) -> int:
 
 
 def command_combine(args) -> int:
-    readers = [BSPoolReader(path) for path in args.inputs]
+    readers = [
+        BSPoolReader(path, verify_payloads=False) for path in args.inputs]
     result = combine_pools(
         readers, args.output, operation=args.operation,
         label=args.label or os.path.splitext(os.path.basename(args.output))[0])

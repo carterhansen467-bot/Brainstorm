@@ -3,6 +3,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -106,6 +108,59 @@ def main():
         assert "document.activeElement === sel" in web.PAGE
         assert "Composite membership set" in web.PAGE
         assert "Organize / Combine" in web.PAGE
+        assert 'id="mergeTools"' in web.PAGE
+        assert "Merge distributed build parts" in web.PAGE
+        assert 'id="mergeSelectionCount"' in web.PAGE
+        assert 'id="mergeSelectionNames"' in web.PAGE
+        assert "Check parts and merge" in web.PAGE
+        assert "covers one continuous range without gaps or overlaps" in web.PAGE
+        assert "Once started, this merge cannot be paused." in web.PAGE
+
+        # Merge selection is an explicit library mode. Checkboxes are rendered
+        # only while its disclosure is open, and a persistent Set—not a fresh
+        # DOM scrape during tick()—owns the selection across one-second polls.
+        assert "let mergeSelected = new Set()" in web.PAGE
+        assert "const pick = mergeMode && mergeEligible(p)" in web.PAGE
+        assert 'mergeSelected, $("mergeTools").open' in web.PAGE
+        assert "mergeSelected.add(event.target.value)" in web.PAGE
+        assert "mergeSelected.delete(event.target.value)" in web.PAGE
+        assert "new Set([...document.querySelectorAll(\".mergePick:checked\")" \
+            not in web.PAGE
+
+        # A native distributed merge deliberately cannot be stopped. The UI
+        # must not offer a fake pause action or describe its failures as scanner
+        # failures.
+        assert "Merge cannot be paused" in web.PAGE
+        assert "The distributed-part merge failed." in web.PAGE
+        assert '$("btnClose").disabled = closing || mergeRunning' in web.PAGE
+
+        script = web.PAGE.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+        node = shutil.which("node")
+        if node:
+            checked = subprocess.run(
+                (node, "--check", "-"), input=script, text=True,
+                capture_output=True)
+            assert checked.returncode == 0, checked.stderr
+            behavior = subprocess.run(
+                (node, "-"), text=True, capture_output=True, input=(
+                    "globalThis.addEventListener=()=>{};\n" + script + r"""
+const part = {
+  name:"part-1.bspool", complete:true, composite:false,
+  native_compatible:true, coverage_complete:true, records:10, bytes:1024,
+  criteria:[], range_start:0, range_end:100
+};
+const selected = new Set([part.name]);
+if (renderPoolCard(part, selected, false).includes("mergePick"))
+  throw new Error("closed merge mode rendered a selection checkbox");
+const openCard = renderPoolCard(part, selected, true);
+if (!openCard.includes("mergePick") || !openCard.includes("checked")
+    || !openCard.includes("merge-selected"))
+  throw new Error("open merge mode lost its persistent selection");
+if (renderPoolCard({...part, complete:false}, selected, true)
+    .includes("mergePick"))
+  throw new Error("ineligible pool rendered a merge checkbox");
+"""))
+            assert behavior.returncode == 0, behavior.stderr
 
     print("pool library grouping: ok")
 

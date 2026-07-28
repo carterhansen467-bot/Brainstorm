@@ -29,7 +29,7 @@ overwrite = false
 target = "engine/controller.lua"
 pattern = "if self.text_input_hook then"
 position = "before"
-payload = "Brainstorm.key_press_update(key)"
+payload = "if Brainstorm.key_press_update(key) then return end"
 match_indent = true
 overwrite = false
 

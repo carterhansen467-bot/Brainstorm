@@ -23,7 +23,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -439,8 +439,15 @@ def start_merge_job(data, pool_dir=None):
             base = "merged-pool"
         os.makedirs(root, exist_ok=True)
         output = os.path.join(root, base + ".bspool")
-        if os.path.exists(output):
-            raise ValueError("That output already exists. Pick a different merged-pool name.")
+        collisions = [
+            output + suffix
+            for suffix in organizer_web.FORMAT_UPGRADE_PROTECTED_SUFFIXES
+            if os.path.lexists(output + suffix)
+        ]
+        if collisions:
+            raise ValueError(
+                "That output name already has pool files. Pick a different "
+                "merged-pool name or remove the old pool and its sidecars.")
         JOB.update(runner=core.MergeRunner(inputs, output), kind="merge",
                    started=time.time(), summary="Merging %d shard pools" % len(inputs),
                    error="", estimate_context=None)
@@ -488,6 +495,7 @@ PAGE = """<!doctype html>
   --green:#55d889; --red:#ff7474; --purple:#9d8cff; --shadow:0 18px 50px #0006;
 }
 * { box-sizing:border-box; }
+[hidden] { display:none !important; }
 html { scroll-behavior:smooth; }
 body { margin:0; min-height:100vh; background:
   radial-gradient(circle at 12% -5%, #332852 0, transparent 32rem),
@@ -663,9 +671,28 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   border-radius:9px; background:#29230f; color:#f2d77a; }
 .pool-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:7px; margin-top:11px; }
 .pool-delete { background:#3c2229 !important; border-color:#74404b !important; color:#ffc1c9 !important; }
+.pool.merge-selected { border-color:#7564ae; box-shadow:inset 0 0 0 1px #7564ae55; }
 .empty-library { grid-column:1 / -1; padding:30px; text-align:center; border:1px dashed #34394e;
   border-radius:13px; color:var(--faint); }
-.merge-panel { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }
+.merge-tools { margin:0 0 14px; }
+.merge-summary-count { margin-left:8px; color:#8f899b; font-size:11px; font-weight:600; }
+.merge-flow { display:grid; gap:12px; }
+.merge-stage { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; align-items:start; }
+.merge-step { display:grid; place-items:center; width:24px; height:24px; border:1px solid #443962;
+  border-radius:7px; background:#28213a; color:#c7baff; font-size:11px; font-weight:850; }
+.merge-stage strong { display:block; color:#ded9e7; font-size:12px; }
+.merge-stage p { margin:3px 0 0; }
+.merge-panel { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end;
+  margin-top:9px; }
+.merge-preflight { padding:10px 11px; border:1px solid #3b425b; border-radius:10px;
+  background:#10141e; color:#aaa6b6; font-size:11px; }
+.merge-mode-bar { display:flex; justify-content:space-between; gap:14px; align-items:center;
+  margin:0 0 12px; padding:11px 13px; border:1px solid #574a7b; border-radius:11px;
+  background:#1c172a; color:#d8d0e8; }
+.merge-mode-bar strong,.merge-mode-bar span { display:block; }
+.merge-mode-bar span { margin-top:2px; color:#9690a2; font-size:11px; overflow-wrap:anywhere; }
+.merge-count { flex:0 0 auto; color:#d8ccff !important; font-size:12px !important;
+  font-weight:800; white-space:nowrap; }
 .tagc { color:var(--muted); }
 .ok { color:var(--green); } .part { color:var(--gold); }
 @media (max-width:900px) {
@@ -690,6 +717,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .voucher-rule button, .voucher-exclusion button { grid-column:1 / -1; }
   .pool-grid, .pool-lineage-grid { grid-template-columns:1fr; }
   .merge-panel { grid-template-columns:1fr; }
+  .merge-mode-bar { align-items:flex-start; flex-direction:column; }
   .library-head { display:block; }
 }
 </style></head><body>
@@ -857,8 +885,8 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
           <h2 id="progTitle">Progress</h2></div><strong id="progressPct">0%</strong></div>
         <div id="bar"><div id="fill"></div></div>
         <div class="stats">
-          <div class="stat"><span>Scanned</span><b id="sScan">0</b></div>
-          <div class="stat"><span>Matches</span><b id="sMatch">0</b></div>
+          <div class="stat"><span id="sScanLabel">Scanned</span><b id="sScan">0</b></div>
+          <div class="stat"><span id="sMatchLabel">Matches</span><b id="sMatch">0</b></div>
           <div class="stat"><span>Speed</span><b id="sRate">—</b></div>
           <div class="stat"><span>Time left</span><b id="sEta">—</b></div>
         </div>
@@ -870,22 +898,34 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   <section class="card library" aria-labelledby="libraryTitle">
     <div class="library-head"><div><h2 id="libraryTitle">Your seed pools</h2>
       <p>Completed pools appear in Brainstorm automatically. Share a pool by copying its single <code>.bspool</code> file.</p></div></div>
-    <div id="pools" class="pool-grid"><div class="empty-library">No seed pools yet.</div></div>
-    <details class="advanced">
-      <summary>Merge distributed pool parts</summary>
+    <details class="advanced merge-tools" id="mergeTools">
+      <summary>Merge distributed build parts <span class="merge-summary-count" id="mergeSummaryCount">No parts selected</span></summary>
       <div class="advanced-body">
-        <p class="hint">Select at least two completed pools above. Their criteria and ranges are checked before merging.</p>
-        <div class="merge-panel"><div class="field"><label for="mergeName">Merged pool name</label>
-          <input type="text" id="mergeName" value="merged-pool" size="22"></div>
-          <button id="btnMerge" onclick="mergePools()">Merge selected parts</button></div>
+        <div class="merge-flow">
+          <div class="merge-stage"><span class="merge-step">1</span><div><strong>Select completed build parts</strong>
+            <p class="hint">While this panel is open, eligible pools below show selection checkboxes. Choose at least two parts from the same distributed build.</p></div></div>
+          <div class="merge-stage"><span class="merge-step">2</span><div><strong>Name the merged output and run the safety check</strong>
+            <div class="merge-panel"><div class="field"><label for="mergeName">New merged pool name</label>
+              <input type="text" id="mergeName" value="merged-pool" size="22">
+              <span class="hint">Brainstorm adds <code>.bspool</code> and never overwrites an existing file.</span></div>
+              <button type="button" id="btnMerge" onclick="mergePools()" disabled>Check parts and merge</button></div></div></div>
+          <div class="merge-preflight">Before publishing a new pool, Brainstorm checks that every selected file is complete, uses the same search criteria, and covers one continuous range without gaps or overlaps. The source parts stay unchanged. Once started, this merge cannot be paused.</div>
+        </div>
         <div id="mergeError" role="alert"></div>
       </div>
     </details>
+    <div class="merge-mode-bar" id="mergeModeBar" role="status" aria-live="polite" hidden>
+      <div><strong>Select parts from the pool library</strong><span id="mergeSelectionNames">No parts selected yet.</span></div>
+      <span class="merge-count" id="mergeSelectionCount">0 parts selected</span>
+    </div>
+    <div id="pools" class="pool-grid"><div class="empty-library">No seed pools yet.</div></div>
   </section>
 </main>
 
 <script>
-let CAT = null, lastRunning = false, lastResultKey = "";
+let CAT = null, lastRunning = false, lastJobKind = "", lastResultKey = "";
+let mergeSelected = new Set(), mergeRequestPending = false, builderBusy = false;
+let latestPoolGroups = [], latestPools = [];
 const $ = id => document.getElementById(id);
 
 // Replace a <select>'s options only when they actually changed, and never
@@ -914,6 +954,43 @@ function fmtSecs(s){ s=Math.round(s);
   if(s<5400) return Math.floor(s/60)+"m "+(s%60)+"s";
   if(s<172800) return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m";
   return (s/86400).toFixed(1)+" days"; }
+
+function mergeEligible(pool){
+  return pool.complete && !pool.composite && pool.native_compatible !== false;
+}
+
+function selectedMergeNames(){
+  return [...mergeSelected].sort((a,b)=>a.localeCompare(b));
+}
+
+function updateMergeControls(){
+  const names = selectedMergeNames(), count = names.length;
+  const countText = `${fmt(count)} part${count===1?"":"s"} selected`;
+  $("mergeSummaryCount").textContent = count ? countText : "No parts selected";
+  $("mergeSelectionCount").textContent = countText;
+  $("mergeSelectionNames").textContent = count
+    ? names.slice(0,4).join(" · ")+(count>4?` · +${fmt(count-4)} more`:"")
+    : "No parts selected yet.";
+  $("mergeModeBar").hidden = !$("mergeTools").open;
+  const named = !!$("mergeName").value.trim();
+  const button = $("btnMerge");
+  button.disabled = builderBusy || mergeRequestPending || count < 2 || !named;
+  if (mergeRequestPending) $("btnClose").disabled = true;
+  button.textContent = mergeRequestPending ? "Checking selected parts…"
+    : lastRunning && lastJobKind === "merge" ? "Merging selected parts…"
+    : "Check parts and merge";
+}
+
+function renderLatestPoolLibrary(){
+  const html = renderPoolLibrary(
+    latestPoolGroups, latestPools, mergeSelected, $("mergeTools").open);
+  // Only replace cards when pool data, merge mode, or a selected state changed.
+  // The persistent Set remains authoritative across the one-second poll.
+  if ($("pools").dataset.rendered !== html){
+    $("pools").dataset.rendered = html;
+    $("pools").innerHTML = html;
+  }
+}
 
 function addRule(key){
   if (!CAT || !CAT.tags.length) return;
@@ -1198,6 +1275,11 @@ async function run(kind){
 }
 async function stopJob(){ await fetch("/api/stop", {method:"POST"}); }
 async function closeBuilder(){
+  if (mergeRequestPending) return;
+  if (lastRunning && lastJobKind === "merge") {
+    $("result").textContent = "A distributed-part merge is running and cannot be paused. Wait for it to finish before closing the Builder.";
+    return;
+  }
   if (lastRunning && !confirm("Pause the active job at its next checkpoint and close the Builder?")) return;
   $("btnClose").disabled = true;
   try {
@@ -1215,11 +1297,28 @@ async function closeBuilder(){
 }
 async function mergePools(){
   $("mergeError").textContent = "";
-  const pools = [...document.querySelectorAll(".mergePick:checked")].map(x=>x.value);
-  const r = await fetch("/api/merge", {method:"POST", body:JSON.stringify({
-    pools, name:$("mergeName").value})});
-  const j = await r.json();
-  if (j.error) $("mergeError").textContent = j.error;
+  const pools = selectedMergeNames();
+  if (pools.length < 2) {
+    $("mergeError").textContent = "Select at least two completed parts from the same distributed build.";
+    updateMergeControls();
+    return;
+  }
+  mergeRequestPending = true;
+  updateMergeControls();
+  try {
+    const r = await fetch("/api/merge", {method:"POST", body:JSON.stringify({
+      pools, name:$("mergeName").value})});
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    await tick();
+  } catch (e) {
+    $("mergeError").textContent = "The selected parts could not be merged: "
+      + (e.message || String(e));
+  } finally {
+    mergeRequestPending = false;
+    if (!builderBusy) $("btnClose").disabled = false;
+    updateMergeControls();
+  }
 }
 
 async function deletePool(name){
@@ -1266,11 +1365,16 @@ function showResult(j){
   const m = j.manifest || {};
   let out = "";
   if (j.rc === 130) {
-    out = j.kind === "estimate"
+    out = j.kind === "merge"
+      ? "The distributed-part merge stopped. The source part files were not changed."
+      : j.kind === "estimate"
       ? "Estimate canceled cleanly. No seed-pool file was changed."
       : "Paused at a checkpoint. Press Build pool again (same name) to resume.";
   } else if (j.rc !== 0) {
-    out = "The scanner reported a problem:\\n" + (j.lines||[]).join("\\n");
+    out = j.kind === "merge"
+      ? "The distributed-part merge failed. The source part files were not changed.\\n"
+        + (j.lines||[]).join("\\n")
+      : "The scanner reported a problem:\\n" + (j.lines||[]).join("\\n");
   } else if (j.kind === "estimate") {
     const scanned = +m.scanned || 1, matched = +m.matched || 0;
     const estimate = j.estimate_context || {};
@@ -1353,7 +1457,7 @@ function inputPoolOptions(groups){
   return html;
 }
 
-function renderPoolCard(p, mergeSelected){
+function renderPoolCard(p, mergeSelected, mergeMode){
   const statusText = p.status_label || (!p.complete
     ? (p.resumable ? "Paused · resumable" : "Incomplete snapshot")
     : p.coverage_complete ? "Complete" : "Provisional · source snapshot");
@@ -1374,7 +1478,8 @@ function renderPoolCard(p, mergeSelected){
     ? ` · ${esc((p.composite_operation || "composite").toUpperCase())} of ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
   const range = p.range_end > p.range_start
     ? ` · ranks ${fmt(p.range_start)}–${fmt(p.range_end-1)}` : "";
-  const pick = p.complete && !p.composite && p.native_compatible !== false
+  const selectedForMerge = mergeMode && mergeSelected.has(p.name);
+  const pick = mergeMode && mergeEligible(p)
     ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>`
     : "";
   const criteriaText = p.composite
@@ -1408,13 +1513,13 @@ function renderPoolCard(p, mergeSelected){
   const deleteAction = `<button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete pool…</button>`;
   const actions = attachmentAction || deleteAction
     ? `<div class="pool-actions">${attachmentAction}${deleteAction}</div>` : "";
-  return `<article class="pool"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
+  return `<article class="pool${selectedForMerge?" merge-selected":""}"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
     + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
     + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}${composite}</div>`
     + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}${attachmentState}${actions}</article>`;
 }
 
-function renderPoolLibrary(groups, pools, mergeSelected){
+function renderPoolLibrary(groups, pools, mergeSelected, mergeMode){
   if (!pools.length)
     return '<div class="empty-library">No seed pools yet. Build one and it will appear here automatically.</div>';
   return (groups || []).map(family=>{
@@ -1425,7 +1530,7 @@ function renderPoolLibrary(groups, pools, mergeSelected){
       const lineageId = lineage.lineage_id
         ? `<span>lineage ${esc(lineage.lineage_id.slice(0,8))}</span>` : "";
       return `<section class="pool-lineage"><div class="pool-lineage-head">${esc(lineage.label)} · ${esc(lineage.display_name)} ${lineageId}</div>`
-        + `<div class="pool-lineage-grid">${lineage.pools.map(p=>renderPoolCard(p, mergeSelected)).join("")}</div></section>`;
+        + `<div class="pool-lineage-grid">${lineage.pools.map(p=>renderPoolCard(p, mergeSelected, mergeMode)).join("")}</div></section>`;
     }).join("");
     return `<section class="pool-family"><div class="pool-family-head"><h3>${esc(family.label)} (${familyCount})</h3>${familyId}</div>${lineages}</section>`;
   }).join("");
@@ -1460,18 +1565,26 @@ async function tick(){
   const job = j.job;
   const running = !!job.running;
   const closing = !!job.closing;
+  const mergeRunning = running && job.kind === "merge";
+  builderBusy = running || closing;
   $("btnEst").disabled = running || closing; $("btnBuild").disabled = running || closing;
-  $("btnMerge").disabled = running || closing;
-  $("btnStop").disabled = !running;
-  $("btnStop").textContent = job.kind === "estimate" ? "Cancel estimate" : "Pause active job";
-  $("btnClose").disabled = closing;
+  $("btnStop").disabled = !running || mergeRunning;
+  $("btnStop").textContent = mergeRunning ? "Merge cannot be paused"
+    : job.kind === "estimate" ? "Cancel estimate" : "Pause active job";
+  $("btnStop").title = mergeRunning
+    ? "Distributed-part merges must finish once started." : "";
+  $("btnClose").disabled = closing || mergeRunning || mergeRequestPending;
   if (running || job.rc !== undefined){
     $("progressCard").style.display = "";
     $("progressState").textContent = closing && running ? "Pausing safely"
+      : mergeRunning ? "Merging"
       : running ? (job.scanned ? "Working" : "Starting")
-      : (job.rc === 0 ? "Complete" : job.rc === 130 ? "Paused" : "Stopped");
+      : (job.rc === 0 ? "Complete"
+        : job.rc === 130 && job.kind !== "merge" ? "Paused" : "Stopped");
     $("progTitle").textContent = (job.kind==="estimate"?"Estimating: ":job.kind==="merge"?"Merging: ":"Building: ")
       + (job.summary||"");
+    $("sScanLabel").textContent = job.kind === "merge" ? "Part records" : "Scanned";
+    $("sMatchLabel").textContent = job.kind === "merge" ? "Merged" : "Matches";
     const frac = job.total ? job.scanned/job.total : 0;
     $("fill").style.width = (100*frac).toFixed(1)+"%";
     $("progressPct").textContent = (100*frac).toFixed(frac && frac < .01 ? 2 : 1)+"%";
@@ -1489,18 +1602,37 @@ async function tick(){
     lastResultKey = resultKey;
   }
   lastRunning = running;
-  const mergeSelected = new Set([...document.querySelectorAll(".mergePick:checked")].map(x=>x.value));
-  const poolsHtml = renderPoolLibrary(j.pool_groups || [], j.pools, mergeSelected);
-  // Rebuild the list only when it changed: a 1s innerHTML rewrite eats the
-  // click that is toggling a merge checkbox.
-  if ($("pools").dataset.rendered !== poolsHtml){
-    $("pools").dataset.rendered = poolsHtml;
-    $("pools").innerHTML = poolsHtml;
+  lastJobKind = job.kind || "";
+  latestPoolGroups = j.pool_groups || [];
+  latestPools = j.pools || [];
+  const eligibleNames = new Set(
+    latestPools.filter(mergeEligible).map(pool=>pool.name));
+  for (const name of [...mergeSelected]){
+    if (!eligibleNames.has(name)) mergeSelected.delete(name);
   }
+  renderLatestPoolLibrary();
+  updateMergeControls();
 }
 addEventListener("load", ()=>{
   $("inputPool").addEventListener("change", ()=>{
     syncSourceControls(); updateSpaceHint(); updateShard(); updateSummary();
+  });
+  $("mergeTools").addEventListener("toggle", ()=>{
+    renderLatestPoolLibrary();
+    updateMergeControls();
+  });
+  $("mergeName").addEventListener("input", updateMergeControls);
+  $("pools").addEventListener("change", event=>{
+    if (!event.target.classList.contains("mergePick")) return;
+    if (event.target.checked) mergeSelected.add(event.target.value);
+    else mergeSelected.delete(event.target.value);
+    const card = event.target.closest(".pool");
+    if (card) card.classList.toggle("merge-selected", event.target.checked);
+    // Keep the render cache in sync with the persistent selection so the next
+    // one-second poll does not replace the checkbox the user just changed.
+    $("pools").dataset.rendered = renderPoolLibrary(
+      latestPoolGroups, latestPools, mergeSelected, $("mergeTools").open);
+    updateMergeControls();
   });
   $("space").addEventListener("change", ()=>{updateSpaceHint(); updateShard();});
   $("count").addEventListener("change", updateShard);
@@ -1520,6 +1652,7 @@ addEventListener("load", ()=>{
     else if (remove) deletePool(remove.dataset.pool);
   });
   syncFilterControls(); syncSourceControls(); updateSpaceHint(); updateShard();
+  updateMergeControls();
   tick(); setInterval(tick, 1000);
 });
 </script></body></html>
@@ -1529,6 +1662,7 @@ addEventListener("load", ()=>{
 class Handler(BaseHTTPRequestHandler):
     snap = None  # set at startup
     pool_dir = core.POOL_DIR
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):  # keep the terminal window calm
         pass
@@ -1551,24 +1685,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _organizer_export(self, parsed):
-        query = parse_qs(parsed.query)
-        name = query.get("source", [""])[0]
-        reader = organizer_web.verified_source_reader(name, self.pool_dir)
-        expected = query.get("snapshot", [""])[0].lower()
-        if expected != reader.snapshot_token:
-            raise organizer_web.organizer.PoolError(
-                "source snapshot changed; inspect before exporting")
-        filename = "%s-%s-records.ndjson" % (
-            os.path.splitext(name)[0], reader.snapshot_token[:8])
-        filename = re.sub(r"[^A-Za-z0-9._+-]+", "-", filename)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Content-Disposition", "attachment; filename=%s" %
-                         quote(filename))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        for line in organizer_web.iter_record_export(reader):
-            self.wfile.write(line)
+        return organizer_web.serve_record_export(
+            self, parsed, self.pool_dir)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1603,11 +1721,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"pools": organizer_web.list_sources(self.pool_dir)})
             elif parsed.path == "/organizer/api/export":
                 self._organizer_export(parsed)
+            elif parsed.path == "/organizer/api/export/status":
+                query = organizer_web.parse_qs(parsed.query)
+                self._json(organizer_web.record_export_status(
+                    query.get("request_id", [""])[0]))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError,
                 organizer_web.organizer.PoolError) as exc:
-            self._json({"error": str(exc)}, 400)
+            self._json(organizer_web.error_payload(exc), 400)
 
     def do_POST(self):
         parsed = urlparse(self.path)

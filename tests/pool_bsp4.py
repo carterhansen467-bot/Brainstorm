@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused tests for the production adaptive BSP4 pool codec."""
 
+import json
 import os
 import random
 import shutil
@@ -8,6 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -256,6 +258,117 @@ class BSP4CodecRegression(unittest.TestCase):
                          expected)
         self.assertEqual([record.rank for record in bsp3.iter_records()],
                          expected)
+
+    def test_reader_block_index_is_compact_and_preserves_sequence_access(self):
+        packed = organizer.PackedBlockSequence()
+        ordinary = []
+        block_count = 10_000
+        for number in range(block_count):
+            block = organizer.Block(
+                8192 + number * 4096, number * 1024, 1024,
+                1023, 2048, 1024, number * 2048,
+                number * 2048 + 1023, organizer.BLOCK3_HEADER_BYTES,
+                organizer.BSP4_RANK_POSITIVE, 0, 0)
+            packed.append(block)
+            ordinary.append(block)
+
+        self.assertEqual(len(packed), block_count)
+        self.assertEqual(packed[0], ordinary[0])
+        self.assertEqual(packed[-1], ordinary[-1])
+        self.assertEqual(packed[10:15], ordinary[10:15])
+        self.assertEqual(list(packed), ordinary)
+        self.assertEqual(
+            packed.packed_bytes, block_count * organizer._PACKED_BLOCK.size)
+
+        # This intentionally understates the ordinary representation by
+        # excluding all Python integer objects. Even under that conservative
+        # comparison, the packed descriptors retain less than half the bytes.
+        ordinary_bytes = (
+            sys.getsizeof(ordinary)
+            + sum(sys.getsizeof(block) for block in ordinary))
+        self.assertLess(sys.getsizeof(packed), ordinary_bytes // 2)
+
+        records = [
+            organizer.Record(index * 2, (TAG,))
+            for index in range(organizer.BSP4_WRITE_RECORDS + 10)
+        ]
+        path, writer = self.writer("packed-reader-index.bspool")
+        publish(writer, records)
+        reader = organizer.BSPoolReader(path, verify_payloads=False)
+        self.assertIsInstance(reader.blocks, organizer.PackedBlockSequence)
+        self.assertEqual([block.count for block in reader.blocks],
+                         [organizer.BSP4_WRITE_RECORDS, 10])
+        self.assertEqual(
+            [record.rank for record in reader.iter_records()],
+            [record.rank for record in records])
+
+    def test_records_file_export_publishes_only_after_full_validation(self):
+        records = [
+            organizer.Record(index * 3, (TAG,))
+            for index in range(organizer.BSP4_WRITE_RECORDS + 10)
+        ]
+        path, writer = self.writer("records-atomic-source.bspool")
+        publish(writer, records)
+        clean = organizer.BSPoolReader(path, verify_payloads=False)
+
+        corrupt = os.path.join(
+            self.temp.name, "records-atomic-corrupt.bspool")
+        second = clean.blocks[1]
+        copy_and_mutate(
+            path, corrupt, second.offset + second.header_bytes)
+        destination = os.path.join(self.temp.name, "records.ndjson")
+        with open(destination, "wb") as handle:
+            handle.write(b"existing export stays intact\n")
+        with self.assertRaisesRegex(organizer.PoolError, "rank checksum"):
+            organizer.command_records(SimpleNamespace(
+                input=corrupt, output=destination))
+        with open(destination, "rb") as handle:
+            self.assertEqual(handle.read(), b"existing export stays intact\n")
+        self.assertFalse([
+            name for name in os.listdir(self.temp.name)
+            if name.startswith(".organizer-records-")
+        ])
+
+        self.assertEqual(organizer.command_records(SimpleNamespace(
+            input=path, output=destination)), 0)
+        with open(destination, "r", encoding="utf-8") as handle:
+            exported = [json.loads(line) for line in handle]
+        self.assertEqual(
+            [item["rank"] for item in exported],
+            [record.rank for record in records])
+
+        with open(path, "rb") as handle:
+            original = handle.read()
+        with self.assertRaisesRegex(
+                organizer.PoolError, "cannot replace its source"):
+            organizer.command_records(SimpleNamespace(
+                input=path, output=path))
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+
+        hardlink = os.path.join(self.temp.name, "records-source-hardlink")
+        try:
+            os.link(path, hardlink)
+        except (AttributeError, NotImplementedError, OSError):
+            hardlink = None
+        if hardlink is not None:
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "cannot replace its source"):
+                organizer.command_records(SimpleNamespace(
+                    input=path, output=hardlink))
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), original)
+
+        case_alias = os.path.join(
+            self.temp.name, os.path.basename(path).swapcase())
+        if (case_alias != path and os.path.exists(case_alias)
+                and os.path.samefile(case_alias, path)):
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "cannot replace its source"):
+                organizer.command_records(SimpleNamespace(
+                    input=path, output=case_alias))
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), original)
 
     def test_adaptive_rank_and_descriptor_codec_selection_roundtrips(self):
         block_records = organizer.BSP4_WRITE_RECORDS

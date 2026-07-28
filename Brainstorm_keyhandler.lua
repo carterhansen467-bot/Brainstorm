@@ -5,11 +5,17 @@ Brainstorm.AUTOREROLL = {}
 
 local saveKeys = { "1", "2", "3", "4", "5" }
 
+local function ctrlDown()
+	return love.keyboard.isDown("lctrl") or love.keyboard.isDown("rctrl")
+end
+
 function Brainstorm.key_press_update(key)
 	-- Brainstorm Key Handler
+	local handled = false
 	for i, k in ipairs(saveKeys) do
 		--  SaveState
 		if key == k and love.keyboard.isDown(Brainstorm.SETTINGS.keybinds.saveState) then
+			handled = true
 			if G.STAGE == G.STAGES.RUN then
 				compress_and_save(G.SETTINGS.profile .. "/" .. "saveState" .. k .. ".jkr", G.ARGS.save_run)
 				saveManagerAlert("Saved state to slot [" .. k .. "]")
@@ -17,6 +23,7 @@ function Brainstorm.key_press_update(key)
 		end
 		--  LoadState
 		if key == k and love.keyboard.isDown(Brainstorm.SETTINGS.keybinds.loadState) then
+			handled = true
 			local data = get_compressed(G.SETTINGS.profile .. "/" .. "saveState" .. k .. ".jkr")
 			if data ~= nil then
 				data = STR_UNPACK(data)
@@ -44,10 +51,13 @@ function Brainstorm.key_press_update(key)
 		end
   end
 	--  FastReroll
-	if key == Brainstorm.SETTINGS.keybinds.rerollSeed and love.keyboard.isDown("lctrl") then
+	local ctrl = ctrlDown()
+	if key == Brainstorm.SETTINGS.keybinds.rerollSeed and ctrl then
+		handled = true
 		FastReroll()
 	end
-	if key == Brainstorm.SETTINGS.keybinds.autoReroll and love.keyboard.isDown("lctrl") then
+	if key == Brainstorm.SETTINGS.keybinds.autoReroll and ctrl then
+		handled = true
 		if Brainstorm.AUTOREROLL.autoRerollActive then
 			Brainstorm.AUTOREROLL.autoRerollActive = false
 			if Brainstorm.stopSearchThread then
@@ -71,27 +81,34 @@ function Brainstorm.key_press_update(key)
 			Brainstorm.AUTOREROLL.autoRerollActive = true
 		end
 	end
-	if key == "j" and love.keyboard.isDown("lctrl") then
+	if key == "j" and ctrl then
+		handled = true
 		local joker = (Brainstorm.currentRunJoker and Brainstorm.currentRunJoker())
 			or Brainstorm.AUTOREROLL.lastJokerFoundAt
-		if joker then
+		if type(joker) == "string" and joker ~= "" then
 			Brainstorm.showJokerFoundAlert("Joker: " .. joker)
+		else
+			Brainstorm.showJokerFoundAlert("No searched Joker location is saved for this seed")
 		end
 	end
 	-- Voucher prediction self-test: dumps predicted vs live voucher to debug_predict.txt.
-	if key == "b" and love.keyboard.isDown("lctrl") then
+	if key == "b" and ctrl then
+		handled = true
 		Brainstorm.debugPredictVoucher()
 		saveManagerAlert("Voucher prediction -> debug_predict.txt")
 	end
 	-- Pack prediction self-test: dumps predicted vs live shop packs to debug_predict.txt.
-	if key == "p" and love.keyboard.isDown("lctrl") then
+	if key == "p" and ctrl then
+		handled = true
 		Brainstorm.debugPredictPacks()
 		saveManagerAlert("Pack prediction -> debug_predict.txt")
 	end
 	-- Diagnostics dump: current seed + enabled filters + per-filter predictions.
 	-- Hit this when a search result looks wrong, then share brainstorm_diagnostics.txt.
-	if key == "d" and love.keyboard.isDown("lctrl") then
+	if key == "d" and ctrl then
+		handled = true
 		Brainstorm.dumpDiagnostics()
 		saveManagerAlert("Diagnostics -> brainstorm_diagnostics.txt")
 	end
+	return handled
 end

@@ -17,6 +17,23 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 cp "$SNAPSHOT" "$OUT/snapshot.cfg"
 
+# Keep the OS primitive itself under both macOS and Windows CI. CC may be the
+# multiword Zig command exported by the Windows job, matching native/build.
+PLATFORM_TEST="$OUT/platform_exclusive_create$EXE"
+TEST_THREAD_FLAGS=""
+[ -n "$EXE" ] || TEST_THREAD_FLAGS="-pthread"
+if [ -n "${CC:-}" ]; then
+  $CC -std=c11 -O2 -Wall -Wextra $TEST_THREAD_FLAGS \
+    -o "$PLATFORM_TEST" tests/platform_exclusive_create.c
+elif [ -n "$EXE" ]; then
+  gcc -std=c11 -O2 -Wall -Wextra \
+    -o "$PLATFORM_TEST" tests/platform_exclusive_create.c
+else
+  cc -std=c11 -O2 -Wall -Wextra $TEST_THREAD_FLAGS \
+    -o "$PLATFORM_TEST" tests/platform_exclusive_create.c
+fi
+"$PLATFORM_TEST" "$OUT/platform-pre-existing.bspool"
+
 cat > "$OUT/criteria.cfg" <<EOF
 poolver 1
 threads 4
@@ -48,6 +65,17 @@ PY
 # A checkpoint is a trust boundary: inconsistent counters must be rejected,
 # never used to truncate/append the pool at a fabricated committed position.
 sed 's/^resume 0$/resume 1/' "$OUT/criteria.cfg" > "$OUT/resume.cfg"
+printf 'pre-existing pool target\r\n' > "$OUT/pre-existing.expected"
+cp "$OUT/pre-existing.expected" "$OUT/resume-without-state.bspool"
+if "./native/brainstorm_seed_pool$EXE" scan "$OUT/snapshot.cfg" \
+    "$OUT/resume.cfg" "$OUT/resume-without-state.bspool" \
+    2>"$OUT/resume-without-state.log"; then
+  echo "FAIL: resume scan overwrote an output without state"; exit 1
+fi
+cmp "$OUT/pre-existing.expected" "$OUT/resume-without-state.bspool"
+grep -q 'output exists without resumable state' \
+  "$OUT/resume-without-state.log"
+
 cp "$OUT/native-v3.bspool" "$OUT/bad-state.bspool"
 cp "$OUT/native-v3.bspool.state" "$OUT/bad-state.bspool.state"
 python3 - "$OUT/bad-state.bspool.state" <<'PY'
@@ -152,6 +180,24 @@ with open(output, "wb") as dst:
                        for i, ch in enumerate(seed))
             dst.write(struct.pack("<Q", rank))
 PY
+
+# Conversion and BSP3-to-BSP4 upgrade are no-overwrite publications. A target
+# created by another program must survive byte-for-byte.
+cp "$OUT/pre-existing.expected" "$OUT/pre-existing-convert.bspool"
+if "./native/brainstorm_seed_pool$EXE" convert "$OUT/legacy-v1.bspool" \
+    "$OUT/pre-existing-convert.bspool" 2>"$OUT/pre-existing-convert.log"; then
+  echo "FAIL: convert overwrote a pre-existing target"; exit 1
+fi
+cmp "$OUT/pre-existing.expected" "$OUT/pre-existing-convert.bspool"
+grep -q 'output already exists' "$OUT/pre-existing-convert.log"
+
+cp "$OUT/pre-existing.expected" "$OUT/pre-existing-upgrade.bspool"
+if "./native/brainstorm_seed_pool$EXE" upgrade "$OUT/native-v3.bspool" \
+    "$OUT/pre-existing-upgrade.bspool" 2>"$OUT/pre-existing-upgrade.log"; then
+  echo "FAIL: upgrade overwrote a pre-existing target"; exit 1
+fi
+cmp "$OUT/pre-existing.expected" "$OUT/pre-existing-upgrade.bspool"
+grep -q 'output already exists' "$OUT/pre-existing-upgrade.log"
 
 "./native/brainstorm_seed_pool$EXE" export "$OUT/legacy-v1.bspool" "$OUT/legacy-v1.txt"
 "./native/brainstorm_seed_pool$EXE" convert "$OUT/legacy-v1.bspool" "$OUT/converted-v2.bspool"

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -23,6 +24,7 @@ if TOOLS not in sys.path:
 import brainstorm_pool_organizer as organizer
 import pool_organizer_web as web
 import pool_builder_web as builder_web
+from pool_record_export_web import RecordExportWebRegression
 
 # Reuse the independently encoded BSP2/BSP3 fixtures from the organizer's
 # format regression tests without making tests/ a Python package.
@@ -79,6 +81,38 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertEqual(cache.hits, 1)
         self.assertLessEqual(cache.maxsize, 4096)
         self.assertEqual(web.READER_CACHE_LIMIT, web.MAX_COMBINE_INPUTS)
+
+    def test_builder_merge_reserves_the_complete_output_artifact_family(self):
+        first_name = "builder-merge-a.bspool"
+        second_name = "builder-merge-b.bspool"
+        fixture.write_bsp3(
+            os.path.join(self.temp.name, first_name), complete=True)
+        fixture.write_bsp3(
+            os.path.join(self.temp.name, second_name), complete=True)
+        request = {
+            "pools": [first_name, second_name],
+            "name": "protected-merge",
+        }
+        output = os.path.join(
+            self.temp.name, "protected-merge.bspool")
+        sentinel = b"pre-existing sidecar remains unchanged\n"
+
+        builder_web.JOB.update(runner=None, closing=False)
+        for suffix in web.FORMAT_UPGRADE_PROTECTED_SUFFIXES:
+            collision = output + suffix
+            with self.subTest(suffix=suffix):
+                with open(collision, "wb") as handle:
+                    handle.write(sentinel)
+                with mock.patch.object(
+                        builder_web.core, "MergeRunner") as runner:
+                    with self.assertRaisesRegex(
+                            ValueError, "already has pool files"):
+                        builder_web.start_merge_job(
+                            request, self.temp.name)
+                    runner.assert_not_called()
+                with open(collision, "rb") as handle:
+                    self.assertEqual(handle.read(), sentinel)
+                os.unlink(collision)
 
     def test_native_summary_accepts_optional_record_metadata_digest(self):
         document = "\n".join([
@@ -619,6 +653,30 @@ class OrganizerWebRegression(unittest.TestCase):
             with web.READER_CACHE_LOCK:
                 web.READER_CACHE.clear()
 
+    def test_reader_cache_charges_packed_index_storage_once(self):
+        blocks = organizer.PackedBlockSequence()
+        block = organizer.Block(
+            8192, 0, 1, 0, 1, 1, 0, 0, 48, 0, 0, 0)
+        # Match the block count of the production 355-million-record BSP3.
+        for _index in range(346717):
+            blocks.append(block)
+
+        class Header:
+            text = ""
+
+        class Reader:
+            header = Header()
+
+        reader = Reader()
+        reader.blocks = blocks
+        weight = web._reader_cache_weight(reader)
+        self.assertEqual(blocks.packed_bytes, 346717 * 56)
+        self.assertLess(weight, web.READER_CACHE_MAX_BYTES)
+        self.assertLess(
+            weight - sys.getsizeof(blocks),
+            4096,
+            "packed block views must not be charged once per index entry")
+
     def test_split_plan_scans_the_verified_reader_once(self):
         reader = organizer.BSPoolReader(self.source)
         original_iter_records = reader.iter_records
@@ -1114,6 +1172,29 @@ class OrganizerWebRegression(unittest.TestCase):
 
         self.assertEqual(self.read_bytes(self.source), source_before)
         self.assertEqual(set(os.listdir(self.temp.name)), files_before)
+
+    def test_split_preflight_blocks_too_many_output_files(self):
+        reader, choices, _destination = self.resolved_split_choices()
+        original_limit = organizer.MAX_SPLIT_OUTPUTS
+        organizer.MAX_SPLIT_OUTPUTS = 1
+        try:
+            plan = web.build_split_plan(
+                reader, choice_plan=choices, publication={
+                    "unmatchedPolicy": "keep",
+                    "prefix": "too-many-preview-files",
+                })
+        finally:
+            organizer.MAX_SPLIT_OUTPUTS = original_limit
+
+        publication = plan["publication"]
+        self.assertGreater(publication["output_count"], 1)
+        self.assertFalse(publication["ready"])
+        self.assertIn(
+            "maximum 1 outputs per publication",
+            " ".join(publication["blockers"]))
+        self.assertFalse(any(
+            name.startswith("too-many-preview-files--")
+            for name in os.listdir(self.temp.name)))
 
     def test_split_keep_and_omit_execution_match_the_preflight(self):
         reader, choices, _destination = self.resolved_split_choices()
@@ -1790,17 +1871,47 @@ class OrganizerWebRegression(unittest.TestCase):
 
     def test_page_invalidates_stale_plans_and_exposes_preflight_cancellation(self):
         page = web.PAGE
-        self.assertIn("Choose how to divide the pool", page)
-        self.assertIn("Organize seeds by", page)
-        self.assertIn("Perkeo Ante 1 Big", page)
-        self.assertIn("Advanced · exact technical metadata", page)
-        self.assertIn("one JSON line for every seed", page)
-        self.assertIn("it does not create a seed pool or change the source", page)
-        self.assertIn("How assignment works", page)
-        self.assertIn("Review the split (no files created)", page)
-        self.assertIn("Your selected pools are read-only", page)
-        self.assertIn("The three combine rules", page)
-        self.assertIn("Review the combined pool (no file created)", page)
+        self.assertIn("Recorded data", page)
+        self.assertIn("Technical pool details", page)
+        self.assertIn("Export all records (.ndjson)", page)
+        self.assertLess(page.index('id="exportBtn"'),
+                        page.index('id="categoryCard"'))
+        self.assertIn("What do you want to split by?", page)
+        self.assertIn('{id:"legendary",label:"Legendary"', page)
+        self.assertIn('{id:"tag",label:"Tag"', page)
+        self.assertIn('{id:"voucher",label:"Voucher"', page)
+        self.assertIn("Choose locations to create pools for", page)
+        self.assertIn("Advanced: split by exact recorded event metadata", page)
+        self.assertNotIn('id="filterKinds" role="radiogroup"', page)
+        self.assertRegex(
+            page,
+            r'<fieldset class="choicegroup"><legend>What do you want to '
+            r'split by\?</legend>[\s\S]*?id="exactKind"[\s\S]*?</fieldset>',
+        )
+        self.assertNotIn("What these checkboxes control", page)
+        self.assertNotIn("Beginning of each new filename", page)
+        self.assertIn('<label for="prefix">New file name</label>', page)
+        self.assertIn("What should happen to seeds without", page)
+        self.assertIn("appears only at an unchecked location", page)
+        self.assertNotIn("Seeds outside the checked locations", page)
+        self.assertNotIn("Do not decide yet", page)
+        self.assertIn("Preview new pools", page)
+        self.assertIn("Review new seed pools", page)
+        self.assertIn('id="applyDecisionsBtn" hidden>Update preview', page)
+        self.assertIn('id="updateStatus" role="status"', page)
+        self.assertIn(
+            '$("applyDecisionsBtn").onclick=()=>prepare(true)', page)
+        self.assertIn(
+            'activeButton.textContent=fromReview?'
+            '"Updating preview…":"Building preview…"', page)
+        self.assertIn(
+            "Advanced: save or load destination decisions", page)
+        self.assertIn("Combine seed lists", page)
+        self.assertIn("Any selected pool", page)
+        self.assertIn("Every selected pool", page)
+        self.assertIn("First pool, minus the others", page)
+        self.assertIn("Check compatibility and preview file", page)
+        self.assertNotIn("The three combine rules", page)
         self.assertIn("Update pool format", page)
         self.assertIn("Check pool format", page)
         self.assertIn("Create BSP4 copy", page)
@@ -1859,9 +1970,12 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn("/api/cancel", page)
         self.assertIn(
             'plan=null;choices={};rules={};splitReviewedFingerprint="";'
-            '$("plan").hidden=true;'
+            '$("reviewCard").hidden=true;$("plan").hidden=true;'
             '$("splitPublication").hidden=true;$("saveBtn").disabled=true;'
             '$("splitBtn").disabled=true;', page)
+        self.assertIn(
+            '$("sumAmbiguous").textContent="Preview to calculate";'
+            '$("sumUnmatched").textContent="Preview to calculate"', page)
         self.assertRegex(page, r'\$\("splitBtn"\)\.disabled=true;.*await loadPools\(true\)')
         self.assertIn('function renderStatus(){\n if(!plan)return;', page)
         self.assertGreaterEqual(len(re.findall(
@@ -2740,7 +2854,7 @@ class OrganizerWebRegression(unittest.TestCase):
             with urlopen(base + "/organize", timeout=10) as response:
                 page = response.read().decode("utf-8")
             self.assertIn("Organize / Combine", page)
-            self.assertIn("Combine pools", page)
+            self.assertIn("Combine seed lists", page)
             self.assertIn("Update pool format", page)
             with urlopen(base + "/organizer/api/pools", timeout=10) as response:
                 pools = json.loads(response.read().decode("utf-8"))["pools"]

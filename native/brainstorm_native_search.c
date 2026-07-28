@@ -5863,10 +5863,38 @@ static bool bspool_reader_read(const BspoolReader *r, uint64_t first,
 	}
 	uint64_t done = 0;
 	while (done < count) {
-		uint64_t record = first + done, lo = 0, hi = r->nblocks;
-		while (lo + 1 < hi) {
-			uint64_t mid = lo + (hi - lo) / 2;
-			if (r->blocks[mid].firstRecord <= record) lo = mid; else hi = mid;
+		uint64_t record = first + done, lo = 0;
+		bool located = false;
+		/* Refilter and pool-search callers consume short adjacent batches.
+		 * Reuse the decoded block cursor before paying an O(log B) index
+		 * search for every batch; also try its immediate successor at the
+		 * block boundary.  bspool_decode_block() remains the authority that
+		 * validates and populates the cached payload. */
+		if (s->cachedBlock < r->nblocks) {
+			const BspoolBlockIndex *cached = &r->blocks[s->cachedBlock];
+			if (record >= cached->firstRecord
+					&& record - cached->firstRecord < cached->count) {
+				lo = s->cachedBlock;
+				located = true;
+			} else if (s->cachedBlock + 1u < r->nblocks) {
+				const BspoolBlockIndex *next =
+						&r->blocks[s->cachedBlock + 1u];
+				if (record >= next->firstRecord
+						&& record - next->firstRecord < next->count) {
+					lo = s->cachedBlock + 1u;
+					located = true;
+				}
+			}
+		}
+		if (!located) {
+			uint64_t hi = r->nblocks;
+			while (lo + 1 < hi) {
+				uint64_t mid = lo + (hi - lo) / 2;
+				if (r->blocks[mid].firstRecord <= record)
+					lo = mid;
+				else
+					hi = mid;
+			}
 		}
 		if (!bspool_decode_block(r, lo, s)) return false;
 		const BspoolBlockIndex *e = &r->blocks[lo];
