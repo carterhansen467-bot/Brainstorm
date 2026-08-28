@@ -1117,7 +1117,7 @@ class OrganizerRegression(unittest.TestCase):
 
         self.assertFalse(owner.rollback_link(staged, destination))
         self.assertTrue(os.path.islink(destination))
-        self.assertEqual(os.readlink(destination), staged)
+        self.assertTrue(os.path.samefile(destination, staged))
 
     def test_inspect_groups_exact_variants_into_friendly_ordered_locations(self):
         perkeo_a2_small_shop = descriptor(
