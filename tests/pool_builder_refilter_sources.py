@@ -124,12 +124,10 @@ def custom_pool_directory_start(snapshot_path):
 
         old_runner = core.Runner
         old_pool_dir = core.POOL_DIR
-        old_job = dict(web.JOB)
+        old_jobs = web.JOBS
         core.Runner = FakeRunner
         core.POOL_DIR = decoy
-        web.JOB.update(
-            runner=None, kind=None, started=0.0, summary="", error="",
-            closing=False, estimate_context=None)
+        web.JOBS = web.BuilderJobLifecycle()
         try:
             web.start_job("build", {
                 "legendary": snapshot.usable_legendaries()[0],
@@ -140,8 +138,7 @@ def custom_pool_directory_start(snapshot_path):
         finally:
             core.Runner = old_runner
             core.POOL_DIR = old_pool_dir
-            web.JOB.clear()
-            web.JOB.update(old_job)
+            web.JOBS = old_jobs
 
         assert len(calls) == 1
         _snapshot_path, _criteria, output, input_pool = calls[0]
@@ -152,9 +149,8 @@ def custom_pool_directory_start(snapshot_path):
 
         original_normcase = core.os.path.normcase
         core.os.path.normcase = lambda value: original_normcase(value).lower()
-        web.JOB.update(
-            runner=None, kind=None, started=0.0, summary="", error="",
-            closing=False, estimate_context=None)
+        old_jobs = web.JOBS
+        web.JOBS = web.BuilderJobLifecycle()
         try:
             try:
                 web.start_job("build", {
@@ -170,8 +166,7 @@ def custom_pool_directory_start(snapshot_path):
                     "Windows case-only input/output alias was accepted")
         finally:
             core.os.path.normcase = original_normcase
-            web.JOB.clear()
-            web.JOB.update(old_job)
+            web.JOBS = old_jobs
 
 
 if __name__ == "__main__":

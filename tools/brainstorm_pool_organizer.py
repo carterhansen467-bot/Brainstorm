@@ -57,10 +57,14 @@ try:
     # Keep bounded extended-header discovery identical to the standalone
     # builder for both event-pool schemas.
     from brainstorm_pool_builder import read_pool_header_text
-    from pool_writer_lock import pool_writer_guard
+    import pool_mutation
+    import pool_split_policy as split_policy
 except ImportError:  # Imported as tools.brainstorm_pool_organizer in tests.
     from tools.brainstorm_pool_builder import read_pool_header_text
-    from tools.pool_writer_lock import pool_writer_guard
+    from tools import pool_mutation, pool_split_policy as split_policy
+
+seed_pool_mutations = pool_mutation.seed_pool_mutations
+pool_writer_guard = seed_pool_mutations.guard
 
 
 HEADER_PREFIX_BYTES = 1024
@@ -221,7 +225,7 @@ CRITERIA_DIRECTIVES = {
 }
 
 
-class PoolError(ValueError):
+class PoolError(split_policy.SplitPolicyError):
     """Raised when a pool cannot be trusted or organized safely."""
 
 
@@ -333,21 +337,8 @@ def _open_source_snapshot_handle(path: str):
 
 
 def fsync_directory(path: str) -> None:
-    """Durably record directory-entry publication where the platform allows."""
-    if os.name == "nt":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = None
-    try:
-        descriptor = os.open(os.path.abspath(path), flags)
-        os.fsync(descriptor)
-    except OSError:
-        # Some network/virtual filesystems reject directory fsync even though
-        # file fsync and atomic link/replace are supported.
-        pass
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    """Compatibility adapter for the seed-pool mutation owner."""
+    seed_pool_mutations.fsync_directory(path)
 
 
 def _header_token(value: str) -> str:
@@ -3134,10 +3125,7 @@ class BSP3OutputWriter:
             except Exception:
                 pass
             self.closed = True
-        try:
-            os.unlink(self.temp_path)
-        except OSError:
-            pass
+        seed_pool_mutations.remove(self.temp_path, missing_ok=True)
 
 
 class BSP4OutputWriter(BSP3OutputWriter):
@@ -3861,10 +3849,9 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
         _check_cancel(cancel_check)
         identity = writer.finalize()
         _check_cancel(cancel_check)
-        os.link(writer.temp_path, output_path)
+        seed_pool_mutations.link_no_overwrite(
+            writer.temp_path, output_path, consume_staged=True)
         published = True
-        os.unlink(writer.temp_path)
-        fsync_directory(directory)
         result = context.as_dict()
         result.update(identity)
         result.update({
@@ -3876,10 +3863,7 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
         return result
     except BaseException:
         if published:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+            seed_pool_mutations.remove(output_path, missing_ok=True)
         writer.abort()
         raise
 
@@ -3899,23 +3883,8 @@ def _check_split_output_limit(output_count: int) -> None:
 
 
 def atomic_json(path: str, value: object) -> None:
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=".organizer-report-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        fsync_directory(directory)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+    """Compatibility adapter for mutation-owned atomic reports."""
+    seed_pool_mutations.atomic_json(path, value)
 
 
 def load_choices(path: Optional[str], reader: BSPoolReader) -> Dict[str, str]:
@@ -3962,13 +3931,18 @@ def split_pool(reader: BSPoolReader, output_dir: str,
                selected_ids: Optional[Sequence[str]], choices_path: Optional[str],
                report_path: Optional[str], remainder_name: Optional[str],
                omit_unmatched: bool,
-               cancel_check: Optional[Callable[[], bool]] = None
+               cancel_check: Optional[Callable[[], bool]] = None,
+               assignment_mode: str = split_policy.MODE_EXCLUSIVE
                ) -> Tuple[Dict[str, object], bool]:
     _check_cancel(cancel_check)
     if not reader.metadata_capable:
         raise PoolError("BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    assignment_mode = split_policy.normalize_mode(assignment_mode)
+    if assignment_mode == split_policy.MODE_MATCHING_COPIES and choices_path:
+        raise PoolError(
+            "--copy-overlaps cannot be combined with --choices")
     choices = load_choices(choices_path, reader)
     all_summary = analyze(
         reader, ambiguity_limit=0, cancel_check=cancel_check)
@@ -3983,54 +3957,25 @@ def split_pool(reader: BSPoolReader, output_dir: str,
     if not selected:
         raise PoolError("snapshot has no known tag/Legendary/voucher occurrence categories")
 
-    category_counts = collections.Counter()
-    ambiguous = []
-    unresolved = 0
-    unmatched = 0
-    used_choices = set()
     remainder_id = "remainder:%s" % quote(remainder_name, safe="_.-") \
         if remainder_name else None
-    processed = 0
-    for record in reader.iter_records(cancel_check=cancel_check):
-        candidates = record_categories(record, selected)
-        chosen = None
-        choice_key = None
-        if len(candidates) > 1:
-            chosen, choice_key = choice_for_record(choices, reader, record)
-            if choice_key:
-                used_choices.add(choice_key)
-            if chosen is not None and chosen not in candidates:
-                raise PoolError("choice for %s is not one of that seed's candidates" %
-                                reader.seed(record.rank))
-            if chosen is None:
-                unresolved += 1
-            ambiguous.append({
-                "seed": reader.seed(record.rank),
-                "rank": record.rank,
-                "candidates": candidates,
-                "choice": chosen,
-            })
-        elif len(candidates) == 1:
-            chosen = candidates[0]
-            extra_choice, choice_key = choice_for_record(choices, reader, record)
-            if extra_choice is not None:
-                used_choices.add(choice_key)
-                if extra_choice != chosen:
-                    raise PoolError("choice for unambiguous seed %s conflicts with its category" %
-                                    reader.seed(record.rank))
-        else:
-            unmatched += 1
-            if remainder_id:
-                chosen = remainder_id
-        if chosen is not None:
-            category_counts[chosen] += 1
-        processed += 1
-        if processed % CANCEL_CHECK_RECORDS == 0:
-            _check_cancel(cancel_check)
-    _check_cancel(cancel_check)
-    unused = sorted(set(choices) - used_choices)
-    if unused:
-        raise PoolError("choices file contains a seed/rank not used by this split: %s" % unused[0])
+    spec = split_policy.SplitSpec.create(
+        assignment_mode, sorted(selected), choices=choices,
+        remainder_id=remainder_id or "")
+    reviewed = split_policy.PoolSplitPolicy(spec).review(
+        reader.iter_records(cancel_check=cancel_check), reader.seed,
+        cancel_check=cancel_check, cancel_interval=CANCEL_CHECK_RECORDS,
+        ambiguity_sample_limit=reader.records,
+        ambiguity_group_limit=0)
+    category_counts = reviewed.destinations()
+    ambiguous = [{
+        "seed": item.seed,
+        "rank": item.rank,
+        "candidates": list(item.candidates),
+        "choice": item.choice or None,
+    } for item in reviewed.ambiguities]
+    unmatched = reviewed.unmatched_records
+    unresolved = reviewed.unresolved_records
 
     category_rows = []
     for category in sorted(category_counts):
@@ -4046,6 +3991,7 @@ def split_pool(reader: BSPoolReader, output_dir: str,
     _check_split_output_limit(len(category_rows))
     report = {
         "organizer_schema": 1,
+        "assignment_mode": assignment_mode,
         "source": source_summary(reader),
         # These two fields intentionally make the generated plan itself a
         # valid --choices template: fill in the blank values and pass it back.
@@ -4057,8 +4003,13 @@ def split_pool(reader: BSPoolReader, output_dir: str,
         "unresolved_ambiguities": unresolved,
         "ambiguous": ambiguous,
         "unmatched_count": unmatched,
+        "overlap_records": reviewed.overlap_records,
+        "unique_copied_records": reviewed.unique_copied_records,
+        "output_memberships": reviewed.output_memberships,
         "unmatched_policy": "remainder" if remainder_id else (
-            "omit" if omit_unmatched else "error"),
+            "omit" if (omit_unmatched or
+                       assignment_mode == split_policy.MODE_MATCHING_COPIES)
+            else "error"),
         "outputs": [],
     }
     if report_path is None:
@@ -4070,13 +4021,16 @@ def split_pool(reader: BSPoolReader, output_dir: str,
         report_path = os.path.abspath(report_path)
     _check_cancel(cancel_check)
     atomic_json(report_path, report)
-    if unresolved or (unmatched and not remainder_id and not omit_unmatched):
+    if unresolved or (assignment_mode == split_policy.MODE_EXCLUSIVE
+                      and unmatched and not remainder_id
+                      and not omit_unmatched):
         return report, False
 
     return write_prepared_split(
         reader, output_dir, sorted(selected), choices, category_rows, report,
         report_path, remainder_id=remainder_id, cancel_check=cancel_check,
-        ambiguity_rules=None)
+        ambiguity_rules=None, assignment_mode=assignment_mode,
+        reviewed_plan=reviewed)
 
 
 def write_prepared_split(
@@ -4086,7 +4040,9 @@ def write_prepared_split(
         remainder_id: Optional[str] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         ambiguity_rules: Optional[Dict[str, str]] = None,
-        group_by_filter: Optional[str] = None
+        group_by_filter: Optional[str] = None,
+        assignment_mode: str = split_policy.MODE_EXCLUSIVE,
+        reviewed_plan: Optional[split_policy.ReviewedSplitPlan] = None
         ) -> Tuple[Dict[str, object], bool]:
     """Publish one already validated, snapshot-pinned split plan.
 
@@ -4095,6 +4051,7 @@ def write_prepared_split(
     ``path`` or ``name`` fields are deliberately ignored.
     """
     _check_cancel(cancel_check)
+    assignment_mode = split_policy.normalize_mode(assignment_mode)
     if not reader.metadata_capable:
         raise PoolError(
             "BSP2 has no per-seed occurrence metadata; refilter/rescan into BSP4 before splitting")
@@ -4172,6 +4129,10 @@ def write_prepared_split(
                     "prepared split ambiguity rule names an unselected category")
             checked_ambiguity_rules[key] = category
 
+    reviewed_spec = split_policy.SplitSpec.create(
+        assignment_mode, sorted(selected), group_by_filter or "",
+        checked_choices, checked_ambiguity_rules, remainder_id or "")
+
     if (isinstance(category_rows, (str, bytes))
             or not isinstance(category_rows, Sequence)):
         raise PoolError("prepared split outputs must be a sequence")
@@ -4202,7 +4163,8 @@ def write_prepared_split(
                 or records <= 0 or records > reader.records):
             raise PoolError("prepared split output has an invalid record count")
         total_records += records
-        if total_records > reader.records:
+        if (assignment_mode == split_policy.MODE_EXCLUSIVE
+                and total_records > reader.records):
             raise PoolError("prepared split output counts exceed the source snapshot")
         filename = safe_filename(category)
         destination = os.path.abspath(os.path.join(output_dir, filename))
@@ -4225,6 +4187,11 @@ def write_prepared_split(
 
     if not isinstance(report, dict):
         raise PoolError("prepared split report must be an object")
+    declared_mode = split_policy.normalize_mode(
+        report.get("assignment_mode"), split_policy.MODE_EXCLUSIVE)
+    if declared_mode != assignment_mode:
+        raise PoolError(
+            "prepared split report assignment mode does not match its plan")
     if str(report.get("source_snapshot_id", "")).lower() != reader.snapshot_token:
         raise PoolError("prepared split report is for a different source snapshot")
     if str(report.get("group_by_filter", "") or "") != (
@@ -4238,12 +4205,19 @@ def write_prepared_split(
         raise PoolError("prepared split report categories do not match its plan")
     if report.get("unresolved_ambiguities", 0) != 0:
         raise PoolError("prepared split still has unresolved ambiguities")
+    declared_choices = report.get("choices", {})
+    if (not isinstance(declared_choices, dict)
+            or {key: value for key, value in declared_choices.items() if value}
+            != checked_choices):
+        raise PoolError(
+            "prepared split report choices do not match its plan")
     declared_rules = report.get("ambiguity_rules", {})
     if (not isinstance(declared_rules, dict)
             or declared_rules != checked_ambiguity_rules):
         raise PoolError(
             "prepared split report ambiguity rules do not match its plan")
     report["source"] = source_summary(reader)
+    report["assignment_mode"] = assignment_mode
     report["source_snapshot_id"] = reader.snapshot_token
     report["group_by_filter"] = group_by_filter or ""
     report["selected_categories"] = sorted(selected)
@@ -4251,6 +4225,41 @@ def write_prepared_split(
     report["outputs"] = []
     if ambiguity_rules is not None:
         report["ambiguity_rules"] = dict(checked_ambiguity_rules)
+
+    if reviewed_plan is None:
+        def report_count(name, default):
+            value = report.get(name, default)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise PoolError(
+                    "prepared split report has an invalid %s" % name)
+            return value
+
+        reviewed_plan = split_policy.ReviewedSplitPlan.for_publication(
+            reviewed_spec, expected_counts,
+            report_count("unmatched_count", 0),
+            report_count("overlap_records",
+                         report.get("ambiguous_count", 0)),
+            report_count("unique_copied_records", total_records),
+            report_count("output_memberships", total_records))
+    elif not isinstance(reviewed_plan, split_policy.ReviewedSplitPlan):
+        raise PoolError("prepared split reviewed plan is invalid")
+    elif reviewed_plan.spec != reviewed_spec:
+        raise PoolError(
+            "prepared split decisions do not match its reviewed plan")
+    if reviewed_plan.destinations() != expected_counts:
+        raise PoolError(
+            "prepared split output counts do not match its reviewed plan")
+    reviewed_statistics = {
+        "unmatched_count": reviewed_plan.unmatched_records,
+        "overlap_records": reviewed_plan.overlap_records,
+        "unique_copied_records": reviewed_plan.unique_copied_records,
+        "output_memberships": reviewed_plan.output_memberships,
+    }
+    for name, expected in reviewed_statistics.items():
+        if name in report and report[name] != expected:
+            raise PoolError(
+                "prepared split report %s does not match its plan" % name)
 
     report_path = os.path.abspath(os.fspath(report_path))
     forbidden_paths = {os.path.normcase(os.path.realpath(reader.path))}
@@ -4268,69 +4277,74 @@ def write_prepared_split(
             if os.path.exists(destination):
                 raise PoolError("output already exists: %s" % destination)
         return _write_split_outputs(
-            reader, selected, checked_choices, remainder_id, destinations,
-            labels, report, report_path, cancel_check,
-            expected_counts=expected_counts,
-            ambiguity_rules=checked_ambiguity_rules,
-            group_by_filter=group_by_filter)
+            reader, reviewed_plan, destinations, labels, report, report_path,
+            cancel_check)
 
 
-def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
-                         choices: Dict[str, str], remainder_id: Optional[str],
+def _write_split_outputs(reader: BSPoolReader,
+                         reviewed_plan: split_policy.ReviewedSplitPlan,
                          destinations: Dict[str, str], labels: Dict[str, str],
                          report: Dict[str, object], report_path: str,
-                         cancel_check: Optional[Callable[[], bool]] = None,
-                         expected_counts: Optional[Dict[str, int]] = None,
-                         ambiguity_rules: Optional[Dict[str, str]] = None,
-                         group_by_filter: Optional[str] = None):
+                         cancel_check: Optional[Callable[[], bool]] = None):
     """Write and publish split outputs while the caller holds every lock."""
     _check_cancel(cancel_check)
     writers = {}  # type: Dict[str, BSP4OutputWriter]
     linked = []  # type: List[str]
-    rules = ambiguity_rules or {}
+    spec = reviewed_plan.spec
+    choices = dict(spec.choices)
+    rules = dict(spec.ambiguity_rules)
+    assignment_mode = spec.assignment_mode
+    policy = split_policy.PoolSplitPolicy(spec)
     used_rules = set()
+    used_choices = set()
+    unmatched_records = 0
+    overlap_records = 0
+    unique_copied_records = 0
+    output_memberships = 0
     try:
         processed = 0
         for record in reader.iter_records(cancel_check=cancel_check):
-            candidates = record_locations(
-                record, group_by_filter, selected) if group_by_filter \
-                else record_categories(record, selected)
-            if len(candidates) > 1:
-                category, choice_key = choice_for_record(
-                    choices, reader, record)
-                rule_key = ambiguity_rule_key(candidates)
-                if rule_key in rules:
-                    used_rules.add(rule_key)
-                    rule_destination = rules[rule_key]
-                    if rule_destination not in candidates:
-                        raise PoolError(
-                            "prepared split ambiguity rule is not one of its candidates")
-                    if choice_key is None:
-                        category = rule_destination
-                if category is None:
-                    raise PoolError(
-                        "prepared split still has an unresolved ambiguity")
-                if category not in candidates:
-                    raise PoolError(
-                        "prepared split choice is not one of its candidates")
-            elif len(candidates) == 1:
-                category = candidates[0]
-            else:
-                category = remainder_id
+            seed = ""
+            if assignment_mode == split_policy.MODE_EXCLUSIVE:
+                seed = (reader.seed(record.rank) if hasattr(reader, "seed")
+                        else "rank:%d" % record.rank)
+            distribution = policy.distribute(record, seed)
+            if distribution.unmatched:
+                unmatched_records += 1
+            if distribution.overlap:
+                overlap_records += 1
+            if distribution.choice_key:
+                used_choices.add(distribution.choice_key)
+            if distribution.rule_key in rules:
+                used_rules.add(distribution.rule_key)
+            if (assignment_mode == split_policy.MODE_EXCLUSIVE
+                    and distribution.overlap
+                    and not distribution.destinations):
+                raise PoolError(
+                    "prepared split still has an unresolved ambiguity")
             processed += 1
             if processed % CANCEL_CHECK_RECORDS == 0:
                 _check_cancel(cancel_check)
-            if category is None:
+            if not distribution.destinations:
                 continue
-            if category not in destinations or category not in labels:
-                raise PoolError(
-                    "prepared split produced an unplanned output category")
-            writer = writers.get(category)
-            if writer is None:
-                writer = BSP4OutputWriter(reader, category, labels[category],
-                                          destinations[category])
-                writers[category] = writer
-            writer.add(record)
+            unique_copied_records += 1
+            output_memberships += len(distribution.destinations)
+            for category in distribution.destinations:
+                if category not in destinations or category not in labels:
+                    raise PoolError(
+                        "prepared split produced an unplanned output category")
+                writer = writers.get(category)
+                if writer is None:
+                    writer = BSP4OutputWriter(
+                        reader, category, labels[category],
+                        destinations[category])
+                    writers[category] = writer
+                writer.add(record)
+        unused_choices = sorted(set(choices) - used_choices)
+        if unused_choices:
+            raise PoolError(
+                "prepared split contains a seed/rank choice not used by this split: %s" %
+                unused_choices[0])
         unused_rules = sorted(set(rules) - used_rules)
         if unused_rules:
             raise PoolError(
@@ -4340,37 +4354,46 @@ def _write_split_outputs(reader: BSPoolReader, selected: Sequence[str],
         for category in sorted(writers):
             _check_cancel(cancel_check)
             outputs.append(writers[category].finalize())
-        if expected_counts is not None:
-            actual_counts = {
-                output["category_id"]: output["records"] for output in outputs
-            }
-            if actual_counts != expected_counts:
-                raise PoolError(
-                    "prepared split output counts do not match its plan")
+        expected_counts = reviewed_plan.destinations()
+        actual_counts = {
+            output["category_id"]: output["records"] for output in outputs
+        }
+        if actual_counts != expected_counts:
+            raise PoolError(
+                "prepared split output counts do not match its plan")
+        actual_statistics = (
+            unmatched_records, overlap_records, unique_copied_records,
+            output_memberships)
+        reviewed_statistics = (
+            reviewed_plan.unmatched_records, reviewed_plan.overlap_records,
+            reviewed_plan.unique_copied_records,
+            reviewed_plan.output_memberships)
+        if actual_statistics != reviewed_statistics:
+            raise PoolError(
+                "prepared split statistics do not match its plan")
+        report["assignment_mode"] = assignment_mode
+        report["unmatched_count"] = unmatched_records
+        report["overlap_records"] = overlap_records
+        report["unique_copied_records"] = unique_copied_records
+        report["output_memberships"] = output_memberships
         # Hard-linking is a no-overwrite atomic publish on the same filesystem.
         # All files are finalized and fsynced before any becomes visible.
         _check_cancel(cancel_check)
+        publications = []
         for category in sorted(writers):
             writer = writers[category]
             _check_cancel(cancel_check)
-            os.link(writer.temp_path, writer.final_path)
-            linked.append(writer.final_path)
+            publications.append((writer.temp_path, writer.final_path))
+        linked.extend(seed_pool_mutations.link_many_no_overwrite(publications))
         for writer in writers.values():
-            os.unlink(writer.temp_path)
-        output_directory = os.path.dirname(next(iter(destinations.values())))
-        fsync_directory(output_directory)
+            seed_pool_mutations.remove(writer.temp_path, missing_ok=True)
         report["outputs"] = outputs
         _check_cancel(cancel_check)
         atomic_json(report_path, report)
         return report, True
     except BaseException:
         for path in linked:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        if linked:
-            fsync_directory(os.path.dirname(linked[0]))
+            seed_pool_mutations.remove(path, missing_ok=True)
         for writer in writers.values():
             writer.abort()
         raise
@@ -4470,11 +4493,14 @@ def command_split(args) -> int:
     reader = BSPoolReader(args.input, verify_payloads=False)
     report, completed = split_pool(
         reader, args.output_dir, args.category, args.choices, args.report,
-        args.remainder, args.omit_unmatched)
+        args.remainder, args.omit_unmatched,
+        assignment_mode=(split_policy.MODE_MATCHING_COPIES
+                         if getattr(args, "copy_overlaps", False)
+                         else split_policy.MODE_EXCLUSIVE))
     if completed:
         print("Split %d committed seeds into %d pool(s)." % (
-            reader.records - report["unmatched_count"] if args.omit_unmatched
-            else reader.records, len(report["outputs"])))
+            report.get("unique_copied_records", reader.records),
+            len(report["outputs"])))
         for output in report["outputs"]:
             print("  %7d  %s" % (output["records"], output["path"]))
         return 0
@@ -4523,7 +4549,12 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser.add_argument("output_dir")
     split_parser.add_argument("--category", action="append",
                               help="exact category id from inspect; repeat to select several")
-    split_parser.add_argument("--choices", help="JSON choices for ambiguous seeds")
+    assignment = split_parser.add_mutually_exclusive_group()
+    assignment.add_argument(
+        "--choices", help="JSON choices for ambiguous seeds")
+    assignment.add_argument(
+        "--copy-overlaps", action="store_true",
+        help="copy each seed to every selected category it matches")
     split_parser.add_argument("--report", help="split plan/result JSON path")
     unmatched = split_parser.add_mutually_exclusive_group()
     unmatched.add_argument("--remainder", help="put seeds matching no selected category in this pool")
@@ -4547,7 +4578,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.function(args)
-    except (OSError, PoolError) as exc:
+    except (OSError, split_policy.SplitPolicyError) as exc:
         print("organizer error: %s" % exc, file=sys.stderr)
         return 1
 

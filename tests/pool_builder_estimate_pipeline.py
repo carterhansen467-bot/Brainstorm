@@ -28,7 +28,7 @@ assert "format count\n" not in text
 assert "estimate_criteria_text(self.crit)" in inspect.getsource(
     core.App._do_estimate)
 assert "core.estimate_criteria_text(crit, sample)" in inspect.getsource(
-    web.start_job)
+    web._prepare_scan_job)
 
 
 # The completed file's measured variable density wins over the deliberately
@@ -105,7 +105,8 @@ runner.scanned = runner.total = 100
 runner.matched = 10
 runner.rate = 500
 runner.started_at = time.monotonic() - 2.0
-web.JOB.update(
+old_jobs = web.JOBS
+web.JOBS = web.BuilderJobLifecycle(
     runner=runner,
     kind="estimate",
     started=time.time() - 2.0,
@@ -141,14 +142,41 @@ assert not os.path.exists(estimate_dir)
 for suffix in core.ESTIMATE_OUTPUT_SUFFIXES:
     assert not os.path.lexists(output + suffix)
 
-web.JOB.update(
-    runner=None,
-    kind=None,
-    started=0.0,
-    summary="",
-    error="",
-    closing=False,
-    estimate_context=None,
-)
+web.JOBS = old_jobs
+
+
+class ActiveLifecycleRunner:
+    output = os.path.join(estimate_dir, "active.bspool")
+    input_pool = None
+    inputs = ()
+    scanned = 12
+    total = 100
+    matched = 2
+    rate = 6
+    lines = ("working",)
+
+    def __init__(self):
+        self.stopped = False
+
+    def done(self):
+        return self.stopped
+
+    def stop(self):
+        self.stopped = True
+
+
+active = ActiveLifecycleRunner()
+lifecycle = web.BuilderJobLifecycle(
+    runner=active, kind="build", started=time.time(), summary="active")
+assert lifecycle.running()
+assert lifecycle.state()["running"]
+try:
+    lifecycle.start("merge", {})
+except ValueError as exc:
+    assert "already running" in str(exc)
+else:
+    raise AssertionError("one lifecycle admitted a second concurrent job")
+lifecycle.stop()
+assert not lifecycle.running()
 
 print("pool builder estimate pipeline: ok")

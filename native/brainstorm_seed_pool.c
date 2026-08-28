@@ -23,6 +23,7 @@
 
 #define BRAINSTORM_NATIVE_CORE_ONLY
 #include "brainstorm_native_search.c"
+#include "staged_artifact.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -7351,66 +7352,6 @@ done:
 	return ok;
 }
 
-static FILE *pool_open_staged_transform(
-		const char *output, char **staged, char *err, size_t errsz) {
-	*staged = NULL;
-	size_t outputBytes = strlen(output);
-	if (outputBytes > SIZE_MAX - 80u) {
-		snprintf(err, errsz, "output path is too long");
-		return NULL;
-	}
-	char *path = malloc(outputBytes + 80u);
-	if (!path) {
-		snprintf(err, errsz, "cannot allocate temporary output path");
-		return NULL;
-	}
-	for (unsigned attempt = 0; attempt < 10000u; attempt++) {
-		snprintf(path, outputBytes + 80u, "%s.partial.%lu.%u",
-				output, bs_process_id(), attempt);
-		FILE *out = bs_fopen_exclusive_binary_update(path);
-		if (out) {
-			*staged = path;
-			return out;
-		}
-		if (errno != EEXIST) {
-			snprintf(err, errsz, "cannot create temporary output: %s",
-					strerror(errno));
-			free(path);
-			return NULL;
-		}
-	}
-	snprintf(err, errsz, "cannot reserve a unique temporary output");
-	free(path);
-	return NULL;
-}
-
-static bool pool_publish_staged_transform(
-		char **staged, const char *output, char *err, size_t errsz) {
-	if (!staged || !*staged) {
-		snprintf(err, errsz, "temporary output identity is missing");
-		return false;
-	}
-	if (bs_rename_noreplace(*staged, output) != 0) {
-		snprintf(err, errsz, "%s",
-				errno == EEXIST
-					? "output already exists; choose a new filename"
-					: "cannot publish completed output");
-		return false;
-	}
-	free(*staged);
-	*staged = NULL;
-	return true;
-}
-
-static void pool_release_failed_transform(char **staged) {
-	if (!staged || !*staged) return;
-	if (bs_file_exists(*staged))
-		fprintf(stderr, "incomplete temporary output retained at %s\n",
-				*staged);
-	free(*staged);
-	*staged = NULL;
-}
-
 static int pool_mode_convert(const char *input, const char *output) {
 	FILE *in = fopen(input, "rb");
 	if (!in) { fprintf(stderr, "cannot open %s: %s\n", input, strerror(errno)); return 1; }
@@ -7445,10 +7386,8 @@ static int pool_mode_convert(const char *input, const char *output) {
 	if (bs_fseeko(in, 0, SEEK_SET) != 0 || fread(original, 1, sizeof original, in) != sizeof original) {
 		fprintf(stderr, "cannot preserve input pool header\n"); bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
-	char *stagedOutput = NULL;
-	FILE *out = pool_open_staged_transform(
-			output, &stagedOutput, err, sizeof err);
-	if (!out) {
+	BsStagedArtifact artifact = BS_STAGED_ARTIFACT_INIT;
+	if (!bs_staged_artifact_open(&artifact, output, err, sizeof err)) {
 		int createErr = errno;
 		fprintf(stderr, "%s%s%s\n",
 				err[0] ? err : "cannot create temporary output",
@@ -7456,13 +7395,13 @@ static int pool_mode_convert(const char *input, const char *output) {
 				err[0] ? "" : strerror(createErr));
 		bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
+	FILE *out = bs_staged_artifact_file(&artifact);
 	if (bs_fseeko(out, POOL_HEADER_SIZE, SEEK_SET) != 0
 			|| !pool_write_repacked_header(out, original, POOL_HEADER_SIZE,
 					BSPOOL_SCHEMA_BLOCKS, POOL_HEADER_SIZE,
 					h.records, 0, 0, 0, NULL, err, sizeof err)) {
 		fprintf(stderr, "%s\n", err);
-		bs_fclose_discard_owned(out, stagedOutput);
-		pool_release_failed_transform(&stagedOutput);
+		bs_staged_artifact_abort(&artifact);
 		bspool_reader_destroy(&reader); fclose(in); return 1;
 	}
 	uint64_t ranks[POOL_OUTPUT_BUFFER / 8];
@@ -7497,17 +7436,9 @@ static int pool_mode_convert(const char *input, const char *output) {
 						NULL, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err); goto fail;
 		}
-		if (fclose(out) != 0) {
-			out = NULL;
-			fprintf(stderr,
-					"cannot close converted pool; failed output was retained\n");
-			goto fail_no_out;
-		}
-		out = NULL;
-		if (!pool_publish_staged_transform(
-				&stagedOutput, output, err, sizeof err)) {
+		if (!bs_staged_artifact_publish(&artifact, err, sizeof err)) {
 			fprintf(stderr, "%s\n", err);
-			goto fail_no_out;
+			goto fail;
 		}
 		bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 		fprintf(stderr, "compressed %" PRIu64 " records: %.3f GB -> %.3f GB (%.1f%% smaller)\n",
@@ -7516,9 +7447,7 @@ static int pool_mode_convert(const char *input, const char *output) {
 		return 0;
 	}
 fail:
-	if (out) bs_fclose_discard_owned(out, stagedOutput);
-fail_no_out:
-	pool_release_failed_transform(&stagedOutput);
+	bs_staged_artifact_abort(&artifact);
 	bspool_scratch_destroy(&scratch); bspool_reader_destroy(&reader); fclose(in);
 	return 1;
 }
@@ -8895,10 +8824,10 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 	char path[1024];
 	if (snprintf(path, sizeof path, "%s.manifest", output) >= (int)sizeof path) return false;
 	if (bs_file_exists(path)) return false;
-	char err[256] = "", *staged = NULL;
-	FILE *f = pool_open_staged_transform(
-			path, &staged, err, sizeof err);
-	if (!f) return false;
+	char err[256] = "";
+	BsStagedArtifact artifact = BS_STAGED_ARTIFACT_INIT;
+	if (!bs_staged_artifact_open(&artifact, path, err, sizeof err)) return false;
+	FILE *f = bs_staged_artifact_file(&artifact);
 	fprintf(f, "BRAINSTORM_SEED_POOL_MERGE %d\nmodelver %d\nencoding %s\n",
 			schema, parts[0].header.modelver,
 			schema == BSPOOL_SCHEMA_ADAPTIVE
@@ -8943,18 +8872,8 @@ static bool pool_write_merge_manifest(const char *output, const PoolMergePart *p
 			parts[i].header.rangeStart, parts[i].header.rangeEnd,
 			parts[i].header.records, parts[i].path);
 	fprintf(f, "complete 1\ncoverage_complete 1\nend\n");
-	if (ferror(f) || fflush(f) != 0 || bs_fsync_file(f) != 0) {
-		bs_fclose_discard_owned(f, staged);
-		pool_release_failed_transform(&staged);
-		return false;
-	}
-	if (fclose(f) != 0) {
-		pool_release_failed_transform(&staged);
-		return false;
-	}
-	if (!pool_publish_staged_transform(
-			&staged, path, err, sizeof err)) {
-		pool_release_failed_transform(&staged);
+	if (!bs_staged_artifact_publish(&artifact, err, sizeof err)) {
+		bs_staged_artifact_abort(&artifact);
 		return false;
 	}
 	return true;
@@ -8975,7 +8894,7 @@ static int pool_mode_merge(
 	PoolMergePart *parts = calloc((size_t)ninputs, sizeof *parts);
 	if (!parts) { fprintf(stderr, "cannot allocate merge input table\n"); return 1; }
 	unsigned char *original = NULL;
-	char *stagedOutput = NULL;
+	BsStagedArtifact artifact = BS_STAGED_ARTIFACT_INIT;
 	char err[256] = "";
 	int opened = 0, rc = 1;
 	uint64_t totalRecords = 0;
@@ -9092,11 +9011,10 @@ static int pool_mode_merge(
 			mergedParts += leaves;
 		}
 	}
-	FILE *out = pool_open_staged_transform(
-			output, &stagedOutput, err, sizeof err);
-	if (!out) {
+	if (!bs_staged_artifact_open(&artifact, output, err, sizeof err)) {
 		goto done;
 	}
+	FILE *out = bs_staged_artifact_file(&artifact);
 	uint64_t familyId = parts[0].header.familyId ? parts[0].header.familyId
 			: pool_hash_fields("family-fallback", parts[0].header.catalogHash,
 					parts[0].header.criteriaHash, (uint64_t)parts[0].header.space,
@@ -9134,7 +9052,7 @@ static int pool_mode_merge(
 			|| !pool_write_repacked_header(out, original, outputHeaderBytes,
 					outputSchema, outputHeaderBytes, totalRecords, 0, 0, 0,
 					&rewrite, err, sizeof err)) {
-		bs_fclose_discard_owned(out, stagedOutput);
+		bs_staged_artifact_abort(&artifact);
 		goto done;
 	}
 	uint64_t written = 0;
@@ -9153,7 +9071,7 @@ static int pool_mode_merge(
 				&membershipDigest, &metadataDigest,
 				&recordMetadataDigest, err, sizeof err)) {
 			pool_merge_event_reset(&eventBlock);
-			bs_fclose_discard_owned(out, stagedOutput);
+			bs_staged_artifact_abort(&artifact);
 			goto done;
 		}
 		fprintf(stderr, "merged=%d/%d records=%" PRIu64 "/%" PRIu64 "\n",
@@ -9168,7 +9086,7 @@ static int pool_mode_merge(
 					err, sizeof err);
 	pool_merge_event_reset(&eventBlock);
 	if (!tailOk) {
-		bs_fclose_discard_owned(out, stagedOutput);
+		bs_staged_artifact_abort(&artifact);
 		goto done;
 	}
 	int64_t dataEnd = bs_ftello(out);
@@ -9192,17 +9110,10 @@ static int pool_mode_merge(
 			&rewrite, err, sizeof err);
 	if (!finalOk) {
 		if (!err[0]) snprintf(err, sizeof err, "cannot finalize merged pool");
-		bs_fclose_discard_owned(out, stagedOutput);
+		bs_staged_artifact_abort(&artifact);
 		goto done;
 	}
-	if (fclose(out) != 0) {
-		if (!err[0])
-			snprintf(err, sizeof err,
-					"cannot close merged pool; failed output was retained");
-		goto done;
-	}
-	if (!pool_publish_staged_transform(
-			&stagedOutput, output, err, sizeof err))
+	if (!bs_staged_artifact_publish(&artifact, err, sizeof err))
 		goto done;
 	if (!pool_write_merge_manifest(output, parts, ninputs, mergedParts, rangeStart, rangeEnd,
 			totalRecords, finalBytes, outputSchema, recordMetadataDigest,
@@ -9224,7 +9135,7 @@ static int pool_mode_merge(
 	rc = 0;
 done:
 	if (rc && err[0]) fprintf(stderr, "merge error: %s\n", err);
-	pool_release_failed_transform(&stagedOutput);
+	bs_staged_artifact_abort(&artifact);
 	for (int i = 0; i < opened; i++) {
 		bspool_reader_destroy(&parts[i].reader);
 		if (parts[i].file) fclose(parts[i].file);

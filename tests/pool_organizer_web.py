@@ -97,7 +97,9 @@ class OrganizerWebRegression(unittest.TestCase):
             self.temp.name, "protected-merge.bspool")
         sentinel = b"pre-existing sidecar remains unchanged\n"
 
-        builder_web.JOB.update(runner=None, closing=False)
+        old_jobs = builder_web.JOBS
+        self.addCleanup(setattr, builder_web, "JOBS", old_jobs)
+        builder_web.JOBS = builder_web.BuilderJobLifecycle()
         for suffix in web.FORMAT_UPGRADE_PROTECTED_SUFFIXES:
             collision = output + suffix
             with self.subTest(suffix=suffix):
@@ -987,6 +989,8 @@ class OrganizerWebRegression(unittest.TestCase):
             cached = web.run_split_plan(request, self.temp.name)
             self.assertEqual(cached["planning_mode"], "summary_projection")
             self.assertEqual(cached["ambiguous_count"], 6)
+            self.assertEqual(cached["overlap_records"],
+                             full["overlap_records"])
             self.assertEqual(cached["unmatched_count"], 0)
             self.assertEqual(cached["publication"]["plan_token"],
                              full["publication"]["plan_token"])
@@ -1017,6 +1021,18 @@ class OrganizerWebRegression(unittest.TestCase):
                 request["choicePlan"], request)
             self.assertEqual(resolved["publication"]["plan_token"],
                              resolved_full["publication"]["plan_token"])
+            self.assertEqual(resolved["overlap_records"],
+                             resolved_full["overlap_records"])
+            web.verified_source_reader = original_verified
+            execute_request = dict(
+                request,
+                snapshot=identity["snapshot"],
+                reviewedPlanToken=resolved["publication"]["plan_token"])
+            result = web.execute_split(
+                name, execute_request, self.temp.name)
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["overlap_records"],
+                             resolved["overlap_records"])
         finally:
             web.verified_source_reader = original_verified
             web.NATIVE_SUMMARY_MIN_BYTES = original_minimum
@@ -1172,6 +1188,114 @@ class OrganizerWebRegression(unittest.TestCase):
 
         self.assertEqual(self.read_bytes(self.source), source_before)
         self.assertEqual(set(os.listdir(self.temp.name)), files_before)
+
+    def test_matching_copy_preview_publish_and_cached_projection_agree(self):
+        reader = organizer.BSPoolReader(self.source)
+        inspection = organizer.analyze(reader, ambiguity_limit=100)
+        selected = [row["category_id"] for row in inspection["categories"]]
+        decisions = {
+            "source_snapshot_id": reader.snapshot_token,
+            "assignment_mode": "matching_copies",
+            "choices": {},
+            "ambiguity_rules": {},
+        }
+        request = {
+            "assignmentMode": "matching_copies",
+            "selectedCategories": selected,
+            "choicePlan": decisions,
+            "unmatchedPolicy": "omit",
+            "prefix": "matching-copy-web",
+        }
+        source_before = self.read_bytes(self.source)
+        full = web.build_split_plan(
+            reader, selected, decisions, request)
+        direct = organizer.split_policy.PoolSplitPolicy(
+            organizer.split_policy.SplitSpec.create(
+                "matching_copies", selected)).review(
+                    organizer.BSPoolReader(self.source).iter_records(),
+                    reader.seed)
+        self.assertEqual(
+            direct.destinations(),
+            {row["category_id"]: row["records"]
+             for row in full["publication"]["outputs"]
+             if row["kind"] == "category"})
+        projected_selected = [selected[0]]
+        projected_request = dict(
+            request,
+            selectedCategories=projected_selected,
+            prefix="matching-copy-projection")
+        projected_full = web.build_split_plan(
+            organizer.BSPoolReader(self.source), projected_selected,
+            decisions, projected_request)
+        projected = web.build_split_plan(
+            web._InspectionPlanReader(self.source, inspection["source"]),
+            projected_selected, decisions, projected_request,
+            inspection=inspection)
+
+        self.assertEqual(full["assignment_mode"], "matching_copies")
+        self.assertEqual(full["overlap_records"], 1)
+        self.assertEqual(full["ambiguous_count"], 0)
+        self.assertEqual(full["unresolved_ambiguities"], 0)
+        self.assertEqual(full["unique_copied_records"], 3)
+        self.assertEqual(full["output_memberships"], 5)
+        self.assertEqual(
+            self.preview_records(projected["publication"]),
+            self.preview_records(projected_full["publication"]))
+        self.assertEqual(projected["planning_mode"], "summary_projection")
+
+        execute_request = dict(request, snapshot=reader.snapshot_token)
+        execute_request["reviewedPlanToken"] = \
+            full["publication"]["plan_token"]
+        result = web.execute_split(
+            self.source_name, execute_request, self.temp.name)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["assignment_mode"], "matching_copies")
+        self.assertEqual(result["overlap_records"], 1)
+        self.assertEqual(result["output_memberships"], 5)
+        self.assertEqual(sum(row["records"] for row in result["outputs"]), 5)
+        self.assertEqual(self.read_bytes(self.source), source_before)
+
+        remainder_request = dict(
+            request, prefix="matching-copy-with-other",
+            unmatchedPolicy="remainder", remainderName="Other seeds")
+        remainder = web.build_split_plan(
+            organizer.BSPoolReader(self.source), selected, decisions,
+            remainder_request)
+        self.assertEqual(remainder["unique_copied_records"], 4)
+        self.assertEqual(remainder["output_memberships"], 6)
+        self.assertEqual(remainder["publication"]["output_count"], 4)
+
+    def test_matching_copy_review_token_includes_assignment_mode(self):
+        reader = organizer.BSPoolReader(self.source)
+        selected = [
+            row["category_id"]
+            for row in organizer.analyze(reader)["categories"]
+        ]
+        decisions = {
+            "source_snapshot_id": reader.snapshot_token,
+            "assignment_mode": "matching_copies",
+            "choices": {},
+            "ambiguity_rules": {},
+        }
+        request = {
+            "snapshot": reader.snapshot_token,
+            "assignmentMode": "matching_copies",
+            "selectedCategories": selected,
+            "choicePlan": decisions,
+            "unmatchedPolicy": "omit",
+            "prefix": "mode-token",
+        }
+        plan = web.build_split_plan(
+            reader, selected, decisions, request)
+        changed = dict(request)
+        changed["assignmentMode"] = "exclusive"
+        changed["choicePlan"] = dict(decisions, assignment_mode="exclusive")
+        changed["reviewedPlanToken"] = plan["publication"]["plan_token"]
+        with self.assertRaisesRegex(
+                organizer.PoolError, "changed after review"):
+            web.execute_split(self.source_name, changed, self.temp.name)
+        self.assertFalse(any(name.startswith("mode-token")
+                             for name in os.listdir(self.temp.name)))
 
     def test_split_preflight_blocks_too_many_output_files(self):
         reader, choices, _destination = self.resolved_split_choices()
@@ -1585,9 +1709,14 @@ class OrganizerWebRegression(unittest.TestCase):
 
             omitted_report = os.path.join(
                 self.temp.name, "cancelled-omitted-report.json")
+            omitted_spec = organizer.split_policy.SplitSpec.create(
+                "exclusive", ["tag:test"])
+            omitted_plan = \
+                organizer.split_policy.ReviewedSplitPlan.for_publication(
+                    omitted_spec, {}, 3, 0, 0, 0)
             with self.assertRaisesRegex(organizer.PoolError, "cancel"):
                 organizer._write_split_outputs(
-                    OmittedOnlyReader(), set(), {}, None, {}, {}, {},
+                    OmittedOnlyReader(), omitted_plan, {}, {}, {},
                     omitted_report, cancel_omitted_iteration)
             self.assertEqual(len(cancellation_calls), 2)
             self.assertFalse(os.path.exists(omitted_report))
@@ -1838,26 +1967,30 @@ class OrganizerWebRegression(unittest.TestCase):
         request["reviewedPlanToken"] = plan["publication"]["plan_token"]
         report_path = os.path.join(
             self.temp.name, plan["publication"]["report_name"])
-        original_link = web.os.link
+        original_link = web.seed_pool_mutations.link_many_no_overwrite
         interrupted = []
 
-        def link_then_interrupt(source, destination, *args, **kwargs):
-            caller = sys._getframe(1).f_globals.get("__name__")
-            result = original_link(source, destination, *args, **kwargs)
-            if (caller == web.__name__ and not interrupted
-                    and ".organizer-stage-" in os.fspath(source)
-                    and os.fspath(destination).endswith(".bspool")):
+        def link_then_interrupt(publications, *args, **kwargs):
+            pairs = tuple(publications)
+            source, destination = pairs[0]
+            should_interrupt = (
+                not interrupted and ".organizer-stage-" in os.fspath(source)
+                and os.fspath(destination).endswith(".bspool"))
+            result = original_link(
+                (pairs[0],) if should_interrupt else pairs,
+                *args, **kwargs)
+            if should_interrupt:
                 interrupted.append(os.fspath(destination))
                 raise KeyboardInterrupt("simulated post-link interrupt")
             return result
 
-        web.os.link = link_then_interrupt
+        web.seed_pool_mutations.link_many_no_overwrite = link_then_interrupt
         try:
             with self.assertRaisesRegex(
                     KeyboardInterrupt, "simulated post-link interrupt"):
                 web.run_split(self.source_name, request, self.temp.name)
         finally:
-            web.os.link = original_link
+            web.seed_pool_mutations.link_many_no_overwrite = original_link
             with web.READER_CACHE_LOCK:
                 web.READER_CACHE.clear()
 
@@ -1876,7 +2009,8 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn("Export all records (.ndjson)", page)
         self.assertLess(page.index('id="exportBtn"'),
                         page.index('id="categoryCard"'))
-        self.assertIn("What do you want to split by?", page)
+        self.assertIn(
+            "What kind of result should organize the new pools?", page)
         self.assertIn('{id:"legendary",label:"Legendary"', page)
         self.assertIn('{id:"tag",label:"Tag"', page)
         self.assertIn('{id:"voucher",label:"Voucher"', page)
@@ -1885,18 +2019,24 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertNotIn('id="filterKinds" role="radiogroup"', page)
         self.assertRegex(
             page,
-            r'<fieldset class="choicegroup"><legend>What do you want to '
-            r'split by\?</legend>[\s\S]*?id="exactKind"[\s\S]*?</fieldset>',
+            r'<fieldset class="choicegroup"><legend>What kind of result '
+            r'should organize the new pools\?</legend>[\s\S]*?'
+            r'id="exactKind"[\s\S]*?</fieldset>',
         )
         self.assertNotIn("What these checkboxes control", page)
         self.assertNotIn("Beginning of each new filename", page)
         self.assertIn('<label for="prefix">New file name</label>', page)
-        self.assertIn("What should happen to seeds without", page)
-        self.assertIn("appears only at an unchecked location", page)
+        self.assertIn("Create pools from one pool", page)
+        self.assertIn("Also create an Other seeds pool", page)
+        self.assertIn('id="policy" value="omit"', page)
+        self.assertIn("Seeds without ${name} at a checked location", page)
         self.assertNotIn("Seeds outside the checked locations", page)
         self.assertNotIn("Do not decide yet", page)
         self.assertIn("Preview new pools", page)
-        self.assertIn("Review new seed pools", page)
+        self.assertIn("Review files to create", page)
+        self.assertIn("Advanced: require each seed to go to only one pool", page)
+        self.assertIn('assignmentMode:assignmentMode()', page)
+        self.assertIn('"matching_copies"', page)
         self.assertIn('id="applyDecisionsBtn" hidden>Update preview', page)
         self.assertIn('id="updateStatus" role="status"', page)
         self.assertIn(
@@ -1905,7 +2045,7 @@ class OrganizerWebRegression(unittest.TestCase):
             'activeButton.textContent=fromReview?'
             '"Updating preview…":"Building preview…"', page)
         self.assertIn(
-            "Advanced: save or load destination decisions", page)
+            "Advanced: exclusive split decision files", page)
         self.assertIn("Combine seed lists", page)
         self.assertIn("Any selected pool", page)
         self.assertIn("Every selected pool", page)
@@ -1947,11 +2087,13 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn(
             "could not confirm whether a BSP4 copy was published", page)
         self.assertIn(
-            'check.disabled=refreshFailed||!poolRows.some(p=>!p.error)',
+            'check.disabled=refreshFailed||!workflowState.pools.some('
+            'p=>!p.error)',
             page)
         self.assertIn(
-            '$("formatSource").disabled=formatRunning;'
-            'formatButton.disabled=formatRunning||!poolRows.some(p=>!p.error)',
+            '$("formatSource").disabled=workflowState.format.running;'
+            'formatButton.disabled=workflowState.format.running||'
+            '!workflowState.pools.some(p=>!p.error)',
             page)
         self.assertIn(
             '$("formatSource").disabled=true;formatButton.disabled=true',
@@ -1968,16 +2110,37 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertIn("publication.outputs", page)
         self.assertIn("publication.blockers", page)
         self.assertIn("/api/cancel", page)
-        self.assertIn(
-            'plan=null;choices={};rules={};splitReviewedFingerprint="";'
-            '$("reviewCard").hidden=true;$("plan").hidden=true;'
-            '$("splitPublication").hidden=true;$("saveBtn").disabled=true;'
-            '$("splitBtn").disabled=true;', page)
+        self.assertIn("class OrganizerWorkflowState", page)
+        self.assertIn("const workflowState=new OrganizerWorkflowState()", page)
+        self.assertNotIn("Object.defineProperties(globalThis", page)
+        self.assertNotIn("splitRunning=true", page)
+        self.assertNotIn("combineRunning=true", page)
+        self.assertNotIn("formatRunning=true", page)
+        self.assertNotIn("poolRows=v.pools||[]", page)
+        self.assertNotIn("choices={};rules={}", page)
+        self.assertNotRegex(
+            page,
+            r"workflowState\.(?:split|combine|format|export)\.\w+\s*=",
+        )
+        self.assertIn("workflowState.completeSplit();", page)
+        self.assertIn("workflowState.reviewCombine(v,fingerprint)", page)
+        self.assertIn("workflowState.resetFormat();", page)
+        self.assertNotIn(
+            'let inspected=null,inspectedName="",plan=null', page)
         self.assertIn(
             '$("sumAmbiguous").textContent="Preview to calculate";'
             '$("sumUnmatched").textContent="Preview to calculate"', page)
+        self.assertIn(
+            '${fmt(publication.overlap_records||0)} overlapping seed(s); '
+            '${fmt(publication.unique_copied_records||0)} unique copied '
+            'seed(s); ${fmt(publication.output_memberships||0)} total '
+            'output memberships.', page)
+        self.assertNotIn(
+            'const overlap=publication.overlap_records?', page)
         self.assertRegex(page, r'\$\("splitBtn"\)\.disabled=true;.*await loadPools\(true\)')
-        self.assertIn('function renderStatus(){\n if(!plan)return;', page)
+        self.assertIn(
+            'function renderStatus(){\n const split=workflowState.split,'
+            'plan=split.plan;if(!plan)return;', page)
         self.assertGreaterEqual(len(re.findall(
             r'id="[^"]*[Cc]ancel[^"]*"', page)), 2)
 
@@ -2616,13 +2779,8 @@ class OrganizerWebRegression(unittest.TestCase):
         server_called = threading.Event()
         shutdown_returned = threading.Event()
         registry_at_server_shutdown = []
-        with builder_web.LOCK:
-            saved_job = dict(builder_web.JOB)
-            builder_web.JOB.update({
-                "runner": None,
-                "kind": None,
-                "estimate_context": None,
-            })
+        saved_jobs = builder_web.JOBS
+        builder_web.JOBS = builder_web.BuilderJobLifecycle()
 
         class FakeServer:
             @staticmethod
@@ -2654,9 +2812,7 @@ class OrganizerWebRegression(unittest.TestCase):
             web._finish_operation("upgrade", event)
             if thread.ident is not None:
                 thread.join(timeout=2)
-            with builder_web.LOCK:
-                builder_web.JOB.clear()
-                builder_web.JOB.update(saved_job)
+            builder_web.JOBS = saved_jobs
             web.allow_active_operations()
 
     def test_native_upgrade_cancellation_reaps_and_unregisters_child(self):

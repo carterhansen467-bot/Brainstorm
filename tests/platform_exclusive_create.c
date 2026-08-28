@@ -16,7 +16,7 @@ static FILE *bs_test_fdopen(int fd, const char *mode);
 #define BS_PLATFORM_FDOPEN bs_test_fdopen
 #endif
 
-#include "../native/platform.h"
+#include "../native/staged_artifact.h"
 
 #ifdef _WIN32
 enum {
@@ -140,6 +140,51 @@ static int test_noreplace_publish(const char *base) {
 	return safe;
 }
 
+static int test_staged_artifact_lifecycle(const char *base) {
+	static const unsigned char bytes[] = "owned staged artifact";
+	size_t targetSize = strlen(base) + sizeof ".artifact";
+	char *target = malloc(targetSize);
+	if (!target) return 0;
+	snprintf(target, targetSize, "%s.artifact", base);
+	remove(target);
+	char err[256] = "";
+	BsStagedArtifact artifact = BS_STAGED_ARTIFACT_INIT;
+	int ok = bs_staged_artifact_open(
+			&artifact, target, err, sizeof err);
+	FILE *file = bs_staged_artifact_file(&artifact);
+	ok = ok && file && fwrite(bytes, 1, sizeof bytes, file) == sizeof bytes
+			&& bs_staged_artifact_publish(&artifact, err, sizeof err)
+			&& !artifact.file && !artifact.stagedPath && !artifact.destination
+			&& read_exact(target, bytes, sizeof bytes);
+
+	/* The lifecycle's final publication check, not a prior existence check,
+	 * protects a destination that appears while the private file is written. */
+	BsStagedArtifact collision = BS_STAGED_ARTIFACT_INIT;
+	ok = ok && bs_staged_artifact_open(
+			&collision, target, err, sizeof err);
+	file = bs_staged_artifact_file(&collision);
+	errno = 0;
+	ok = ok && file && fwrite(bytes, 1, sizeof bytes, file) == sizeof bytes
+			&& !bs_staged_artifact_publish(&collision, err, sizeof err)
+			&& errno == EEXIST
+			&& read_exact(target, bytes, sizeof bytes);
+	char *retained = NULL;
+	if (collision.stagedPath) {
+		size_t n = strlen(collision.stagedPath) + 1u;
+		retained = malloc(n);
+		if (retained) memcpy(retained, collision.stagedPath, n);
+	}
+	bs_staged_artifact_abort(&collision);
+	if (retained) {
+		remove(retained);
+		free(retained);
+	}
+	remove(target);
+	free(target);
+	if (!ok) fprintf(stderr, "owned staged-artifact lifecycle failed: %s\n", err);
+	return ok;
+}
+
 static void *race_create(void *opaque) {
 	ExclusiveRace *race = (ExclusiveRace *)opaque;
 	errno = 0;
@@ -228,6 +273,13 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	if (!test_noreplace_publish(argv[1])) {
+		remove(argv[1]);
+		free(freshPath);
+		free(racePath);
+		free(discardPath);
+		return 1;
+	}
+	if (!test_staged_artifact_lifecycle(argv[1])) {
 		remove(argv[1]);
 		free(freshPath);
 		free(racePath);

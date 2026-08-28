@@ -553,14 +553,23 @@ with existing files. The older **`Seed Pool Organizer.command`** (macOS) and
 **`Seed Pool Organizer.bat`** (Windows) entry points remain as compatible direct
 shortcuts. To update a completed BSP3 pool without command-line steps, choose
 **Update pool format**, check the file, and create its verified BSP4 copy.
-Inspector recommends a named recorded filter to organize by and lets
-you switch to another recorded filter. Locations use friendly labels such as
-**Perkeo Ante 1 Big**. Source, occurrence, flag, and other technical variants
-at the same location are collapsed in the display while their complete metadata
-is retained in every derivative. Inspector asks for a destination choice only
-when the selected filter occurs at multiple locations in the same seed.
-Incomplete sources use only their committed checkpoint, and every derivative
-records the source snapshot and lineage.
+Inspector recommends a named recorded filter to organize by and lets you switch
+to another recorded filter. Locations use friendly labels such as **Perkeo Ante
+1 Big**. Source, occurrence, flag, and other technical variants at the same
+location are collapsed in the display while their complete metadata is retained
+in every derivative. The normal **Create pools from one pool** workflow copies a
+seed into every selected location pool it matches. The preview reports exact
+per-file counts, overlapping seeds, unique copied seeds, and total output
+memberships so those intentional overlaps are visible. Seeds outside the
+selected locations remain only in the unchanged source unless **Also create an
+Other seeds pool** is selected.
+
+An **Exclusive split** remains under Advanced for workflows that require each
+included seed to appear in exactly one destination. Only that mode asks for a
+destination when the selected filter occurs at multiple locations in the same
+seed; loading an older saved decision file selects it automatically. Incomplete
+sources use only their committed checkpoint, and every derivative records the
+source snapshot and lineage.
 
 Large ambiguity sets are grouped by their exact candidate-category set, so one
 reviewed destination rule can resolve every seed with the same choices. The
@@ -587,6 +596,12 @@ so the whole set cannot be one filesystem-atomic transaction: reported errors
 and cancellation roll it back, but terminating the process or operating system
 during the final link sequence can leave a partial set that must be removed or
 completed manually.
+
+The command-line Organizer retains its historical exclusive behavior. Add
+`--copy-overlaps` to `split` to copy each seed into every selected exact category
+it matches; this flag cannot be combined with `--choices`. Without `--remainder`,
+seeds that match none of the selected categories stay only in the unchanged
+source pool.
 
 General combining is separate from **Merge distributed pool parts**. The shard
 merge remains the strict fast path for completed, contiguous parts of one

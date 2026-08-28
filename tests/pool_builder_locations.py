@@ -176,6 +176,6 @@ try:
 finally:
     server.shutdown()
     server.server_close()
-    web.JOB["closing"] = False
+    web.JOBS.reopen()
 
 print("pool builder exact locations: ok")

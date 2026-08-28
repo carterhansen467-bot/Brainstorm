@@ -39,9 +39,12 @@ import time
 from collections import deque
 
 try:
-    from pool_writer_lock import pool_writer_guard as _pool_writer_guard
+    import pool_mutation
 except ImportError:  # Imported as tools.brainstorm_pool_builder.
-    from tools.pool_writer_lock import pool_writer_guard as _pool_writer_guard
+    from tools import pool_mutation
+
+seed_pool_mutations = pool_mutation.seed_pool_mutations
+_pool_writer_guard = seed_pool_mutations.guard
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 if IS_FROZEN:
@@ -565,7 +568,7 @@ def _cleanup_estimate_artifacts(output):
         path = output + suffix
         for attempt in range(5):
             try:
-                os.unlink(path)
+                seed_pool_mutations.remove(path)
                 removed.append(path)
                 break
             except FileNotFoundError:
@@ -646,8 +649,9 @@ class Runner:
             command = [POOL_BIN, "refilter", snapshot_path, self.criteria_path,
                        input_pool, output]
         try:
-            with open(self.criteria_path, "w", encoding="utf-8") as f:
-                f.write(criteria_text)
+            seed_pool_mutations.atomic_text(
+                self.criteria_path, criteria_text,
+                prefix=".%s.criteria." % os.path.basename(output))
             self.proc = subprocess.Popen(
                 command,
                 stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
@@ -1608,20 +1612,9 @@ def _attach_completed_pool_locked(path, name, role, pool_dir,
     lines.extend("predicate %s" % value for value in signature["predicates"])
     lines.extend(("end", ""))
     marker_path = path + ".attached"
-    fd, temporary = tempfile.mkstemp(
-        prefix=".%s.attached." % os.path.basename(path), dir=pool_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write("\n".join(lines))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, marker_path)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+    seed_pool_mutations.atomic_text(
+        marker_path, "\n".join(lines),
+        prefix=".%s.attached." % os.path.basename(path), suffix="")
     marker = read_pool_attachment(path, pool, current_catalog_hash)
     if not marker or not marker.get("valid"):
         raise ValueError("The attachment marker failed validation after writing.")
@@ -1637,7 +1630,7 @@ def detach_pool(name, pool_dir=POOL_DIR, protected_paths=()):
         marker_path = path + ".attached"
         if not os.path.lexists(marker_path):
             return {"name": name, "detached": False}
-        os.unlink(marker_path)
+        seed_pool_mutations.remove(marker_path)
         return {"name": name, "detached": True}
 
 
@@ -1698,15 +1691,8 @@ def delete_completed_pool(name, token, pool_dir=POOL_DIR, protected_paths=()):
             raise ValueError(
                 "The pool files changed after confirmation; review the deletion again.")
         paths = [item["path"] for item in plan["files"]]
-        # Sidecars first keeps the usable .bspool present if an earlier unlink
-        # fails. A stopped pool does not require its sidecars to remain usable.
-        main = plan["path"]
-        ordered = [value for value in paths if value != main] + [main]
-        removed = []
-        for value in ordered:
-            os.unlink(value)
-            removed.append(os.path.basename(value))
-        plan["removed"] = removed
+        plan["removed"] = seed_pool_mutations.delete_artifacts(
+            paths, plan["path"])
         return plan
 
 

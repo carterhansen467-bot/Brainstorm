@@ -943,6 +943,182 @@ class OrganizerRegression(unittest.TestCase):
         with mock.patch.object(organizer.os, "name", "nt"):
             self.assertEqual(organizer._safe_split_output_limit(), 256)
 
+    def test_seed_pool_mutation_owner_publication_and_deletion_contract(self):
+        owner = organizer.seed_pool_mutations
+        root = os.path.join(self.temp.name, "mutation-owner")
+        os.makedirs(root)
+        staged = os.path.join(root, ".staged-pool")
+        destination = os.path.join(root, "published.bspool")
+        with open(staged, "wb") as handle:
+            handle.write(b"verified pool bytes")
+
+        owner.link_no_overwrite(staged, destination)
+        self.assertTrue(os.path.samefile(staged, destination))
+        with self.assertRaises(FileExistsError):
+            owner.link_no_overwrite(staged, destination)
+        self.assertTrue(owner.rollback_link(staged, destination))
+        self.assertFalse(os.path.exists(destination))
+        self.assertFalse(any(
+            name.startswith(".pool-rollback-")
+            for name in os.listdir(root)))
+
+        staged_second = os.path.join(root, ".staged-second")
+        first_destination = os.path.join(root, "first.bspool")
+        with open(staged_second, "wb") as handle:
+            handle.write(b"second verified pool")
+        with open(destination, "wb") as handle:
+            handle.write(b"occupied")
+        with self.assertRaises(FileExistsError):
+            owner.link_many_no_overwrite((
+                (staged, first_destination),
+                (staged_second, destination),
+            ))
+        self.assertFalse(os.path.exists(first_destination))
+        self.assertTrue(os.path.exists(staged))
+        self.assertTrue(os.path.exists(staged_second))
+
+        raced_destination = os.path.join(root, "raced.bspool")
+        later_destination = os.path.join(root, "later.bspool")
+        real_link = organizer.pool_mutation.os.link
+        link_calls = 0
+
+        def replace_then_fail(source, target, *args, **kwargs):
+            nonlocal link_calls
+            link_calls += 1
+            if link_calls == 1:
+                return real_link(source, target, *args, **kwargs)
+            if link_calls == 2:
+                os.unlink(raced_destination)
+                with open(raced_destination, "wb") as handle:
+                    handle.write(b"foreign replacement during publication")
+                raise FileExistsError("simulated later publication collision")
+            return real_link(source, target, *args, **kwargs)
+
+        with mock.patch.object(
+                organizer.pool_mutation.os, "link",
+                side_effect=replace_then_fail):
+            with self.assertRaises(FileExistsError):
+                owner.link_many_no_overwrite((
+                    (staged, raced_destination),
+                    (staged_second, later_destination),
+                ))
+        with open(raced_destination, "rb") as handle:
+            self.assertEqual(
+                handle.read(), b"foreign replacement during publication")
+        self.assertFalse(os.path.exists(later_destination))
+        self.assertTrue(os.path.exists(staged))
+        self.assertTrue(os.path.exists(staged_second))
+
+        verified_destination = os.path.join(root, "verified-race.bspool")
+        owner.link_no_overwrite(staged, verified_destination)
+        real_identity_check = owner._same_artifact_entry
+        replacement_written = False
+
+        def replace_after_identity_check(source, target):
+            nonlocal replacement_written
+            identical = real_identity_check(source, target)
+            if identical and not replacement_written:
+                replacement_written = True
+                if os.path.exists(verified_destination):
+                    os.unlink(verified_destination)
+                with open(verified_destination, "wb") as handle:
+                    handle.write(b"foreign replacement after identity check")
+            return identical
+
+        with mock.patch.object(
+                owner, "_same_artifact_entry",
+                side_effect=replace_after_identity_check):
+            self.assertTrue(
+                owner.rollback_link(staged, verified_destination))
+        with open(verified_destination, "rb") as handle:
+            self.assertEqual(
+                handle.read(), b"foreign replacement after identity check")
+
+        with open(destination, "wb") as handle:
+            handle.write(b"foreign replacement")
+        self.assertFalse(owner.rollback_link(staged, destination))
+        with open(destination, "rb") as handle:
+            self.assertEqual(handle.read(), b"foreign replacement")
+
+        marker = os.path.join(root, "published.bspool.attached")
+        report = os.path.join(root, "publication.json")
+        owner.atomic_text(marker, "enabled 1\n")
+        owner.atomic_json(report, {"completed": True, "records": 1})
+        with open(marker, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "enabled 1\n")
+        with open(report, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {
+                "completed": True,
+                "records": 1,
+            })
+
+        main = os.path.join(root, "delete-me.bspool")
+        blocking_sidecar = main + ".manifest"
+        with open(main, "wb") as handle:
+            handle.write(b"pool")
+        os.mkdir(blocking_sidecar)
+        with self.assertRaises(OSError):
+            owner.delete_artifacts([main, blocking_sidecar], main)
+        self.assertTrue(os.path.isfile(main))
+
+    def test_seed_pool_mutation_rollback_preserves_restore_collision(self):
+        owner = organizer.seed_pool_mutations
+        root = os.path.join(self.temp.name, "rollback-restore-race")
+        os.makedirs(root)
+        staged = os.path.join(root, ".staged-pool")
+        destination = os.path.join(root, "published.bspool")
+        with open(staged, "wb") as handle:
+            handle.write(b"our staged pool")
+        with open(destination, "wb") as handle:
+            handle.write(b"first foreign artifact")
+
+        real_identity_check = owner._same_artifact_entry
+        replacement_written = False
+
+        def replace_while_quarantined(source, target):
+            nonlocal replacement_written
+            identical = real_identity_check(source, target)
+            if not identical and not replacement_written:
+                replacement_written = True
+                if os.path.exists(destination):
+                    os.unlink(destination)
+                with open(destination, "wb") as handle:
+                    handle.write(b"second foreign artifact")
+            return identical
+
+        with mock.patch.object(
+                owner, "_same_artifact_entry",
+                side_effect=replace_while_quarantined):
+            self.assertFalse(owner.rollback_link(staged, destination))
+
+        with open(destination, "rb") as handle:
+            self.assertEqual(handle.read(), b"second foreign artifact")
+        recovery_paths = [
+            os.path.join(root, name, "artifact")
+            for name in os.listdir(root)
+            if name.startswith(".pool-rollback-")
+        ]
+        self.assertEqual(len(recovery_paths), 1)
+        with open(recovery_paths[0], "rb") as handle:
+            self.assertEqual(handle.read(), b"first foreign artifact")
+
+    def test_seed_pool_mutation_rollback_preserves_foreign_symlink(self):
+        owner = organizer.seed_pool_mutations
+        root = os.path.join(self.temp.name, "rollback-symlink-race")
+        os.makedirs(root)
+        staged = os.path.join(root, ".staged-pool")
+        destination = os.path.join(root, "published.bspool")
+        with open(staged, "wb") as handle:
+            handle.write(b"our staged pool")
+        try:
+            os.symlink(staged, destination)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest("symbolic links unavailable: %s" % exc)
+
+        self.assertFalse(owner.rollback_link(staged, destination))
+        self.assertTrue(os.path.islink(destination))
+        self.assertEqual(os.readlink(destination), staged)
+
     def test_inspect_groups_exact_variants_into_friendly_ordered_locations(self):
         perkeo_a2_small_shop = descriptor(
             2, "j_perkeo", 2, 1, 1, 0, 0)
@@ -1103,6 +1279,168 @@ class OrganizerRegression(unittest.TestCase):
                 with open(exported, "r", encoding="ascii") as handle:
                     seeds = [line.strip() for line in handle if line.strip()]
                 self.assertEqual(len(seeds), output["records"])
+
+    def test_cli_handles_split_policy_errors_without_a_traceback(self):
+        choices_path = os.path.join(self.temp.name, "unused-choices.json")
+        with open(choices_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "source_snapshot_id": self.identity["snapshot"],
+                "choices": {
+                    "UNUSED": organizer.Occurrence.decode(TAG).category_id,
+                },
+            }, handle)
+
+        result = self.run_tool(
+            "split", self.source, os.path.join(self.temp.name, "unused"),
+            "--choices", choices_path, "--omit-unmatched", expected=1)
+        self.assertIn("organizer error:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_matching_copy_policy_and_cli_publish_every_overlap(self):
+        reader = organizer.BSPoolReader(self.source)
+        inspection = organizer.analyze(reader, ambiguity_limit=None)
+        selected = [row["category_id"] for row in inspection["categories"]]
+        spec = organizer.split_policy.SplitSpec.create(
+            "matching_copies", selected)
+        policy = organizer.split_policy.PoolSplitPolicy(spec)
+        reviewed = policy.review(reader.iter_records(), reader.seed)
+
+        self.assertEqual(reviewed.overlap_records, 1)
+        self.assertEqual(reviewed.unmatched_records, 1)
+        self.assertEqual(reviewed.unique_copied_records, 3)
+        self.assertEqual(reviewed.output_memberships, 5)
+        self.assertEqual(reviewed.unresolved_records, 0)
+        self.assertEqual(sorted(reviewed.destinations().values()), [1, 2, 2])
+
+        # Repeated occurrences of one destination never duplicate a seed
+        # within that destination pool.
+        repeated = organizer.Record(
+            0, (organizer.Occurrence.decode(TAG),
+                organizer.Occurrence.decode(TAG)))
+        distribution = policy.distribute(repeated, reader.seed(0))
+        self.assertEqual(len(distribution.destinations), 1)
+
+        output_dir = os.path.join(self.temp.name, "matching-copies")
+        report_path = os.path.join(self.temp.name, "matching-copies.json")
+        with open(self.source, "rb") as handle:
+            source_before = handle.read()
+        self.run_tool(
+            "split", self.source, output_dir, "--copy-overlaps",
+            "--report", report_path)
+        with open(report_path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+        self.assertEqual(report["assignment_mode"], "matching_copies")
+        self.assertEqual(report["overlap_records"], 1)
+        self.assertEqual(report["unique_copied_records"], 3)
+        self.assertEqual(report["output_memberships"], 5)
+        self.assertEqual(report["unmatched_policy"], "omit")
+        self.assertEqual(len(report["outputs"]), 3)
+        self.assertEqual(sum(row["records"] for row in report["outputs"]), 5)
+        with open(self.source, "rb") as handle:
+            self.assertEqual(handle.read(), source_before)
+
+        source_overlap = next(
+            record for record in organizer.BSPoolReader(self.source).iter_records()
+            if record.rank == 1)
+        containing_overlap = []
+        for output in report["outputs"]:
+            records = list(organizer.BSPoolReader(output["path"]).iter_records())
+            matching = [record for record in records if record.rank == 1]
+            if matching:
+                containing_overlap.append(matching[0])
+        self.assertEqual(len(containing_overlap), 3)
+        for copied in containing_overlap:
+            self.assertEqual(
+                [item.raw for item in copied.occurrences],
+                [item.raw for item in source_overlap.occurrences])
+
+        incompatible = self.run_tool(
+            "split", self.source, os.path.join(self.temp.name, "invalid-mode"),
+            "--copy-overlaps", "--choices", "choices.json", expected=2)
+        self.assertIn("not allowed with argument", incompatible.stderr)
+
+    def test_matching_copy_split_never_decodes_seed_text(self):
+        reader = organizer.BSPoolReader(self.source)
+        output_dir = os.path.join(self.temp.name, "rank-only-matching")
+        report_path = os.path.join(self.temp.name, "rank-only-matching.json")
+
+        with mock.patch.object(
+                reader, "seed",
+                side_effect=AssertionError("matching copies decoded a seed")):
+            report, completed = organizer.split_pool(
+                reader, output_dir, None, None, report_path, None, False,
+                assignment_mode=organizer.split_policy.MODE_MATCHING_COPIES)
+
+        self.assertTrue(completed)
+        self.assertEqual(report["unique_copied_records"], 3)
+        self.assertEqual(report["output_memberships"], 5)
+
+    def test_split_policy_modes_decisions_and_other_seed_output(self):
+        tag = organizer.Occurrence.decode(TAG)
+        legendary = organizer.Occurrence.decode(LEGENDARY)
+        tag_id = tag.category_id
+        legendary_id = legendary.category_id
+        records = [
+            organizer.Record(0, tuple()),
+            organizer.Record(1, (tag,)),
+            organizer.Record(2, (tag, legendary)),
+            organizer.Record(3, (tag, tag)),
+        ]
+        seed = lambda rank: "seed%d" % rank
+
+        matching_spec = organizer.split_policy.SplitSpec.create(
+            "matching_copies", [tag_id, legendary_id],
+            remainder_id="remainder:Other")
+        matching = organizer.split_policy.PoolSplitPolicy(
+            matching_spec).review(records, seed)
+        self.assertEqual(matching.unmatched_records, 1)
+        self.assertEqual(matching.overlap_records, 1)
+        self.assertEqual(matching.unique_copied_records, 4)
+        self.assertEqual(matching.output_memberships, 5)
+        self.assertEqual(matching.destinations(), {
+            tag_id: 3,
+            legendary_id: 1,
+            "remainder:Other": 1,
+        })
+
+        rule_key = organizer.split_policy.ambiguity_rule_key(
+            [tag_id, legendary_id])
+        exclusive_spec = organizer.split_policy.SplitSpec.create(
+            "exclusive", [tag_id, legendary_id],
+            choices={"seed2": tag_id},
+            ambiguity_rules={rule_key: legendary_id},
+            remainder_id="remainder:Other")
+        exclusive_policy = organizer.split_policy.PoolSplitPolicy(
+            exclusive_spec)
+        direct = exclusive_policy.distribute(records[2], seed(2))
+        self.assertEqual(direct.destinations, (tag_id,))
+        self.assertFalse(direct.resolved_by_rule)
+        exclusive = exclusive_policy.review(records, seed)
+        self.assertEqual(exclusive.destinations(), {
+            tag_id: 3,
+            "remainder:Other": 1,
+        })
+
+        shared_spec = organizer.split_policy.SplitSpec.create(
+            "exclusive", [tag_id, legendary_id],
+            ambiguity_rules={rule_key: legendary_id})
+        shared = organizer.split_policy.PoolSplitPolicy(
+            shared_spec).review(records, seed)
+        self.assertEqual(shared.destinations(), {
+            tag_id: 2,
+            legendary_id: 1,
+        })
+        with self.assertRaisesRegex(
+                organizer.split_policy.SplitPolicyError, "not used"):
+            organizer.split_policy.PoolSplitPolicy(
+                organizer.split_policy.SplitSpec.create(
+                    "exclusive", [tag_id, legendary_id],
+                    choices={"missing-seed": tag_id})).review(records, seed)
+        with self.assertRaisesRegex(
+                organizer.split_policy.SplitPolicyError,
+                "does not accept exclusive"):
+            organizer.split_policy.SplitSpec.create(
+                "matching_copies", [tag_id], choices={"seed1": tag_id})
 
     def _mixed_filter_sources(self, paused_second=False):
         first = os.path.join(self.temp.name, "tag-filter.bspool")

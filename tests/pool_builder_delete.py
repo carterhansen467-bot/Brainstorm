@@ -97,7 +97,8 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
         def done():
             return False
 
-    web.JOB["runner"] = ActiveRunner()
+    old_jobs = web.JOBS
+    web.JOBS = web.BuilderJobLifecycle(runner=ActiveRunner())
     try:
         try:
             web.plan_pool_deletion(name, pool_dir)
@@ -106,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix="bs_pool_delete_") as pool_dir:
         else:
             raise AssertionError("web deletion ignored its active refilter input")
     finally:
-        web.JOB["runner"] = None
+        web.JOBS = old_jobs
 
     assert web.organizer_web.SPLIT_LOCK.acquire(False)
     try:

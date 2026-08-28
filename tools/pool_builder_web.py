@@ -31,9 +31,6 @@ import brainstorm_pool_builder as core
 import pool_organizer_web as organizer_web
 
 DEFAULT_PORT = 8917
-LOCK = threading.Lock()
-JOB = {"runner": None, "kind": None, "started": 0.0, "summary": "", "error": "",
-       "closing": False, "estimate_context": None}
 
 
 # ------------------------------------------------------------- criteria ----
@@ -237,34 +234,161 @@ def pool_library(current_catalog_hash=None, pool_dir=None):
     return core.read_pool_library(pool_dir or core.POOL_DIR, current_catalog_hash)
 
 
-def _active_pool_paths():
-    """Paths a live scan/refilter/merge currently owns. LOCK must be held."""
-    runner = JOB["runner"]
-    if runner is None or runner.done():
-        return ()
-    values = [getattr(runner, "output", None),
-              getattr(runner, "input_pool", None)]
-    values.extend(getattr(runner, "inputs", ()) or ())
-    return tuple(value for value in values if value)
+class BuilderJobLifecycle:
+    """Own scan, estimate, and merge admission, state, stop, and cleanup."""
+
+    def __init__(self, runner=None, kind=None, started=0.0, summary="",
+                 error="", closing=False, estimate_context=None):
+        self._lock = threading.Lock()
+        self._runner = runner
+        self._kind = kind
+        self._started = started
+        self._summary = summary
+        self._error = error
+        self._closing = closing
+        self._estimate_context = estimate_context
+
+    def reopen(self):
+        with self._lock:
+            self._closing = False
+
+    def running(self):
+        with self._lock:
+            return self._runner is not None and not self._runner.done()
+
+    def stop(self):
+        with self._lock:
+            runner = self._runner
+        if runner is not None and not runner.done():
+            runner.stop()
+
+    def _active_paths_locked(self):
+        runner = self._runner
+        if runner is None or runner.done():
+            return ()
+        values = [getattr(runner, "output", None),
+                  getattr(runner, "input_pool", None)]
+        values.extend(getattr(runner, "inputs", ()) or ())
+        return tuple(value for value in values if value)
+
+    def mutate_pool(self, callback):
+        """Serialize a pool mutation against every active workflow."""
+        with self._lock:
+            if self._closing:
+                raise ValueError(
+                    "The Builder is closing; reopen it before changing a pool.")
+            if not organizer_web.SPLIT_LOCK.acquire(False):
+                raise ValueError(
+                    "An organizer split is using the pool library; wait for it to finish.")
+            try:
+                if not organizer_web.COMBINE_LOCK.acquire(False):
+                    raise ValueError(
+                        "An organizer combine or format update is using the pool library; wait for it to finish.")
+                try:
+                    return callback(self._active_paths_locked())
+                finally:
+                    organizer_web.COMBINE_LOCK.release()
+            finally:
+                organizer_web.SPLIT_LOCK.release()
+
+    def _cleanup_estimate_locked(self):
+        runner = self._runner
+        if (self._kind == "estimate" and runner is not None and runner.done()
+                and hasattr(runner, "result_manifest")):
+            runner.result_manifest(cleanup=True)
+
+    def start(self, kind, data, snapshot=None, pool_dir=None):
+        with self._lock:
+            if self._closing:
+                raise ValueError(
+                    "The Builder is closing; reopen it to start another job.")
+            if self._runner is not None and not self._runner.done():
+                raise ValueError(
+                    "A scan or merge is already running -- stop it first.")
+            self._cleanup_estimate_locked()
+            if kind == "merge":
+                runner, summary, context = _prepare_merge_job(data, pool_dir)
+            else:
+                if snapshot is None:
+                    raise ValueError("A Builder snapshot is required.")
+                runner, summary, context = _prepare_scan_job(
+                    kind, data, snapshot, pool_dir)
+            self._runner = runner
+            self._kind = kind
+            self._started = time.time()
+            self._summary = summary
+            self._error = ""
+            self._estimate_context = context
+
+    def state(self):
+        # Overlapping HTTP polls see one completed-result cache/cleanup.
+        with self._lock:
+            runner = self._runner
+            out = {
+                "running": False,
+                "kind": self._kind,
+                "summary": self._summary,
+                "error": self._error,
+                "closing": self._closing,
+                "estimate_context": self._estimate_context,
+            }
+            if runner is None:
+                return out
+            out.update({
+                "running": not runner.done(),
+                "scanned": runner.scanned,
+                "total": runner.total,
+                "matched": runner.matched,
+                "rate": runner.rate,
+                "elapsed": time.time() - self._started,
+                "lines": list(runner.lines)[-8:],
+                "output": os.path.basename(runner.output),
+            })
+            if runner.done():
+                out["rc"] = runner.returncode()
+                if hasattr(runner, "result_manifest"):
+                    out["manifest"] = runner.result_manifest(
+                        cleanup=self._kind == "estimate")
+                else:
+                    out["manifest"] = core.read_manifest(
+                        runner.output + ".manifest")
+                if self._kind == "estimate":
+                    out["estimate_projection"] = estimate_projection(
+                        out["manifest"], self._estimate_context or {})
+            return out
+
+    def shutdown_when_safe(self, server):
+        """Pause the child, drain Organizer work, cleanup, then stop HTTP."""
+        time.sleep(0.2)
+        organizer_web.begin_operation_shutdown()
+        self.pause_and_wait()
+        server.shutdown()
+
+    def pause_and_wait(self):
+        """Stop the active child and finish every owned cleanup transition."""
+        self.stop()
+        while self.running():
+            time.sleep(0.1)
+        organizer_web.wait_for_active_operations()
+        with self._lock:
+            self._cleanup_estimate_locked()
+
+    def begin_shutdown(self, server):
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+        organizer_web.begin_operation_shutdown()
+        threading.Thread(
+            target=self.shutdown_when_safe, args=(server,), daemon=True).start()
+
+
+JOBS = BuilderJobLifecycle()
 
 
 def _with_delete_locks(callback):
-    """Serialize deletion against Builder jobs and organizer mutations."""
-    with LOCK:
-        if JOB["closing"]:
-            raise ValueError("The Builder is closing; reopen it before deleting a pool.")
-        if not organizer_web.SPLIT_LOCK.acquire(False):
-            raise ValueError("An organizer split is using the pool library; wait for it to finish.")
-        try:
-            if not organizer_web.COMBINE_LOCK.acquire(False):
-                raise ValueError(
-                    "An organizer combine or format update is using the pool library; wait for it to finish.")
-            try:
-                return callback(_active_pool_paths())
-            finally:
-                organizer_web.COMBINE_LOCK.release()
-        finally:
-            organizer_web.SPLIT_LOCK.release()
+    """Compatibility adapter for the pool-library mutation functions."""
+    return JOBS.mutate_pool(callback)
 
 
 def plan_pool_deletion(name, pool_dir=None):
@@ -293,188 +417,127 @@ def detach_pool(name, pool_dir=None):
         lambda protected: core.detach_pool(name, root, protected))
 
 
-# ------------------------------------------------------------------ job ----
-
-def _job_state_locked():
-    r = JOB["runner"]
-    out = {"running": False, "kind": JOB["kind"], "summary": JOB["summary"],
-           "error": JOB["error"], "closing": JOB["closing"],
-           "estimate_context": JOB["estimate_context"]}
-    if r is None:
-        return out
-    out.update({
-        "running": not r.done(),
-        "scanned": r.scanned, "total": r.total, "matched": r.matched,
-        "rate": r.rate, "elapsed": time.time() - JOB["started"],
-        "lines": list(r.lines)[-8:],
-        "output": os.path.basename(r.output),
-    })
-    if r.done():
-        out["rc"] = r.returncode()
-        if hasattr(r, "result_manifest"):
-            out["manifest"] = r.result_manifest(cleanup=JOB["kind"] == "estimate")
-        else:
-            out["manifest"] = core.read_manifest(r.output + ".manifest")
-        if JOB["kind"] == "estimate":
-            out["estimate_projection"] = estimate_projection(
-                out["manifest"], JOB["estimate_context"] or {})
-    return out
-
-
 def job_state():
-    # ThreadingHTTPServer may issue overlapping state polls. Serialize the
-    # first completed-result cache/unlink so every response gets the same
-    # manifest after the temporary files disappear.
-    with LOCK:
-        return _job_state_locked()
+    return JOBS.state()
 
 
-def _cleanup_replaced_estimate_locked():
-    runner = JOB["runner"]
-    if (JOB["kind"] == "estimate" and runner is not None and runner.done()
-            and hasattr(runner, "result_manifest")):
-        runner.result_manifest(cleanup=True)
+def _prepare_scan_job(kind, data, snap, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    crit = criteria_from_json(data, snap)
+    snapshot_copy = snap.current_model_copy()
+    current_catalog_hash = core.catalog_hash_file(snapshot_copy)
+    input_name = os.path.basename(str(data.get("inputPool", "")))
+    input_pool = None
+    input_records = 0
+    if input_name:
+        candidate = os.path.join(root, input_name)
+        if not input_name.lower().endswith(".bspool") \
+                or not os.path.isfile(candidate):
+            raise ValueError("The selected input pool no longer exists.")
+        head = read_pool_header(candidate)
+        blockers = core.pool_refilter_blockers(head, current_catalog_hash)
+        if blockers:
+            raise ValueError(
+                "%s cannot be used as a Builder input: %s."
+                % (input_name, "; ".join(blockers)))
+        input_records = int(head.get("records", "0") or 0)
+        input_pool = candidate
+        crit.space = head.get("space", "natural")
+        if crit.shard_total > 1:
+            raise ValueError(
+                "Distributed parts apply to Balatro's seed space, not an input pool.")
+    if kind == "estimate":
+        sample = clamp_int(data.get("sample", core.ESTIMATE_COUNT),
+                           100_000, SEEDCAP)
+        text = core.estimate_criteria_text(crit, sample)
+        context = estimate_context(crit, data, input_name, input_records)
+        output = None
+    else:
+        os.makedirs(root, exist_ok=True)
+        output = os.path.join(root, crit.pool_name() + ".bspool")
+        if core.read_state(output + ".state").get("done") == "1":
+            raise ValueError(
+                "That pool is already complete. Pick a different name, "
+                "or delete the old files first.")
+        count = clamp_int(data.get("count", 0), 0, SEEDCAP)
+        text = crit.text("binary", count)
+        context = None
+    if (input_pool and output is not None
+            and core.same_pool_path(input_pool, output)):
+        raise ValueError(
+            "Choose a new output name; a pool cannot overwrite its own input.")
+    summary = crit.summary()
+    if kind == "estimate" and not input_pool:
+        summary += " [%s-seed quick sample]" % format(sample, ",")
+    # Resolve every fallible setup input before creating the disposable
+    # directory. Runner owns exact artifact cleanup from this point on.
+    if kind == "estimate":
+        output = os.path.join(
+            tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
+    runner = core.Runner(
+        snapshot_copy, text, output, input_pool,
+        temporary=kind == "estimate")
+    return runner, summary, context
 
 
 def start_job(kind, data, snap, pool_dir=None):
-    with LOCK:
-        if JOB["closing"]:
-            raise ValueError("The Builder is closing; reopen it to start another job.")
-        r = JOB["runner"]
-        if r is not None and not r.done():
-            raise ValueError("A scan is already running -- stop it first.")
-        _cleanup_replaced_estimate_locked()
-        root = pool_dir or core.POOL_DIR
-        crit = criteria_from_json(data, snap)
-        snapshot_copy = snap.current_model_copy()
-        current_catalog_hash = core.catalog_hash_file(snapshot_copy)
-        input_name = os.path.basename(str(data.get("inputPool", "")))
-        input_pool = None
-        input_records = 0
-        if input_name:
-            candidate = os.path.join(root, input_name)
-            if not input_name.lower().endswith(".bspool") \
-                    or not os.path.isfile(candidate):
-                raise ValueError("The selected input pool no longer exists.")
-            head = read_pool_header(candidate)
-            blockers = core.pool_refilter_blockers(
-                head, current_catalog_hash)
-            if blockers:
-                raise ValueError(
-                    "%s cannot be used as a Builder input: %s."
-                    % (input_name, "; ".join(blockers)))
-            input_records = int(head.get("records", "0") or 0)
-            input_pool = candidate
-            crit.space = head.get("space", "natural")
-            if crit.shard_total > 1:
-                raise ValueError("Distributed parts apply to Balatro's seed space, not an input pool.")
-        if kind == "estimate":
-            sample = clamp_int(data.get("sample", core.ESTIMATE_COUNT),
-                               100_000, SEEDCAP)
-            text = core.estimate_criteria_text(crit, sample)
-            context = estimate_context(crit, data, input_name, input_records)
-            out = None
-        else:
-            os.makedirs(root, exist_ok=True)
-            out = os.path.join(root, crit.pool_name() + ".bspool")
-            if core.read_state(out + ".state").get("done") == "1":
-                raise ValueError("That pool is already complete. Pick a different "
-                                 "name, or delete the old files first.")
-            count = clamp_int(data.get("count", 0), 0, SEEDCAP)
-            text = crit.text("binary", count)
-            context = None
-        if (input_pool and out is not None
-                and core.same_pool_path(input_pool, out)):
-            raise ValueError("Choose a new output name; a pool cannot overwrite its own input.")
-        summary = crit.summary()
-        if kind == "estimate" and not input_pool:
-            summary += " [%s-seed quick sample]" % format(sample, ",")
-        # Resolve every fallible setup input before creating the disposable
-        # directory. Runner owns exact artifact cleanup from this point on.
-        if kind == "estimate":
-            out = os.path.join(
-                tempfile.mkdtemp(prefix="bs_pool_est_"), "estimate")
-        runner = core.Runner(
-            snapshot_copy, text, out, input_pool,
-            temporary=kind == "estimate")
-        JOB.update(runner=runner,
-                   kind=kind, started=time.time(), summary=summary, error="",
-                   estimate_context=context)
+    JOBS.start(kind, data, snap, pool_dir)
+
+
+def _prepare_merge_job(data, pool_dir=None):
+    root = pool_dir or core.POOL_DIR
+    names = []
+    for value in data.get("pools", []):
+        name = os.path.basename(str(value))
+        if name and name not in names:
+            names.append(name)
+    if len(names) < 2:
+        raise ValueError("Select at least two completed shard pools.")
+    inputs = []
+    for name in names:
+        path = os.path.join(root, name)
+        if not name.lower().endswith(".bspool") or not os.path.isfile(path):
+            raise ValueError("A selected pool no longer exists: %s" % name)
+        head = read_pool_header(path)
+        native_incompatibility = core.pool_native_incompatibility(head)
+        if native_incompatibility:
+            raise ValueError(
+                "%s cannot be merged by the native Builder: %s."
+                % (name, native_incompatibility))
+        if head.get("complete") != "1":
+            raise ValueError("Finish %s before merging it." % name)
+        inputs.append(path)
+    base = re.sub(
+        r"[^A-Za-z0-9._+-]", "-", str(data.get("name", "")).strip())
+    if base.lower().endswith(".bspool"):
+        base = base[:-7]
+    if not base:
+        base = "merged-pool"
+    os.makedirs(root, exist_ok=True)
+    output = os.path.join(root, base + ".bspool")
+    collisions = [
+        output + suffix
+        for suffix in organizer_web.FORMAT_UPGRADE_PROTECTED_SUFFIXES
+        if os.path.lexists(output + suffix)
+    ]
+    if collisions:
+        raise ValueError(
+            "That output name already has pool files. Pick a different "
+            "merged-pool name or remove the old pool and its sidecars.")
+    return (core.MergeRunner(inputs, output),
+            "Merging %d shard pools" % len(inputs), None)
 
 
 def start_merge_job(data, pool_dir=None):
-    with LOCK:
-        if JOB["closing"]:
-            raise ValueError("The Builder is closing; reopen it to start another job.")
-        r = JOB["runner"]
-        if r is not None and not r.done():
-            raise ValueError("A scan or merge is already running.")
-        _cleanup_replaced_estimate_locked()
-        root = pool_dir or core.POOL_DIR
-        names = []
-        for value in data.get("pools", []):
-            name = os.path.basename(str(value))
-            if name and name not in names:
-                names.append(name)
-        if len(names) < 2:
-            raise ValueError("Select at least two completed shard pools.")
-        inputs = []
-        for name in names:
-            path = os.path.join(root, name)
-            if not name.lower().endswith(".bspool") or not os.path.isfile(path):
-                raise ValueError("A selected pool no longer exists: %s" % name)
-            head = read_pool_header(path)
-            native_incompatibility = core.pool_native_incompatibility(head)
-            if native_incompatibility:
-                raise ValueError(
-                    "%s cannot be merged by the native Builder: %s."
-                    % (name, native_incompatibility))
-            if head.get("complete") != "1":
-                raise ValueError("Finish %s before merging it." % name)
-            inputs.append(path)
-        base = re.sub(r"[^A-Za-z0-9._+-]", "-", str(data.get("name", "")).strip())
-        if base.lower().endswith(".bspool"):
-            base = base[:-7]
-        if not base:
-            base = "merged-pool"
-        os.makedirs(root, exist_ok=True)
-        output = os.path.join(root, base + ".bspool")
-        collisions = [
-            output + suffix
-            for suffix in organizer_web.FORMAT_UPGRADE_PROTECTED_SUFFIXES
-            if os.path.lexists(output + suffix)
-        ]
-        if collisions:
-            raise ValueError(
-                "That output name already has pool files. Pick a different "
-                "merged-pool name or remove the old pool and its sidecars.")
-        JOB.update(runner=core.MergeRunner(inputs, output), kind="merge",
-                   started=time.time(), summary="Merging %d shard pools" % len(inputs),
-                   error="", estimate_context=None)
+    JOBS.start("merge", data, pool_dir=pool_dir)
 
 
 def shutdown_when_safe(server):
-    """Pause an active child at its next checkpoint, then stop the web server."""
-    time.sleep(0.2)  # let the POST response reach the browser first
-    organizer_web.begin_operation_shutdown()
-    r = JOB["runner"]
-    if r is not None and not r.done():
-        r.stop()
-        while not r.done():
-            time.sleep(0.1)
-    organizer_web.wait_for_active_operations()
-    with LOCK:
-        _cleanup_replaced_estimate_locked()
-    server.shutdown()
+    JOBS.shutdown_when_safe(server)
 
 
 def begin_shutdown(server):
-    with LOCK:
-        if JOB["closing"]:
-            return
-        JOB["closing"] = True
-    organizer_web.begin_operation_shutdown()
-    threading.Thread(target=shutdown_when_safe, args=(server,), daemon=True).start()
+    JOBS.begin_shutdown(server)
 
 
 SEEDCAP = core.SEEDSPACE_TOTAL  # UI clamp only; the scanner enforces per-space bounds
@@ -1759,9 +1822,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
         elif parsed.path == "/api/stop":
-            r = JOB["runner"]
-            if r is not None:
-                r.stop()
+            JOBS.stop()
             self._json({"ok": True})
         elif parsed.path == "/api/delete-plan":
             try:
@@ -1789,8 +1850,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as e:
                 self._json({"error": str(e)}, 200)
         elif parsed.path == "/api/shutdown":
-            self._json({"ok": True, "pausing": bool(
-                JOB["runner"] is not None and not JOB["runner"].done())})
+            self._json({"ok": True, "pausing": JOBS.running()})
             begin_shutdown(self.server)
         elif parsed.path.startswith("/organizer/api/"):
             try:
@@ -1855,7 +1915,7 @@ def main():
         input("Press Return to close...")
         return 1
     Handler.snap = core.Snapshot(core.SNAPSHOT)
-    JOB["closing"] = False
+    JOBS.reopen()
     organizer_web.allow_active_operations()
     port = DEFAULT_PORT
     try:
@@ -1879,15 +1939,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         organizer_web.begin_operation_shutdown()
-        r = JOB["runner"]
-        if r is not None and not r.done():
+        if JOBS.running():
             print("\nPausing the scan at a checkpoint...")
-            r.stop()
-            while not r.done():
-                time.sleep(0.1)
-        organizer_web.wait_for_active_operations()
-        with LOCK:
-            _cleanup_replaced_estimate_locked()
+        JOBS.pause_and_wait()
         print("Bye.")
     finally:
         organizer_web.begin_operation_shutdown()
