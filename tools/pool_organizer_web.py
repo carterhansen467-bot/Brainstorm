@@ -598,6 +598,22 @@ def list_sources(pool_dir=None):
     return rows
 
 
+def _degraded_summary_notice(records):
+    """Explain the slow exact path taken when the native helper is absent."""
+    binary = _POOL_BINARY_NAME
+    return {
+        "kind": "warning",
+        "title": "Native seed-pool helper missing; using the slow exact reader",
+        "text": ("%s would normally be summarized by %s in seconds. That "
+                 "helper was not found, so every inspection and preview reads "
+                 "all %s records in Python instead. Results are identical, but "
+                 "each step can take tens of minutes and is not cached. Put %s "
+                 "in the mod's native folder, or reinstall the full package, "
+                 "to restore the fast path.") % (
+                     "This pool", binary, format(records, ","), binary),
+    }
+
+
 def _notices(source):
     notices = []
     if not source["complete"]:
@@ -1672,12 +1688,18 @@ def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
     header = _bounded_header(path)
     # Composite inspection retains the full semantic per-record validation.
     # Large ordinary event pools can use the bounded native block summary.
-    use_native = (
+    summarizable = (
         identity["bytes"] >= NATIVE_SUMMARY_MIN_BYTES
         and int(header.one("BRAINSTORM_SEED_POOL"))
         in organizer.EVENT_POOL_SCHEMAS
-        and not header.values.get("composite_schema")
-        and bool(_native_pool_binary()))
+        and not header.values.get("composite_schema"))
+    # A missing helper is not a blocker here: the Lua-independent Python
+    # traversal stays exact, so inspection must still work. It is orders of
+    # magnitude slower on a production pool, though, and the former silent
+    # fallback was indistinguishable from a hung request. Record it so the
+    # page can say why the wait is long instead of spinning without a reason.
+    degraded_native_summary = summarizable and not _native_pool_binary()
+    use_native = summarizable and not degraded_native_summary
     if use_native:
         cached = _cached_summary(path, identity)
         if cached is not None:
@@ -1734,6 +1756,9 @@ def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
     report = organizer.analyze(
         reader, ambiguity_limit=ambiguity_limit, cancel_check=cancel_check)
     report["notices"] = _notices(report["source"])
+    if degraded_native_summary:
+        report["notices"].insert(
+            0, _degraded_summary_notice(report["source"]["records"]))
     return report
 
 
@@ -3268,6 +3293,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 <div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool to see what it contains. Inspection is read-only.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
+ <div class="notice warning" id="nativeHelperWarning" hidden></div>
  <div class="row"><button class="go" id="inspectBtn" disabled>Loading pools…</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
  <div class="workstatus" id="inspectionStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="inspectionTitle">Inspecting pool…</b><span id="inspectionDetail">Reading the committed snapshot.</span></div></div>
  <div id="sourceInfo" hidden>
@@ -3387,6 +3413,17 @@ const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;"
 const fmt=n=>Number(n||0).toLocaleString();
 const fmtBytes=n=>{n=Number(n||0);if(n>=1073741824)return `${(n/1073741824).toFixed(2)} GiB`;if(n>=1048576)return `${(n/1048576).toFixed(2)} MiB`;if(n>=1024)return `${(n/1024).toFixed(1)} KiB`;return `${fmt(n)} bytes`};
 async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";error.publicationState=v.publication_state||"";throw error}return v}
+function renderNativeHelperWarning(v){
+ const box=$("nativeHelperWarning");if(!box)return;
+ const min=v.native_summary_min_bytes||0;
+ const slow=(v.pools||[]).filter(p=>!p.error&&p.bytes>=min);
+ if(v.native_summary!==false||!slow.length){box.hidden=true;box.innerHTML="";return}
+ box.hidden=false;
+ box.innerHTML=`<strong>Native seed-pool helper missing — large pools will be very slow</strong>`
+  +`Brainstorm could not find its seed-pool helper, so ${slow.length} listed pool(s) must be read record by record in Python. `
+  +`Inspecting or previewing one is exact but can take tens of minutes per step, and the result is not cached. `
+  +`Put the helper in the mod's <code>native</code> folder, or reinstall the full package, to restore the fast path.`;
+}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
@@ -3480,6 +3517,7 @@ async function loadPools(preserve=false){
  const inspectButton=$("inspectBtn"),formatButton=$("formatCheckBtn");inspectButton.disabled=true;inspectButton.textContent="Loading pools…";formatButton.disabled=true;formatButton.textContent="Loading pools…";
  try{
   const v=await api("/api/pools");workflowState.setPools(v.pools||[]);
+  renderNativeHelperWarning(v);
   $("source").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"} · ${p.coverage_complete?"complete":"provisional"} coverage`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   $("formatSource").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · BSP${p.schema} · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
@@ -3717,7 +3755,11 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 response_started = True
                 self.wfile.write(body)
             elif parsed.path == "/api/pools":
-                self._json({"pools": list_sources(self.pool_dir)})
+                self._json({
+                    "pools": list_sources(self.pool_dir),
+                    "native_summary": bool(_native_pool_binary()),
+                    "native_summary_min_bytes": NATIVE_SUMMARY_MIN_BYTES,
+                })
             elif parsed.path == "/api/export":
                 serve_record_export(self, parsed, self.pool_dir)
             elif parsed.path == "/api/export/status":
