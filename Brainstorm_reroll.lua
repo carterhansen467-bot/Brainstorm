@@ -3556,7 +3556,21 @@ end
 -- return an explicit label -> filename map.  Empty filename is the normal
 -- automatic mode: a compatible authoritative attachment wins; otherwise an
 -- accelerator can fall back to the next safe source and unrestricted search.
-local SEED_POOL_OPTION_MAX = 24
+-- create_option_cycle applies w as minw, not a fixed width, so the DynaText
+-- inside stretches the bar whenever the option string is longer. Keeping
+-- every option at or under this width means the Seed Pool selector renders
+-- at exactly w = 4 like its neighbours no matter which pool is chosen.
+-- Measured at scale 0.7: bar text room is about 229px at ~12.8px/char.
+-- The full name and label are shown on the summary rows beneath it.
+local SEED_POOL_OPTION_MAX = 17
+-- Measured budget for one row of the pool summary. These rows are single
+-- non-wrapping text nodes; a row wider than this drives the settings panel
+-- wider than the visible screen and drags the whole layout off centre. The
+-- default "Automatic: compatible attached pools first" (42) sits centred, a
+-- 66-character row already pulls it about 75px off, and ~140 pulls it ~230px.
+-- Keep every row at or under this and the panel geometry stays put.
+local SEED_POOL_INFO_ROW_MAX = 48
+local SEED_POOL_INFO_LABEL_MAX = SEED_POOL_INFO_ROW_MAX
 
 function Brainstorm.seedPoolOptionLabel(name, header, suffix)
 	local value = header and header.label or ""
@@ -3624,9 +3638,6 @@ function Brainstorm.poolInfoString(name)
 	if not Brainstorm.poolNativeCompatible(h) then
 		bits[#bits + 1] = "UNSUPPORTED POOL SCHEMA"
 	end
-	if h.label and h.label ~= "" and (h.label .. ".bspool") ~= name then
-		bits[#bits + 1] = '"' .. h.label .. '"'
-	end
 	if h.pool_id and h.pool_id ~= "" then bits[#bits + 1] = "id " .. h.pool_id:sub(1, 8) end
 	if h.space == "settable" then
 		bits[#bits + 1] = "all vanilla-settable seeds (no 0)"
@@ -3672,7 +3683,31 @@ function Brainstorm.poolInfoString(name)
 		bits[#bits + 1] = "complete"
 	end
 	bits[#bits + 1] = "+ current filters"
-	return table.concat(bits, "  |  ")
+	-- Narrow separators first, then drop trailing detail until the row fits.
+	-- Everything ahead of the drop point is ordered most- to least-critical by
+	-- the assembly above, so a long pool loses "+ current filters" before it
+	-- loses its seed count or completeness.
+	local line = table.concat(bits, " | ")
+	while #line > SEED_POOL_INFO_ROW_MAX and #bits > 1 do
+		table.remove(bits)
+		line = table.concat(bits, " | ")
+	end
+	return line
+end
+
+-- The selected pool's label, as its own display row. Empty when the pool has
+-- no label, when the label merely repeats the filename, or when nothing is
+-- selected -- the caller hides the row in those cases.
+function Brainstorm.poolInfoLabel(name)
+	if not name or name == "" then return "" end
+	local h = Brainstorm.readPoolHeader(Brainstorm.seedPoolDir() .. "/" .. name)
+	if not h then return "" end
+	local label = h.label
+	if not label or label == "" or (label .. ".bspool") == name then return "" end
+	if #label > SEED_POOL_INFO_LABEL_MAX then
+		label = label:sub(1, SEED_POOL_INFO_LABEL_MAX - 3) .. "..."
+	end
+	return '"' .. label .. '"'
 end
 
 -- Selected pool's full path, or nil when no pool is selected. Existence is

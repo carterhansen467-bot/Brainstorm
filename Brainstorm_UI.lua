@@ -321,12 +321,13 @@ G.FUNCS.change_seed_pool = function(x)
 	end
 	Brainstorm.SETTINGS.autoreroll.seedPoolFile = mapped
 	Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(Brainstorm.SETTINGS.autoreroll.seedPoolFile)
+	Brainstorm.UI_POOL_INFO.label = Brainstorm.poolInfoLabel(Brainstorm.SETTINGS.autoreroll.seedPoolFile)
 	nativefs.write(Brainstorm.modPath() .. "/settings.lua", STR_PACK(Brainstorm.SETTINGS))
 end
 
 -- Identity line under the Seed Pool cycler (label / pool_id / space /
 -- records). A ref'd table so the text swaps live as the cycler moves.
-Brainstorm.UI_POOL_INFO = { text = "" }
+Brainstorm.UI_POOL_INFO = { text = "", label = "" }
 
 -- Stake the found run starts at (applies to both "Current run" overwrite and
 -- banked slots). Only the gameplay-relevant tiers: White (base), Black
@@ -513,7 +514,10 @@ function Brainstorm.buildJokerSelected()
 		}}
 	end
 	local row = {
-		Brainstorm.jokerSprite(sel.key, 0.9, 1.2),
+		-- Deliberately smaller than a slot card: this row appears on top of the
+		-- existing layout inside a panel that cannot grow, so the preview has to
+		-- pay for itself. See the slot cards below for the full-size rendering.
+		Brainstorm.jokerSprite(sel.key, 0.62, 0.83),
 		{n = G.UIT.C, config = {align = "cm", padding = 0.06}, nodes = {
 			{n = G.UIT.T, config = {text = "Add to slot:", scale = 0.44, colour = G.C.UI.TEXT_LIGHT}},
 		}},
@@ -534,7 +538,7 @@ function Brainstorm.buildJokerSlots()
 		local key = (slot and slot.key) or ""
 		local filled = key ~= ""
 		local negOn = slot and slot.requireNegative
-		cards[#cards + 1] = {n = G.UIT.C, config = {align = "cm", colour = G.C.CLEAR, padding = 0.1, minw = 2.1}, nodes = {
+		cards[#cards + 1] = {n = G.UIT.C, config = {align = "cm", colour = G.C.CLEAR, padding = 0.06, minw = 2.1}, nodes = {
 			{n = G.UIT.R, config = {align = "cm", padding = 0.03}, nodes = {
 				{n = G.UIT.T, config = {text = "Slot " .. i, scale = 0.42, colour = G.C.UI.TEXT_LIGHT}},
 			}},
@@ -570,7 +574,7 @@ function Brainstorm.buildJokerSlots()
 		}}
 	end
 	return {n = G.UIT.ROOT, config = {align = "cm", colour = G.C.CLEAR}, nodes = {
-		{n = G.UIT.R, config = {align = "cm", padding = 0.1}, nodes = cards},
+		{n = G.UIT.R, config = {align = "cm", padding = 0.06}, nodes = cards},
 	}}
 end
 
@@ -728,14 +732,15 @@ function create_tabs(args)
 					end)
 				Brainstorm.seedPoolFileByOption = poolFiles
 				Brainstorm.UI_POOL_INFO.text = Brainstorm.poolInfoString(savedPool or "")
+				Brainstorm.UI_POOL_INFO.label = Brainstorm.poolInfoLabel(savedPool or "")
 				if Brainstorm.refreshSearchEstimateDisplay then
 					Brainstorm.refreshSearchEstimateDisplay(true)
 				end
 				-- Left column: the core search settings
-				local leftColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
+				local leftColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.035}, nodes = {
 					create_option_cycle({
 						label = "Search Tag",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = searchTagKeys,
 						opt_callback = "change_search_tag",
@@ -743,7 +748,7 @@ function create_tabs(args)
 					}),
 					create_option_cycle({
 						label = "Search Pack",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = searchPackKeys,
 						opt_callback = "change_search_pack",
@@ -751,7 +756,7 @@ function create_tabs(args)
 					}),
 					create_option_cycle({
 						label = "Search Voucher",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = voucherNames,
 						opt_callback = "change_search_voucher",
@@ -759,7 +764,7 @@ function create_tabs(args)
 					}),
 					create_option_cycle({
 						label = "Voucher Ante",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = Brainstorm.voucherAnteOptions,
 						opt_callback = "change_search_voucher_ante",
@@ -777,18 +782,38 @@ function create_tabs(args)
 					}},
 					create_option_cycle({
 						label = "Seed Pool",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = poolNames,
 						opt_callback = "change_seed_pool",
 						current_option = poolCurrent,
 					}),
-					{n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
-						{n = G.UIT.T, config = {
-							ref_table = Brainstorm.UI_POOL_INFO,
-							ref_value = "text",
-							scale = 0.26,
-							colour = G.C.UI.TEXT_INACTIVE,
+				}}
+
+				-- The pool summary is one non-wrapping line describing the whole
+				-- search, but it used to live inside leftColumn, whose natural
+				-- width is the 4-unit cycle bars. Any real pool label made this
+				-- line 1.5-2.3x that width, so it drove the column, the panel and
+				-- the visible screen sideways -- worse for every longer pool name.
+				-- It spans both columns now, so its width no longer feeds back
+				-- into the column layout.
+				local poolInfoRow = {n = G.UIT.R, config = {align = "cm", padding = 0.01}, nodes = {
+					{n = G.UIT.C, config = {align = "cm"}, nodes = {
+						{n = G.UIT.R, config = {align = "cm"}, nodes = {
+							{n = G.UIT.T, config = {
+								ref_table = Brainstorm.UI_POOL_INFO,
+								ref_value = "label",
+								scale = 0.24,
+								colour = G.C.UI.TEXT_INACTIVE,
+							}},
+						}},
+						{n = G.UIT.R, config = {align = "cm"}, nodes = {
+							{n = G.UIT.T, config = {
+								ref_table = Brainstorm.UI_POOL_INFO,
+								ref_value = "text",
+								scale = 0.26,
+								colour = G.C.UI.TEXT_INACTIVE,
+							}},
 						}},
 					}},
 				}}
@@ -797,10 +822,10 @@ function create_tabs(args)
 				-- is tinted to the selected legendary's sprite colour.
 				Brainstorm.applyLegendaryBarColour()
 				Brainstorm.applyNegLegendaryDisplay()
-				local rightColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.08}, nodes = {
+				local rightColumn = {n = G.UIT.C, config = {align = "cm", padding = 0.035}, nodes = {
 					create_option_cycle({
 						label = "Search Legendary",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						colour = Brainstorm.legendaryBarColour,
 						no_pips = true,
@@ -839,7 +864,7 @@ function create_tabs(args)
 					}},
 					create_option_cycle({
 						label = "Search Threads",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = Brainstorm.searchThreadsOptions,
 						opt_callback = "change_search_threads",
@@ -847,7 +872,7 @@ function create_tabs(args)
 					}),
 					create_option_cycle({
 						label = "Found Seed",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = Brainstorm.foundSeedSlotOptions,
 						opt_callback = "change_found_seed_slot",
@@ -855,7 +880,7 @@ function create_tabs(args)
 					}),
 					create_option_cycle({
 						label = "Found Stake",
-						scale = 0.8,
+						scale = 0.7,
 						w = 4,
 						options = Brainstorm.foundStakeOptions,
 						opt_callback = "change_found_seed_stake",
@@ -867,17 +892,22 @@ function create_tabs(args)
 					n = G.UIT.ROOT,
 					config = {
 						align = "cm",
-						padding = 0.05,
+						-- This tab is the tallest in the group: two dense columns, the
+						-- pool summary, the toggles and the estimate. At the previous
+						-- spacing the panel ran past the top and bottom of the screen,
+						-- clipping the Back button. Keep this tight.
+						padding = 0.02,
 						colour = G.C.CLEAR,
 						minh = 6.5,
 					},
 					nodes = {
-						{n = G.UIT.R, config = {align = "cm", padding = 0.1}, nodes = {
+						{n = G.UIT.R, config = {align = "cm", padding = 0.06}, nodes = {
 							leftColumn,
 							rightColumn,
 						}},
+						poolInfoRow,
 						-- Debug Mode + Illegal Seed Input centered beneath both columns.
-						{n = G.UIT.R, config = {align = "cm", padding = 0.05}, nodes = {
+						{n = G.UIT.R, config = {align = "cm", padding = 0.03}, nodes = {
 							{n = G.UIT.C, config = {align = "cm"}, nodes = {
 								create_toggle({
 									label = "Debug Mode",
@@ -931,7 +961,7 @@ function create_tabs(args)
 			tab_definition_function_args = "Brainstorm",
 		}
 		args.tabs[#args.tabs + 1] = {
-			label = "Brainstorm: Jokers",
+			label = "Jokers",
 			tab_definition_function = function()
 				Brainstorm.allJokerNames = {"None"}
 				Brainstorm.allJokerKeys  = {""}
@@ -996,8 +1026,22 @@ function create_tabs(args)
 					prompt_text = "Search jokers...",
 					extended_corpus = true,
 					callback = function()
+						-- Typing a new search abandons a pick that was never assigned
+						-- to a slot. Without this the results list reappears while the
+						-- "Add to slot" row is still shown, and the two together push
+						-- the estimate row under the Back button -- the panel cannot
+						-- grow. Assigning to a slot clears the selection the same way.
+						local ss = Brainstorm.jokerSearchState
+						local had_selection = ss and ss.selected and ss.selected.key ~= ""
+						if had_selection then
+							ss.selected.name = "None"
+							ss.selected.key  = ""
+						end
 						Brainstorm.doJokerFilter()
 						Brainstorm.refreshJokerSection("bs_joker_results", Brainstorm.buildJokerResults)
+						if had_selection then
+							Brainstorm.refreshJokerSection("bs_joker_selected", Brainstorm.buildJokerSelected)
+						end
 					end,
 				}
 
@@ -1041,7 +1085,7 @@ function create_tabs(args)
 						{n = G.UIT.R, config = {align = "cm", padding = 0.1}, nodes = {create_text_input(inputArgs)}},
 						resultsSection,
 						selectedSection,
-						{n = G.UIT.R, config = {align = "cm", padding = 0.08}, nodes = {
+						{n = G.UIT.R, config = {align = "cm", padding = 0.05}, nodes = {
 							{n = G.UIT.B, config = {w = 5, h = 0.02, colour = G.C.WHITE}},
 						}},
 						matchModeRow,
@@ -1053,7 +1097,7 @@ function create_tabs(args)
 			tab_definition_function_args = "BrainstormJokers",
 		}
 		args.tabs[#args.tabs + 1] = {
-			label = "Brainstorm: Multi-Ante",
+			label = "Multi-Ante",
 			tab_definition_function = function()
 				local cfg = Brainstorm.SETTINGS.multiAnteSearch or {}
 				-- Header: the Anywhere toggle + its depth cycle, above the per-ante rows.
