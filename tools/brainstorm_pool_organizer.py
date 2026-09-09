@@ -2867,7 +2867,9 @@ def source_summary(reader: BSPoolReader) -> Dict[str, object]:
 
 def analyze(reader: BSPoolReader, selected: Optional[set] = None,
             ambiguity_limit: Optional[int] = None,
-            cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, object]:
+            cancel_check: Optional[Callable[[], bool]] = None,
+            progress: Optional[Callable[[int, int], None]] = None
+            ) -> Dict[str, object]:
     _check_cancel(cancel_check)
     counts = collections.Counter()
     details = {}  # type: Dict[str, Dict[str, object]]
@@ -2948,7 +2950,11 @@ def analyze(reader: BSPoolReader, selected: Optional[set] = None,
         processed += 1
         if processed % CANCEL_CHECK_RECORDS == 0:
             _check_cancel(cancel_check)
+            if progress is not None:
+                progress(processed, reader.records)
     _check_cancel(cancel_check)
+    if progress is not None:
+        progress(processed, reader.records)
     categories = []
     for category in counts:
         item = dict(details[category])
@@ -4552,9 +4558,13 @@ def build_native_split_plan(reader: BSPoolReader, spec: split_policy.SplitSpec,
     Returns the document and a rank -> original choice keys map so an unused
     native choice can be reported with the reviewer's own key text.
     """
-    if not categories or len(categories) != len(set(categories)) \
-            or len(categories) > 256:
-        raise PoolError("native split plan needs 1-256 distinct outputs")
+    if not categories or len(categories) != len(set(categories)):
+        raise PoolError("native split plan needs distinct outputs")
+    if len(categories) > 256:
+        # Selected-but-empty categories still need helper outputs; beyond the
+        # helper's table size the exact Python writer takes over.
+        raise NativeSplitUnsupported(
+            "native split supports at most 256 outputs per publication")
     index = {category: number for number, category in enumerate(categories)}
     lines = [
         b"BRAINSTORM_SPLIT_PLAN %d" % NATIVE_SPLIT_PLAN_SCHEMA,

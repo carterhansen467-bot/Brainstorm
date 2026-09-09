@@ -3754,6 +3754,28 @@ class NativeSplitRegression(unittest.TestCase):
         self.assertEqual(final["records_done"], 6)
         self.assertTrue(any(kind == "combine" for kind, _fields in seen))
 
+    def test_inspection_and_preview_report_live_progress(self):
+        name, snapshot = self.default_source(self.temp.name)
+        original_binary = web._native_pool_binary
+        web._native_pool_binary = lambda: ""
+        try:
+            inspection = web.run_inspect(name, self.temp.name)
+            progress = web.operation_progress("analysis")
+            self.assertEqual(progress["state"], "done")
+            self.assertEqual(progress["records_done"], 4)
+            self.assertEqual(progress["records_total"], 4)
+            self.assertEqual(progress["phase"], "scanning")
+            reader = web.verified_source_reader(name, self.temp.name)
+            request = self.exclusive_request("keep", "scan")(reader, snapshot)
+            plan = web.run_split_plan(dict(request, source=name), self.temp.name)
+            self.assertEqual(plan["planning_mode"], "record_scan")
+            progress = web.operation_progress("analysis")
+            self.assertEqual(progress["state"], "done")
+            self.assertEqual(progress["records_done"], 4)
+        finally:
+            web._native_pool_binary = original_binary
+        self.assertEqual(inspection["source"]["records"], 4)
+
     def test_embedded_page_scripts_parse(self):
         node = shutil.which("node")
         if not node:

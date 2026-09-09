@@ -606,9 +606,10 @@ byte-identical pools. The organizer then fills in each header itself, re-reads
 every staged file, and asks the helper to summarize each one so record counts,
 digests, and category membership are proven before anything is published. A
 355-million-seed source that took about half an hour to copy in Python finishes
-in well under a minute this way. The page polls live progress (seeds copied,
-percentage, and time remaining) for split and combine work while the request is
-open, so a long copy is never mistaken for a hung request. Without the helper
+in well under a minute this way. The page polls live progress (seeds scanned or
+copied, percentage, and time remaining) for inspection, preview, split, and
+combine work while the request is open, so a long scan or copy is never
+mistaken for a hung request. Without the helper
 the exact Python copy still runs; the preview then states the expected duration
 up front. An outdated helper without a split mode, or a source with a
 historical non-ascending block layout, hands the copy back to Python

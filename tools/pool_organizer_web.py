@@ -306,10 +306,26 @@ def _progress_finish(kind, state):
         value["updated_at"] = time.time()
 
 
+def _analysis_progress(done, total):
+    _progress_set("analysis", phase="scanning", records_done=done,
+                  records_total=total)
+
+
+def _counted_records(reader, cancel_check=None):
+    """Yield a reader's records while reporting exact scan progress."""
+    for number, record in enumerate(
+            reader.iter_records(cancel_check=cancel_check), 1):
+        if number % organizer.CANCEL_CHECK_RECORDS == 0:
+            _analysis_progress(number, reader.records)
+        yield record
+    _analysis_progress(reader.records, reader.records)
+
+
 def operation_progress(kind):
     """Return a copy of one operation's live progress for the page."""
-    if kind not in ("split", "combine", "upgrade"):
-        raise organizer.PoolError("choose split, combine, or upgrade progress")
+    if kind not in ("analysis", "split", "combine", "upgrade"):
+        raise organizer.PoolError(
+            "choose analysis, split, combine, or upgrade progress")
     with ACTIVE_OPERATION_LOCK:
         value = OPERATION_PROGRESS.get(kind)
         snapshot = dict(value) if value else {"state": "idle"}
@@ -1951,7 +1967,7 @@ def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
             # directly instead of reopening the damaged physical prefix.
             report = organizer.analyze(
                 reader, ambiguity_limit=ambiguity_limit,
-                cancel_check=cancel_check)
+                cancel_check=cancel_check, progress=_analysis_progress)
             if _summary_identity(path) != identity:
                 raise organizer.PoolError(
                     "source changed while its verified reconstructed view "
@@ -1987,7 +2003,8 @@ def inspect_source(name, pool_dir=None, ambiguity_limit=100, cancel_check=None):
     reader = verified_source_reader(
         name, pool_dir, cancel_check=cancel_check)
     report = organizer.analyze(
-        reader, ambiguity_limit=ambiguity_limit, cancel_check=cancel_check)
+        reader, ambiguity_limit=ambiguity_limit, cancel_check=cancel_check,
+        progress=_analysis_progress)
     report["notices"] = _notices(report["source"])
     if degraded_native_summary:
         report["notices"].insert(
@@ -2253,7 +2270,7 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
     if not summary_projection and distribution_policy is not None:
         def policy_records():
             nonlocal opaque_associations
-            for record in reader.iter_records(cancel_check=cancel_check):
+            for record in _counted_records(reader, cancel_check):
                 for occurrence in record.occurrences:
                     if occurrence.known:
                         if group_by_filter:
@@ -2310,8 +2327,8 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
         used_rules = set(reviewed_distribution.used_rules)
         record_source = ()
     else:
-        record_source = () if summary_projection else reader.iter_records(
-            cancel_check=cancel_check)
+        record_source = () if summary_projection else _counted_records(
+            reader, cancel_check)
     for record_index, record in enumerate(record_source):
         if record_index % 8192 == 0:
             _operation_cancelled(cancel_check)
@@ -3204,9 +3221,14 @@ def _execute_combine_with_readers(
 
 def _run_analysis(callback):
     event = _begin_operation("analysis")
+    _progress_begin("analysis", native=False)
+    state = "failed"
     try:
-        return callback(event.is_set)
+        result = callback(event.is_set)
+        state = "done"
+        return result
     finally:
+        _progress_finish("analysis", state)
         _finish_operation("analysis", event)
 
 
@@ -3696,6 +3718,7 @@ function fmtDuration(s){s=Math.max(0,Math.round(Number(s)||0));if(s<60)return `$
 function splitState(kind,title,detail){const box=$("splitStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("splitStatusTitle").textContent=title;$("splitStatusDetail").textContent=detail}
 function combineState(kind,title,detail){const box=$("combineStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("combineStatusTitle").textContent=title;$("combineStatusDetail").textContent=detail}
 function describeCombineProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return `Starting · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Reading input seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
+function describeScanProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return "";const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Scanning seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}. The source pool is not being changed.`}
 function describeSplitProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0,mode=p.native?"native helper":"Python copy (slow path)";if(p.phase==="verifying")return `Verifying the new files (${mode}) · ${fmtDuration(p.elapsed_seconds)} elapsed.`;if(!total||!done)return `Starting the ${mode} · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Copying seeds with the ${mode}: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
@@ -3812,7 +3835,7 @@ async function inspect(){
  const started=performance.now();
  button.disabled=true;refresh.disabled=true;picker.disabled=true;$("analysisCancelBtn").hidden=false;button.textContent=row?`Inspecting ${fmt(row.records)} seeds…`:"Inspecting pool…";
  inspectionState("",`Inspecting ${source}`,row&&row.records>=32000000?`Verifying a large pool (${fmt(row.records)} committed seeds). First inspection can take several seconds; cached inspections are immediate.`:"Reading and verifying the committed snapshot.");
- const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);$("inspectionDetail").textContent=`Still working — ${seconds}s elapsed. The source pool is not being changed.`},1000);
+ let polling=false;const timer=setInterval(async()=>{const seconds=Math.floor((performance.now()-started)/1000);if(polling)return;polling=true;try{const text=describeScanProgress(await api("/api/progress?operation=analysis"));$("inspectionDetail").textContent=text||`Still working — ${seconds}s elapsed. The source pool is not being changed.`}catch(_e){$("inspectionDetail").textContent=`Still working — ${seconds}s elapsed. The source pool is not being changed.`}finally{polling=false}},1000);
  // Yield once so the busy state paints before a CPU-heavy local request.
  await new Promise(resolve=>setTimeout(resolve,40));
  try{
@@ -3832,7 +3855,7 @@ function splitRequest(){const split=workflowState.split;return {source:split.sou
 function splitFingerprint(){if(!workflowState.split.inspection)return "";const request=splitRequest();return JSON.stringify({source:request.source,snapshot:request.snapshot,assignmentMode:request.assignmentMode,groupByFilter:request.groupByFilter,categories:request.selectedCategories,choices:Object.entries(request.choicePlan.choices).sort(),rules:Object.entries(request.choicePlan.ambiguity_rules).sort(),policy:request.unmatchedPolicy,remainder:request.remainderName,prefix:request.prefix})}
 async function prepare(fromReview=false){
  clear();const split=workflowState.split;if(!split.inspection)return;const button=$("planBtn"),applyButton=$("applyDecisionsBtn"),activeButton=fromReview?applyButton:button,request=splitRequest(),fingerprint=splitFingerprint(),row=workflowState.pools.find(p=>p.name===split.source),started=performance.now(),setState=fromReview?updateState:reviewState,detailNode=fromReview?$("updateDetail"):$("reviewDetail");button.disabled=true;applyButton.disabled=true;$("analysisCancelBtn").hidden=false;activeButton.textContent=fromReview?"Updating preview…":"Building preview…";if(fromReview)$("reviewStatus").hidden=true;else $("updateStatus").hidden=true;setState("","Building output preview",row?`Calculating destinations for ${fmt(row.records)} recorded seeds. The source pool is not being changed.`:"Calculating destinations from the selected locations.");
- const timer=setInterval(()=>{const seconds=Math.floor((performance.now()-started)/1000);detailNode.textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`},1000);
+ let polling=false;const timer=setInterval(async()=>{const seconds=Math.floor((performance.now()-started)/1000);if(polling)return;polling=true;try{const text=describeScanProgress(await api("/api/progress?operation=analysis"));detailNode.textContent=text||`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`}catch(_e){detailNode.textContent=`Still reviewing — ${seconds}s elapsed. You can cancel safely; the source pool is not being changed.`}finally{polling=false}},1000);
  await new Promise(resolve=>setTimeout(resolve,40));
  try{const v=await api("/api/plan",request);if(fingerprint!==splitFingerprint())throw Error("Selections changed while the preview was running. Preview the current choices again.");workflowState.reviewSplit(v,fingerprint);renderPlan();renderSplitPublication();$("saveBtn").disabled=assignmentMode()!=="exclusive";const elapsed=(performance.now()-started)/1000;setState("success",fromReview?"Preview updated":"Preview ready",v.planning_mode==="summary_projection"?`Reused the verified inspection totals; no full rescan was needed. Finished in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`:`Finished the exact record preview in ${elapsed<0.1?"under 0.1":elapsed.toFixed(1)}s.`);$("reviewCard").scrollIntoView({behavior:"smooth",block:"start"})}catch(e){invalidateSplitReview();setState("error","Preview failed",e.message||String(e));fail(e)}finally{clearInterval(timer);$("analysisCancelBtn").hidden=true;button.disabled=false;applyButton.disabled=false;button.textContent="Preview new pools";applyButton.textContent="Update preview"}
 }
