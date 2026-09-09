@@ -1798,23 +1798,35 @@ class NativeSplitHelper:
 
     def summarize(self, path, cancel_check=None):
         _progress_set("split", phase="verifying")
+        _progress_set("combine", phase="verifying")
         return _run_native_summary(path, cancel_check=cancel_check)
 
     def split(self, source, plan_path, cancel_check=None, progress=None):
+        return self._stream(
+            "split", [source, plan_path], organizer.NativeSplitUnsupported,
+            cancel_check, progress)
+
+    def combine(self, plan_path, cancel_check=None, progress=None):
+        return self._stream(
+            "combine", [plan_path], organizer.NativeCombineUnsupported,
+            cancel_check, lambda done, _total: progress(done)
+            if progress is not None else None)
+
+    def _stream(self, verb, arguments, unsupported, cancel_check, progress):
         lines = collections.deque(maxlen=200)
         stdout_parts = []
         stdout_bytes = [0]
         try:
             process = subprocess.Popen(
-                [self.binary, "split", source, plan_path],
+                [self.binary, verb] + list(arguments),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace")
         except OSError as exc:
             raise organizer.PoolError(
-                "native split could not start: %s" % exc) from exc
+                "native %s could not start: %s" % (verb, exc)) from exc
         with ACTIVE_UPGRADE_PROCESS_LOCK:
             ACTIVE_UPGRADE_PROCESSES.add(process)
-        _progress_set("split", phase="copying")
+        _progress_set(verb, phase="copying")
 
         def pump_stderr():
             try:
@@ -1868,21 +1880,21 @@ class NativeSplitHelper:
                         ACTIVE_UPGRADE_PROCESSES.discard(process)
             if termination_error is not None:
                 raise organizer.PoolError(
-                    "native split helper could not be stopped safely: %s"
-                    % termination_error)
+                    "native %s helper could not be stopped safely: %s"
+                    % (verb, termination_error))
         if cancelled:
             raise OperationCancelled(
-                "split cancelled safely; no new pool was published")
+                "%s cancelled safely; no new pool was published" % verb)
         detail = next((line for line in reversed(lines) if line.strip()),
                       "native helper exited with code %d" % process.returncode)
         if process.returncode in (organizer.NATIVE_SPLIT_EXIT_UNSUPPORTED, 2):
             # 4: the helper declined this source. 2: an older helper without
-            # a split mode printed its usage. Both hand back to Python.
-            raise organizer.NativeSplitUnsupported(detail)
+            # this mode printed its usage. Both hand back to Python.
+            raise unsupported(detail)
         if process.returncode:
-            raise organizer.PoolError("native split failed: %s" % detail)
+            raise organizer.PoolError("native %s failed: %s" % (verb, detail))
         if stdout_bytes[0] > 4 * 1024 * 1024:
-            raise organizer.PoolError("native split result is too large")
+            raise organizer.PoolError("native %s result is too large" % verb)
         return "".join(stdout_parts)
 
 
@@ -3238,8 +3250,8 @@ def _execute_combine_with_readers(
         report_path = _unique_combine_report_path(root, output_name)
     _operation_cancelled(cancel_check)
     total_records = sum(reader.records for reader in context.readers)
-    _progress_begin("combine", records_total=total_records, native=False,
-                    phase="copying")
+    _progress_begin("combine", records_total=total_records,
+                    native=bool(_native_pool_binary()), phase="copying")
     progress_state = "failed"
     try:
         result = organizer.combine_pools(
@@ -3247,7 +3259,8 @@ def _execute_combine_with_readers(
             progress=lambda consumed: _progress_set(
                 "combine", phase="copying", records_done=consumed,
                 records_total=total_records),
-            cancel_check=cancel_check)
+            cancel_check=cancel_check,
+            native_combine=_native_split_helper())
         _progress_set("combine", phase="publishing",
                       records_done=total_records,
                       records_total=total_records)
@@ -3778,7 +3791,7 @@ function renderNativeHelperWarning(v){
 function fmtDuration(s){s=Math.max(0,Math.round(Number(s)||0));if(s<60)return `${s}s`;if(s<3600)return `${Math.floor(s/60)}m ${s%60}s`;return `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`}
 function splitState(kind,title,detail){const box=$("splitStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("splitStatusTitle").textContent=title;$("splitStatusDetail").textContent=detail}
 function combineState(kind,title,detail){const box=$("combineStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("combineStatusTitle").textContent=title;$("combineStatusDetail").textContent=detail}
-function describeCombineProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return `Starting · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Reading input seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
+function describeCombineProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0,mode=p.native?"native helper":"Python merge (slow path)";if(p.phase==="verifying")return `Verifying the new file (${mode}) · ${fmtDuration(p.elapsed_seconds)} elapsed.`;if(!total||!done)return `Starting the ${mode} · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Reading input seeds with the ${mode}: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
 function describeScanProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return "";const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Scanning seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}. The source pool is not being changed.`}
 function describeSplitProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0,mode=p.native?"native helper":"Python copy (slow path)";if(p.phase==="verifying")return `Verifying the new files (${mode}) · ${fmtDuration(p.elapsed_seconds)} elapsed.`;if(!total||!done)return `Starting the ${mode} · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Copying seeds with the ${mode}: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
 function renderPoolFolderNotice(v){
@@ -3994,7 +4007,7 @@ async function createCombine(){
  const combine=workflowState.combine;if(!combine.plan||combine.reviewedFingerprint!==combineFingerprint()||!combine.plan.publication.ready)return;$("combineError").textContent="";workflowState.startCombine();$("combineCreateBtn").disabled=true;$("combineCreateBtn").textContent="Creating combined seed pool…";$("combineCancelBtn").hidden=false;
  const started=performance.now();combineState("","Creating combined seed pool…","Starting. The input pools are not being changed.");
  let polling=false;const timer=setInterval(async()=>{if(polling)return;polling=true;try{const p=await api("/api/progress?operation=combine");const text=describeCombineProgress(p);$("combineStatusDetail").textContent=text||`Still working — ${fmtDuration((performance.now()-started)/1000)} elapsed.`}catch(_e){}finally{polling=false}},1000);
- try{const v=await api("/api/combine",combineRequest(true));combineState("success",`Created ${v.name}`,`${fmt(v.records)} unique seed(s) written in ${fmtDuration((performance.now()-started)/1000)}.`);renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);workflowState.invalidateCombine();$("combinePublication").hidden=true;$("combineTechnical").hidden=true;$("combineCreateBtn").disabled=true;$("combineSumCompatibility").textContent="Created"}catch(e){combineState("error","Combined pool creation stopped",e.message||String(e));$("combineError").textContent=e.message||String(e);invalidateCombine("Check again after this failure")}finally{clearInterval(timer);workflowState.finishCombine();$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool";updateCombineBase()}
+ try{const v=await api("/api/combine",combineRequest(true));combineState("success",`Created ${v.name}`,`${fmt(v.records)} unique seed(s) written in ${fmtDuration((performance.now()-started)/1000)}${v.native_combine?" with the native helper":" with the Python merge path"}.`);renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);workflowState.invalidateCombine();$("combinePublication").hidden=true;$("combineTechnical").hidden=true;$("combineCreateBtn").disabled=true;$("combineSumCompatibility").textContent="Created"}catch(e){combineState("error","Combined pool creation stopped",e.message||String(e));$("combineError").textContent=e.message||String(e);invalidateCombine("Check again after this failure")}finally{clearInterval(timer);workflowState.finishCombine();$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool";updateCombineBase()}
 }
 async function cancelCombine(){$("combineCancelBtn").disabled=true;$("combineCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"combine"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineCancelBtn").disabled=false;$("combineCancelBtn").textContent="Cancel file creation"}}
 async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel compatibility check"}}

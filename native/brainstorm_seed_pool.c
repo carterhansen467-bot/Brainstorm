@@ -9171,19 +9171,19 @@ static int pool_mode_upgrade_locked(const char *input, const char *output) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* Organizer split.
+/* Organizer split and combine.
  *
- * The Python Organizer owns the reviewed split plan, every output header,
+ * The Python Organizer owns the reviewed plan, every output header,
  * publication, and rollback. Copying hundreds of millions of records through
- * Python objects took hours with nothing on screen, so this mode streams the
- * records instead: it verifies the source exactly like `summarize`, applies
- * the reviewed distribution policy of tools/pool_split_policy.py, and writes
- * canonical BSP4 blocks with the same codec choices, digests, and index
+ * Python objects took hours with nothing on screen, so these modes stream the
+ * records instead: they verify each source exactly like `summarize`, apply the
+ * same distribution or set rules as tools/brainstorm_pool_organizer.py, and
+ * write canonical BSP4 blocks with the same codec choices, digests, and index
  * layout as the Python BSP4OutputWriter. Both paths therefore produce
- * byte-identical output data for one plan; the Organizer fills in each
- * header afterwards and re-verifies every file with `summarize`.
+ * byte-identical output data for one plan; the Organizer fills in each header
+ * afterwards and re-verifies every file with `summarize`.
  *
- * Plan document (LF lines, "end" terminated):
+ * Split plan document (LF lines, "end" terminated):
  *   BRAINSTORM_SPLIT_PLAN 1
  *   mode exclusive|matching_copies
  *   header_bytes <n>
@@ -9196,12 +9196,34 @@ static int pool_mode_upgrade_locked(const char *input, const char *output) {
  *   rule <hex16> <index>                     (optional, exclusive only)
  *   end
  *
- * Result document on stdout:
+ * Split result document on stdout:
  *   BRAINSTORM_SPLIT_RESULT 1
  *   source_records/source_membership_digest/source_metadata_digest
  *   unmatched/overlap/unique_copied/output_memberships
  *   used_choices/used_rules, optional unused_choice <rank>, unused_rule <hex>
  *   output <index> <records> <data_bytes> <membership> <metadata>
+ *   end
+ *
+ * Combine plan document:
+ *   BRAINSTORM_COMBINE_PLAN 1
+ *   operation union|intersection|difference
+ *   header_bytes <n>
+ *   output <path>
+ *   input <index> <path>                     (canonical Organizer order)
+ *   provenance <index> <hex>                 (non-composite input: descriptor
+ *                                            added to each of its records)
+ *   operand <index> <hex>                    (output operand descriptor stamped
+ *                                            on each record the input contributes)
+ *   branch <index> <hex16>                   (composite input: allowed branch)
+ *   declared <index> <hex16>                 (composite input: declared operand)
+ *   expr <index> <postfix tokens...>         (composite input: o<hex16> leaves,
+ *                                            u<n>/i<n>/d<n> operators)
+ *   end
+ *
+ * Combine result document on stdout:
+ *   BRAINSTORM_COMBINE_RESULT 1
+ *   input <index> <records> <membership> <metadata>
+ *   consumed/records/data_bytes/membership_digest/metadata_digest
  *   end
  *
  * Exit status 4 means the source needs the exact Python path (for example a
@@ -9212,6 +9234,312 @@ static int pool_mode_upgrade_locked(const char *input, const char *output) {
 #define POOL_SPLIT_LINE_MAX 16384
 #define POOL_SPLIT_MASK_WORDS (POOL_SPLIT_MAX_OUTPUTS / 64)
 #define POOL_SPLIT_EXIT_UNSUPPORTED 4
+#define POOL_COMBINE_MAX_INPUTS 64
+#define POOL_COMBINE_EXPR_MAX 512
+/* 0x80/0x81 + big-endian u64: provenance and operand descriptors. */
+#define POOL_COMBINE_ID_DESCRIPTOR_BYTES 9
+
+typedef struct { const unsigned char *bytes; size_t len; int output; } PoolSplitDescriptorRef;
+typedef struct { uint32_t block, generation; int32_t slot; } PoolSplitSlot;
+
+/* One verified source, decoded one block at a time into ranks plus per-record
+ * descriptor chains (the inverted metadata turned back into records). */
+typedef struct {
+	FILE *file;
+	BspoolHeader header;
+	BspoolReader reader;
+	bool adaptive, ready;
+	BspoolScratch scratch;
+	unsigned char *metadata;
+	size_t metadataCap;
+	uint32_t *indexes;
+	PoolSplitDescriptorRef *descriptors;
+	size_t descriptorCap, ndescriptors;
+	int32_t *recordHead;
+	int32_t *assocNext, *assocDescriptor;
+	size_t assocCap;
+	uint32_t count;
+	const uint64_t *ranks;
+	uint64_t membershipDigest, metadataDigest, consumed;
+	uint64_t priorLast;
+	bool havePriorLast;
+} PoolEventCursor;
+
+static bool pool_event_cursor_reserve(PoolEventCursor *c, size_t descriptors,
+		size_t associations) {
+	if (descriptors > c->descriptorCap) {
+		size_t cap = c->descriptorCap ? c->descriptorCap : 256;
+		while (cap < descriptors) cap *= 2;
+		PoolSplitDescriptorRef *p = realloc(c->descriptors, cap * sizeof *p);
+		if (!p) return false;
+		c->descriptors = p; c->descriptorCap = cap;
+	}
+	if (associations > c->assocCap) {
+		size_t cap = c->assocCap ? c->assocCap : 16384;
+		while (cap < associations) cap *= 2;
+		int32_t *next = realloc(c->assocNext, cap * sizeof *next);
+		if (!next) return false;
+		c->assocNext = next;
+		int32_t *desc = realloc(c->assocDescriptor, cap * sizeof *desc);
+		if (!desc) return false;
+		c->assocDescriptor = desc; c->assocCap = cap;
+	}
+	return true;
+}
+
+static void pool_event_cursor_destroy(PoolEventCursor *c) {
+	free(c->descriptors); free(c->recordHead); free(c->assocNext);
+	free(c->assocDescriptor); free(c->indexes); free(c->metadata);
+	bspool_scratch_destroy(&c->scratch);
+	if (c->ready) bspool_reader_destroy(&c->reader);
+	if (c->file) fclose(c->file);
+	memset(c, 0, sizeof *c);
+	c->scratch.cachedBlock = UINT64_MAX;
+}
+
+static bool pool_event_cursor_open(PoolEventCursor *c, const char *path,
+		char *err, size_t errsz) {
+	memset(c, 0, sizeof *c);
+	c->scratch.cachedBlock = UINT64_MAX;
+	c->file = fopen(path, "rb");
+	if (!c->file) { snprintf(err, errsz, "cannot open %s: %s", path, strerror(errno)); return false; }
+	if (!bspool_read_header(c->file, &c->header, err, errsz)) return false;
+	c->adaptive = c->header.schema == BSPOOL_SCHEMA_ADAPTIVE
+			&& c->header.encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS;
+	if (!c->adaptive && (c->header.schema != BSPOOL_SCHEMA_EVENTS
+			|| c->header.encoding != BSPOOL_ENCODING_DELTA_EVENTS)) {
+		snprintf(err, errsz, "%s is not a BSP3 or BSP4 event pool", path); return false;
+	}
+	int64_t fileBytes = bs_file_size(c->file);
+	if (fileBytes < 0) { snprintf(err, errsz, "cannot stat %s", path); return false; }
+	if (!bspool_reader_init(&c->reader, fileno(c->file), &c->header,
+			(uint64_t)fileBytes, err, errsz)) return false;
+	c->ready = true;
+	c->recordHead = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *c->recordHead);
+	c->indexes = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *c->indexes);
+	if (!c->recordHead || !c->indexes || !pool_event_cursor_reserve(c, 256, 16384)) {
+		snprintf(err, errsz, "cannot allocate source cursor"); return false;
+	}
+	c->membershipDigest = c->adaptive ? bspool4_membership_digest_start() : POOL_HASH_INIT;
+	c->metadataDigest = c->adaptive ? bspool4_metadata_digest_start() : POOL_HASH_INIT;
+	return true;
+}
+
+/* Load and verify block b. Returns 1 on success, 0 on error, and -1 when the
+ * layout needs the exact Python path (blocks not physically rank ordered). */
+static int pool_event_cursor_load(PoolEventCursor *c, uint64_t b,
+		char *err, size_t errsz) {
+	const BspoolReader *reader = &c->reader;
+	const BspoolBlockIndex *block = &reader->blocks[b];
+	BspoolBlockInfo info;
+	unsigned char rawHeader[BSPOOL4_BLOCK_HEADER_SIZE];
+	if (!bspool_reader_block_header(reader, b, &info, rawHeader)
+			|| info.count != block->count
+			|| info.rankBytes != block->rankBytes
+			|| info.metadataBytes != block->metadataBytes
+			|| info.associations != block->associations
+			|| info.first < reader->rangeStart || info.last >= reader->rangeEnd
+			|| info.first > info.last || !info.count
+			|| info.count > BSPOOL_BLOCK_MAX_RECORDS
+			|| (c->adaptive && (info.first != block->firstRank
+				|| info.last != block->lastRank
+				|| info.rankCodec != block->rankCodec
+				|| info.metadataEncoding != block->metadataEncoding
+				|| info.flags != block->flags))) {
+		snprintf(err, errsz, "cannot read pool block %" PRIu64, b); return 0;
+	}
+	if (c->havePriorLast && info.first <= c->priorLast) {
+		/* Historical writers could commit rank-ordered blocks out of
+		 * physical order. The exact Python traversal sorts those; this
+		 * streaming copy deliberately does not. */
+		snprintf(err, errsz, "source blocks are not physically rank ordered; use the exact Organizer path");
+		return -1;
+	}
+	c->priorLast = info.last; c->havePriorLast = true;
+	const unsigned char *metadata;
+	if (c->adaptive) {
+		if (!bspool_decode_block(reader, b, &c->scratch)
+				|| !bspool4_membership_digest_update(
+					&c->membershipDigest, c->scratch.ranks, info.count)) {
+			snprintf(err, errsz, "cannot decode adaptive pool block %" PRIu64, b); return 0;
+		}
+		if (info.metadataBytes > c->metadataCap) {
+			unsigned char *p = realloc(c->metadata, info.metadataBytes);
+			if (!p) { snprintf(err, errsz, "cannot allocate block metadata"); return 0; }
+			c->metadata = p; c->metadataCap = info.metadataBytes;
+		}
+		if (bs_pread(reader->fd, c->metadata, info.metadataBytes,
+				(int64_t)(block->offset + info.headerBytes + info.rankBytes))
+				!= (int64_t)info.metadataBytes) {
+			snprintf(err, errsz, "cannot read adaptive pool block %" PRIu64, b); return 0;
+		}
+		unsigned char semantic[14];
+		semantic[0] = (unsigned char)info.headerBytes;
+		semantic[1] = info.metadataEncoding;
+		bspool_put_u32le(semantic + 2, info.count);
+		bspool_put_u32le(semantic + 6, info.metadataBytes);
+		bspool_put_u32le(semantic + 10, info.associations);
+		uint64_t crc = bspool_crc64_update(0, semantic, sizeof semantic);
+		crc = bspool_crc64_update(crc, c->metadata, info.metadataBytes);
+		if (crc != info.metadataCrc64) {
+			snprintf(err, errsz, "pool block %" PRIu64 " metadata checksum differs", b); return 0;
+		}
+		uint32_t canonicalBytes = 0;
+		if (!bspool4_metadata_canonical_pass(c->metadata, info.metadataBytes,
+				info.count, info.associations, NULL, &canonicalBytes)) {
+			snprintf(err, errsz, "pool block %" PRIu64 " metadata is malformed", b); return 0;
+		}
+		unsigned char frame[12];
+		bspool_put_u32le(frame, info.count);
+		bspool_put_u32le(frame + 4, info.associations);
+		bspool_put_u32le(frame + 8, canonicalBytes);
+		c->metadataDigest = pool_hash_update(c->metadataDigest, frame, sizeof frame);
+		uint32_t checkedBytes = 0;
+		if (!bspool4_metadata_canonical_pass(c->metadata, info.metadataBytes,
+				info.count, info.associations, &c->metadataDigest, &checkedBytes)
+				|| checkedBytes != canonicalBytes) {
+			snprintf(err, errsz, "pool block %" PRIu64 " metadata is malformed", b); return 0;
+		}
+		metadata = c->metadata;
+	} else {
+		if (info.rankBytes > SIZE_MAX - info.metadataBytes
+				|| !bspool_scratch_bytes(&c->scratch, (size_t)info.rankBytes + info.metadataBytes)
+				|| !bspool_scratch_ranks(&c->scratch, info.count)
+				|| bs_pread(reader->fd, c->scratch.bytes, block->payloadBytes,
+					(int64_t)(block->offset + info.headerBytes))
+					!= (int64_t)block->payloadBytes) {
+			snprintf(err, errsz, "cannot read pool block %" PRIu64, b); return 0;
+		}
+		c->scratch.cachedBlock = UINT64_MAX;
+		uint64_t crc = bspool_crc64_update(0, rawHeader + 4, 36);
+		crc = bspool_crc64_update(crc, c->scratch.bytes, block->payloadBytes);
+		if (crc != info.crc64) {
+			snprintf(err, errsz, "pool block %" PRIu64 " checksum differs", b); return 0;
+		}
+		uint64_t rank = info.first;
+		c->scratch.ranks[0] = rank;
+		size_t rankAt = 0;
+		for (uint32_t i = 1; i < info.count; i++) {
+			uint64_t delta = 0;
+			if (!bspool_varint_read(c->scratch.bytes, info.rankBytes, &rankAt, &delta)
+					|| !delta || rank > UINT64_MAX - delta) {
+				snprintf(err, errsz, "pool block %" PRIu64 " ranks are malformed", b); return 0;
+			}
+			rank += delta;
+			if (rank >= reader->rangeEnd) {
+				snprintf(err, errsz, "pool block %" PRIu64 " rank is outside range", b); return 0;
+			}
+			c->scratch.ranks[i] = rank;
+		}
+		if (rankAt != info.rankBytes || rank != info.last) {
+			snprintf(err, errsz, "pool block %" PRIu64 " rank boundary differs", b); return 0;
+		}
+		c->membershipDigest = pool_hash_update(c->membershipDigest, rawHeader, BSPOOL3_BLOCK_HEADER_SIZE);
+		c->membershipDigest = pool_hash_update(c->membershipDigest, c->scratch.bytes, block->payloadBytes);
+		metadata = c->scratch.bytes + block->rankBytes;
+		c->metadataDigest = pool_hash_update(c->metadataDigest, metadata, block->metadataBytes);
+	}
+	/* Invert the descriptor lists into per-record chains. */
+	uint64_t descriptors = 0;
+	size_t at = 0;
+	if (!bspool_varint_read(metadata, block->metadataBytes, &at, &descriptors)
+			|| descriptors > block->associations
+			|| !pool_event_cursor_reserve(c, (size_t)descriptors, block->associations)) {
+		snprintf(err, errsz, "cannot decode event descriptor count"); return 0;
+	}
+	for (uint32_t i = 0; i < info.count; i++) c->recordHead[i] = -1;
+	uint32_t associations = 0;
+	const unsigned char *prior = NULL;
+	size_t priorLen = 0;
+	for (uint64_t d = 0; d < descriptors; d++) {
+		uint64_t len64 = 0, matches = 0;
+		if (!bspool_varint_read(metadata, block->metadataBytes, &at, &len64)
+				|| !len64 || len64 > block->metadataBytes - at) {
+			snprintf(err, errsz, "cannot decode event descriptor"); return 0;
+		}
+		size_t len = (size_t)len64;
+		const unsigned char *raw = metadata + at;
+		if (prior) {
+			size_t common = len < priorLen ? len : priorLen;
+			int compare = memcmp(prior, raw, common);
+			if (compare > 0 || (compare == 0 && priorLen >= len)) {
+				snprintf(err, errsz, "event descriptors are not canonical"); return 0;
+			}
+		}
+		prior = raw; priorLen = len;
+		at += len;
+		if (!bspool_varint_read(metadata, block->metadataBytes, &at, &matches)
+				|| !matches || matches > block->count
+				|| matches > block->associations - associations) {
+			snprintf(err, errsz, "cannot decode event descriptor matches"); return 0;
+		}
+		if (raw[0] >= 1 && raw[0] <= 3) {
+			unsigned keyLen = len > 1 ? raw[1] : 0;
+			if (!keyLen || len != (size_t)keyLen + 7 || !raw[2 + keyLen]) {
+				snprintf(err, errsz, "known occurrence descriptor is malformed"); return 0;
+			}
+			for (unsigned i = 0; i < keyLen; i++)
+				if (raw[2 + i] < 33 || raw[2 + i] > 126) {
+					snprintf(err, errsz, "occurrence key contains unsafe characters"); return 0;
+				}
+		}
+		if (c->adaptive) {
+			if (at >= block->metadataBytes) {
+				snprintf(err, errsz, "adaptive descriptor codec is missing"); return 0;
+			}
+			unsigned codec = metadata[at++];
+			if (!pool_summary_bsp4_indexes(metadata, block->metadataBytes, &at,
+					codec, (uint32_t)matches, block->count, c->indexes)) {
+				snprintf(err, errsz, "cannot decode adaptive descriptor record indexes"); return 0;
+			}
+		} else {
+			uint64_t record = 0;
+			for (uint32_t i = 0; i < (uint32_t)matches; i++) {
+				uint64_t value = 0;
+				if (!bspool_varint_read(metadata, block->metadataBytes, &at, &value)
+						|| (i && (!value || record > UINT64_MAX - value))) {
+					snprintf(err, errsz, "cannot decode descriptor record index"); return 0;
+				}
+				record = i ? record + value : value;
+				if (record >= block->count) {
+					snprintf(err, errsz, "descriptor record index is outside block"); return 0;
+				}
+				c->indexes[i] = (uint32_t)record;
+			}
+		}
+		c->descriptors[d].bytes = raw;
+		c->descriptors[d].len = len;
+		c->descriptors[d].output = -1;
+		for (uint32_t i = 0; i < (uint32_t)matches; i++) {
+			uint32_t record = c->indexes[i];
+			c->assocDescriptor[associations] = (int32_t)d;
+			c->assocNext[associations] = c->recordHead[record];
+			c->recordHead[record] = (int32_t)associations;
+			associations++;
+		}
+	}
+	if (at != block->metadataBytes || associations != block->associations) {
+		snprintf(err, errsz, "event metadata has trailing bytes"); return 0;
+	}
+	c->ndescriptors = (size_t)descriptors;
+	c->count = info.count;
+	c->ranks = c->scratch.ranks;
+	c->consumed += info.count;
+	return 1;
+}
+
+static bool pool_event_cursor_finish(const PoolEventCursor *c, char *err, size_t errsz) {
+	if (c->consumed != c->header.records) {
+		snprintf(err, errsz, "committed blocks do not match the pool record count"); return false;
+	}
+	if (c->header.membershipDigest && c->header.membershipDigest != c->membershipDigest) {
+		snprintf(err, errsz, "membership_digest differs from committed pool bytes"); return false;
+	}
+	if (c->header.metadataDigest && c->header.metadataDigest != c->metadataDigest) {
+		snprintf(err, errsz, "metadata_digest differs from committed event metadata"); return false;
+	}
+	return true;
+}
 
 /* Open-addressing index from descriptor bytes to a pending block's slot.
  * Entries hold slot + 1 (0 is empty) and compare against the block's own
@@ -9243,23 +9571,6 @@ typedef struct {
 	PoolSplitRule *rules;
 	size_t nrules, ruleCap;
 } PoolSplitPlan;
-
-typedef struct { const unsigned char *bytes; size_t len; int output; } PoolSplitDescriptorRef;
-typedef struct { uint32_t block, generation; int32_t slot; } PoolSplitSlot;
-
-typedef struct {
-	PoolSplitDescriptorRef *descriptors;
-	size_t descriptorCap;
-	int32_t *recordHead;
-	int32_t *assocNext, *assocDescriptor;
-	size_t assocCap;
-	uint64_t (*candidates)[POOL_SPLIT_MASK_WORDS];
-	uint32_t *indexes;
-	PoolSplitSlot *slots;
-	size_t slotCap; /* descriptors x outputs */
-	unsigned char *metadata;
-	size_t metadataCap;
-} PoolSplitBlockState;
 
 static uint64_t pool_split_hash_bytes(const unsigned char *bytes, size_t len) {
 	return pool_hash_update(POOL_HASH_INIT, bytes, len);
@@ -9342,6 +9653,18 @@ static bool pool_split_parse_hex(const char *text, unsigned char **out, size_t *
 	return true;
 }
 
+static bool pool_split_parse_hex16(const char *text, uint64_t *out) {
+	if (strlen(text) != 16) return false;
+	uint64_t key = 0;
+	for (int c = 0; c < 16; c++) {
+		if (!isxdigit((unsigned char)text[c]) || isupper((unsigned char)text[c])) return false;
+		key = key << 4 | (uint64_t)(isdigit((unsigned char)text[c])
+				? text[c] - '0' : text[c] - 'a' + 10);
+	}
+	*out = key;
+	return true;
+}
+
 static int pool_split_choice_compare(const void *a, const void *b) {
 	const PoolSplitChoice *x = a, *y = b;
 	return x->rank < y->rank ? -1 : x->rank > y->rank;
@@ -9352,16 +9675,18 @@ static int pool_split_rule_compare(const void *a, const void *b) {
 	return x->key < y->key ? -1 : x->key > y->key;
 }
 
+static void pool_split_output_reset(PoolSplitOutput *out) {
+	if (out->file) (void)bs_fclose_discard_owned(out->file, out->path);
+	out->file = NULL;
+	pool_merge_event_reset(&out->block);
+	free(out->index.entries);
+	free(out->path);
+	free(out->categoryId);
+	memset(out, 0, sizeof *out);
+}
+
 static void pool_split_plan_free(PoolSplitPlan *plan) {
-	for (int i = 0; i < plan->noutputs; i++) {
-		PoolSplitOutput *out = &plan->outputs[i];
-		if (out->file) (void)bs_fclose_discard_owned(out->file, out->path);
-		out->file = NULL;
-		pool_merge_event_reset(&out->block);
-		free(out->index.entries);
-		free(out->path);
-		free(out->categoryId);
-	}
+	for (int i = 0; i < plan->noutputs; i++) pool_split_output_reset(&plan->outputs[i]);
 	pool_split_map_free(&plan->descriptors);
 	pool_split_map_free(&plan->locations);
 	free(plan->choices);
@@ -9369,6 +9694,49 @@ static void pool_split_plan_free(PoolSplitPlan *plan) {
 	memset(plan, 0, sizeof *plan);
 	plan->remainder = -1;
 }
+
+static bool pool_split_output_init(PoolSplitOutput *out, const char *path,
+		const char *categoryId) {
+	memset(out, 0, sizeof *out);
+	out->path = malloc(strlen(path) + 1);
+	out->categoryId = malloc(strlen(categoryId) + 1);
+	if (!out->path || !out->categoryId) {
+		free(out->path); free(out->categoryId);
+		memset(out, 0, sizeof *out);
+		return false;
+	}
+	strcpy(out->path, path);
+	strcpy(out->categoryId, categoryId);
+	out->membershipDigest = bspool4_membership_digest_start();
+	out->metadataDigest = bspool4_metadata_digest_start();
+	out->recordMetadataDigest = pool_hash_update(POOL_HASH_INIT,
+			POOL_RECORD_METADATA_DOMAIN, sizeof POOL_RECORD_METADATA_DOMAIN - 1u);
+	return true;
+}
+
+/* Reserve one output before any record is read: a name collision or a full
+ * disk must fail before the expensive work. The header region stays zero for
+ * the Organizer to fill in. */
+static bool pool_split_output_create(PoolSplitOutput *out, int headerBytes,
+		char *err, size_t errsz) {
+	static unsigned char zeros[4096];
+	out->file = bs_fopen_exclusive_binary_update(out->path);
+	if (!out->file) {
+		snprintf(err, errsz, "cannot create output %s: %s", out->path, strerror(errno));
+		return false;
+	}
+	for (int remaining = headerBytes; remaining > 0;) {
+		size_t n = remaining > (int)sizeof zeros ? sizeof zeros : (size_t)remaining;
+		if (fwrite(zeros, 1, n, out->file) != n) {
+			snprintf(err, errsz, "cannot reserve output header"); return false;
+		}
+		remaining -= (int)n;
+	}
+	return true;
+}
+
+static bool pool_split_output_finalize(PoolSplitOutput *out, int headerBytes,
+		char *err, size_t errsz);
 
 /* Every line is "<directive> <fields...>"; the output path is the remainder of
  * its line so it may contain spaces. Indexes are validated against the
@@ -9432,20 +9800,9 @@ static bool pool_split_load_plan(const char *path, PoolSplitPlan *plan,
 			if (!pathLen) goto malformed;
 			for (const char *c = category; *c; c++)
 				if ((unsigned char)*c < 33 || (unsigned char)*c > 126) goto malformed;
-			PoolSplitOutput *out = &plan->outputs[plan->noutputs];
-			memset(out, 0, sizeof *out);
-			out->path = malloc(pathLen + 1);
-			out->categoryId = malloc(strlen(category) + 1);
-			if (!out->path || !out->categoryId) {
-				free(out->path); free(out->categoryId);
+			if (!pool_split_output_init(&plan->outputs[plan->noutputs], sp, category)) {
 				snprintf(err, errsz, "cannot allocate split output table"); goto done;
 			}
-			memcpy(out->path, sp, pathLen + 1);
-			strcpy(out->categoryId, category);
-			out->membershipDigest = bspool4_membership_digest_start();
-			out->metadataDigest = bspool4_metadata_digest_start();
-			out->recordMetadataDigest = pool_hash_update(POOL_HASH_INIT,
-					POOL_RECORD_METADATA_DOMAIN, sizeof POOL_RECORD_METADATA_DOMAIN - 1u);
 			plan->noutputs++;
 		} else if (!strcmp(d, "location")) {
 			char *kindText = pool_tok(&sp), *keyHex = pool_tok(&sp);
@@ -9555,16 +9912,9 @@ static bool pool_split_load_plan(const char *path, PoolSplitPlan *plan,
 		plan->rules = calloc(nrule, sizeof *plan->rules);
 		if (!plan->rules) { snprintf(err, errsz, "cannot allocate split rules"); goto done; }
 		for (size_t i = 0; i < nrule; i++) {
-			const char *text = pendingRules[i].text;
-			if (strlen(text) != 16 || pendingRules[i].output >= plan->noutputs
-					|| pendingRules[i].output == plan->remainder) goto malformed;
-			uint64_t key = 0;
-			for (int c = 0; c < 16; c++) {
-				if (!isxdigit((unsigned char)text[c]) || isupper((unsigned char)text[c])) goto malformed;
-				key = key << 4 | (uint64_t)(isdigit((unsigned char)text[c])
-						? text[c] - '0' : text[c] - 'a' + 10);
-			}
-			plan->rules[i].key = key;
+			if (pendingRules[i].output >= plan->noutputs
+					|| pendingRules[i].output == plan->remainder
+					|| !pool_split_parse_hex16(pendingRules[i].text, &plan->rules[i].key)) goto malformed;
 			plan->rules[i].output = pendingRules[i].output;
 		}
 		plan->nrules = nrule;
@@ -9622,42 +9972,6 @@ static PoolSplitRule *pool_split_find_rule(PoolSplitPlan *plan, uint64_t key) {
 	return NULL;
 }
 
-static bool pool_split_state_reserve(PoolSplitBlockState *st, size_t descriptors,
-		size_t associations, int noutputs) {
-	if (descriptors > st->descriptorCap) {
-		size_t cap = st->descriptorCap ? st->descriptorCap : 256;
-		while (cap < descriptors) cap *= 2;
-		PoolSplitDescriptorRef *p = realloc(st->descriptors, cap * sizeof *p);
-		if (!p) return false;
-		st->descriptors = p; st->descriptorCap = cap;
-	}
-	if (associations > st->assocCap) {
-		size_t cap = st->assocCap ? st->assocCap : 16384;
-		while (cap < associations) cap *= 2;
-		int32_t *next = realloc(st->assocNext, cap * sizeof *next);
-		if (!next) return false;
-		st->assocNext = next;
-		int32_t *desc = realloc(st->assocDescriptor, cap * sizeof *desc);
-		if (!desc) return false;
-		st->assocDescriptor = desc; st->assocCap = cap;
-	}
-	size_t slots = st->descriptorCap * (size_t)noutputs;
-	if (slots > st->slotCap) {
-		PoolSplitSlot *p = realloc(st->slots, slots * sizeof *p);
-		if (!p) return false;
-		memset(p + st->slotCap, 0, (slots - st->slotCap) * sizeof *p);
-		st->slots = p; st->slotCap = slots;
-	}
-	return true;
-}
-
-static void pool_split_state_destroy(PoolSplitBlockState *st) {
-	free(st->descriptors); free(st->recordHead); free(st->assocNext);
-	free(st->assocDescriptor); free(st->candidates); free(st->indexes);
-	free(st->slots); free(st->metadata);
-	memset(st, 0, sizeof *st);
-}
-
 static bool pool_split_slot_index_grow(PoolSplitSlotIndex *ix,
 		const PoolMergeEventBlock *block) {
 	size_t cap = ix->cap ? ix->cap * 2 : 64;
@@ -9708,68 +10022,113 @@ static bool pool_split_flush(PoolSplitOutput *out, char *err, size_t errsz) {
 	return true;
 }
 
-/* Append one source record (its rank plus every descriptor the source stored
- * for it) to an output's pending canonical block. */
-static bool pool_split_output_add(PoolSplitPlan *plan, int k, uint64_t rank,
-		uint32_t record, uint32_t sourceBlock, PoolSplitBlockState *st,
-		char *err, size_t errsz) {
-	PoolSplitOutput *out = &plan->outputs[k];
+/* Start one output record: its rank must exceed every earlier rank. */
+static bool pool_split_output_begin(PoolSplitOutput *out, uint64_t rank,
+		uint16_t *local, char *err, size_t errsz) {
 	PoolMergeEventBlock *block = &out->block;
 	if (block->hasPriorRank && rank <= block->priorRank) {
-		snprintf(err, errsz, "split output records are not strictly ordered"); return false;
+		snprintf(err, errsz, "output records are not strictly ordered"); return false;
 	}
 	block->priorRank = rank; block->hasPriorRank = true;
-	uint16_t local = (uint16_t)block->used;
-	block->ranks[local] = rank;
-	for (int32_t a = st->recordHead[record]; a >= 0; a = st->assocNext[a]) {
-		int32_t d = st->assocDescriptor[a];
-		PoolSplitSlot *slot = &st->slots[(size_t)d * (size_t)plan->noutputs + (size_t)k];
-		int32_t index;
-		if (slot->block == sourceBlock + 1u && slot->generation == out->generation) {
-			/* Fast path: this source block already placed the descriptor in
-			 * the current pending block. */
-			index = slot->slot;
-		} else {
-			/* The pending block accumulates records from many source blocks,
-			 * so the same descriptor bytes may already be present. */
-			const unsigned char *bytes = st->descriptors[d].bytes;
-			size_t len = st->descriptors[d].len;
-			size_t probe = 0;
-			if ((out->index.used + 1u) * 2u >= out->index.cap
-					&& !pool_split_slot_index_grow(&out->index, block)) {
-				snprintf(err, errsz, "cannot allocate split output descriptor index"); return false;
+	*local = (uint16_t)block->used;
+	block->ranks[*local] = rank;
+	return true;
+}
+
+/* Associate one descriptor with the record being built. `slot` optionally
+ * caches the pending-block slot for a caller-owned key; NULL means always use
+ * the block's descriptor index. Repeated bytes for one record coalesce. */
+static bool pool_split_output_descriptor(PoolSplitOutput *out, uint16_t local,
+		const unsigned char *bytes, size_t len, PoolSplitSlot *slot,
+		uint32_t slotBlock, char *err, size_t errsz) {
+	PoolMergeEventBlock *block = &out->block;
+	int32_t index;
+	if (slot && slot->block == slotBlock + 1u && slot->generation == out->generation) {
+		index = slot->slot;
+	} else {
+		size_t probe = 0;
+		if ((out->index.used + 1u) * 2u >= out->index.cap
+				&& !pool_split_slot_index_grow(&out->index, block)) {
+			snprintf(err, errsz, "cannot allocate output descriptor index"); return false;
+		}
+		index = pool_split_slot_find(&out->index, block, bytes, len, &probe);
+		if (index < 0) {
+			if (block->ndescriptors == block->descriptorCap) {
+				size_t cap = block->descriptorCap ? block->descriptorCap * 2 : 16;
+				PoolMetaDescriptor *p = realloc(block->descriptors, cap * sizeof *p);
+				if (!p) { snprintf(err, errsz, "cannot allocate output metadata"); return false; }
+				block->descriptors = p; block->descriptorCap = cap;
 			}
-			index = pool_split_slot_find(&out->index, block, bytes, len, &probe);
-			if (index < 0) {
-				if (block->ndescriptors == block->descriptorCap) {
-					size_t cap = block->descriptorCap ? block->descriptorCap * 2 : 16;
-					PoolMetaDescriptor *p = realloc(block->descriptors, cap * sizeof *p);
-					if (!p) { snprintf(err, errsz, "cannot allocate split output metadata"); return false; }
-					block->descriptors = p; block->descriptorCap = cap;
-				}
-				index = (int32_t)block->ndescriptors;
-				memset(&block->descriptors[index], 0, sizeof block->descriptors[index]);
-				if (!pool_meta_descriptor_set(&block->descriptors[index], bytes, len)) {
-					snprintf(err, errsz, "cannot copy split output descriptor"); return false;
-				}
-				block->ndescriptors++;
-				out->index.entries[probe] = (uint32_t)index + 1u;
-				out->index.used++;
+			index = (int32_t)block->ndescriptors;
+			memset(&block->descriptors[index], 0, sizeof block->descriptors[index]);
+			if (!pool_meta_descriptor_set(&block->descriptors[index], bytes, len)) {
+				snprintf(err, errsz, "cannot copy output descriptor"); return false;
 			}
-			slot->block = sourceBlock + 1u;
+			block->ndescriptors++;
+			out->index.entries[probe] = (uint32_t)index + 1u;
+			out->index.used++;
+		}
+		if (slot) {
+			slot->block = slotBlock + 1u;
 			slot->generation = out->generation;
 			slot->slot = index;
 		}
-		PoolMetaDescriptor *entry = &block->descriptors[index];
-		if (entry->count && entry->records[entry->count - 1] == local) continue;
-		if (block->associations == UINT32_MAX || !pool_meta_record(entry, local)) {
-			snprintf(err, errsz, "cannot record split output association"); return false;
-		}
-		block->associations++;
 	}
-	block->used++;
-	if (block->used == POOL_EVENT_BLOCK_RECORDS_V4) return pool_split_flush(out, err, errsz);
+	PoolMetaDescriptor *entry = &block->descriptors[index];
+	if (entry->count && entry->records[entry->count - 1] == local) return true;
+	if (block->associations == UINT32_MAX || !pool_meta_record(entry, local)) {
+		snprintf(err, errsz, "cannot record output association"); return false;
+	}
+	block->associations++;
 	return true;
+}
+
+static bool pool_split_output_end(PoolSplitOutput *out, char *err, size_t errsz) {
+	out->block.used++;
+	if (out->block.used == POOL_EVENT_BLOCK_RECORDS_V4) return pool_split_flush(out, err, errsz);
+	return true;
+}
+
+static bool pool_split_output_finalize(PoolSplitOutput *out, int headerBytes,
+		char *err, size_t errsz) {
+	if (!pool_split_flush(out, err, errsz)) return false;
+	int64_t dataEnd = bs_ftello(out->file);
+	if (dataEnd < headerBytes) {
+		snprintf(err, errsz, "output byte accounting failed"); return false;
+	}
+	out->dataBytes = (uint64_t)dataEnd - (uint64_t)headerBytes;
+	uint64_t finalBytes = 0;
+	if (!pool_append_adaptive_index(out->file, headerBytes, out->records,
+			out->dataBytes, out->membershipDigest, out->metadataDigest,
+			&finalBytes, err, errsz))
+		return false;
+	if (fflush(out->file) != 0 || bs_fsync_file(out->file) != 0
+			|| fclose(out->file) != 0) {
+		out->file = NULL;
+		snprintf(err, errsz, "cannot finalize output %s: %s", out->path, strerror(errno));
+		return false;
+	}
+	out->file = NULL;
+	return true;
+}
+
+/* Append one source record (its rank plus every descriptor the source stored
+ * for it) to an output's pending canonical block. */
+static bool pool_split_output_add(PoolSplitPlan *plan, int k, uint64_t rank,
+		uint32_t record, uint32_t sourceBlock, const PoolEventCursor *cursor,
+		PoolSplitSlot *slots, char *err, size_t errsz) {
+	PoolSplitOutput *out = &plan->outputs[k];
+	uint16_t local;
+	if (!pool_split_output_begin(out, rank, &local, err, errsz)) return false;
+	for (int32_t a = cursor->recordHead[record]; a >= 0; a = cursor->assocNext[a]) {
+		int32_t d = cursor->assocDescriptor[a];
+		if (!pool_split_output_descriptor(out, local, cursor->descriptors[d].bytes,
+				cursor->descriptors[d].len,
+				&slots[(size_t)d * (size_t)plan->noutputs + (size_t)k],
+				sourceBlock, err, errsz))
+			return false;
+	}
+	return pool_split_output_end(out, err, errsz);
 }
 
 static int pool_split_popcount(const uint64_t mask[POOL_SPLIT_MASK_WORDS]) {
@@ -9789,272 +10148,49 @@ static int pool_mode_split(const char *input, const char *planPath) {
 	plan.remainder = -1;
 	char err[256] = "";
 	int rc = 1;
-	FILE *in = NULL;
-	BspoolReader reader;
-	bool readerReady = false;
-	BspoolScratch scratch = { .cachedBlock = UINT64_MAX };
-	PoolSplitBlockState st;
-	memset(&st, 0, sizeof st);
+	PoolEventCursor cursor;
+	memset(&cursor, 0, sizeof cursor);
+	cursor.scratch.cachedBlock = UINT64_MAX;
+	PoolSplitSlot *slots = NULL;
+	size_t slotCap = 0;
+	uint64_t (*candidates)[POOL_SPLIT_MASK_WORDS] = NULL;
 	if (!pool_split_load_plan(planPath, &plan, err, sizeof err)) goto fail;
-	in = fopen(input, "rb");
-	if (!in) { snprintf(err, sizeof err, "cannot open %s: %s", input, strerror(errno)); goto fail; }
-	BspoolHeader h;
-	if (!bspool_read_header(in, &h, err, sizeof err)) goto fail;
-	bool adaptive = h.schema == BSPOOL_SCHEMA_ADAPTIVE
-			&& h.encoding == BSPOOL_ENCODING_ADAPTIVE_EVENTS;
-	if (!adaptive && (h.schema != BSPOOL_SCHEMA_EVENTS
-			|| h.encoding != BSPOOL_ENCODING_DELTA_EVENTS)) {
-		snprintf(err, sizeof err, "native split requires a BSP3 or BSP4 event pool"); goto fail;
-	}
-	if (h.headerBytes != plan.headerBytes) {
+	if (!pool_event_cursor_open(&cursor, input, err, sizeof err)) goto fail;
+	if (cursor.header.headerBytes != plan.headerBytes) {
 		snprintf(err, sizeof err, "split plan header size differs from the source pool"); goto fail;
 	}
-	int64_t fileBytes = bs_file_size(in);
-	if (fileBytes < 0 || !bspool_reader_init(&reader, fileno(in), &h,
-			(uint64_t)fileBytes, err, sizeof err)) {
-		if (fileBytes < 0) snprintf(err, sizeof err, "cannot stat pool");
-		goto fail;
-	}
-	readerReady = true;
-	st.recordHead = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *st.recordHead);
-	st.candidates = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *st.candidates);
-	st.indexes = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *st.indexes);
-	if (!st.recordHead || !st.candidates || !st.indexes
-			|| !pool_split_state_reserve(&st, 256, 16384, plan.noutputs)) {
-		snprintf(err, sizeof err, "cannot allocate split state"); goto fail;
-	}
-	/* Reserve every output before reading a single record so a name collision
-	 * or full disk fails before any expensive work. */
-	static unsigned char zeros[4096];
-	for (int k = 0; k < plan.noutputs; k++) {
-		PoolSplitOutput *out = &plan.outputs[k];
-		out->file = bs_fopen_exclusive_binary_update(out->path);
-		if (!out->file) {
-			snprintf(err, sizeof err, "cannot create split output %s: %s", out->path, strerror(errno));
+	candidates = malloc(BSPOOL_BLOCK_MAX_RECORDS * sizeof *candidates);
+	if (!candidates) { snprintf(err, sizeof err, "cannot allocate split state"); goto fail; }
+	for (int k = 0; k < plan.noutputs; k++)
+		if (!pool_split_output_create(&plan.outputs[k], plan.headerBytes, err, sizeof err))
 			goto fail;
-		}
-		for (int remaining = plan.headerBytes; remaining > 0;) {
-			size_t n = remaining > (int)sizeof zeros ? sizeof zeros : (size_t)remaining;
-			if (fwrite(zeros, 1, n, out->file) != n) {
-				snprintf(err, sizeof err, "cannot reserve split output header"); goto fail;
-			}
-			remaining -= (int)n;
-		}
-	}
-	uint64_t membershipDigest = adaptive
-			? bspool4_membership_digest_start() : POOL_HASH_INIT;
-	uint64_t metadataDigest = adaptive
-			? bspool4_metadata_digest_start() : POOL_HASH_INIT;
 	uint64_t unmatched = 0, overlap = 0, uniqueCopied = 0, memberships = 0;
-	uint64_t done = 0, priorLast = 0;
-	bool havePriorLast = false;
 	size_t choiceAt = 0;
 	double lastProgress = bs_monotonic_seconds();
-	for (uint64_t b = 0; b < reader.nblocks; b++) {
-		const BspoolBlockIndex *block = &reader.blocks[b];
-		BspoolBlockInfo info;
-		unsigned char rawHeader[BSPOOL4_BLOCK_HEADER_SIZE];
-		if (!bspool_reader_block_header(&reader, b, &info, rawHeader)
-				|| info.count != block->count
-				|| info.rankBytes != block->rankBytes
-				|| info.metadataBytes != block->metadataBytes
-				|| info.associations != block->associations
-				|| info.first < reader.rangeStart || info.last >= reader.rangeEnd
-				|| info.first > info.last || !info.count
-				|| info.count > BSPOOL_BLOCK_MAX_RECORDS
-				|| (adaptive && (info.first != block->firstRank
-					|| info.last != block->lastRank
-					|| info.rankCodec != block->rankCodec
-					|| info.metadataEncoding != block->metadataEncoding
-					|| info.flags != block->flags))) {
-			snprintf(err, sizeof err, "cannot read pool block %" PRIu64, b); goto fail;
+	for (uint64_t b = 0; b < cursor.reader.nblocks; b++) {
+		int loaded = pool_event_cursor_load(&cursor, b, err, sizeof err);
+		if (loaded < 0) { fprintf(stderr, "%s\n", err); rc = POOL_SPLIT_EXIT_UNSUPPORTED; goto cleanup; }
+		if (!loaded) goto fail;
+		size_t need = cursor.descriptorCap * (size_t)plan.noutputs;
+		if (need > slotCap) {
+			PoolSplitSlot *p = realloc(slots, need * sizeof *p);
+			if (!p) { snprintf(err, sizeof err, "cannot allocate split state"); goto fail; }
+			memset(p + slotCap, 0, (need - slotCap) * sizeof *p);
+			slots = p; slotCap = need;
 		}
-		if (havePriorLast && info.first <= priorLast) {
-			/* Historical writers could commit rank-ordered blocks out of
-			 * physical order. The exact Python traversal sorts those; this
-			 * streaming copy deliberately does not. */
-			fprintf(stderr, "source blocks are not physically rank ordered; use the exact Organizer path\n");
-			rc = POOL_SPLIT_EXIT_UNSUPPORTED;
-			goto cleanup;
-		}
-		priorLast = info.last; havePriorLast = true;
-		const uint64_t *ranks;
-		const unsigned char *metadata;
-		if (adaptive) {
-			if (!bspool_decode_block(&reader, b, &scratch)
-					|| !bspool4_membership_digest_update(
-						&membershipDigest, scratch.ranks, info.count)) {
-				snprintf(err, sizeof err, "cannot decode adaptive pool block %" PRIu64, b); goto fail;
+		for (size_t d = 0; d < cursor.ndescriptors; d++)
+			cursor.descriptors[d].output = pool_split_candidate(
+					&plan, cursor.descriptors[d].bytes, cursor.descriptors[d].len);
+		memset(candidates, 0, (size_t)cursor.count * sizeof *candidates);
+		for (uint32_t r = 0; r < cursor.count; r++)
+			for (int32_t a = cursor.recordHead[r]; a >= 0; a = cursor.assocNext[a]) {
+				int output = cursor.descriptors[cursor.assocDescriptor[a]].output;
+				if (output >= 0) candidates[r][output / 64] |= UINT64_C(1) << (output % 64);
 			}
-			if (info.metadataBytes > st.metadataCap) {
-				unsigned char *p = realloc(st.metadata, info.metadataBytes);
-				if (!p) { snprintf(err, sizeof err, "cannot allocate split metadata"); goto fail; }
-				st.metadata = p; st.metadataCap = info.metadataBytes;
-			}
-			if (bs_pread(reader.fd, st.metadata, info.metadataBytes,
-					(int64_t)(block->offset + info.headerBytes + info.rankBytes))
-					!= (int64_t)info.metadataBytes) {
-				snprintf(err, sizeof err, "cannot read adaptive pool block %" PRIu64, b); goto fail;
-			}
-			unsigned char semantic[14];
-			semantic[0] = (unsigned char)info.headerBytes;
-			semantic[1] = info.metadataEncoding;
-			bspool_put_u32le(semantic + 2, info.count);
-			bspool_put_u32le(semantic + 6, info.metadataBytes);
-			bspool_put_u32le(semantic + 10, info.associations);
-			uint64_t crc = bspool_crc64_update(0, semantic, sizeof semantic);
-			crc = bspool_crc64_update(crc, st.metadata, info.metadataBytes);
-			if (crc != info.metadataCrc64) {
-				snprintf(err, sizeof err, "pool block %" PRIu64 " metadata checksum differs", b); goto fail;
-			}
-			uint32_t canonicalBytes = 0;
-			if (!bspool4_metadata_canonical_pass(st.metadata, info.metadataBytes,
-					info.count, info.associations, NULL, &canonicalBytes)) {
-				snprintf(err, sizeof err, "pool block %" PRIu64 " metadata is malformed", b); goto fail;
-			}
-			unsigned char frame[12];
-			bspool_put_u32le(frame, info.count);
-			bspool_put_u32le(frame + 4, info.associations);
-			bspool_put_u32le(frame + 8, canonicalBytes);
-			metadataDigest = pool_hash_update(metadataDigest, frame, sizeof frame);
-			uint32_t checkedBytes = 0;
-			if (!bspool4_metadata_canonical_pass(st.metadata, info.metadataBytes,
-					info.count, info.associations, &metadataDigest, &checkedBytes)
-					|| checkedBytes != canonicalBytes) {
-				snprintf(err, sizeof err, "pool block %" PRIu64 " metadata is malformed", b); goto fail;
-			}
-			ranks = scratch.ranks;
-			metadata = st.metadata;
-		} else {
-			if (info.rankBytes > SIZE_MAX - info.metadataBytes
-					|| !bspool_scratch_bytes(&scratch, (size_t)info.rankBytes + info.metadataBytes)
-					|| !bspool_scratch_ranks(&scratch, info.count)
-					|| bs_pread(reader.fd, scratch.bytes, block->payloadBytes,
-						(int64_t)(block->offset + info.headerBytes))
-						!= (int64_t)block->payloadBytes) {
-				snprintf(err, sizeof err, "cannot read pool block %" PRIu64, b); goto fail;
-			}
-			scratch.cachedBlock = UINT64_MAX;
-			uint64_t crc = bspool_crc64_update(0, rawHeader + 4, 36);
-			crc = bspool_crc64_update(crc, scratch.bytes, block->payloadBytes);
-			if (crc != info.crc64) {
-				snprintf(err, sizeof err, "pool block %" PRIu64 " checksum differs", b); goto fail;
-			}
-			uint64_t rank = info.first;
-			scratch.ranks[0] = rank;
-			size_t rankAt = 0;
-			for (uint32_t i = 1; i < info.count; i++) {
-				uint64_t delta = 0;
-				if (!bspool_varint_read(scratch.bytes, info.rankBytes, &rankAt, &delta)
-						|| !delta || rank > UINT64_MAX - delta) {
-					snprintf(err, sizeof err, "pool block %" PRIu64 " ranks are malformed", b); goto fail;
-				}
-				rank += delta;
-				if (rank >= reader.rangeEnd) {
-					snprintf(err, sizeof err, "pool block %" PRIu64 " rank is outside range", b); goto fail;
-				}
-				scratch.ranks[i] = rank;
-			}
-			if (rankAt != info.rankBytes || rank != info.last) {
-				snprintf(err, sizeof err, "pool block %" PRIu64 " rank boundary differs", b); goto fail;
-			}
-			membershipDigest = pool_hash_update(membershipDigest, rawHeader, BSPOOL3_BLOCK_HEADER_SIZE);
-			membershipDigest = pool_hash_update(membershipDigest, scratch.bytes, block->payloadBytes);
-			metadata = scratch.bytes + block->rankBytes;
-			metadataDigest = pool_hash_update(metadataDigest, metadata, block->metadataBytes);
-			ranks = scratch.ranks;
-		}
-		/* Invert the block's descriptor lists into per-record chains and
-		 * candidate output sets. */
-		uint64_t descriptors = 0;
-		size_t at = 0;
-		if (!bspool_varint_read(metadata, block->metadataBytes, &at, &descriptors)
-				|| descriptors > block->associations
-				|| !pool_split_state_reserve(&st, (size_t)descriptors, block->associations, plan.noutputs)) {
-			snprintf(err, sizeof err, "cannot decode event descriptor count"); goto fail;
-		}
-		for (uint32_t i = 0; i < info.count; i++) st.recordHead[i] = -1;
-		memset(st.candidates, 0, (size_t)info.count * sizeof *st.candidates);
-		uint32_t associations = 0;
-		const unsigned char *prior = NULL;
-		size_t priorLen = 0;
-		for (uint64_t d = 0; d < descriptors; d++) {
-			uint64_t len64 = 0, matches = 0;
-			if (!bspool_varint_read(metadata, block->metadataBytes, &at, &len64)
-					|| !len64 || len64 > block->metadataBytes - at) {
-				snprintf(err, sizeof err, "cannot decode event descriptor"); goto fail;
-			}
-			size_t len = (size_t)len64;
-			const unsigned char *raw = metadata + at;
-			if (prior) {
-				size_t common = len < priorLen ? len : priorLen;
-				int compare = memcmp(prior, raw, common);
-				if (compare > 0 || (compare == 0 && priorLen >= len)) {
-					snprintf(err, sizeof err, "event descriptors are not canonical"); goto fail;
-				}
-			}
-			prior = raw; priorLen = len;
-			at += len;
-			if (!bspool_varint_read(metadata, block->metadataBytes, &at, &matches)
-					|| !matches || matches > block->count
-					|| matches > block->associations - associations) {
-				snprintf(err, sizeof err, "cannot decode event descriptor matches"); goto fail;
-			}
-			if (raw[0] >= 1 && raw[0] <= 3) {
-				unsigned keyLen = len > 1 ? raw[1] : 0;
-				if (!keyLen || len != (size_t)keyLen + 7 || !raw[2 + keyLen]) {
-					snprintf(err, sizeof err, "known occurrence descriptor is malformed"); goto fail;
-				}
-				for (unsigned i = 0; i < keyLen; i++)
-					if (raw[2 + i] < 33 || raw[2 + i] > 126) {
-						snprintf(err, sizeof err, "occurrence key contains unsafe characters"); goto fail;
-					}
-			}
-			if (adaptive) {
-				if (at >= block->metadataBytes) {
-					snprintf(err, sizeof err, "adaptive descriptor codec is missing"); goto fail;
-				}
-				unsigned codec = metadata[at++];
-				if (!pool_summary_bsp4_indexes(metadata, block->metadataBytes, &at,
-						codec, (uint32_t)matches, block->count, st.indexes)) {
-					snprintf(err, sizeof err, "cannot decode adaptive descriptor record indexes"); goto fail;
-				}
-			} else {
-				uint64_t record = 0;
-				for (uint32_t i = 0; i < (uint32_t)matches; i++) {
-					uint64_t value = 0;
-					if (!bspool_varint_read(metadata, block->metadataBytes, &at, &value)
-							|| (i && (!value || record > UINT64_MAX - value))) {
-						snprintf(err, sizeof err, "cannot decode descriptor record index"); goto fail;
-					}
-					record = i ? record + value : value;
-					if (record >= block->count) {
-						snprintf(err, sizeof err, "descriptor record index is outside block"); goto fail;
-					}
-					st.indexes[i] = (uint32_t)record;
-				}
-			}
-			int output = pool_split_candidate(&plan, raw, len);
-			st.descriptors[d].bytes = raw;
-			st.descriptors[d].len = len;
-			st.descriptors[d].output = output;
-			for (uint32_t i = 0; i < (uint32_t)matches; i++) {
-				uint32_t record = st.indexes[i];
-				st.assocDescriptor[associations] = (int32_t)d;
-				st.assocNext[associations] = st.recordHead[record];
-				st.recordHead[record] = (int32_t)associations;
-				associations++;
-				if (output >= 0)
-					st.candidates[record][output / 64] |= UINT64_C(1) << (output % 64);
-			}
-		}
-		if (at != block->metadataBytes || associations != block->associations) {
-			snprintf(err, sizeof err, "event metadata has trailing bytes"); goto fail;
-		}
 		/* Distribute in rank order, mirroring PoolSplitPolicy.distribute(). */
-		for (uint32_t r = 0; r < info.count; r++) {
-			uint64_t rank = ranks[r];
-			const uint64_t *mask = st.candidates[r];
+		for (uint32_t r = 0; r < cursor.count; r++) {
+			uint64_t rank = cursor.ranks[r];
+			const uint64_t *mask = candidates[r];
 			int ncand = pool_split_popcount(mask);
 			PoolSplitChoice *choice = NULL;
 			while (choiceAt < plan.nchoices && plan.choices[choiceAt].rank < rank) choiceAt++;
@@ -10068,12 +10204,12 @@ static int pool_mode_split(const char *input, const char *planPath) {
 				if (ncand) {
 					for (int k = 0; k < plan.noutputs; k++)
 						if (pool_split_mask_has(mask, k)
-								&& !pool_split_output_add(&plan, k, rank, r, (uint32_t)b, &st, err, sizeof err))
+								&& !pool_split_output_add(&plan, k, rank, r, (uint32_t)b, &cursor, slots, err, sizeof err))
 							goto fail;
 					uniqueCopied++;
 					memberships += (uint64_t)ncand;
 				} else if (plan.remainder >= 0) {
-					if (!pool_split_output_add(&plan, plan.remainder, rank, r, (uint32_t)b, &st, err, sizeof err))
+					if (!pool_split_output_add(&plan, plan.remainder, rank, r, (uint32_t)b, &cursor, slots, err, sizeof err))
 						goto fail;
 					uniqueCopied++;
 					memberships++;
@@ -10115,50 +10251,22 @@ static int pool_mode_split(const char *input, const char *planPath) {
 				destination = plan.remainder;
 			}
 			if (destination < 0) continue;
-			if (!pool_split_output_add(&plan, destination, rank, r, (uint32_t)b, &st, err, sizeof err))
+			if (!pool_split_output_add(&plan, destination, rank, r, (uint32_t)b, &cursor, slots, err, sizeof err))
 				goto fail;
 			uniqueCopied++;
 			memberships++;
 		}
-		done += info.count;
 		double now = bs_monotonic_seconds();
-		if (now - lastProgress >= 0.5 || b + 1 == reader.nblocks) {
-			fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", done, h.records);
+		if (now - lastProgress >= 0.5 || b + 1 == cursor.reader.nblocks) {
+			fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", cursor.consumed, cursor.header.records);
 			fflush(stderr);
 			lastProgress = now;
 		}
 	}
-	if (done != h.records) {
-		snprintf(err, sizeof err, "committed blocks do not match the pool record count"); goto fail;
-	}
-	if (h.membershipDigest && h.membershipDigest != membershipDigest) {
-		snprintf(err, sizeof err, "membership_digest differs from committed pool bytes"); goto fail;
-	}
-	if (h.metadataDigest && h.metadataDigest != metadataDigest) {
-		snprintf(err, sizeof err, "metadata_digest differs from committed event metadata"); goto fail;
-	}
-	for (int k = 0; k < plan.noutputs; k++) {
-		PoolSplitOutput *out = &plan.outputs[k];
-		if (!pool_split_flush(out, err, sizeof err)) goto fail;
-		int64_t dataEnd = bs_ftello(out->file);
-		if (dataEnd < plan.headerBytes) {
-			snprintf(err, sizeof err, "split output byte accounting failed"); goto fail;
-		}
-		uint64_t dataBytes = (uint64_t)dataEnd - (uint64_t)plan.headerBytes;
-		uint64_t finalBytes = 0;
-		if (!pool_append_adaptive_index(out->file, plan.headerBytes, out->records,
-				dataBytes, out->membershipDigest, out->metadataDigest,
-				&finalBytes, err, sizeof err))
+	if (!pool_event_cursor_finish(&cursor, err, sizeof err)) goto fail;
+	for (int k = 0; k < plan.noutputs; k++)
+		if (!pool_split_output_finalize(&plan.outputs[k], plan.headerBytes, err, sizeof err))
 			goto fail;
-		if (fflush(out->file) != 0 || bs_fsync_file(out->file) != 0
-				|| fclose(out->file) != 0) {
-			out->file = NULL;
-			snprintf(err, sizeof err, "cannot finalize split output %s: %s", out->path, strerror(errno));
-			goto fail;
-		}
-		out->file = NULL;
-		out->dataBytes = dataBytes;
-	}
 	uint64_t usedChoices = 0, usedRules = 0;
 	const PoolSplitChoice *unusedChoice = NULL;
 	const PoolSplitRule *unusedRule = NULL;
@@ -10171,9 +10279,9 @@ static int pool_mode_split(const char *input, const char *planPath) {
 		else if (!unusedRule) unusedRule = &plan.rules[i];
 	}
 	printf("BRAINSTORM_SPLIT_RESULT 1\n");
-	printf("source_records %" PRIu64 "\n", h.records);
-	printf("source_membership_digest %016" PRIx64 "\n", membershipDigest);
-	printf("source_metadata_digest %016" PRIx64 "\n", metadataDigest);
+	printf("source_records %" PRIu64 "\n", cursor.header.records);
+	printf("source_membership_digest %016" PRIx64 "\n", cursor.membershipDigest);
+	printf("source_metadata_digest %016" PRIx64 "\n", cursor.metadataDigest);
 	printf("unmatched %" PRIu64 "\n", unmatched);
 	printf("overlap %" PRIu64 "\n", overlap);
 	printf("unique_copied %" PRIu64 "\n", uniqueCopied);
@@ -10195,11 +10303,416 @@ fail:
 	fprintf(stderr, "%s\n", err[0] ? err : "cannot split pool");
 	rc = 1;
 cleanup:
-	pool_split_state_destroy(&st);
-	bspool_scratch_destroy(&scratch);
-	if (readerReady) bspool_reader_destroy(&reader);
-	if (in) fclose(in);
+	free(slots);
+	free(candidates);
+	pool_event_cursor_destroy(&cursor);
 	pool_split_plan_free(&plan);
+	return rc;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Combine: a k-way rank merge of 2..64 verified event pools into one
+ * composite BSP4, mirroring _iter_combined_records() and
+ * _CombineRecordNormalizer in tools/brainstorm_pool_organizer.py. */
+
+typedef struct {
+	char *path;
+	PoolEventCursor cursor;
+	uint64_t block;      /* next block index to load */
+	uint32_t at;         /* position inside the loaded block */
+	bool loaded, exhausted, composite;
+	uint64_t *branches;  size_t nbranches;
+	uint64_t *declared;  size_t ndeclared;
+	char **expr;         size_t nexpr;
+	unsigned char *provenance; size_t provenanceLen;
+	unsigned char *operand;    size_t operandLen;
+} PoolCombineInput;
+
+typedef struct {
+	int operation; /* 0 union, 1 intersection, 2 difference */
+	int headerBytes, ninputs;
+	PoolCombineInput inputs[POOL_COMBINE_MAX_INPUTS];
+	PoolSplitOutput output;
+} PoolCombinePlan;
+
+static void pool_combine_plan_free(PoolCombinePlan *plan) {
+	for (int i = 0; i < plan->ninputs; i++) {
+		PoolCombineInput *in = &plan->inputs[i];
+		pool_event_cursor_destroy(&in->cursor);
+		free(in->path); free(in->branches); free(in->declared);
+		for (size_t t = 0; t < in->nexpr; t++) free(in->expr[t]);
+		free(in->expr); free(in->provenance); free(in->operand);
+	}
+	pool_split_output_reset(&plan->output);
+	memset(plan, 0, sizeof *plan);
+}
+
+static bool pool_combine_push_u64(uint64_t **list, size_t *n, uint64_t value) {
+	uint64_t *p = realloc(*list, (*n + 1) * sizeof *p);
+	if (!p) return false;
+	p[(*n)++] = value;
+	*list = p;
+	return true;
+}
+
+static bool pool_combine_load_plan(const char *path, PoolCombinePlan *plan,
+		char *err, size_t errsz) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { snprintf(err, errsz, "cannot open combine plan %s: %s", path, strerror(errno)); return false; }
+	static char line[POOL_SPLIT_LINE_MAX];
+	bool sawMagic = false, sawEnd = false, sawOperation = false, sawOutput = false;
+	int lineNumber = 0;
+	bool ok = false;
+	plan->operation = -1;
+	while (fgets(line, sizeof line, f)) {
+		lineNumber++;
+		size_t n = strlen(line);
+		if (n && line[n - 1] != '\n' && !feof(f)) {
+			snprintf(err, errsz, "combine plan line %d is too long", lineNumber); goto done;
+		}
+		while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+		if (!n) continue;
+		if (!sawMagic) {
+			if (strcmp(line, "BRAINSTORM_COMBINE_PLAN 1")) {
+				snprintf(err, errsz, "combine plan has an unknown format"); goto done;
+			}
+			sawMagic = true;
+			continue;
+		}
+		if (!strcmp(line, "end")) { sawEnd = true; break; }
+		char *sp = line;
+		char *d = pool_tok(&sp);
+		if (!d) continue;
+		if (!strcmp(d, "operation")) {
+			char *v = pool_tok(&sp);
+			if (!v || sawOperation || pool_tok(&sp)) goto malformed;
+			if (!strcmp(v, "union")) plan->operation = 0;
+			else if (!strcmp(v, "intersection")) plan->operation = 1;
+			else if (!strcmp(v, "difference")) plan->operation = 2;
+			else goto malformed;
+			sawOperation = true;
+		} else if (!strcmp(d, "header_bytes")) {
+			char *v = pool_tok(&sp);
+			uint64_t value = 0;
+			if (!v || !pool_parse_u64(v, &value) || value < BSPOOL_HEADER_SIZE
+					|| value > BSPOOL_HEADER_MAX_SIZE || plan->headerBytes || pool_tok(&sp))
+				goto malformed;
+			plan->headerBytes = (int)value;
+		} else if (!strcmp(d, "output")) {
+			while (*sp && isspace((unsigned char)*sp)) sp++;
+			size_t pathLen = strlen(sp);
+			while (pathLen && isspace((unsigned char)sp[pathLen - 1])) sp[--pathLen] = 0;
+			if (!pathLen || sawOutput) goto malformed;
+			if (!pool_split_output_init(&plan->output, sp, "composite")) {
+				snprintf(err, errsz, "cannot allocate combine output"); goto done;
+			}
+			sawOutput = true;
+		} else if (!strcmp(d, "input")) {
+			char *indexText = pool_tok(&sp);
+			uint64_t index = 0;
+			if (!indexText || !pool_parse_u64(indexText, &index)
+					|| index != (uint64_t)plan->ninputs
+					|| plan->ninputs >= POOL_COMBINE_MAX_INPUTS) goto malformed;
+			while (*sp && isspace((unsigned char)*sp)) sp++;
+			size_t pathLen = strlen(sp);
+			while (pathLen && isspace((unsigned char)sp[pathLen - 1])) sp[--pathLen] = 0;
+			if (!pathLen) goto malformed;
+			PoolCombineInput *in = &plan->inputs[plan->ninputs];
+			memset(in, 0, sizeof *in);
+			in->cursor.scratch.cachedBlock = UINT64_MAX;
+			in->path = malloc(pathLen + 1);
+			if (!in->path) { snprintf(err, errsz, "cannot allocate combine plan"); goto done; }
+			memcpy(in->path, sp, pathLen + 1);
+			plan->ninputs++;
+		} else if (!strcmp(d, "provenance") || !strcmp(d, "operand")
+				|| !strcmp(d, "branch") || !strcmp(d, "declared")) {
+			char *indexText = pool_tok(&sp);
+			char *value = pool_tok(&sp);
+			uint64_t index = 0;
+			if (!indexText || !value || pool_tok(&sp)
+					|| !pool_parse_u64(indexText, &index)
+					|| index >= (uint64_t)plan->ninputs) goto malformed;
+			PoolCombineInput *in = &plan->inputs[index];
+			if (!strcmp(d, "provenance") || !strcmp(d, "operand")) {
+				unsigned char *bytes = NULL;
+				size_t len = 0;
+				unsigned char **target = !strcmp(d, "provenance") ? &in->provenance : &in->operand;
+				size_t *targetLen = !strcmp(d, "provenance") ? &in->provenanceLen : &in->operandLen;
+				if (*target || !pool_split_parse_hex(value, &bytes, &len)
+						|| len != POOL_COMBINE_ID_DESCRIPTOR_BYTES) {
+					free(bytes); goto malformed;
+				}
+				*target = bytes; *targetLen = len;
+			} else {
+				uint64_t id = 0;
+				if (!pool_split_parse_hex16(value, &id)) goto malformed;
+				bool pushed = !strcmp(d, "branch")
+						? pool_combine_push_u64(&in->branches, &in->nbranches, id)
+						: pool_combine_push_u64(&in->declared, &in->ndeclared, id);
+				if (!pushed) { snprintf(err, errsz, "cannot allocate combine plan"); goto done; }
+				in->composite = true;
+			}
+		} else if (!strcmp(d, "expr")) {
+			char *indexText = pool_tok(&sp);
+			uint64_t index = 0;
+			if (!indexText || !pool_parse_u64(indexText, &index)
+					|| index >= (uint64_t)plan->ninputs) goto malformed;
+			PoolCombineInput *in = &plan->inputs[index];
+			if (in->nexpr) goto malformed;
+			char *token;
+			while ((token = pool_tok(&sp)) != NULL) {
+				if (in->nexpr >= POOL_COMBINE_EXPR_MAX) goto malformed;
+				char **p = realloc(in->expr, (in->nexpr + 1) * sizeof *p);
+				if (!p) { snprintf(err, errsz, "cannot allocate combine plan"); goto done; }
+				in->expr = p;
+				in->expr[in->nexpr] = malloc(strlen(token) + 1);
+				if (!in->expr[in->nexpr]) { snprintf(err, errsz, "cannot allocate combine plan"); goto done; }
+				strcpy(in->expr[in->nexpr], token);
+				in->nexpr++;
+			}
+			if (!in->nexpr) goto malformed;
+			in->composite = true;
+		} else {
+			goto malformed;
+		}
+	}
+	if (!sawMagic || !sawEnd || !sawOperation || !sawOutput || !plan->headerBytes
+			|| plan->ninputs < 2) {
+		snprintf(err, errsz, "combine plan is incomplete"); goto done;
+	}
+	for (int i = 0; i < plan->ninputs; i++) {
+		PoolCombineInput *in = &plan->inputs[i];
+		if (!in->operand) { snprintf(err, errsz, "combine plan input %d has no operand", i); goto done; }
+		if (in->composite) {
+			if (in->provenance || !in->nbranches || !in->ndeclared || !in->nexpr) {
+				snprintf(err, errsz, "combine plan composite input %d is incomplete", i); goto done;
+			}
+		} else if (!in->provenance) {
+			snprintf(err, errsz, "combine plan input %d has no provenance", i); goto done;
+		}
+	}
+	ok = true;
+	goto done;
+malformed:
+	snprintf(err, errsz, "combine plan line %d is malformed", lineNumber);
+done:
+	fclose(f);
+	return ok;
+}
+
+static bool pool_combine_id_in(const uint64_t *list, size_t n, uint64_t value) {
+	for (size_t i = 0; i < n; i++) if (list[i] == value) return true;
+	return false;
+}
+
+/* expression_matches(): postfix o<hex16> leaves and u<n>/i<n>/d<n> operators. */
+static bool pool_combine_expression_matches(const PoolCombineInput *in,
+		const uint64_t *operands, size_t noperands, bool *result) {
+	bool stack[POOL_COMBINE_EXPR_MAX];
+	size_t depth = 0;
+	for (size_t t = 0; t < in->nexpr; t++) {
+		const char *token = in->expr[t];
+		if (token[0] == 'o') {
+			uint64_t id = 0;
+			if (!pool_split_parse_hex16(token + 1, &id) || depth >= POOL_COMBINE_EXPR_MAX) return false;
+			stack[depth++] = pool_combine_id_in(operands, noperands, id);
+			continue;
+		}
+		uint64_t n = 0;
+		if ((token[0] != 'u' && token[0] != 'i' && token[0] != 'd')
+				|| !pool_parse_u64(token + 1, &n) || n < 2 || n > depth) return false;
+		size_t base = depth - (size_t)n;
+		bool value;
+		if (token[0] == 'u') {
+			value = false;
+			for (size_t k = base; k < depth; k++) value = value || stack[k];
+		} else if (token[0] == 'i') {
+			value = true;
+			for (size_t k = base; k < depth; k++) value = value && stack[k];
+		} else {
+			value = stack[base];
+			for (size_t k = base + 1; k < depth; k++) value = value && !stack[k];
+		}
+		depth = base;
+		stack[depth++] = value;
+	}
+	if (depth != 1) return false;
+	*result = stack[0];
+	return true;
+}
+
+/* Load the next block of one input, or mark it exhausted. */
+static int pool_combine_advance_block(PoolCombineInput *in, char *err, size_t errsz) {
+	if (in->block >= in->cursor.reader.nblocks) { in->exhausted = true; in->loaded = false; return 1; }
+	int loaded = pool_event_cursor_load(&in->cursor, in->block, err, errsz);
+	if (loaded <= 0) return loaded;
+	in->block++;
+	in->at = 0;
+	in->loaded = true;
+	return 1;
+}
+
+static int pool_combine_advance(PoolCombineInput *in, char *err, size_t errsz) {
+	in->at++;
+	if (in->at < in->cursor.count) return 1;
+	return pool_combine_advance_block(in, err, errsz);
+}
+
+/* Validate one input's current record like _CombineRecordNormalizer and,
+ * when `emit` is set, contribute its descriptors to the output record. */
+static bool pool_combine_contribute(PoolCombinePlan *plan, int i, uint16_t local,
+		bool emit, char *err, size_t errsz) {
+	PoolCombineInput *in = &plan->inputs[i];
+	const PoolEventCursor *c = &in->cursor;
+	uint64_t provenance[POOL_COMBINE_MAX_INPUTS * 2], operands[POOL_COMBINE_MAX_INPUTS * 2];
+	size_t nprovenance = 0, noperands = 0;
+	for (int32_t a = c->recordHead[in->at]; a >= 0; a = c->assocNext[a]) {
+		const PoolSplitDescriptorRef *d = &c->descriptors[c->assocDescriptor[a]];
+		if (d->len == POOL_COMBINE_ID_DESCRIPTOR_BYTES && d->bytes[0] == 0x81) {
+			/* An input's own operand provenance is replaced by this operation's. */
+			if (noperands >= sizeof operands / sizeof *operands) {
+				snprintf(err, errsz, "composite source %s has too many operand descriptors", in->path); return false;
+			}
+			operands[noperands++] = pool_summary_be64(d->bytes + 1);
+			continue;
+		}
+		if (d->len == POOL_COMBINE_ID_DESCRIPTOR_BYTES && d->bytes[0] == 0x80) {
+			if (nprovenance >= sizeof provenance / sizeof *provenance) {
+				snprintf(err, errsz, "composite source %s has too many provenance descriptors", in->path); return false;
+			}
+			provenance[nprovenance++] = pool_summary_be64(d->bytes + 1);
+		}
+		if (emit && !pool_split_output_descriptor(&plan->output, local, d->bytes, d->len, NULL, 0, err, errsz))
+			return false;
+	}
+	if (in->composite) {
+		if (!nprovenance) {
+			snprintf(err, errsz, "composite source %s has a seed without provenance", in->path); return false;
+		}
+		for (size_t k = 0; k < nprovenance; k++)
+			if (!pool_combine_id_in(in->branches, in->nbranches, provenance[k])) {
+				snprintf(err, errsz, "composite source %s references an undeclared branch", in->path); return false;
+			}
+		if (!noperands) {
+			snprintf(err, errsz, "composite source %s has missing or undeclared operand provenance", in->path); return false;
+		}
+		for (size_t k = 0; k < noperands; k++)
+			if (!pool_combine_id_in(in->declared, in->ndeclared, operands[k])) {
+				snprintf(err, errsz, "composite source %s has missing or undeclared operand provenance", in->path); return false;
+			}
+		bool matches = false;
+		if (!pool_combine_expression_matches(in, operands, noperands, &matches)) {
+			snprintf(err, errsz, "composite source %s has an unusable expression", in->path); return false;
+		}
+		if (!matches) {
+			snprintf(err, errsz, "composite source %s has operand provenance that does not satisfy its expression", in->path); return false;
+		}
+	} else {
+		if (nprovenance || noperands) {
+			snprintf(err, errsz, "non-composite source contains undeclared provenance metadata"); return false;
+		}
+		if (emit && !pool_split_output_descriptor(&plan->output, local, in->provenance, in->provenanceLen, NULL, 0, err, errsz))
+			return false;
+	}
+	return true;
+}
+
+static int pool_mode_combine(const char *planPath) {
+	static PoolCombinePlan plan;
+	memset(&plan, 0, sizeof plan);
+	char err[256] = "";
+	int rc = 1;
+	if (!pool_combine_load_plan(planPath, &plan, err, sizeof err)) goto fail;
+	uint64_t total = 0;
+	for (int i = 0; i < plan.ninputs; i++) {
+		PoolCombineInput *in = &plan.inputs[i];
+		if (!pool_event_cursor_open(&in->cursor, in->path, err, sizeof err)) goto fail;
+		if (in->cursor.header.headerBytes > plan.headerBytes) {
+			snprintf(err, sizeof err, "combine plan header size is smaller than input %d", i); goto fail;
+		}
+		total += in->cursor.header.records;
+	}
+	if (!pool_split_output_create(&plan.output, plan.headerBytes, err, sizeof err)) goto fail;
+	for (int i = 0; i < plan.ninputs; i++) {
+		int loaded = pool_combine_advance_block(&plan.inputs[i], err, sizeof err);
+		if (loaded < 0) { fprintf(stderr, "%s\n", err); rc = POOL_SPLIT_EXIT_UNSUPPORTED; goto cleanup; }
+		if (!loaded) goto fail;
+	}
+	uint64_t consumed = 0, written = 0;
+	double lastProgress = bs_monotonic_seconds();
+	int present[POOL_COMBINE_MAX_INPUTS];
+	for (;;) {
+		/* The smallest current rank across inputs; a linear scan over at most
+		 * 64 cursors is cheaper than maintaining a heap for this fan-in. */
+		uint64_t rank = 0;
+		int npresent = 0;
+		for (int i = 0; i < plan.ninputs; i++) {
+			PoolCombineInput *in = &plan.inputs[i];
+			if (!in->loaded) continue;
+			uint64_t candidate = in->cursor.ranks[in->at];
+			if (!npresent || candidate < rank) { rank = candidate; npresent = 0; }
+			if (candidate == rank) present[npresent++] = i;
+		}
+		if (!npresent) break;
+		bool include = plan.operation == 0
+				|| (plan.operation == 1 && npresent == plan.ninputs)
+				|| (plan.operation == 2 && npresent == 1 && present[0] == 0);
+		uint16_t local = 0;
+		if (include && !pool_split_output_begin(&plan.output, rank, &local, err, sizeof err)) goto fail;
+		for (int p = 0; p < npresent; p++)
+			if (!pool_combine_contribute(&plan, present[p], local, include, err, sizeof err)) goto fail;
+		if (include) {
+			for (int p = 0; p < npresent; p++) {
+				const PoolCombineInput *in = &plan.inputs[present[p]];
+				if (!pool_split_output_descriptor(&plan.output, local, in->operand, in->operandLen, NULL, 0, err, sizeof err))
+					goto fail;
+			}
+			if (!pool_split_output_end(&plan.output, err, sizeof err)) goto fail;
+			written++;
+		}
+		for (int p = 0; p < npresent; p++) {
+			PoolCombineInput *in = &plan.inputs[present[p]];
+			int advanced = pool_combine_advance(in, err, sizeof err);
+			if (advanced < 0) { fprintf(stderr, "%s\n", err); rc = POOL_SPLIT_EXIT_UNSUPPORTED; goto cleanup; }
+			if (!advanced) goto fail;
+			consumed++;
+		}
+		double now = bs_monotonic_seconds();
+		if (now - lastProgress >= 0.5) {
+			fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", consumed, total);
+			fflush(stderr);
+			lastProgress = now;
+		}
+	}
+	fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", consumed, total);
+	fflush(stderr);
+	for (int i = 0; i < plan.ninputs; i++)
+		if (!pool_event_cursor_finish(&plan.inputs[i].cursor, err, sizeof err)) goto fail;
+	if (consumed != total) {
+		snprintf(err, sizeof err, "combine consumed %" PRIu64 " of %" PRIu64 " input records", consumed, total);
+		goto fail;
+	}
+	if (!pool_split_output_finalize(&plan.output, plan.headerBytes, err, sizeof err)) goto fail;
+	printf("BRAINSTORM_COMBINE_RESULT 1\n");
+	for (int i = 0; i < plan.ninputs; i++) {
+		const PoolEventCursor *c = &plan.inputs[i].cursor;
+		printf("input %d %" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n",
+				i, c->header.records, c->membershipDigest, c->metadataDigest);
+	}
+	printf("consumed %" PRIu64 "\n", consumed);
+	printf("records %" PRIu64 "\n", plan.output.records);
+	printf("data_bytes %" PRIu64 "\n", plan.output.dataBytes);
+	printf("membership_digest %016" PRIx64 "\n", plan.output.membershipDigest);
+	printf("metadata_digest %016" PRIx64 "\n", plan.output.metadataDigest);
+	printf("end\n");
+	(void)written;
+	rc = fflush(stdout) != 0 || ferror(stdout) ? 1 : 0;
+	goto cleanup;
+fail:
+	fprintf(stderr, "%s\n", err[0] ? err : "cannot combine pools");
+	rc = 1;
+cleanup:
+	pool_combine_plan_free(&plan);
 	return rc;
 }
 
@@ -10214,8 +10727,9 @@ static void pool_usage(const char *prog) {
 			"  %s convert <legacy-input.bspool> <compressed-output.bspool>\n"
 			"  %s upgrade <bsp3-input.bspool> <bsp4-output.bspool>\n"
 			"  %s merge <output.bspool> <part1.bspool> <part2.bspool> [more parts...]\n"
-			"  %s split <input.bspool> <organizer-split-plan.txt>\n",
-			prog, prog, prog, prog, prog, prog, prog, prog, prog);
+			"  %s split <input.bspool> <organizer-split-plan.txt>\n"
+			"  %s combine <organizer-combine-plan.txt>\n",
+			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -10234,6 +10748,8 @@ int main(int argc, char **argv) {
 		return pool_mode_merge_locked(argv[2], argc - 3, argv + 3);
 	if (argc == 4 && !strcmp(argv[1], "split"))
 		return pool_mode_split(argv[2], argv[3]);
+	if (argc == 3 && !strcmp(argv[1], "combine"))
+		return pool_mode_combine(argv[2]);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);

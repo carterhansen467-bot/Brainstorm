@@ -3811,22 +3811,28 @@ def _iter_combined_records(context: CombineContext,
 def combine_pools(readers: Sequence[BSPoolReader], output_path: str,
                   operation: str = "union", label: str = "Combined seed pool",
                   progress=None,
-                  cancel_check: Optional[Callable[[], bool]] = None
-                  ) -> Dict[str, object]:
-    """Stream a literal set operation and atomically publish one BSP4 pool."""
+                  cancel_check: Optional[Callable[[], bool]] = None,
+                  native_combine=None) -> Dict[str, object]:
+    """Stream a literal set operation and atomically publish one BSP4 pool.
+
+    ``native_combine`` optionally streams the merge through the native helper
+    (see _combine_pools_native); ``progress`` receives the number of input
+    records consumed so far.
+    """
     _check_cancel(cancel_check)
     output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with pool_writer_guard(output_path):
         return _combine_pools_locked(
-            readers, output_path, operation, label, progress, cancel_check)
+            readers, output_path, operation, label, progress, cancel_check,
+            native_combine)
 
 
 def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
                           operation: str, label: str,
                           progress=None,
-                          cancel_check: Optional[Callable[[], bool]] = None
-                          ) -> Dict[str, object]:
+                          cancel_check: Optional[Callable[[], bool]] = None,
+                          native_combine=None) -> Dict[str, object]:
     _check_cancel(cancel_check)
     context = prepare_combine(readers, operation)
     directory = os.path.dirname(output_path)
@@ -3843,6 +3849,16 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
             context, label, header_bytes, records, data_bytes,
             membership, metadata)
 
+    if native_combine is not None and not any(
+            reader._repaired_bsp3_headers for reader in context.readers):
+        # A reconstructed BSP3 header prefix exists only in Python memory;
+        # the byte-strict helper must not reopen that damaged file.
+        try:
+            return _combine_pools_native(
+                context, output_path, label, header_bytes, header_builder,
+                native_combine, progress, cancel_check)
+        except NativeHelperUnsupported:
+            pass  # the exact Python merge below handles every layout
     writer = BSP4OutputWriter(
         context.readers[0], "composite:%s" % context.operation, label,
         output_path, header_bytes=header_bytes,
@@ -3865,6 +3881,7 @@ def _combine_pools_locked(readers: Sequence[BSPoolReader], output_path: str,
             "records": writer.records,
             "header_bytes": header_bytes,
             "completed": True,
+            "native_combine": False,
         })
         return result
     except BaseException:
@@ -4309,7 +4326,7 @@ def _write_split_outputs(reader: BSPoolReader,
             return _write_split_outputs_native(
                 reader, reviewed_plan, destinations, labels, report,
                 report_path, cancel_check, native_split, progress)
-        except NativeSplitUnsupported:
+        except NativeHelperUnsupported:
             # The exact Python traversal below handles every layout.
             pass
     writers = {}  # type: Dict[str, BSP4OutputWriter]
@@ -4523,7 +4540,11 @@ def category_id_to_descriptor(category_id: str) -> bytes:
     return raw
 
 
-class NativeSplitUnsupported(PoolError):
+class NativeHelperUnsupported(PoolError):
+    """The native helper declined this work; use the exact Python path."""
+
+
+class NativeSplitUnsupported(NativeHelperUnsupported):
     """The native helper declined this source; use the exact Python path."""
 
 
@@ -4914,7 +4935,258 @@ def _write_split_outputs_native(
         report["native_split"] = True
         return _publish_split_outputs(
             publications, report, report_path, cancel_check)
-    except NativeSplitUnsupported:
+    except NativeHelperUnsupported:
+        raise
+    except BaseException:
+        discard_stage()
+        raise
+
+
+
+NATIVE_COMBINE_PLAN_SCHEMA = 1
+NATIVE_COMBINE_RESULT_SCHEMA = 1
+
+
+class NativeCombineUnsupported(NativeHelperUnsupported):
+    """The native helper declined this combine; use the exact Python path."""
+
+
+def _expression_postfix(value: Dict[str, object]) -> List[str]:
+    """Serialize a validated composite expression for the native evaluator."""
+    token = value.get("operand")
+    if token is not None:
+        return ["o%s" % ("%016x" % int(token, 16))]
+    tokens = []
+    for item in value["inputs"]:
+        tokens.extend(_expression_postfix(item))
+    tokens.append("%s%d" % (value["op"][0], len(value["inputs"])))
+    return tokens
+
+
+def build_native_combine_plan(context: CombineContext, header_bytes: int,
+                              staged_path: str) -> bytes:
+    """Serialize one prepared CombineContext for the helper's combine mode."""
+    if len(context.readers) < 2 or len(context.readers) > COMPOSITE_MAX_INPUTS:
+        raise PoolError("native combine plan needs 2-64 inputs")
+    lines = [
+        b"BRAINSTORM_COMBINE_PLAN %d" % NATIVE_COMBINE_PLAN_SCHEMA,
+        b"operation %s" % context.operation.encode("ascii"),
+        b"header_bytes %d" % header_bytes,
+        b"output %s" % _native_plan_path_bytes(staged_path),
+    ]
+    for index, reader in enumerate(context.readers):
+        lines.append(b"input %d %s" % (index, _native_plan_path_bytes(reader.path)))
+    for index, reader in enumerate(context.readers):
+        branch_ids = context.source_branch_ids[index]
+        operand = context.operands[index]
+        lines.append(b"operand %d %s" % (
+            index, operand_descriptor(operand.operand_id).hex().encode("ascii")))
+        if reader.is_composite:
+            for branch_id in branch_ids:
+                lines.append(b"branch %d %016x" % (index, branch_id))
+            for operand_id in sorted(reader.composite_operands):
+                lines.append(b"declared %d %016x" % (index, operand_id))
+            tokens = _expression_postfix(reader.composite_expression)
+            lines.append(b"expr %d %s" % (
+                index, " ".join(tokens).encode("ascii")))
+        else:
+            if len(branch_ids) != 1:
+                raise PoolError("native combine plan input has no direct branch")
+            lines.append(b"provenance %d %s" % (
+                index, provenance_descriptor(branch_ids[0]).hex().encode("ascii")))
+    lines.append(b"end")
+    return b"\n".join(lines) + b"\n"
+
+
+def parse_native_combine_result(text: str) -> Dict[str, object]:
+    lines = text.splitlines()
+    if (not lines or lines[0] != "BRAINSTORM_COMBINE_RESULT %d"
+            % NATIVE_COMBINE_RESULT_SCHEMA or lines[-1] != "end"):
+        raise PoolError("native combine returned an invalid result document")
+    integer_fields = {"consumed", "records", "data_bytes"}
+    hex_fields = {"membership_digest", "metadata_digest"}
+    values = {}  # type: Dict[str, object]
+    inputs = {}  # type: Dict[int, Dict[str, int]]
+    for line in lines[1:-1]:
+        parts = line.split()
+        if not parts:
+            continue
+        key = parts[0]
+        if key in integer_fields:
+            if (len(parts) != 2 or key in values
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[1])):
+                raise PoolError("native combine result malforms %s" % key)
+            values[key] = int(parts[1])
+        elif key in hex_fields:
+            if (len(parts) != 2 or key in values
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[1])):
+                raise PoolError("native combine result malforms %s" % key)
+            values[key] = int(parts[1], 16)
+        elif key == "input":
+            if (len(parts) != 5
+                    or not re.fullmatch(r"[0-9]{1,3}", parts[1])
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[2])
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[3])
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[4])
+                    or int(parts[1]) in inputs):
+                raise PoolError("native combine result has a malformed input")
+            inputs[int(parts[1])] = {
+                "records": int(parts[2]),
+                "membership_digest": int(parts[3], 16),
+                "metadata_digest": int(parts[4], 16),
+            }
+        else:
+            raise PoolError("native combine result has an unknown field")
+    if not (integer_fields | hex_fields).issubset(values) or not inputs \
+            or sorted(inputs) != list(range(len(inputs))):
+        raise PoolError("native combine result is incomplete")
+    values["inputs"] = inputs
+    return values
+
+
+def _combine_pools_native(context: CombineContext, output_path: str,
+                          label: str, header_bytes: int, header_builder,
+                          helper, progress,
+                          cancel_check: Optional[Callable[[], bool]]
+                          ) -> Dict[str, object]:
+    """Stream the set operation through the helper, then verify the file.
+
+    Python owns the plan, the composite header, and publication. After the
+    helper writes the record blocks, the staged file is re-read structurally
+    and summarized natively: record counts, digests, and per-operand
+    provenance counts must match what the set rule implies before the pool
+    is linked into place.
+    """
+    directory = os.path.dirname(output_path)
+    staged = os.path.join(
+        directory, ".organizer-native-combine-%d-%s.tmp" % (
+            os.getpid(), os.urandom(4).hex()))
+    plan_path = staged + ".plan"
+    plan_bytes = build_native_combine_plan(context, header_bytes, staged)
+    expected_operand_counts = {}
+    for index, reader in enumerate(context.readers):
+        operand_id = context.operands[index].operand_id
+        if context.operation == "union":
+            expected_operand_counts[operand_id] = None  # checked below
+        elif context.operation == "intersection":
+            expected_operand_counts[operand_id] = "records"
+        else:
+            expected_operand_counts[operand_id] = "records" if index == 0 else 0
+
+    def discard_stage():
+        for path in (staged, plan_path):
+            try:
+                seed_pool_mutations.remove(path, missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        with open(plan_path, "wb") as handle:
+            handle.write(plan_bytes)
+        _check_cancel(cancel_check)
+        try:
+            result = parse_native_combine_result(helper.combine(
+                plan_path, cancel_check=cancel_check, progress=progress))
+        except NativeHelperUnsupported:
+            discard_stage()
+            raise
+        _check_cancel(cancel_check)
+        if len(result["inputs"]) != len(context.readers):
+            raise PoolError("native combine input count differs from its plan")
+        total = 0
+        for index, reader in enumerate(context.readers):
+            verified = result["inputs"][index]
+            if verified["records"] != reader.records:
+                raise PoolError(
+                    "native combine input record count differs from %s"
+                    % os.path.basename(reader.path))
+            reader.accept_native_verification(
+                verified["membership_digest"], verified["metadata_digest"])
+            total += reader.records
+        if result["consumed"] != total:
+            raise PoolError("native combine did not consume every input record")
+        records = result["records"]
+        header, identity = header_builder(
+            records, result["data_bytes"], result["membership_digest"],
+            result["metadata_digest"])
+        if len(header) != header_bytes:
+            raise PoolError(
+                "composite output header builder returned the wrong size")
+        with open(staged, "r+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() < header_bytes + result["data_bytes"]:
+                raise PoolError("native combine output is shorter than reported")
+            handle.seek(0)
+            if handle.read(header_bytes) != b"\0" * header_bytes:
+                raise PoolError("native combine output header area is not blank")
+            handle.seek(0)
+            handle.write(header)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged_reader = BSPoolReader(staged, verify_payloads=False)
+        if (staged_reader.schema != 4 or not staged_reader.complete
+                or staged_reader.records != records
+                or staged_reader.data_bytes != result["data_bytes"]
+                or staged_reader.membership_digest != result["membership_digest"]
+                or staged_reader.metadata_digest != result["metadata_digest"]
+                or staged_reader.header_bytes != header_bytes
+                or not staged_reader.is_composite
+                or staged_reader.snapshot_token != identity["snapshot_id"]):
+            raise PoolError(
+                "native combine output does not match its reported identity")
+        if records:
+            summary = helper.summarize(staged, cancel_check=cancel_check)
+            if summary is None:
+                raise PoolError("native combine output could not be summarized")
+            if (summary["records"] != records
+                    or int(summary["membership_digest"], 16)
+                        != result["membership_digest"]
+                    or int(summary["metadata_digest"], 16)
+                        != result["metadata_digest"]
+                    or summary["records_without_provenance"]
+                    or summary["records_without_operands"]):
+                raise PoolError(
+                    "native combine output summary differs from its reported "
+                    "digests or provenance")
+            operand_counts = {
+                int(key, 16): count
+                for key, count in summary["operand_counts"].items()}
+            for operand_id, expected in expected_operand_counts.items():
+                actual = operand_counts.get(operand_id, 0)
+                if expected == "records":
+                    if actual != records:
+                        raise PoolError(
+                            "native combine output is missing an operand on "
+                            "some records")
+                elif expected is None:
+                    index = next(
+                        number for number, operand in enumerate(context.operands)
+                        if operand.operand_id == operand_id)
+                    if actual != context.readers[index].records:
+                        raise PoolError(
+                            "native combine union lost records of one input")
+                elif actual != expected:
+                    raise PoolError(
+                        "native combine difference kept a subtracted operand")
+            if set(operand_counts) - set(expected_operand_counts):
+                raise PoolError(
+                    "native combine output names an unplanned operand")
+        seed_pool_mutations.remove(plan_path, missing_ok=True)
+        _check_cancel(cancel_check)
+        seed_pool_mutations.link_no_overwrite(
+            staged, output_path, consume_staged=True)
+        result_dict = context.as_dict()
+        result_dict.update(identity)
+        result_dict.update({
+            "path": output_path,
+            "records": records,
+            "category_id": "composite:%s" % context.operation,
+            "header_bytes": header_bytes,
+            "completed": True,
+            "native_combine": True,
+        })
+        return result_dict
+    except NativeHelperUnsupported:
         raise
     except BaseException:
         discard_stage()

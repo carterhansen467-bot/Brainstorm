@@ -623,6 +623,17 @@ it matches; this flag cannot be combined with `--choices`. Without `--remainder`
 seeds that match none of the selected categories stay only in the unchanged
 source pool.
 
+Combining streams through the same native helper (`brainstorm_seed_pool
+combine`) whenever it is installed: the helper merges every input in rank
+order, verifies each input exactly like `summarize`, applies the union,
+intersection, or difference rule with the same provenance and operand
+descriptors as the Python merge, and writes canonical BSP4 blocks, so both
+paths produce byte-identical composite pools. The Organizer writes the
+composite header itself, re-reads the staged file, and summarizes it natively
+to prove the record count, digests, and per-operand provenance before it is
+linked into place; without the helper, or for a historical block layout, the
+exact Python merge still runs.
+
 General combining is separate from **Merge distributed pool parts**. The shard
 merge remains the strict fast path for completed, contiguous parts of one
 identical search. The organizer accepts 2–64 compatible recorded pools and:

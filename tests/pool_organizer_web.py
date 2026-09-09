@@ -3834,5 +3834,348 @@ class NativeSplitRegression(unittest.TestCase):
                         label, number, check.stderr))
 
 
+class NativeCombineRegression(unittest.TestCase):
+    """The helper's combine mode must publish exactly what the Python merge would."""
+
+    def setUp(self):
+        NativeSplitRegression.clear_caches()
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="brainstorm-native-combine-")
+        self.binary = web._native_pool_binary()
+
+    def tearDown(self):
+        NativeSplitRegression.clear_caches()
+        self.temp.cleanup()
+
+    def require_native(self):
+        if not self.binary:
+            self.skipTest("native pool helper is not built")
+
+    # -- fixtures -----------------------------------------------------------
+
+    @staticmethod
+    def three_sources(pool_dir):
+        d = fixture.descriptor
+        fixture.write_bsp3(os.path.join(pool_dir, "a.bspool"), complete=True)
+        fixture.write_custom_bsp3(
+            os.path.join(pool_dir, "b.bspool"), [1, 2, 7, 8],
+            [[fixture.TAG], [fixture.TAG, fixture.LEGENDARY], [fixture.VOUCHER],
+             [d(1, "tag_charm", 1, 1, 0, 0, 2)]],
+            "bbbbbbbbbbbbbbb1", [
+                "tag_route collect", "tag tag_negative 3 small 3 small 1",
+                "legendary j_perkeo 4 big 4 big 1 shop",
+                "voucher v_overstock_norm 2 2"])
+        fixture.write_custom_bsp3(
+            os.path.join(pool_dir, "c.bspool"), [0, 2, 9],
+            [[fixture.VOUCHER], [fixture.LEGENDARY], [fixture.TAG]],
+            "cccccccccccccc12", [
+                "tag_route observe",
+                "legendary j_perkeo 1 small 4 big 0 shop", "soul_depth any"])
+        return ["a.bspool", "b.bspool", "c.bspool"]
+
+    @staticmethod
+    def disjoint_sources(pool_dir):
+        for name, ranks, criteria in (
+                ("x.bspool", [10, 11], "dddddddddddddd13"),
+                ("y.bspool", [20, 21], "eeeeeeeeeeeeee14")):
+            fixture.write_custom_bsp3(
+                os.path.join(pool_dir, name), ranks,
+                [[fixture.TAG]] * len(ranks), criteria,
+                ["tag_route collect", "tag tag_negative 3 small 3 small 1"])
+        return ["x.bspool", "y.bspool"]
+
+    def bsp4_sources(self, pool_dir):
+        names = []
+        for name in self.three_sources(pool_dir):
+            source = os.path.join(pool_dir, name)
+            output = os.path.join(pool_dir, name[:-7] + "4.bspool")
+            subprocess.run(
+                [self.binary, "upgrade", source, output], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            os.unlink(source)
+            manifest = output + ".manifest"
+            if os.path.exists(manifest):
+                os.unlink(manifest)
+            names.append(os.path.basename(output))
+        return names
+
+    @staticmethod
+    def multiblock_sources(pool_dir):
+        import random
+        d = fixture.descriptor
+        fixture.write_custom_bsp3(
+            os.path.join(pool_dir, "base.bspool"), [5],
+            [[d(2, "j_perkeo", 1, 2, 1, 0, 0)]], "fedcba9876543210",
+            ["tag_route collect", "legendary j_perkeo 1 big 3 small 1 shop"],
+            range_start=0, range_end=10 ** 7)
+        base = organizer.BSPoolReader(os.path.join(pool_dir, "base.bspool"))
+        names = []
+        for number, seed in enumerate((11, 12)):
+            rnd = random.Random(seed)
+            ranks = sorted(rnd.sample(range(0, 10 ** 7), 30000))
+            name = "mb%d.bspool" % number
+            writer = organizer.BSP4OutputWriter(
+                base, "legendary:j_perkeo:A1:big:shop:o0:none",
+                "multiblock %d" % number, os.path.join(pool_dir, name))
+            for index, rank in enumerate(ranks):
+                raws = [d(2, "j_perkeo", 1 + rnd.randrange(3), rnd.randrange(3),
+                          1 + index % 3, 1, rnd.randrange(3)),
+                        d(1, "tag_charm", 1, 1, 0, 0, 2)]
+                writer.add(organizer.Record(rank, tuple(
+                    organizer.Occurrence.decode(raw)
+                    for raw in dict.fromkeys(raws))))
+            writer.finalize()
+            os.replace(writer.temp_path, writer.final_path)
+            names.append(name)
+        os.unlink(os.path.join(pool_dir, "base.bspool"))
+        return names
+
+    # -- machinery ----------------------------------------------------------
+
+    @staticmethod
+    def combine_in(pool_dir, names, operation, output_name, base=None):
+        NativeSplitRegression.clear_caches()
+        snapshots = {
+            name: organizer.BSPoolReader(
+                os.path.join(pool_dir, name), verify_payloads=False).snapshot_token
+            for name in names}
+        request = {"sources": list(names), "operation": operation,
+                   "name": output_name, "label": output_name}
+        if base is not None:
+            request["base"] = base
+        plan = web.run_combine_plan(dict(request, snapshots=snapshots), pool_dir)
+        assert plan["publication"]["ready"], plan["publication"]
+        request.update(snapshots=plan["snapshots"],
+                       reviewedPublication=plan["publication"])
+        return web.run_combine(request, pool_dir)
+
+    def combine_both_ways(self, make_sources, steps):
+        outputs = {}
+        results = {}
+        for native in (True, False):
+            pool_dir = os.path.join(
+                self.temp.name, "native" if native else "python")
+            os.makedirs(pool_dir)
+            names = make_sources(pool_dir)
+            original = web._native_pool_binary
+            if not native:
+                web._native_pool_binary = lambda: ""
+            try:
+                last = None
+                for operation, inputs, output_name, base in steps:
+                    last = self.combine_in(
+                        pool_dir, [names[index] for index in inputs],
+                        operation, output_name,
+                        None if base is None else names[base])
+                    self.assertTrue(last["completed"])
+                    self.assertEqual(last["native_combine"], native)
+                    names.append(output_name + ".bspool")
+            finally:
+                web._native_pool_binary = original
+            self.assertEqual(
+                [entry for entry in os.listdir(pool_dir)
+                 if entry.startswith(".organizer")], [])
+            outputs[native] = {
+                name: NativeSplitRegression.read_bytes(os.path.join(pool_dir, name))
+                for name in names}
+            results[native] = {
+                key: value for key, value in last.items()
+                if key not in ("path", "report_path", "native_combine", "inputs")}
+        self.assertEqual(results[True], results[False])
+        self.assertEqual(outputs[True], outputs[False])
+        return results[True]
+
+    # -- tests --------------------------------------------------------------
+
+    def test_native_combine_matches_python_for_every_operation(self):
+        self.require_native()
+        scenarios = [
+            ("union", self.three_sources, [("union", [0, 1], "u-ab", None)], 6),
+            ("intersection", self.three_sources,
+             [("intersection", [0, 1], "i-ab", None)], 2),
+            ("difference base first", self.three_sources,
+             [("difference", [0, 1], "d-ab", 0)], 2),
+            ("difference base second", self.three_sources,
+             [("difference", [0, 1], "d-ba", 1)], 2),
+            ("three-way union", self.three_sources,
+             [("union", [0, 1, 2], "u-abc", None)], 7),
+            ("composite intersection", self.three_sources,
+             [("union", [0, 1], "u-ab", None),
+              ("intersection", [3, 2], "i-uab-c", None)], 2),
+            ("composite difference", self.three_sources,
+             [("union", [0, 1], "u-ab", None),
+              ("difference", [3, 2], "d-uab-c", 3)], 4),
+            ("composite of composites", self.three_sources,
+             [("union", [0, 1], "u-ab", None), ("union", [1, 2], "u-bc", None),
+              ("intersection", [3, 4], "i-uu", None)], 5),
+            ("empty intersection", self.disjoint_sources,
+             [("intersection", [0, 1], "empty", None)], 0),
+            ("BSP4 union", self.bsp4_sources, [("union", [0, 1], "u4", None)], 6),
+            ("BSP4 three-way difference", self.bsp4_sources,
+             [("difference", [0, 1, 2], "d4", 0)], 1),
+            ("multi-block union", self.multiblock_sources,
+             [("union", [0, 1], "mb-u", None)], 59908),
+            ("multi-block difference", self.multiblock_sources,
+             [("difference", [0, 1], "mb-d", 0)], 29908),
+        ]
+        for label, make_sources, steps, expected in scenarios:
+            with self.subTest(scenario=label):
+                self.tearDown()
+                self.setUp()
+                result = self.combine_both_ways(make_sources, steps)
+                self.assertEqual(result["records"], expected)
+
+    def test_native_combine_plan_document_and_result_contract(self):
+        names = self.three_sources(self.temp.name)
+        readers = [organizer.BSPoolReader(os.path.join(self.temp.name, name))
+                   for name in names[:2]]
+        context = organizer.prepare_combine(readers, "difference")
+        document = organizer.build_native_combine_plan(
+            context, 16384, os.path.join(self.temp.name, "staged out.tmp"))
+        lines = document.decode("utf-8").splitlines()
+        self.assertEqual(lines[:4], [
+            "BRAINSTORM_COMBINE_PLAN 1", "operation difference",
+            "header_bytes 16384",
+            "output %s" % os.path.join(self.temp.name, "staged out.tmp")])
+        self.assertEqual(lines[-1], "end")
+        for index, reader in enumerate(context.readers):
+            self.assertIn("input %d %s" % (index, reader.path), lines)
+            branch = context.source_branch_ids[index][0]
+            self.assertIn("provenance %d %s" % (
+                index, organizer.provenance_descriptor(branch).hex()), lines)
+            self.assertIn("operand %d %s" % (
+                index, organizer.operand_descriptor(
+                    context.operands[index].operand_id).hex()), lines)
+        self.assertFalse([line for line in lines if line.startswith("expr ")])
+
+        union = self.combine_in(self.temp.name, names[:2], "union", "u-ab")
+        composite = organizer.BSPoolReader(union["path"])
+        nested = organizer.prepare_combine(
+            [composite, organizer.BSPoolReader(
+                os.path.join(self.temp.name, names[2]))], "intersection")
+        nested_lines = organizer.build_native_combine_plan(
+            nested, 16384, os.path.join(self.temp.name, "x.tmp")
+        ).decode("utf-8").splitlines()
+        composite_index = next(
+            index for index, reader in enumerate(nested.readers)
+            if reader.is_composite)
+        expr = next(line for line in nested_lines
+                    if line.startswith("expr %d " % composite_index))
+        tokens = expr.split()[2:]
+        self.assertEqual(tokens[-1], "u2")
+        self.assertEqual(sorted(tokens[:-1]), sorted(
+            "o%016x" % operand_id for operand_id in composite.composite_operands))
+        self.assertEqual(
+            len([line for line in nested_lines
+                 if line.startswith("branch %d " % composite_index)]), 2)
+        self.assertEqual(
+            len([line for line in nested_lines
+                 if line.startswith("declared %d " % composite_index)]), 2)
+        self.assertFalse([line for line in nested_lines
+                          if line.startswith("provenance %d " % composite_index)])
+
+        parsed = organizer.parse_native_combine_result("\n".join([
+            "BRAINSTORM_COMBINE_RESULT 1",
+            "input 0 4 0123456789abcdef fedcba9876543210",
+            "input 1 4 1111111111111111 2222222222222222",
+            "consumed 8", "records 6", "data_bytes 120",
+            "membership_digest 3333333333333333",
+            "metadata_digest 4444444444444444", "end", ""]))
+        self.assertEqual(parsed["records"], 6)
+        self.assertEqual(parsed["inputs"][1]["membership_digest"],
+                         0x1111111111111111)
+        for broken in (
+                "BRAINSTORM_COMBINE_RESULT 2\nend\n",
+                "BRAINSTORM_COMBINE_RESULT 1\nrecords 6\nend\n",
+                "BRAINSTORM_COMBINE_RESULT 1\ninput 1 4 1111111111111111 "
+                "2222222222222222\nconsumed 8\nrecords 6\ndata_bytes 120\n"
+                "membership_digest 3333333333333333\n"
+                "metadata_digest 4444444444444444\nend\n",
+                "BRAINSTORM_COMBINE_RESULT 1\nsurprise 1\nend\n"):
+            with self.assertRaises(organizer.PoolError):
+                organizer.parse_native_combine_result(broken)
+
+    @staticmethod
+    def staged_output_from_plan(plan_path):
+        with open(plan_path, "rb") as handle:
+            for line in handle.read().split(b"\n"):
+                if line.startswith(b"output "):
+                    return os.fsdecode(line[7:])
+        raise AssertionError("plan has no output line")
+
+    def test_native_combine_unsupported_falls_back_to_python(self):
+        names = self.three_sources(self.temp.name)
+        calls = []
+        harness = self
+
+        class DecliningHelper:
+            def combine(self, plan_path, cancel_check=None, progress=None):
+                calls.append(plan_path)
+                staged = harness.staged_output_from_plan(plan_path)
+                with open(staged, "wb") as handle:
+                    handle.write(b"partial native output")
+                raise organizer.NativeCombineUnsupported(
+                    "source blocks are not physically rank ordered")
+
+            def summarize(self, path, cancel_check=None):
+                raise AssertionError("fallback must not summarize")
+
+        original = web._native_split_helper
+        web._native_split_helper = lambda: DecliningHelper()
+        try:
+            result = self.combine_in(self.temp.name, names[:2], "union", "fallback")
+        finally:
+            web._native_split_helper = original
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["native_combine"])
+        self.assertEqual(result["records"], 6)
+        self.assertEqual(
+            [entry for entry in os.listdir(self.temp.name)
+             if entry.startswith(".organizer")], [])
+
+    def test_native_combine_failure_and_tampering_publish_nothing(self):
+        self.require_native()
+        names = self.three_sources(self.temp.name)
+        before = NativeSplitRegression.published_entries(self.temp.name)
+        real = web.NativeSplitHelper(self.binary)
+        harness = self
+
+        class FailingHelper:
+            def combine(self, plan_path, cancel_check=None, progress=None):
+                raise organizer.PoolError("native combine failed: disk full")
+
+            def summarize(self, path, cancel_check=None):
+                raise AssertionError("not reached")
+
+        class TamperingHelper:
+            def combine(self, plan_path, cancel_check=None, progress=None):
+                staged = harness.staged_output_from_plan(plan_path)
+                text = real.combine(plan_path, cancel_check, progress)
+                with open(staged, "r+b") as handle:
+                    handle.seek(organizer.HEADER_EVENTS_BYTES + 12)
+                    byte = handle.read(1)
+                    handle.seek(organizer.HEADER_EVENTS_BYTES + 12)
+                    handle.write(bytes((byte[0] ^ 0x01,)))
+                return text
+
+            def summarize(self, path, cancel_check=None):
+                return real.summarize(path, cancel_check)
+
+        original = web._native_split_helper
+        try:
+            for helper, pattern in ((FailingHelper(), "disk full"),
+                                    (TamperingHelper(), ".")):
+                web._native_split_helper = lambda helper=helper: helper
+                with self.assertRaisesRegex(organizer.PoolError, pattern):
+                    self.combine_in(self.temp.name, names[:2], "union", "broken")
+                self.assertEqual(
+                    NativeSplitRegression.published_entries(self.temp.name),
+                    before)
+        finally:
+            web._native_split_helper = original
+        self.assertEqual(web.operation_progress("combine")["state"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
