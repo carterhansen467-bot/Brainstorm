@@ -3776,6 +3776,42 @@ class NativeSplitRegression(unittest.TestCase):
             web._native_pool_binary = original_binary
         self.assertEqual(inspection["source"]["records"], 4)
 
+    def test_pool_folder_payload_flags_archives_and_foreign_snapshots(self):
+        name, _snapshot = self.default_source(self.temp.name)
+        with open(os.path.join(self.temp.name, "seed_pools.zip"), "wb") as handle:
+            handle.write(b"PK\x05\x06" + b"\0" * 18)
+        os.makedirs(os.path.join(self.temp.name, "folder.zip"))
+        snapshot = os.path.join(self.temp.name, "native_search.cfg")
+        with open(snapshot, "w", encoding="ascii", newline="\n") as handle:
+            handle.write("session 7\nmodelver 6\ntagdef tag_charm 1\n"
+                         "check_pr 0.5 0.25\nthreads 4\njokerdef j_perkeo 4\n")
+        import brainstorm_pool_builder as core
+        self.assertEqual(web.catalog_hash_file(snapshot),
+                         core.catalog_hash_file(snapshot))
+        original = web.snapshot_catalog_hash
+        try:
+            web.snapshot_catalog_hash = lambda mod_dir=None: "aaaaaaaaaaaaaaaa"
+            payload = web.pools_payload(self.temp.name)
+            self.assertEqual(payload["archives"], ["seed_pools.zip"])
+            self.assertEqual(payload["snapshot_catalog_hash"], "aaaaaaaaaaaaaaaa")
+            self.assertEqual([row["catalog_matches"] for row in payload["pools"]],
+                             [True])
+            web.snapshot_catalog_hash = lambda mod_dir=None: "bbbbbbbbbbbbbbbb"
+            payload = web.pools_payload(self.temp.name)
+            self.assertEqual([row["catalog_matches"] for row in payload["pools"]],
+                             [False])
+            web.snapshot_catalog_hash = lambda mod_dir=None: ""
+            payload = web.pools_payload(self.temp.name)
+            self.assertEqual([row["catalog_matches"] for row in payload["pools"]],
+                             [None])
+        finally:
+            web.snapshot_catalog_hash = original
+        self.assertEqual(web.snapshot_catalog_hash(self.temp.name),
+                         core.catalog_hash_file(snapshot))
+        self.assertEqual(web.snapshot_catalog_hash(os.path.join(
+            self.temp.name, "nowhere")), "")
+        self.assertEqual([row["name"] for row in payload["pools"]], [name])
+
     def test_embedded_page_scripts_parse(self):
         node = shutil.which("node")
         if not node:

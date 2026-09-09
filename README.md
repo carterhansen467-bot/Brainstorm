@@ -699,11 +699,21 @@ silently introducing short, `O`, or `0` seeds that the game would not naturally
 deal.
 
 **Sharing pools:** send someone the single `.bspool` file; they drop it into
-their own `Mods/Brainstorm/seed_pools/` folder. The header carries the model
-version, the criteria that built it, and a fingerprint of the unlock/pool
-snapshot it was scanned against. The recipient must have the same model and
-ordered profile/unlock snapshot; otherwise the helper refuses the pool and asks
-for a rebuild. A warning is not sufficient here because booster bans, tag pool
+their own `Mods/Brainstorm/seed_pools/` folder. If it travels as a `.zip` or
+other archive, extract the `.bspool` (and any sidecar files packed next to it)
+into that folder first: Brainstorm, the Builder, and the Organizer read only
+`.bspool` files, and both apps now point out archives left in the folder. The
+header carries the model version, the criteria that built it, and a fingerprint
+of the unlock/pool snapshot it was scanned against. The recipient must have the
+same model and ordered profile/unlock snapshot; otherwise the helper refuses the
+pool and asks for a rebuild. That fingerprint covers the unlocked tags, Jokers,
+vouchers, and boosters, any vouchers owned when the snapshot was taken, and the
+runtime random-seeding parity checks, so two players match only when all of
+those agree (a snapshot taken at the start of a run, with identical unlocks, on
+platforms whose LuaJIT seeds its generator the same way). The Organizer lists
+such pools as "other profile snapshot" and explains the mismatch; they can
+still be inspected, split, or combined there, but every derived pool keeps the
+same fingerprint. A warning is not sufficient here because booster bans, tag pool
 order, and legendary availability can change the pool's guarantees.
 
 Pool criteria and current in-game filters are evaluated on one cumulative

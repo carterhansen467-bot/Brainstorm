@@ -981,6 +981,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <div><strong>Select parts from the pool library</strong><span id="mergeSelectionNames">No parts selected yet.</span></div>
       <span class="merge-count" id="mergeSelectionCount">0 parts selected</span>
     </div>
+    <p class="hint" id="poolArchiveNotice" hidden></p>
     <div id="pools" class="pool-grid"><div class="empty-library">No seed pools yet.</div></div>
   </section>
 </main>
@@ -1667,6 +1668,8 @@ async function tick(){
   lastRunning = running;
   lastJobKind = job.kind || "";
   latestPoolGroups = j.pool_groups || [];
+  {const notice = $("poolArchiveNotice"), archives = j.pool_archives || [];
+   if (notice){ if (archives.length){ notice.hidden = false; notice.textContent = `Compressed archive${archives.length === 1 ? "" : "s"} in seed_pools cannot be used directly (${archives.join(", ")}): extract the .bspool file inside, with any sidecar files next to it, into this same folder. Brainstorm and these apps read only .bspool files.`; } else { notice.hidden = true; notice.textContent = ""; } }}
   latestPools = j.pools || [];
   const eligibleNames = new Set(
     latestPools.filter(mergeEligible).map(pool=>pool.name));
@@ -1778,6 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "vouchers": vouchers, "cpus": os.cpu_count() or 8},
                     "pools": pools,
                     "pool_groups": pool_groups,
+                    "pool_archives": organizer_web.list_archives(self.pool_dir),
                     "job": job_state(),
                 })
             elif parsed.path == "/organizer/api/pools":

@@ -676,10 +676,70 @@ def _verify_upgrade_record_equivalence(
     return digest
 
 
+# A shared pool usually arrives as a download. Archives dropped straight into
+# seed_pools are invisible to every reader, which looked like "the pool does
+# not work"; name them so the page can say what to do.
+ARCHIVE_SUFFIXES = (
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".zst")
+# Mirrors brainstorm_pool_builder.catalog_hash_file and the native helper's
+# pool_hash_catalog_file: the profile/unlock catalog plus the runtime parity
+# checks, hashed with FNV-1a over each token and a NUL, then a newline.
+CATALOG_DIRECTIVES = frozenset((
+    "modelver", "tagdef", "vouchdef", "vouchroute", "vouchowned",
+    "jokerdef", "boostdef", "specialdef"))
+SNAPSHOT_NAME = "native_search.cfg"
+
+
+def catalog_hash_file(path):
+    value = 1469598103934665603
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            tokens = line.split()
+            if not tokens or (tokens[0] not in CATALOG_DIRECTIVES
+                              and not tokens[0].startswith("check_")):
+                continue
+            for token in tokens:
+                for byte in token.encode("utf-8") + b"\0":
+                    value ^= byte
+                    value = (value * 1099511628211) & 0xffffffffffffffff
+            value ^= ord("\n")
+            value = (value * 1099511628211) & 0xffffffffffffffff
+    return "%016x" % value
+
+
+def snapshot_catalog_hash(mod_dir=None):
+    """This computer's current profile fingerprint, or "" without a snapshot."""
+    path = os.path.join(mod_dir or MOD_DIR, SNAPSHOT_NAME)
+    try:
+        return catalog_hash_file(path)
+    except OSError:
+        return ""
+
+
+def list_archives(pool_dir=None):
+    root = _pool_root(pool_dir)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(
+        name for name in names
+        if name.lower().endswith(ARCHIVE_SUFFIXES)
+        and os.path.isfile(os.path.join(root, name)))
+
+
 def pools_payload(pool_dir=None):
     """The /api/pools document shared by the standalone and unified apps."""
+    pools = list_sources(pool_dir)
+    snapshot = snapshot_catalog_hash()
+    for row in pools:
+        recorded = str(row.get("catalog_hash") or "").lower()
+        row["catalog_matches"] = (
+            (recorded == snapshot) if snapshot and recorded else None)
     return {
-        "pools": list_sources(pool_dir),
+        "pools": pools,
+        "archives": list_archives(pool_dir),
+        "snapshot_catalog_hash": snapshot,
         "native_summary": bool(_native_pool_binary()),
         "native_split": bool(_native_pool_binary()),
         "native_summary_min_bytes": NATIVE_SUMMARY_MIN_BYTES,
@@ -3583,6 +3643,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool to see what it contains. Inspection is read-only.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
  <div class="notice warning" id="nativeHelperWarning" hidden></div>
+ <div class="notice warning" id="poolFolderNotice" hidden></div>
  <div class="row"><button class="go" id="inspectBtn" disabled>Loading pools…</button><button class="ghost" id="refreshBtn">Refresh list</button></div>
  <div class="workstatus" id="inspectionStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="inspectionTitle">Inspecting pool…</b><span id="inspectionDetail">Reading the committed snapshot.</span></div></div>
  <div id="sourceInfo" hidden>
@@ -3720,6 +3781,13 @@ function combineState(kind,title,detail){const box=$("combineStatus");box.hidden
 function describeCombineProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return `Starting · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Reading input seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
 function describeScanProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return "";const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Scanning seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}. The source pool is not being changed.`}
 function describeSplitProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0,mode=p.native?"native helper":"Python copy (slow path)";if(p.phase==="verifying")return `Verifying the new files (${mode}) · ${fmtDuration(p.elapsed_seconds)} elapsed.`;if(!total||!done)return `Starting the ${mode} · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Copying seeds with the ${mode}: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
+function renderPoolFolderNotice(v){
+ const box=$("poolFolderNotice");if(!box)return;const parts=[];const archives=v.archives||[];
+ if(archives.length)parts.push(`<strong>Compressed archive${archives.length===1?"":"s"} in the seed_pools folder cannot be used directly</strong>${archives.map(esc).join(", ")} — extract the <code>.bspool</code> file inside (together with any sidecar files next to it) into this same folder, then click Refresh list. Brainstorm, the Seed Pool Builder, and this page read only <code>.bspool</code> files.`);
+ const foreign=(v.pools||[]).filter(p=>!p.error&&p.catalog_matches===false);
+ if(foreign.length)parts.push(`<strong>${fmt(foreign.length)} pool${foreign.length===1?" was":"s were"} built for a different profile snapshot</strong>${foreign.map(p=>esc(p.name)).join(", ")} — the unlock catalog or random-number parity recorded in the file does not match this computer's <code>native_search.cfg</code>. You can still inspect, split, or combine such a pool here, but every new pool keeps the same fingerprint and the in-game search refuses them with "profile/unlock snapshot differs". Shared pools work only between players whose snapshots match exactly: the same unlocked tags, Jokers, vouchers, and boosters, no vouchers owned when the snapshot was taken, and the same platform random-seeding behavior. Otherwise rebuild the pool with this computer's snapshot.`);
+ if(!parts.length){box.hidden=true;box.innerHTML="";return}
+ box.hidden=false;box.innerHTML=parts.join("<br><br>")}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
@@ -3813,8 +3881,8 @@ async function loadPools(preserve=false){
  const inspectButton=$("inspectBtn"),formatButton=$("formatCheckBtn");inspectButton.disabled=true;inspectButton.textContent="Loading pools…";formatButton.disabled=true;formatButton.textContent="Loading pools…";
  try{
   const v=await api("/api/pools");workflowState.setPools(v.pools||[]);
-  renderNativeHelperWarning(v);
-  $("source").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"} · ${p.coverage_complete?"complete":"provisional"} coverage`}</option>`).join(""):'<option value="">No .bspool files found</option>';
+  renderNativeHelperWarning(v);renderPoolFolderNotice(v);
+  $("source").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"} · ${p.coverage_complete?"complete":"provisional"} coverage${p.catalog_matches===false?" · other profile snapshot":""}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   $("formatSource").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · BSP${p.schema} · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
   if([...$("formatSource").options].some(o=>o.value===priorFormat))$("formatSource").value=priorFormat;
