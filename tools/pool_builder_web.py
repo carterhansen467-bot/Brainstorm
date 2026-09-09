@@ -1781,13 +1781,17 @@ class Handler(BaseHTTPRequestHandler):
                     "job": job_state(),
                 })
             elif parsed.path == "/organizer/api/pools":
-                self._json({"pools": organizer_web.list_sources(self.pool_dir)})
+                self._json(organizer_web.pools_payload(self.pool_dir))
             elif parsed.path == "/organizer/api/export":
                 self._organizer_export(parsed)
             elif parsed.path == "/organizer/api/export/status":
                 query = organizer_web.parse_qs(parsed.query)
                 self._json(organizer_web.record_export_status(
                     query.get("request_id", [""])[0]))
+            elif parsed.path == "/organizer/api/progress":
+                query = organizer_web.parse_qs(parsed.query)
+                self._json(organizer_web.operation_progress(
+                    query.get("operation", [""])[0]))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError,
@@ -1917,6 +1921,8 @@ def main():
     Handler.snap = core.Snapshot(core.SNAPSHOT)
     JOBS.reopen()
     organizer_web.allow_active_operations()
+    for entry in organizer_web.sweep_stale_stage_dirs(core.POOL_DIR):
+        print("Removed abandoned organizer staging folder %s" % entry)
     port = DEFAULT_PORT
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

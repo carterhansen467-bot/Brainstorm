@@ -597,6 +597,25 @@ and cancellation roll it back, but terminating the process or operating system
 during the final link sequence can leave a partial set that must be removed or
 completed manually.
 
+Creating the new files streams through the native seed-pool helper
+(`brainstorm_seed_pool split`) whenever it is installed. The helper reads the
+source once, verifies every block exactly as `summarize` does, applies the same
+reviewed distribution rules as the Python organizer, and writes canonical BSP4
+blocks with identical codec choices and digests, so both paths produce
+byte-identical pools. The organizer then fills in each header itself, re-reads
+every staged file, and asks the helper to summarize each one so record counts,
+digests, and category membership are proven before anything is published. A
+355-million-seed source that took about half an hour to copy in Python finishes
+in well under a minute this way. The page polls live progress (seeds copied,
+percentage, and time remaining) for split and combine work while the request is
+open, so a long copy is never mistaken for a hung request. Without the helper
+the exact Python copy still runs; the preview then states the expected duration
+up front. An outdated helper without a split mode, or a source with a
+historical non-ascending block layout, hands the copy back to Python
+automatically. Abandoned `.organizer-stage-*` folders left by a killed
+Organizer are removed at startup once their writer locks prove nobody owns
+them.
+
 The command-line Organizer retains its historical exclusive behavior. Add
 `--copy-overlaps` to `split` to copy each seed into every selected exact category
 it matches; this flag cannot be combined with `--choices`. Without `--remainder`,

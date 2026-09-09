@@ -51,7 +51,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import (Callable, Dict, Iterable, Iterator, List, NamedTuple,
                     Optional, Sequence, Tuple)
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 try:
     # Keep bounded extended-header discovery identical to the standalone
@@ -4042,13 +4042,19 @@ def write_prepared_split(
         ambiguity_rules: Optional[Dict[str, str]] = None,
         group_by_filter: Optional[str] = None,
         assignment_mode: str = split_policy.MODE_EXCLUSIVE,
-        reviewed_plan: Optional[split_policy.ReviewedSplitPlan] = None
+        reviewed_plan: Optional[split_policy.ReviewedSplitPlan] = None,
+        native_split=None,
+        progress: Optional[Callable[[int, int], None]] = None
         ) -> Tuple[Dict[str, object], bool]:
     """Publish one already validated, snapshot-pinned split plan.
 
     ``category_rows`` supplies identities, labels, and exact output counts only.
     Output paths are always derived locally from those identities; caller-owned
     ``path`` or ``name`` fields are deliberately ignored.
+
+    ``native_split`` optionally streams the copy through the native helper
+    (see _write_split_outputs_native); ``progress`` receives
+    ``(records_done, records_total)`` while records are being copied.
     """
     _check_cancel(cancel_check)
     assignment_mode = split_policy.normalize_mode(assignment_mode)
@@ -4278,18 +4284,29 @@ def write_prepared_split(
                 raise PoolError("output already exists: %s" % destination)
         return _write_split_outputs(
             reader, reviewed_plan, destinations, labels, report, report_path,
-            cancel_check)
+            cancel_check, native_split=native_split, progress=progress)
 
 
 def _write_split_outputs(reader: BSPoolReader,
                          reviewed_plan: split_policy.ReviewedSplitPlan,
                          destinations: Dict[str, str], labels: Dict[str, str],
                          report: Dict[str, object], report_path: str,
-                         cancel_check: Optional[Callable[[], bool]] = None):
+                         cancel_check: Optional[Callable[[], bool]] = None,
+                         native_split=None,
+                         progress: Optional[Callable[[int, int], None]] = None):
     """Write and publish split outputs while the caller holds every lock."""
     _check_cancel(cancel_check)
+    if native_split is not None and not reader._repaired_bsp3_headers:
+        # A reconstructed BSP3 header prefix exists only in Python memory;
+        # the byte-strict helper must not reopen that damaged file.
+        try:
+            return _write_split_outputs_native(
+                reader, reviewed_plan, destinations, labels, report,
+                report_path, cancel_check, native_split, progress)
+        except NativeSplitUnsupported:
+            # The exact Python traversal below handles every layout.
+            pass
     writers = {}  # type: Dict[str, BSP4OutputWriter]
-    linked = []  # type: List[str]
     spec = reviewed_plan.spec
     choices = dict(spec.choices)
     rules = dict(spec.ambiguity_rules)
@@ -4325,6 +4342,8 @@ def _write_split_outputs(reader: BSPoolReader,
             processed += 1
             if processed % CANCEL_CHECK_RECORDS == 0:
                 _check_cancel(cancel_check)
+                if progress is not None:
+                    progress(processed, reader.records)
             if not distribution.destinations:
                 continue
             unique_copied_records += 1
@@ -4376,6 +4395,10 @@ def _write_split_outputs(reader: BSPoolReader,
         report["overlap_records"] = overlap_records
         report["unique_copied_records"] = unique_copied_records
         report["output_memberships"] = output_memberships
+        report["outputs"] = outputs
+        report["native_split"] = False
+        if progress is not None:
+            progress(processed, reader.records)
         # Hard-linking is a no-overwrite atomic publish on the same filesystem.
         # All files are finalized and fsynced before any becomes visible.
         _check_cancel(cancel_check)
@@ -4384,18 +4407,507 @@ def _write_split_outputs(reader: BSPoolReader,
             writer = writers[category]
             _check_cancel(cancel_check)
             publications.append((writer.temp_path, writer.final_path))
-        linked.extend(seed_pool_mutations.link_many_no_overwrite(publications))
+        return _publish_split_outputs(
+            publications, report, report_path, cancel_check)
+    except BaseException:
         for writer in writers.values():
-            seed_pool_mutations.remove(writer.temp_path, missing_ok=True)
-        report["outputs"] = outputs
+            writer.abort()
+        raise
+
+
+
+def seed_to_rank(seed: str, charset: str) -> int:
+    """Invert rank_to_seed(); raise PoolError for text outside the space."""
+    if not isinstance(seed, str) or not seed:
+        raise PoolError("seed text is empty")
+    if charset == NATURAL_CHARSET:
+        base = 34
+        if len(seed) != 8:
+            raise PoolError("natural seeds are exactly 8 characters")
+    elif charset == SETTABLE_CHARSET:
+        base = 35
+    elif charset == TOTAL_CHARSET:
+        base = 36
+    else:
+        raise PoolError("unknown seed charset")
+    if len(seed) > 8:
+        raise PoolError("seeds are at most 8 characters")
+    value = 0
+    weight = 1
+    for ch in seed:
+        digit = charset.find(ch)
+        if digit < 0:
+            raise PoolError("seed %r uses a character outside its space" % seed)
+        value += digit * weight
+        weight *= base
+    if charset == NATURAL_CHARSET:
+        return value
+    # Shorter seeds occupy the leading blocks of the variable-length space.
+    offset = 0
+    block = base
+    for _ in range(1, len(seed)):
+        offset += block
+        block *= base
+    return offset + value
+
+
+_PHASE_BY_NAME = {name: code for code, name in PHASE_NAMES.items()}
+_SOURCE_BY_NAME = {name: code for code, name in SOURCE_NAMES.items()}
+_KIND_BY_NAME = {name: code for code, name in KIND_NAMES.items()}
+_FLAG_BY_NAME = {name: bit for bit, name in FLAG_NAMES}
+
+
+def _numeric_text(value: str, prefix: str, names: Dict[str, int]) -> int:
+    if value in names:
+        return names[value]
+    match = re.fullmatch(re.escape(prefix) + r"([0-9]{1,3})", value)
+    if not match or int(match.group(1)) > 255:
+        raise PoolError("category id has an invalid %s field" % prefix.rstrip("-"))
+    return int(match.group(1))
+
+
+def _flags_from_text(value: str) -> int:
+    if value == "none":
+        return 0
+    flags = 0
+    for name in value.split("+"):
+        if name in _FLAG_BY_NAME:
+            flags |= _FLAG_BY_NAME[name]
+        elif re.fullmatch(r"0x[0-9a-f]{2}", name):
+            flags |= int(name, 16)
+        else:
+            raise PoolError("category id has an invalid flag field")
+    return flags
+
+
+def location_id_parts(location_id: str) -> Tuple[int, bytes, int, int]:
+    """Return (kind, key bytes, ante, phase) for one exact location id."""
+    parts = location_id.split(":") if isinstance(location_id, str) else []
+    if len(parts) != 4 or parts[0] not in _KIND_BY_NAME \
+            or not re.fullmatch(r"A[0-9]{1,3}", parts[2]):
+        raise PoolError("location id is malformed: %s" % location_id)
+    key = unquote(parts[1]).encode("ascii", "strict") if parts[1] else b""
+    if not key or len(key) > 255 or any(b < 33 or b > 126 for b in key):
+        raise PoolError("location id has an invalid key: %s" % location_id)
+    ante = int(parts[2][1:])
+    if not 1 <= ante <= 255:
+        raise PoolError("location id has an invalid Ante: %s" % location_id)
+    phase = _numeric_text(parts[3], "phase-", _PHASE_BY_NAME)
+    return _KIND_BY_NAME[parts[0]], key, ante, phase
+
+
+def category_id_to_descriptor(category_id: str) -> bytes:
+    """Re-encode the exact raw descriptor named by one known category id.
+
+    Occurrence.category_id is a bijection over known descriptors, so the
+    result is checked by decoding it again.
+    """
+    parts = category_id.split(":") if isinstance(category_id, str) else []
+    if len(parts) != 7 or not re.fullmatch(r"o[0-9]{1,3}", parts[5]):
+        raise PoolError("category id is malformed: %s" % category_id)
+    kind, key, ante, phase = location_id_parts(":".join(parts[:4]))
+    source = _numeric_text(parts[4], "source-", _SOURCE_BY_NAME)
+    ordinal = int(parts[5][1:])
+    flags = _flags_from_text(parts[6])
+    if source > 255 or ordinal > 255:
+        raise PoolError("category id has an out-of-range field: %s" % category_id)
+    raw = bytes((kind, len(key))) + key + bytes((ante, phase, source, ordinal, flags))
+    if Occurrence.decode(raw).category_id != category_id:
+        raise PoolError("category id does not round-trip: %s" % category_id)
+    return raw
+
+
+class NativeSplitUnsupported(PoolError):
+    """The native helper declined this source; use the exact Python path."""
+
+
+NATIVE_SPLIT_PLAN_SCHEMA = 1
+NATIVE_SPLIT_RESULT_SCHEMA = 1
+# Helper exit status meaning "this source needs the exact Python path".
+NATIVE_SPLIT_EXIT_UNSUPPORTED = 4
+
+
+def _native_plan_path_bytes(path: str) -> bytes:
+    """Encode one staged path the way the helper's C runtime will open it."""
+    if os.name == "nt":
+        try:
+            return path.encode("mbcs", "strict")
+        except (UnicodeEncodeError, LookupError):
+            raise NativeSplitUnsupported(
+                "staged output path is not representable for the native helper")
+    encoded = os.fsencode(path)
+    if b"\n" in encoded or b"\r" in encoded:
+        raise NativeSplitUnsupported("staged output path contains a line break")
+    return encoded
+
+
+def build_native_split_plan(reader: BSPoolReader, spec: split_policy.SplitSpec,
+                            categories: Sequence[str],
+                            staged_paths: Dict[str, str]
+                            ) -> Tuple[bytes, Dict[int, List[str]]]:
+    """Serialize one reviewed SplitSpec for the native helper's split mode.
+
+    ``categories`` lists every output the helper must own, in index order:
+    each selected category, plus the remainder when one is configured.
+    Returns the document and a rank -> original choice keys map so an unused
+    native choice can be reported with the reviewer's own key text.
+    """
+    if not categories or len(categories) != len(set(categories)) \
+            or len(categories) > 256:
+        raise PoolError("native split plan needs 1-256 distinct outputs")
+    index = {category: number for number, category in enumerate(categories)}
+    lines = [
+        b"BRAINSTORM_SPLIT_PLAN %d" % NATIVE_SPLIT_PLAN_SCHEMA,
+        b"mode %s" % spec.assignment_mode.encode("ascii"),
+        b"header_bytes %d" % reader.header_bytes,
+    ]
+    for number, category in enumerate(categories):
+        if not category or any(ch.isspace() or ord(ch) < 33 or ord(ch) > 126
+                               for ch in category):
+            raise PoolError("native split plan category id is unsafe")
+        lines.append(b"output %d %s %s" % (
+            number, category.encode("ascii"),
+            _native_plan_path_bytes(staged_paths[category])))
+    if spec.remainder_id:
+        if spec.remainder_id not in index:
+            raise PoolError("native split plan is missing its remainder output")
+        lines.append(b"remainder %d" % index[spec.remainder_id])
+    for category in spec.selected_categories:
+        if category not in index:
+            raise PoolError("native split plan is missing a selected output")
+        if spec.group_by_filter:
+            kind, key, ante, phase = location_id_parts(category)
+            lines.append(b"location %d %s %d %d %d" % (
+                kind, key.hex().encode("ascii"), ante, phase, index[category]))
+        else:
+            lines.append(b"descriptor %s %d" % (
+                category_id_to_descriptor(category).hex().encode("ascii"),
+                index[category]))
+    rank_keys = {}  # type: Dict[int, List[str]]
+    rank_choices = {}  # type: Dict[int, str]
+    for key, category in spec.choices:
+        if category not in index:
+            raise PoolError("native split plan choice names an unselected output")
+        if key.startswith("rank:"):
+            try:
+                rank = int(key[5:])
+            except ValueError:
+                raise PoolError("choice rank is not an integer: %s" % key)
+            if rank < 0 or rank >= reader.range_end:
+                raise PoolError(
+                    "prepared split contains a seed/rank choice not used by "
+                    "this split: %s" % key)
+        else:
+            try:
+                rank = seed_to_rank(key, reader.charset)
+            except PoolError:
+                raise PoolError(
+                    "prepared split contains a seed/rank choice not used by "
+                    "this split: %s" % key)
+        prior = rank_choices.get(rank)
+        if prior is not None and prior != category:
+            raise PoolError("choices disagree for seed %s / rank %d" % (
+                reader.seed(rank), rank))
+        rank_choices[rank] = category
+        rank_keys.setdefault(rank, []).append(key)
+    for rank in sorted(rank_choices):
+        lines.append(b"choice %d %d" % (rank, index[rank_choices[rank]]))
+    for key, category in spec.ambiguity_rules:
+        if category not in index or not re.fullmatch(r"[0-9a-f]{16}", key):
+            raise PoolError("native split plan ambiguity rule is invalid")
+        lines.append(b"rule %s %d" % (key.encode("ascii"), index[category]))
+    lines.append(b"end")
+    return b"\n".join(lines) + b"\n", rank_keys
+
+
+def parse_native_split_result(text: str) -> Dict[str, object]:
+    lines = text.splitlines()
+    if (not lines or lines[0] != "BRAINSTORM_SPLIT_RESULT %d"
+            % NATIVE_SPLIT_RESULT_SCHEMA or lines[-1] != "end"):
+        raise PoolError("native split returned an invalid result document")
+    integer_fields = {
+        "source_records", "unmatched", "overlap", "unique_copied",
+        "output_memberships", "used_choices", "used_rules", "unused_choice",
+    }
+    hex_fields = {
+        "source_membership_digest", "source_metadata_digest", "unused_rule",
+    }
+    values = {}  # type: Dict[str, object]
+    outputs = {}  # type: Dict[int, Dict[str, int]]
+    for line in lines[1:-1]:
+        parts = line.split()
+        if not parts:
+            continue
+        key = parts[0]
+        if key in integer_fields:
+            if (len(parts) != 2 or key in values
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[1])):
+                raise PoolError("native split result malforms %s" % key)
+            values[key] = int(parts[1])
+        elif key in hex_fields:
+            if (len(parts) != 2 or key in values
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[1])):
+                raise PoolError("native split result malforms %s" % key)
+            values[key] = parts[1]
+        elif key == "output":
+            if (len(parts) != 6
+                    or not re.fullmatch(r"[0-9]{1,3}", parts[1])
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[2])
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[3])
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[4])
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[5])
+                    or int(parts[1]) in outputs):
+                raise PoolError("native split result has a malformed output")
+            outputs[int(parts[1])] = {
+                "records": int(parts[2]),
+                "data_bytes": int(parts[3]),
+                "membership_digest": int(parts[4], 16),
+                "metadata_digest": int(parts[5], 16),
+            }
+        else:
+            raise PoolError("native split result has an unknown field")
+    required = (integer_fields | hex_fields) - {"unused_choice", "unused_rule"}
+    if not required.issubset(values) or not outputs \
+            or sorted(outputs) != list(range(len(outputs))):
+        raise PoolError("native split result is incomplete")
+    values["outputs"] = outputs
+    return values
+
+
+def _publish_split_outputs(publications: Sequence[Tuple[str, str]],
+                           report: Dict[str, object], report_path: str,
+                           cancel_check: Optional[Callable[[], bool]]
+                           ) -> Tuple[Dict[str, object], bool]:
+    """Hard-link every finalized stage file, then commit the report.
+
+    Publication is a no-overwrite atomic link on one filesystem, taken only
+    after every file is finalized and fsynced. A later failure removes only
+    the links made here.
+    """
+    _check_cancel(cancel_check)
+    linked = []  # type: List[str]
+    try:
+        linked.extend(seed_pool_mutations.link_many_no_overwrite(publications))
+        for staged_path, _final_path in publications:
+            try:
+                seed_pool_mutations.remove(staged_path, missing_ok=True)
+            except OSError:
+                # The link is already the complete publication. A stage name
+                # that Windows antivirus still holds open is private debris
+                # that the caller's staging cleanup retries; it must not
+                # roll back finished pools.
+                pass
         _check_cancel(cancel_check)
         atomic_json(report_path, report)
-        return report, True
     except BaseException:
         for path in linked:
             seed_pool_mutations.remove(path, missing_ok=True)
-        for writer in writers.values():
-            writer.abort()
+        for staged_path, _final_path in publications:
+            seed_pool_mutations.remove(staged_path, missing_ok=True)
+        raise
+    return report, True
+
+
+def _write_split_outputs_native(
+        reader: BSPoolReader, reviewed_plan: split_policy.ReviewedSplitPlan,
+        destinations: Dict[str, str], labels: Dict[str, str],
+        report: Dict[str, object], report_path: str,
+        cancel_check: Optional[Callable[[], bool]], helper,
+        progress: Optional[Callable[[int, int], None]]):
+    """Stream the split through the native helper, then verify every file.
+
+    The helper only writes record blocks. Python still owns the plan, builds
+    each header exactly as its own writer would, re-reads every staged file,
+    and asks the helper to summarize each one so record counts, digests, and
+    category membership are proven before anything is published.
+    """
+    spec = reviewed_plan.spec
+    output_dir = os.path.dirname(next(iter(destinations.values())))
+    categories = sorted(set(destinations) | set(spec.selected_categories)
+                        | ({spec.remainder_id} if spec.remainder_id else set()))
+    staged = {
+        category: os.path.join(output_dir, ".organizer-native-%d.tmp" % number)
+        for number, category in enumerate(categories)
+    }
+    plan_bytes, rank_keys = build_native_split_plan(
+        reader, spec, categories, staged)
+    plan_path = os.path.join(output_dir, ".organizer-native-plan.txt")
+    expected_counts = reviewed_plan.destinations()
+
+    def discard_stage():
+        for path in list(staged.values()) + [plan_path]:
+            try:
+                seed_pool_mutations.remove(path, missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        with open(plan_path, "wb") as handle:
+            handle.write(plan_bytes)
+        _check_cancel(cancel_check)
+        try:
+            result = parse_native_split_result(helper.split(
+                reader.path, plan_path, cancel_check=cancel_check,
+                progress=progress))
+        except NativeSplitUnsupported:
+            discard_stage()
+            raise
+        _check_cancel(cancel_check)
+        if result["source_records"] != reader.records:
+            raise PoolError(
+                "native split record count differs from the pool header")
+        reader.accept_native_verification(
+            int(result["source_membership_digest"], 16),
+            int(result["source_metadata_digest"], 16))
+        if "unused_choice" in result:
+            keys = rank_keys.get(result["unused_choice"], [])
+            raise PoolError(
+                "prepared split contains a seed/rank choice not used by this "
+                "split: %s" % (sorted(keys)[0] if keys else
+                               "rank:%d" % result["unused_choice"]))
+        if "unused_rule" in result:
+            raise PoolError(
+                "prepared split contains an ambiguity rule not used by this "
+                "split: %s" % result["unused_rule"])
+        if (result["used_choices"] != len(rank_keys)
+                or result["used_rules"] != len(spec.ambiguity_rules)):
+            raise PoolError("native split decision accounting differs from its plan")
+        outputs_by_index = result["outputs"]
+        if len(outputs_by_index) != len(categories):
+            raise PoolError("native split output count differs from its plan")
+        actual_counts = {}
+        for number, category in enumerate(categories):
+            records = outputs_by_index[number]["records"]
+            if category not in destinations:
+                if records:
+                    raise PoolError(
+                        "prepared split produced an unplanned output category")
+                continue
+            actual_counts[category] = records
+        if actual_counts != expected_counts:
+            raise PoolError("prepared split output counts do not match its plan")
+        actual_statistics = (
+            result["unmatched"], result["overlap"], result["unique_copied"],
+            result["output_memberships"])
+        reviewed_statistics = (
+            reviewed_plan.unmatched_records, reviewed_plan.overlap_records,
+            reviewed_plan.unique_copied_records,
+            reviewed_plan.output_memberships)
+        if actual_statistics != reviewed_statistics:
+            raise PoolError("prepared split statistics do not match its plan")
+
+        selected_raws = {}
+        selected_locations = {}
+        for category in spec.selected_categories:
+            if spec.group_by_filter:
+                selected_locations[category] = location_id_parts(category)
+            else:
+                selected_raws[category] = category_id_to_descriptor(category)
+        outputs = []
+        publications = []
+        for number, category in enumerate(categories):
+            _check_cancel(cancel_check)
+            path = staged[category]
+            if category not in destinations:
+                seed_pool_mutations.remove(path, missing_ok=True)
+                continue
+            native = outputs_by_index[number]
+            records = native["records"]
+            header, identity = build_output_header(
+                reader, category, labels[category], records,
+                native["data_bytes"], native["membership_digest"],
+                native["metadata_digest"], schema=4)
+            if len(header) != reader.header_bytes:
+                raise PoolError(
+                    "organizer output header builder returned the wrong size")
+            with open(path, "r+b") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() < reader.header_bytes + native["data_bytes"]:
+                    raise PoolError("native split output is shorter than reported")
+                handle.seek(0)
+                if handle.read(reader.header_bytes) != b"\0" * reader.header_bytes:
+                    raise PoolError("native split output header area is not blank")
+                handle.seek(0)
+                handle.write(header)
+                handle.flush()
+                os.fsync(handle.fileno())
+            staged_reader = BSPoolReader(path, verify_payloads=False)
+            if (staged_reader.schema != 4 or not staged_reader.complete
+                    or staged_reader.records != records
+                    or staged_reader.data_bytes != native["data_bytes"]
+                    or staged_reader.membership_digest
+                        != native["membership_digest"]
+                    or staged_reader.metadata_digest
+                        != native["metadata_digest"]
+                    or staged_reader.header_bytes != reader.header_bytes
+                    or staged_reader.snapshot_token != identity["snapshot_id"]):
+                raise PoolError(
+                    "native split output does not match its reported identity")
+            summary = helper.summarize(path, cancel_check=cancel_check)
+            if summary is None:
+                raise PoolError("native split output could not be summarized")
+            if (summary["records"] != records
+                    or int(summary["membership_digest"], 16)
+                        != native["membership_digest"]
+                    or int(summary["metadata_digest"], 16)
+                        != native["metadata_digest"]):
+                raise PoolError(
+                    "native split output summary differs from its reported digests")
+            category_counts = {}
+            for raw, count in summary["categories"]:
+                category_counts[raw] = category_counts.get(raw, 0) + count
+            location_counts = {}
+            for kind, key, ante, phase, count in summary["locations"]:
+                location_counts[(kind, key, ante, phase)] = \
+                    location_counts.get((kind, key, ante, phase), 0) + count
+            if category == spec.remainder_id:
+                stray = (
+                    any(category_counts.get(raw, 0)
+                        for raw in selected_raws.values())
+                    or any(location_counts.get(location, 0)
+                           for location in selected_locations.values()))
+                if stray:
+                    raise PoolError(
+                        "native split remainder contains a selected seed")
+            elif spec.group_by_filter:
+                if location_counts.get(
+                        selected_locations[category], 0) != records:
+                    raise PoolError(
+                        "native split output %s does not contain only its "
+                        "location" % category)
+            elif category_counts.get(selected_raws[category], 0) != records:
+                raise PoolError(
+                    "native split output %s does not contain only its "
+                    "category" % category)
+            if reader.is_composite and (
+                    summary["records_without_provenance"]
+                    or summary["records_without_operands"]):
+                raise PoolError(
+                    "native split output lost composite provenance")
+            identity.update({
+                "path": destinations[category],
+                "records": records,
+                "category_id": category,
+            })
+            outputs.append(identity)
+            publications.append((path, destinations[category]))
+        try:
+            seed_pool_mutations.remove(plan_path, missing_ok=True)
+        except OSError:
+            pass
+        report["assignment_mode"] = spec.assignment_mode
+        report["unmatched_count"] = result["unmatched"]
+        report["overlap_records"] = result["overlap"]
+        report["unique_copied_records"] = result["unique_copied"]
+        report["output_memberships"] = result["output_memberships"]
+        report["outputs"] = outputs
+        report["native_split"] = True
+        return _publish_split_outputs(
+            publications, report, report_path, cancel_check)
+    except NativeSplitUnsupported:
+        raise
+    except BaseException:
+        discard_stage()
         raise
 
 

@@ -9,6 +9,9 @@ import re
 import sys
 import tempfile
 import threading
+import shutil
+import subprocess
+import time
 import unittest
 from unittest import mock
 from http.server import ThreadingHTTPServer
@@ -23,6 +26,7 @@ if TOOLS not in sys.path:
 
 import brainstorm_pool_organizer as organizer
 import pool_organizer_web as web
+import pool_split_policy as split_policy
 import pool_builder_web as builder_web
 from pool_record_export_web import RecordExportWebRegression
 
@@ -3042,6 +3046,734 @@ class OrganizerWebRegression(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+
+class NativeSplitRegression(unittest.TestCase):
+    """The helper's split mode must publish exactly what the Python writer would.
+
+    Every scenario runs the same reviewed request through both paths into two
+    pool folders and compares the published files byte for byte, plus the
+    reports minus their paths. The native path is what production pools use;
+    the Python path remains the exact oracle.
+    """
+
+    def setUp(self):
+        self.clear_caches()
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="brainstorm-native-split-")
+        self.binary = web._native_pool_binary()
+
+    def tearDown(self):
+        self.clear_caches()
+        self.temp.cleanup()
+
+    @staticmethod
+    def clear_caches():
+        with web.READER_CACHE_LOCK:
+            web.READER_CACHE.clear()
+        with web.REVIEWED_SPLIT_CACHE_LOCK:
+            web.REVIEWED_SPLIT_CACHE.clear()
+
+    def require_native(self):
+        if not self.binary:
+            self.skipTest("native pool helper is not built")
+
+    @staticmethod
+    def read_bytes(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    @staticmethod
+    def published_entries(pool_dir):
+        """Directory entries other than persistent advisory lock files."""
+        return sorted(entry for entry in os.listdir(pool_dir)
+                      if not entry.endswith(".writer.lock"))
+
+    # -- fixtures -----------------------------------------------------------
+
+    @staticmethod
+    def default_source(pool_dir):
+        name = "source.bspool"
+        identity = fixture.write_bsp3(
+            os.path.join(pool_dir, name), complete=True)
+        return name, identity["snapshot"]
+
+    @staticmethod
+    def location_source(pool_dir):
+        d = fixture.descriptor
+        name = "filter-location.bspool"
+        identity = fixture.write_custom_bsp3(
+            os.path.join(pool_dir, name), [20, 21, 22, 23], [
+                [d(2, "j_perkeo", 1, 2, 1, 0, 0), d(2, "j_perkeo", 1, 2, 2, 1, 1),
+                 d(1, "tag_negative", 3, 1, 0, 0, 0),
+                 d(3, "v_overstock_norm", 2, 0, 1, 1, 4)],
+                [d(2, "j_perkeo", 1, 2, 1, 0, 0), d(1, "tag_negative", 4, 2, 0, 0, 0)],
+                [d(2, "j_perkeo", 2, 1, 1, 0, 0), d(1, "tag_negative", 3, 1, 0, 0, 0),
+                 bytes((9, 2, 0xAA, 0xBB))],
+                [d(2, "j_perkeo", 2, 1, 1, 0, 0), d(1, "tag_negative", 4, 2, 0, 0, 0),
+                 d(3, "v_overstock_norm", 2, 0, 1, 1, 4)],
+            ], "13579bdf2468ace0", [
+                "tag_route collect",
+                "tag tag_negative 3 small 4 big 1",
+                "legendary j_perkeo 1 big 2 small 1 shop",
+                "voucher v_overstock_norm 2 2",
+            ])
+        return name, identity["snapshot"]
+
+    def upgraded_source(self, make_source):
+        """Turn a BSP3 fixture into a native BSP4 pool (adaptive codecs)."""
+        def make(pool_dir):
+            name, _snapshot = make_source(pool_dir)
+            source = os.path.join(pool_dir, name)
+            output = os.path.join(pool_dir, name[:-7] + "-BSP4.bspool")
+            subprocess.run(
+                [self.binary, "upgrade", source, output],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            os.unlink(source)
+            manifest = output + ".manifest"
+            if os.path.exists(manifest):
+                os.unlink(manifest)
+            reader = organizer.BSPoolReader(output)
+            self.assertEqual(reader.schema, 4)
+            return os.path.basename(output), reader.snapshot_token
+        return make
+
+    @staticmethod
+    def multiblock_source(pool_dir):
+        """30,000 Python-written BSP4 records: 8 source blocks, 3 locations."""
+        import random
+        d = fixture.descriptor
+        base_name = "base.bspool"
+        fixture.write_custom_bsp3(
+            os.path.join(pool_dir, base_name), [5],
+            [[d(2, "j_perkeo", 1, 2, 1, 0, 0)]], "fedcba9876543210",
+            ["tag_route collect", "legendary j_perkeo 1 big 3 small 1 shop"],
+            range_start=0, range_end=10 ** 7)
+        base = organizer.BSPoolReader(os.path.join(pool_dir, base_name))
+        rnd = random.Random(11)
+        ranks = sorted(rnd.sample(range(0, 10 ** 7), 30000))
+        locations = [(1, 2), (2, 1), (3, 0)]
+        name = "multiblock.bspool"
+        writer = organizer.BSP4OutputWriter(
+            base, "legendary:j_perkeo:A1:big:shop:o0:none",
+            "multiblock source", os.path.join(pool_dir, name))
+        for number, rank in enumerate(ranks):
+            ante, phase = locations[rnd.randrange(3)]
+            raws = [d(2, "j_perkeo", ante, phase, 1 + number % 3, 1,
+                      rnd.randrange(3))]
+            if rnd.random() < 0.2:
+                ante, phase = locations[rnd.randrange(3)]
+                raws.append(d(2, "j_perkeo", ante, phase, 2, 2, 1))
+            raws.append(d(1, "tag_charm", 1, 1, 0, 0, 2))
+            writer.add(organizer.Record(rank, tuple(
+                organizer.Occurrence.decode(raw)
+                for raw in dict.fromkeys(raws))))
+        writer.finalize()
+        os.replace(writer.temp_path, writer.final_path)
+        os.unlink(os.path.join(pool_dir, base_name))
+        reader = organizer.BSPoolReader(os.path.join(pool_dir, name))
+        assert len(reader.blocks) == 8
+        return name, reader.snapshot_token
+
+    # -- requests -----------------------------------------------------------
+
+    @staticmethod
+    def choice_document(reader, snapshot, prefer, by_rank=False):
+        ambiguity = web.build_split_plan(reader)["ambiguous"][0]
+        destination = next(category for category in ambiguity["candidates"]
+                           if category.startswith(prefer))
+        key = "rank:%d" % ambiguity["rank"] if by_rank else ambiguity["seed"]
+        return {"source_snapshot_id": snapshot, "choices": {key: destination}}
+
+    def exclusive_request(self, policy, prefix, by_rank=False,
+                          prefer="legendary:"):
+        def make(reader, snapshot):
+            request = {
+                "snapshot": snapshot,
+                "selectedCategories": None,
+                "choicePlan": self.choice_document(
+                    reader, snapshot, prefer, by_rank),
+                "unmatchedPolicy": policy,
+                "prefix": prefix,
+            }
+            if policy == "remainder":
+                request["remainderName"] = "Needs review"
+            return request
+        return make
+
+    @staticmethod
+    def rule_request(reader, snapshot):
+        ambiguity = web.build_split_plan(reader)["ambiguous"][0]
+        key = organizer.ambiguity_rule_key(ambiguity["candidates"])
+        return {
+            "snapshot": snapshot,
+            "selectedCategories": None,
+            "choicePlan": {"source_snapshot_id": snapshot, "choices": {},
+                           "ambiguity_rules": {
+                               key: sorted(ambiguity["candidates"])[-1]}},
+            "unmatchedPolicy": "omit",
+            "prefix": "rule",
+        }
+
+    @staticmethod
+    def copies_request(reader, snapshot):
+        categories = [row["category_id"]
+                      for row in web.build_split_plan(reader)["categories"]]
+        return {
+            "snapshot": snapshot,
+            "selectedCategories": categories,
+            "assignmentMode": "matching_copies",
+            "unmatchedPolicy": "keep",
+            "prefix": "copies",
+        }
+
+    @staticmethod
+    def location_request(locations, mode="exclusive", policy="stop",
+                         prefix="by-perkeo", rules=None):
+        def make(reader, snapshot):
+            request = {
+                "snapshot": snapshot,
+                "groupByFilter": "legendary:j_perkeo",
+                "selectedCategories": list(locations),
+                "assignmentMode": mode,
+                "choicePlan": {
+                    "source_snapshot_id": snapshot,
+                    "group_by_filter": "legendary:j_perkeo",
+                    "choices": {},
+                    "ambiguity_rules": {},
+                },
+                "unmatchedPolicy": policy,
+                "prefix": prefix,
+            }
+            if rules:
+                plan = web.build_split_plan(
+                    reader, selected_ids=list(locations), publication={
+                        "groupByFilter": "legendary:j_perkeo",
+                        "unmatchedPolicy": policy, "prefix": prefix})
+                self_rules = {
+                    group["rule_key"]: sorted(group["candidates"])[-1]
+                    for group in plan["ambiguity_groups"]}
+                assert self_rules and not plan["ambiguity_groups_truncated"]
+                request["choicePlan"]["ambiguity_rules"] = self_rules
+            return request
+        return make
+
+    # -- machinery ----------------------------------------------------------
+
+    def run_split_in(self, pool_dir, name, request, native):
+        self.clear_caches()
+        original = web._native_pool_binary
+        if not native:
+            web._native_pool_binary = lambda: ""
+        try:
+            plan = web.run_split_plan(dict(request, source=name), pool_dir)
+            self.assertTrue(plan["publication"]["ready"],
+                            plan["publication"]["blockers"])
+            self.assertEqual(plan["publication"]["native_split"], native)
+            self.assertIsInstance(
+                plan["publication"]["python_copy_estimate_seconds"], int)
+            request = dict(
+                request, reviewedPlanToken=plan["publication"]["plan_token"])
+            return web.run_split(name, request, pool_dir)
+        finally:
+            web._native_pool_binary = original
+
+    def split_both_ways(self, make_source, make_request):
+        results = {}
+        contents = {}
+        for native in (True, False):
+            pool_dir = os.path.join(
+                self.temp.name, "native" if native else "python")
+            os.makedirs(pool_dir)
+            name, snapshot = make_source(pool_dir)
+            self.clear_caches()
+            reader = web.verified_source_reader(name, pool_dir)
+            request = make_request(reader, snapshot)
+            result = self.run_split_in(pool_dir, name, request, native)
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["native_split"], native)
+            self.assertEqual(
+                [entry for entry in os.listdir(pool_dir)
+                 if entry.startswith(".organizer")], [])
+            self.assertTrue(os.path.isfile(result["report_path"]))
+            contents[native] = {
+                row["name"]: self.read_bytes(os.path.join(pool_dir, row["name"]))
+                for row in result["outputs"]}
+            for row in result["outputs"]:
+                row.pop("path")
+            results[native] = {
+                key: value for key, value in result.items()
+                if key not in ("report_path", "native_split", "source",
+                               "preflight")}
+        self.assertEqual(results[True], results[False])
+        self.assertEqual(contents[True], contents[False])
+        self.assertTrue(all(contents[True].values()))
+        return results[True], contents[True]
+
+    # -- tests --------------------------------------------------------------
+
+    def test_native_split_matches_python_for_every_policy_and_mode(self):
+        self.require_native()
+        scenarios = [
+            ("exclusive seed choice, keep", self.default_source,
+             self.exclusive_request("keep", "keep")),
+            ("exclusive seed choice, omit", self.default_source,
+             self.exclusive_request("omit", "omit")),
+            ("exclusive rank choice, remainder", self.default_source,
+             self.exclusive_request("remainder", "rank", by_rank=True,
+                                    prefer="tag:")),
+            ("exclusive shared rule, omit", self.default_source,
+             self.rule_request),
+            ("matching copies, keep", self.default_source,
+             self.copies_request),
+            ("locations exclusive", self.location_source,
+             self.location_request(["legendary:j_perkeo:A1:big",
+                                    "legendary:j_perkeo:A2:small"])),
+            ("single location omit", self.location_source,
+             self.location_request(["legendary:j_perkeo:A2:small"],
+                                   policy="omit", prefix="one")),
+            ("BSP4 exclusive seed choice, keep",
+             self.upgraded_source(self.default_source),
+             self.exclusive_request("keep", "bsp4")),
+            ("BSP4 locations exclusive",
+             self.upgraded_source(self.location_source),
+             self.location_request(["legendary:j_perkeo:A1:big",
+                                    "legendary:j_perkeo:A2:small"])),
+            ("multi-block matching copies", self.multiblock_source,
+             self.location_request(
+                 ["legendary:j_perkeo:A1:big", "legendary:j_perkeo:A2:small",
+                  "legendary:j_perkeo:A3:boss"], mode="matching_copies",
+                 policy="omit", prefix="mb-copies")),
+            ("multi-block exclusive rules, keep", self.multiblock_source,
+             self.location_request(
+                 ["legendary:j_perkeo:A1:big", "legendary:j_perkeo:A2:small",
+                  "legendary:j_perkeo:A3:boss"], policy="keep",
+                 prefix="mb-rules", rules=True)),
+        ]
+        for label, make_source, make_request in scenarios:
+            with self.subTest(scenario=label):
+                self.tearDown()
+                self.setUp()
+                result, contents = self.split_both_ways(
+                    make_source, make_request)
+                self.assertGreater(len(result["outputs"]), 0)
+                if label.startswith("multi-block"):
+                    # Outputs cross the 4,096-record canonical block boundary
+                    # while their records arrive from eight source blocks.
+                    for name in contents:
+                        path = os.path.join(self.temp.name, "native", name)
+                        self.assertGreater(
+                            len(organizer.BSPoolReader(path).blocks), 2)
+
+    def test_native_split_plan_document_and_result_contract(self):
+        name, snapshot = self.default_source(self.temp.name)
+        reader = organizer.BSPoolReader(os.path.join(self.temp.name, name))
+        tag = "tag:tag_negative:A3:small:none:o0:none"
+        legendary = "legendary:j_perkeo:A4:big:shop:o1:negative"
+        remainder = "remainder:Unmatched%20seeds"
+        seed = reader.seed(1)
+        rule_key = organizer.ambiguity_rule_key([tag, legendary])
+        spec = split_policy.SplitSpec.create(
+            "exclusive", [tag, legendary], "",
+            {seed: legendary, "rank:2": tag}, {rule_key: tag}, remainder)
+        categories = [legendary, remainder, tag]
+        staged = {category: os.path.join(self.temp.name, "stage %d.tmp" % k)
+                  for k, category in enumerate(categories)}
+        document, rank_keys = organizer.build_native_split_plan(
+            reader, spec, categories, staged)
+        self.assertEqual(document.decode("utf-8").splitlines(), [
+            "BRAINSTORM_SPLIT_PLAN 1",
+            "mode exclusive",
+            "header_bytes 8192",
+            "output 0 %s %s" % (legendary, staged[legendary]),
+            "output 1 %s %s" % (remainder, staged[remainder]),
+            "output 2 %s %s" % (tag, staged[tag]),
+            "remainder 1",
+            "descriptor %s 0" % fixture.LEGENDARY.hex(),
+            "descriptor %s 2" % fixture.TAG.hex(),
+            "choice 1 0",
+            "choice 2 2",
+            "rule %s 2" % rule_key,
+            "end",
+        ])
+        self.assertEqual(rank_keys, {1: [seed], 2: ["rank:2"]})
+        with self.assertRaisesRegex(organizer.PoolError, "choices disagree"):
+            organizer.build_native_split_plan(
+                reader, split_policy.SplitSpec.create(
+                    "exclusive", [tag, legendary], "",
+                    {seed: legendary, "rank:1": tag}), [tag, legendary],
+                {tag: "a", legendary: "b"})
+        location_spec = split_policy.SplitSpec.create(
+            "matching_copies", ["legendary:j_perkeo:A4:big"],
+            "legendary:j_perkeo")
+        document, _keys = organizer.build_native_split_plan(
+            reader, location_spec, ["legendary:j_perkeo:A4:big"],
+            {"legendary:j_perkeo:A4:big": "x"})
+        self.assertIn(
+            "location 2 %s 4 2 0" % b"j_perkeo".hex(),
+            document.decode("utf-8").splitlines())
+
+        result = organizer.parse_native_split_result("\n".join([
+            "BRAINSTORM_SPLIT_RESULT 1", "source_records 4",
+            "source_membership_digest 0123456789abcdef",
+            "source_metadata_digest fedcba9876543210",
+            "unmatched 1", "overlap 1", "unique_copied 3",
+            "output_memberships 3", "used_choices 1", "used_rules 0",
+            "unused_rule 00000000000000aa",
+            "output 0 2 40 1111111111111111 2222222222222222",
+            "output 1 1 30 3333333333333333 4444444444444444",
+            "end", ""]))
+        self.assertEqual(result["outputs"][1]["membership_digest"],
+                         0x3333333333333333)
+        self.assertEqual(result["unused_rule"], "00000000000000aa")
+        for broken in (
+                "BRAINSTORM_SPLIT_RESULT 2\nend\n",
+                "BRAINSTORM_SPLIT_RESULT 1\nsource_records 4\n",
+                "BRAINSTORM_SPLIT_RESULT 1\nsource_records 4\n"
+                "source_membership_digest 0123456789abcdef\n"
+                "source_metadata_digest fedcba9876543210\nunmatched 1\n"
+                "overlap 1\nunique_copied 3\noutput_memberships 3\n"
+                "used_choices 1\nused_rules 0\n"
+                "output 1 1 30 3333333333333333 4444444444444444\nend\n",
+                "BRAINSTORM_SPLIT_RESULT 1\nsurprise 1\nend\n"):
+            with self.assertRaises(organizer.PoolError):
+                organizer.parse_native_split_result(broken)
+
+    def test_seed_rank_and_category_descriptor_round_trips(self):
+        for charset in (organizer.NATURAL_CHARSET, organizer.SETTABLE_CHARSET,
+                        organizer.TOTAL_CHARSET):
+            for rank in (0, 1, 33, 34, 35, 36, 1224, 1225, 1226, 1259, 1260,
+                         1295, 1296, 12345678, 34 ** 8 - 1):
+                seed = organizer.rank_to_seed(rank, charset)
+                self.assertEqual(organizer.seed_to_rank(seed, charset), rank)
+        with self.assertRaises(organizer.PoolError):
+            organizer.seed_to_rank("0000000O", organizer.NATURAL_CHARSET)
+        with self.assertRaises(organizer.PoolError):
+            organizer.seed_to_rank("ABCDEFGHI", organizer.TOTAL_CHARSET)
+        for raw in (fixture.TAG, fixture.LEGENDARY, fixture.VOUCHER,
+                    fixture.descriptor(2, "j_perkeo", 9, 7, 9, 200, 0x0F),
+                    fixture.descriptor(1, "tag_x%20y", 1, 1, 0, 0, 0)):
+            occurrence = organizer.Occurrence.decode(raw)
+            self.assertEqual(
+                organizer.category_id_to_descriptor(occurrence.category_id),
+                raw)
+            self.assertEqual(
+                organizer.location_id_parts(occurrence.location_id),
+                (occurrence.kind, occurrence.key.encode("ascii"),
+                 occurrence.ante, occurrence.phase))
+        for bad in ("tag:tag_x:A0:small:none:o0:none", "tag:tag_x:A1",
+                    "legendary:j_perkeo:A1:small:none:o0:0x100"):
+            with self.assertRaises(organizer.PoolError):
+                organizer.category_id_to_descriptor(bad)
+
+    def test_native_split_unsupported_source_falls_back_to_python(self):
+        name, snapshot = self.default_source(self.temp.name)
+        reader = web.verified_source_reader(name, self.temp.name)
+        request = self.exclusive_request("keep", "fallback")(reader, snapshot)
+        calls = []
+
+        class DecliningHelper:
+            def split(self, source, plan_path, cancel_check=None,
+                      progress=None):
+                calls.append(plan_path)
+                stage = os.path.dirname(plan_path)
+                with open(os.path.join(stage, ".organizer-native-0.tmp"),
+                          "wb") as handle:
+                    handle.write(b"partial native output")
+                raise organizer.NativeSplitUnsupported(
+                    "source blocks are not physically rank ordered")
+
+            def summarize(self, path, cancel_check=None):
+                raise AssertionError("fallback must not summarize")
+
+        original = web._native_split_helper
+        web._native_split_helper = lambda: DecliningHelper()
+        try:
+            result = self.run_split_in(self.temp.name, name, request, True)
+        finally:
+            web._native_split_helper = original
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["native_split"])
+        self.assertEqual(len(result["outputs"]), 4)
+        self.assertEqual(
+            [entry for entry in os.listdir(self.temp.name)
+             if entry.startswith(".organizer")], [])
+
+    def test_native_split_failure_publishes_nothing(self):
+        name, snapshot = self.default_source(self.temp.name)
+        reader = web.verified_source_reader(name, self.temp.name)
+        request = self.exclusive_request("keep", "failed")(reader, snapshot)
+        before = self.published_entries(self.temp.name)
+
+        class FailingHelper:
+            def split(self, source, plan_path, cancel_check=None,
+                      progress=None):
+                raise organizer.PoolError(
+                    "native split failed: cannot create split output")
+
+            def summarize(self, path, cancel_check=None):
+                raise AssertionError("failed split must not summarize")
+
+        original = web._native_split_helper
+        web._native_split_helper = lambda: FailingHelper()
+        try:
+            with self.assertRaisesRegex(organizer.PoolError,
+                                        "cannot create split output"):
+                self.run_split_in(self.temp.name, name, request, True)
+        finally:
+            web._native_split_helper = original
+        self.assertEqual(self.published_entries(self.temp.name), before)
+        self.assertEqual(web.operation_progress("split")["state"], "failed")
+
+    def test_native_split_verification_rejects_tampered_or_miscounted_output(self):
+        self.require_native()
+        name, snapshot = self.default_source(self.temp.name)
+        reader = web.verified_source_reader(name, self.temp.name)
+        request = self.exclusive_request("keep", "tamper")(reader, snapshot)
+        before = self.published_entries(self.temp.name)
+        real = web.NativeSplitHelper(self.binary)
+
+        class TamperingHelper:
+            def split(self, source, plan_path, cancel_check=None,
+                      progress=None):
+                text = real.split(source, plan_path, cancel_check, progress)
+                stage = os.path.dirname(plan_path)
+                target = os.path.join(stage, ".organizer-native-0.tmp")
+                with open(target, "r+b") as handle:
+                    handle.seek(organizer.HEADER_EVENTS_BYTES + 12)
+                    byte = handle.read(1)
+                    handle.seek(organizer.HEADER_EVENTS_BYTES + 12)
+                    handle.write(bytes((byte[0] ^ 0x01,)))
+                return text
+
+            def summarize(self, path, cancel_check=None):
+                return real.summarize(path, cancel_check)
+
+        class MiscountingHelper(TamperingHelper):
+            def split(self, source, plan_path, cancel_check=None,
+                      progress=None):
+                text = real.split(source, plan_path, cancel_check, progress)
+                return re.sub(r"(?m)^output 0 (\d+) ", lambda match:
+                              "output 0 %d " % (int(match.group(1)) + 1),
+                              text)
+
+        original = web._native_split_helper
+        try:
+            web._native_split_helper = lambda: TamperingHelper()
+            with self.assertRaises(organizer.PoolError):
+                self.run_split_in(self.temp.name, name, request, True)
+            self.assertEqual(self.published_entries(self.temp.name), before)
+            web._native_split_helper = lambda: MiscountingHelper()
+            with self.assertRaisesRegex(
+                    organizer.PoolError, "counts do not match its plan"):
+                self.run_split_in(self.temp.name, name, request, True)
+            self.assertEqual(self.published_entries(self.temp.name), before)
+        finally:
+            web._native_split_helper = original
+
+    def test_split_progress_is_live_while_the_request_is_open(self):
+        name, snapshot = self.default_source(self.temp.name)
+        reader = web.verified_source_reader(name, self.temp.name)
+        request = self.exclusive_request("keep", "progress")(reader, snapshot)
+        release = threading.Event()
+        observed = []
+
+        class SlowHelper:
+            def split(self, source, plan_path, cancel_check=None,
+                      progress=None):
+                progress(1, 4)
+                release.wait(timeout=10)
+                raise organizer.NativeSplitUnsupported("hand back to Python")
+
+            def summarize(self, path, cancel_check=None):
+                raise AssertionError("not reached")
+
+        original = web._native_split_helper
+        web._native_split_helper = lambda: SlowHelper()
+        outcome = {}
+
+        def worker():
+            try:
+                outcome["result"] = self.run_split_in(
+                    self.temp.name, name, request, True)
+            except BaseException as exc:  # pragma: no cover - reported below
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        try:
+            thread.start()
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                progress = web.operation_progress("split")
+                if progress["state"] == "running" and progress["records_done"]:
+                    observed.append(progress)
+                    break
+                time.sleep(0.02)
+            release.set()
+            thread.join(timeout=15)
+        finally:
+            release.set()
+            web._native_split_helper = original
+        self.assertNotIn("error", outcome, outcome.get("error"))
+        self.assertTrue(observed, "progress never became visible")
+        self.assertEqual(observed[0]["records_done"], 1)
+        self.assertEqual(observed[0]["records_total"], 4)
+        self.assertEqual(observed[0]["phase"], "copying")
+        self.assertTrue(observed[0]["native"])
+        self.assertAlmostEqual(observed[0]["percent"], 25.0)
+        self.assertGreaterEqual(observed[0]["elapsed_seconds"], 0.0)
+        final = web.operation_progress("split")
+        self.assertEqual(final["state"], "done")
+        self.assertEqual(final["records_done"], 4)
+        self.assertFalse(outcome["result"]["native_split"])
+        with self.assertRaises(organizer.PoolError):
+            web.operation_progress("export")
+
+    def test_progress_and_pool_routes_exist_in_both_apps(self):
+        name, _snapshot = self.default_source(self.temp.name)
+
+        class UnifiedHandler(builder_web.Handler):
+            pass
+
+        UnifiedHandler.pool_dir = self.temp.name
+        for handler, prefix in ((web.make_handler(self.temp.name), ""),
+                                (UnifiedHandler, "/organizer")):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            try:
+                with urlopen(base + prefix + "/api/progress?operation=split",
+                             timeout=10) as response:
+                    progress = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(progress["operation"], "split")
+                self.assertIn(progress["state"], ("idle", "done", "failed"))
+                with urlopen(base + prefix + "/api/pools", timeout=10) as response:
+                    pools = json.loads(response.read().decode("utf-8"))
+                self.assertEqual([row["name"] for row in pools["pools"]], [name])
+                self.assertEqual(pools["native_split"], bool(self.binary))
+                self.assertEqual(pools["native_summary"], bool(self.binary))
+                self.assertEqual(pools["native_summary_min_bytes"],
+                                 web.NATIVE_SUMMARY_MIN_BYTES)
+                try:
+                    urlopen(base + prefix + "/api/progress?operation=nope",
+                            timeout=10)
+                except HTTPError as error:
+                    self.assertEqual(error.code, 400)
+                else:
+                    self.fail("unknown progress operation was accepted")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_stale_split_stage_folders_are_swept_only_when_dead_and_old(self):
+        name, _snapshot = self.default_source(self.temp.name)
+        old = time.time() - 2 * web.STALE_STAGE_MIN_AGE_SECONDS
+        dead = os.path.join(self.temp.name, ".organizer-stage-dead0001")
+        fresh = os.path.join(self.temp.name, ".organizer-stage-fresh001")
+        held = os.path.join(self.temp.name, ".organizer-stage-held0001")
+        for folder in (dead, fresh, held):
+            os.makedirs(folder)
+            for entry in ("a.bspool.writer.lock", ".organizer-native-0.tmp"):
+                with open(os.path.join(folder, entry), "wb") as handle:
+                    handle.write(b"")
+        os.utime(dead, (old, old))
+        os.utime(held, (old, old))
+        with organizer.pool_writer_guard(os.path.join(held, "a.bspool")):
+            removed = web.sweep_stale_stage_dirs(self.temp.name)
+        self.assertEqual(removed, [".organizer-stage-dead0001"])
+        self.assertFalse(os.path.exists(dead))
+        self.assertTrue(os.path.isdir(fresh))
+        self.assertTrue(os.path.isdir(held))
+        self.assertEqual(
+            web.sweep_stale_stage_dirs(self.temp.name),
+            [".organizer-stage-held0001"])
+        self.assertTrue(os.path.isfile(os.path.join(self.temp.name, name)))
+
+    def test_outdated_helper_without_split_mode_falls_back(self):
+        name, snapshot = self.default_source(self.temp.name)
+        reader = web.verified_source_reader(name, self.temp.name)
+        request = self.exclusive_request("keep", "outdated")(reader, snapshot)
+        if os.name == "nt":
+            stub = os.path.join(self.temp.name, "old-helper.bat")
+            with open(stub, "w", encoding="ascii", newline="\r\n") as handle:
+                handle.write("@echo usage: old helper 1>&2\r\n@exit /b 2\r\n")
+        else:
+            stub = os.path.join(self.temp.name, "old-helper.sh")
+            with open(stub, "w", encoding="ascii", newline="\n") as handle:
+                handle.write("#!/bin/sh\necho 'usage: old helper' >&2\nexit 2\n")
+            os.chmod(stub, 0o755)
+        original = web._native_split_helper
+        web._native_split_helper = lambda: web.NativeSplitHelper(stub)
+        try:
+            result = self.run_split_in(self.temp.name, name, request, True)
+        finally:
+            web._native_split_helper = original
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["native_split"])
+        self.assertEqual(len(result["outputs"]), 4)
+
+    def test_combine_reports_live_progress(self):
+        first = "combine-a.bspool"
+        second = "combine-b.bspool"
+        first_identity = fixture.write_bsp3(
+            os.path.join(self.temp.name, first), complete=True)
+        second_identity = fixture.write_custom_bsp3(
+            os.path.join(self.temp.name, second), [7, 8],
+            [[fixture.TAG], [fixture.TAG, fixture.LEGENDARY]],
+            "bbbbbbbbbbbbbbbb", [
+                "tag_route collect",
+                "tag tag_negative 3 small 3 small 1",
+                "legendary j_perkeo 4 big 4 big 1 shop",
+                "voucher v_overstock_norm 2 2",
+            ])
+        seen = []
+        original = web._progress_set
+
+        def spy(kind, **fields):
+            seen.append((kind, dict(fields)))
+            original(kind, **fields)
+
+        web._progress_set = spy
+        try:
+            result = web.run_combine({
+                "sources": [first, second], "operation": "union",
+                "name": "combined-progress",
+                "snapshots": {first: first_identity["snapshot"],
+                              second: second_identity["snapshot"]}},
+                self.temp.name)
+        finally:
+            web._progress_set = original
+        self.assertTrue(result["completed"])
+        final = web.operation_progress("combine")
+        self.assertEqual(final["state"], "done")
+        self.assertEqual(final["records_total"], 6)
+        self.assertEqual(final["records_done"], 6)
+        self.assertTrue(any(kind == "combine" for kind, _fields in seen))
+
+    def test_embedded_page_scripts_parse(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        for label, page in (("organizer", web.PAGE),
+                            ("builder", builder_web.PAGE)):
+            blocks = re.findall(r"<script>(.*?)</script>", page, re.S)
+            self.assertTrue(blocks, "%s page has no inline script" % label)
+            for number, block in enumerate(blocks):
+                path = os.path.join(
+                    self.temp.name, "%s-%d.js" % (label, number))
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(block)
+                check = subprocess.run(
+                    [node, "--check", path], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                self.assertEqual(
+                    check.returncode, 0,
+                    "%s script %d does not parse:\n%s" % (
+                        label, number, check.stderr))
 
 
 if __name__ == "__main__":

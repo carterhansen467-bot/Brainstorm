@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import socket
 import struct
 import subprocess
@@ -268,6 +269,68 @@ def _finish_operation(kind, event):
             del ACTIVE_OPERATIONS[kind]
 
 
+# Live progress of long mutations, polled by the page while its request is
+# still open. A production split copies hundreds of millions of records; with
+# nothing on screen that wait was indistinguishable from a hung request.
+OPERATION_PROGRESS = {}
+# Conservative pure-Python copy throughput (records/s) for the plan preview
+# warning shown when the native helper is missing. Measured 140K/s on an
+# Apple M-series laptop; slower Windows machines see well under that.
+PYTHON_COPY_RECORDS_PER_SECOND = 60000
+
+
+def _progress_begin(kind, **fields):
+    with ACTIVE_OPERATION_LOCK:
+        value = {"state": "running", "started_at": time.time(),
+                 "updated_at": time.time(), "phase": "starting",
+                 "records_done": 0, "records_total": 0}
+        value.update(fields)
+        OPERATION_PROGRESS[kind] = value
+
+
+def _progress_set(kind, **fields):
+    with ACTIVE_OPERATION_LOCK:
+        value = OPERATION_PROGRESS.get(kind)
+        if value is None or value.get("state") != "running":
+            return
+        value.update(fields)
+        value["updated_at"] = time.time()
+
+
+def _progress_finish(kind, state):
+    with ACTIVE_OPERATION_LOCK:
+        value = OPERATION_PROGRESS.get(kind)
+        if value is None:
+            return
+        value["state"] = state
+        value["updated_at"] = time.time()
+
+
+def operation_progress(kind):
+    """Return a copy of one operation's live progress for the page."""
+    if kind not in ("split", "combine", "upgrade"):
+        raise organizer.PoolError("choose split, combine, or upgrade progress")
+    with ACTIVE_OPERATION_LOCK:
+        value = OPERATION_PROGRESS.get(kind)
+        snapshot = dict(value) if value else {"state": "idle"}
+    if snapshot.get("state") == "running":
+        now = time.time()
+        elapsed = max(0.0, now - snapshot.get("started_at", now))
+        done = int(snapshot.get("records_done") or 0)
+        total = int(snapshot.get("records_total") or 0)
+        snapshot["elapsed_seconds"] = elapsed
+        snapshot["percent"] = (100.0 * done / total) if total else 0.0
+        snapshot["eta_seconds"] = (
+            elapsed * (total - done) / done if done and total and done < total
+            else None)
+    snapshot["operation"] = kind
+    return snapshot
+
+
+def _python_copy_estimate_seconds(records):
+    return int(max(0, int(records or 0)) // PYTHON_COPY_RECORDS_PER_SECOND)
+
+
 def cancel_operation(kind):
     if kind not in ("analysis", "export", "split", "combine", "upgrade"):
         raise organizer.PoolError(
@@ -363,6 +426,60 @@ def wait_for_active_operations(poll_seconds=0.05):
 
 def _pool_root(pool_dir=None):
     return os.path.abspath(pool_dir or POOL_DIR)
+
+
+STALE_STAGE_PREFIX = ".organizer-stage-"
+# A just-created stage may not have taken its writer locks yet; only folders
+# older than this are candidates, and only when every lock inside is free.
+STALE_STAGE_MIN_AGE_SECONDS = 10 * 60
+
+
+def sweep_stale_stage_dirs(pool_dir=None, now=None):
+    """Remove abandoned private split staging folders.
+
+    A killed Organizer (or one closed from the console while a split ran)
+    leaves ``.organizer-stage-*`` behind with empty lock and temp files, which
+    looks alarming beside the real pools and can never be finished. A live
+    split holds every ``.writer.lock`` in its stage for the whole publication,
+    so a folder is removed only when it is old enough and every lock in it
+    can be taken. Returns the removed folder names.
+    """
+    root = _pool_root(pool_dir)
+    removed = []
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return removed
+    if now is None:
+        now = time.time()
+    for entry in sorted(entries):
+        if not entry.startswith(STALE_STAGE_PREFIX):
+            continue
+        path = os.path.join(root, entry)
+        try:
+            status = os.lstat(path)
+            if (not stat.S_ISDIR(status.st_mode)
+                    or now - status.st_mtime < STALE_STAGE_MIN_AGE_SECONDS):
+                continue
+            locks = [name for name in os.listdir(path)
+                     if name.endswith(".writer.lock")]
+        except OSError:
+            continue
+        live = False
+        for name in locks:
+            try:
+                with organizer.pool_writer_guard(
+                        os.path.join(path, name[:-len(".writer.lock")])):
+                    pass
+            except (ValueError, OSError):
+                live = True
+                break
+        if live:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.lexists(path):
+            removed.append(entry)
+    return removed
 
 
 def resolve_source(name, pool_dir=None):
@@ -541,6 +658,16 @@ def _verify_upgrade_record_equivalence(
         raise organizer.PoolError(
             "record metadata digest count differs from the pool header")
     return digest
+
+
+def pools_payload(pool_dir=None):
+    """The /api/pools document shared by the standalone and unified apps."""
+    return {
+        "pools": list_sources(pool_dir),
+        "native_summary": bool(_native_pool_binary()),
+        "native_split": bool(_native_pool_binary()),
+        "native_summary_min_bytes": NATIVE_SUMMARY_MIN_BYTES,
+    }
 
 
 def list_sources(pool_dir=None):
@@ -1582,6 +1709,112 @@ def _run_native_summary(path, cancel_check=None):
     return _parse_native_summary(stdout)
 
 
+class NativeSplitHelper:
+    """Drive the helper's split mode and summarize outputs for verification.
+
+    The organizer library treats this object as an opaque runner: ``split``
+    returns the helper's result document text and raises
+    NativeSplitUnsupported when the source needs the exact Python path.
+    """
+
+    def __init__(self, binary):
+        self.binary = binary
+
+    def summarize(self, path, cancel_check=None):
+        _progress_set("split", phase="verifying")
+        return _run_native_summary(path, cancel_check=cancel_check)
+
+    def split(self, source, plan_path, cancel_check=None, progress=None):
+        lines = collections.deque(maxlen=200)
+        stdout_parts = []
+        stdout_bytes = [0]
+        try:
+            process = subprocess.Popen(
+                [self.binary, "split", source, plan_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise organizer.PoolError(
+                "native split could not start: %s" % exc) from exc
+        with ACTIVE_UPGRADE_PROCESS_LOCK:
+            ACTIVE_UPGRADE_PROCESSES.add(process)
+        _progress_set("split", phase="copying")
+
+        def pump_stderr():
+            try:
+                for line in process.stderr:
+                    line = line.rstrip("\r\n")
+                    match = re.fullmatch(r"progress ([0-9]+) ([0-9]+)", line)
+                    if match:
+                        if progress is not None:
+                            progress(int(match.group(1)), int(match.group(2)))
+                        continue
+                    lines.append(line)
+            finally:
+                process.stderr.close()
+
+        def pump_stdout():
+            try:
+                for line in process.stdout:
+                    stdout_bytes[0] += len(line)
+                    if stdout_bytes[0] <= 4 * 1024 * 1024:
+                        stdout_parts.append(line)
+            finally:
+                process.stdout.close()
+
+        readers = []
+        cancelled = False
+        try:
+            for target in (pump_stderr, pump_stdout):
+                thread = threading.Thread(target=target, daemon=True)
+                thread.start()
+                readers.append(thread)
+            while process.poll() is None:
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    break
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            termination_error = None
+            try:
+                if process.poll() is None:
+                    _terminate_upgrade_process(process)
+            except (OSError, subprocess.SubprocessError) as exc:
+                termination_error = exc
+            finally:
+                for thread in readers:
+                    thread.join(timeout=5.0)
+                with ACTIVE_UPGRADE_PROCESS_LOCK:
+                    if process.poll() is not None:
+                        ACTIVE_UPGRADE_PROCESSES.discard(process)
+            if termination_error is not None:
+                raise organizer.PoolError(
+                    "native split helper could not be stopped safely: %s"
+                    % termination_error)
+        if cancelled:
+            raise OperationCancelled(
+                "split cancelled safely; no new pool was published")
+        detail = next((line for line in reversed(lines) if line.strip()),
+                      "native helper exited with code %d" % process.returncode)
+        if process.returncode in (organizer.NATIVE_SPLIT_EXIT_UNSUPPORTED, 2):
+            # 4: the helper declined this source. 2: an older helper without
+            # a split mode printed its usage. Both hand back to Python.
+            raise organizer.NativeSplitUnsupported(detail)
+        if process.returncode:
+            raise organizer.PoolError("native split failed: %s" % detail)
+        if stdout_bytes[0] > 4 * 1024 * 1024:
+            raise organizer.PoolError("native split result is too large")
+        return "".join(stdout_parts)
+
+
+def _native_split_helper():
+    binary = _native_pool_binary()
+    return NativeSplitHelper(binary) if binary else None
+
+
 def _source_from_native_summary(reader, summary):
     reader.accept_native_verification(
         int(summary["membership_digest"], 16),
@@ -2346,6 +2579,9 @@ def build_split_plan(reader, selected_ids=None, choice_plan=None,
             "plan_token": token,
             "coverage_complete": source["coverage_complete"],
             "occurrence_metadata_complete": source["occurrence_metadata_complete"],
+            "native_split": bool(_native_pool_binary()),
+            "python_copy_estimate_seconds": _python_copy_estimate_seconds(
+                reader.records),
         },
     }
     _remember_reviewed_split(
@@ -2462,13 +2698,26 @@ def execute_split(name, request, pool_dir=None, cancel_check=None):
             raise organizer.PoolError(
                 "publication changed after review; prepare the split plan again")
         stage_report = os.path.join(stage, "split-report.json")
-        report, completed = organizer.write_prepared_split(
-            reader, stage, preflight["selected_categories"], choices,
-            category_rows, report, stage_report,
-            remainder_id=remainder_id, cancel_check=cancel_check,
-            ambiguity_rules=ambiguity_rules,
-            group_by_filter=group_by_filter,
-            assignment_mode=assignment_mode)
+        native_split = _native_split_helper()
+        _progress_begin(
+            "split", records_total=reader.records,
+            native=native_split is not None, source=name)
+        progress_state = "failed"
+        try:
+            report, completed = organizer.write_prepared_split(
+                reader, stage, preflight["selected_categories"], choices,
+                category_rows, report, stage_report,
+                remainder_id=remainder_id, cancel_check=cancel_check,
+                ambiguity_rules=ambiguity_rules,
+                group_by_filter=group_by_filter,
+                assignment_mode=assignment_mode,
+                native_split=native_split,
+                progress=lambda done, total: _progress_set(
+                    "split", phase="copying", records_done=done,
+                    records_total=total))
+            progress_state = "done"
+        finally:
+            _progress_finish("split", progress_state)
         if not completed:
             report["completed"] = False
             return report
@@ -2541,6 +2790,10 @@ def execute_split(name, request, pool_dir=None, cancel_check=None):
         # original publication error.
         if cleanup_error is not None and not committed and not primary_error:
             raise cleanup_error
+        try:
+            sweep_stale_stage_dirs(root)
+        except Exception:
+            pass
 
 
 def _combine_source_names(value):
@@ -2907,9 +3160,23 @@ def _execute_combine_with_readers(
     else:
         report_path = _unique_combine_report_path(root, output_name)
     _operation_cancelled(cancel_check)
-    result = organizer.combine_pools(
-        context.readers, output_path, operation, label,
-        cancel_check=cancel_check)
+    total_records = sum(reader.records for reader in context.readers)
+    _progress_begin("combine", records_total=total_records, native=False,
+                    phase="copying")
+    progress_state = "failed"
+    try:
+        result = organizer.combine_pools(
+            context.readers, output_path, operation, label,
+            progress=lambda consumed: _progress_set(
+                "combine", phase="copying", records_done=consumed,
+                records_total=total_records),
+            cancel_check=cancel_check)
+        _progress_set("combine", phase="publishing",
+                      records_done=total_records,
+                      records_total=total_records)
+        progress_state = "done"
+    finally:
+        _progress_finish("combine", progress_state)
     result["name"] = os.path.basename(output_path)
     result["notices"] = _combine_notices(context)
     if not result["records"]:
@@ -3330,8 +3597,9 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  <div class="workstatus" id="updateStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="updateTitle">Updating preview…</b><span id="updateDetail">Applying the selected destinations.</span></div></div>
  <div class="plan" id="plan" hidden><div class="planbar"><div><b id="planTitle">Seeds that fit more than one checked category</b><div class="hint" id="planHint"></div></div><span class="pill" id="choicePill" role="status" aria-live="polite">Choose destinations</span></div><div class="row"><button class="ghost small" id="clearRulesBtn" hidden>Clear shared decisions</button><button class="ghost small" id="clearChoicesBtn" hidden>Clear individual seed decisions</button></div><div class="amb" id="ambiguities"></div><div class="pager" id="pager"></div></div>
  <div class="review-actions"><button class="ghost" id="applyDecisionsBtn" hidden>Update preview</button></div>
- <div id="splitPublication" hidden><h3 class="reviewtitle">Files that will be created</h3><div class="statehint" id="splitPublicationState"></div><div class="manifest" id="splitManifest"></div><div class="hint" id="splitReport"></div></div>
+ <div id="splitPublication" hidden><h3 class="reviewtitle">Files that will be created</h3><div class="statehint" id="splitPublicationState"></div><div class="manifest" id="splitManifest"></div><div class="hint" id="splitReport"></div><div class="notice warning" id="splitNativeWarning" hidden></div></div>
  <div class="review-actions"><button class="go" id="splitBtn" disabled>Create these seed pools</button></div>
+ <div class="workstatus" id="splitStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="splitStatusTitle">Creating new seed pools…</b><span id="splitStatusDetail">Starting.</span></div></div>
  <details class="advanced"><summary>Advanced: exclusive split decision files</summary><div class="advancedbody"><p class="hint">Loading an existing decision file switches to Exclusive split. Decision files are tied to this exact unchanged source snapshot.</p><div class="row"><button class="ghost" id="saveBtn" disabled>Save decisions (.json)</button><button class="ghost" id="loadBtn">Load saved decisions</button><input type="file" id="loadFile" accept="application/json,.json" hidden></div></div></details>
 </section></div>
 <aside class="side"><section class="card summary"><h2>Organizer summary</h2><dl>
@@ -3359,7 +3627,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 </section></div>
 <aside class="side"><section class="card summary"><h2>Combine summary</h2><dl>
  <div><dt>Rule</dt><dd id="combineSumOperation">Union</dd></div><div><dt>Selected pools</dt><dd id="combineSumInputs">Choose at least two</dd></div><div><dt>Can combine?</dt><dd id="combineSumCompatibility">Not reviewed</dd></div><div><dt>Recorded filters</dt><dd id="combineSumBranches">—</dd></div><div><dt>Membership rule</dt><dd id="combineSumExpression">—</dd></div><div><dt>Search coverage</dt><dd id="combineSumCoverage">—</dd></div><div><dt>Match details</dt><dd id="combineSumMetadata">—</dd></div></dl>
- <div class="actions"><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel compatibility check</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
+ <div class="actions"><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel compatibility check</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="workstatus" id="combineStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="combineStatusTitle">Creating combined seed pool…</b><span id="combineStatusDetail">Starting.</span></div></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="formatWorkspace" role="tabpanel" aria-labelledby="formatModeBtn" hidden><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Check or update a pool</h2><p class="copy">Choose a <code>.bspool</code> file from Brainstorm's <code>seed_pools</code> folder. Checking reads only its header. A supported update creates a separate BSP4 copy; the original file is never changed.</p></div></div>
@@ -3424,6 +3692,11 @@ function renderNativeHelperWarning(v){
   +`Inspecting or previewing one is exact but can take tens of minutes per step, and the result is not cached. `
   +`Put the helper in the mod's <code>native</code> folder, or reinstall the full package, to restore the fast path.`;
 }
+function fmtDuration(s){s=Math.max(0,Math.round(Number(s)||0));if(s<60)return `${s}s`;if(s<3600)return `${Math.floor(s/60)}m ${s%60}s`;return `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`}
+function splitState(kind,title,detail){const box=$("splitStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("splitStatusTitle").textContent=title;$("splitStatusDetail").textContent=detail}
+function combineState(kind,title,detail){const box=$("combineStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("combineStatusTitle").textContent=title;$("combineStatusDetail").textContent=detail}
+function describeCombineProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0;if(!total||!done)return `Starting · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Reading input seeds: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
+function describeSplitProgress(p){if(!p||p.state!=="running")return "";const total=p.records_total||0,done=p.records_done||0,mode=p.native?"native helper":"Python copy (slow path)";if(p.phase==="verifying")return `Verifying the new files (${mode}) · ${fmtDuration(p.elapsed_seconds)} elapsed.`;if(!total||!done)return `Starting the ${mode} · ${fmtDuration(p.elapsed_seconds)} elapsed.`;const pct=(100*done/total).toFixed(1),eta=p.eta_seconds==null?"":` · about ${fmtDuration(p.eta_seconds)} left`;return `Copying seeds with the ${mode}: ${fmt(done)} of ${fmt(total)} (${pct}%) · ${fmtDuration(p.elapsed_seconds)} elapsed${eta}.`}
 function fail(e){$("error").textContent=e.message||String(e)}
 function clear(){$("error").textContent="";$("result").innerHTML=""}
 function inspectionState(kind,title,detail){const box=$("inspectionStatus");box.hidden=false;box.className=`workstatus${kind?" "+kind:""}`;$("inspectionTitle").textContent=title;$("inspectionDetail").textContent=detail}
@@ -3588,6 +3861,7 @@ function renderSplitPublication(){
  const blockers=publication.blockers||[];$("splitPublicationState").innerHTML=publication.ready?`<strong>Ready to create ${fmt(publication.output_count)} new pool file${publication.output_count===1?"":"s"}.</strong> <span class="source-retained">The original source pool will remain unchanged.</span> Existing files will not be overwritten. If creation reports an error or you cancel it, unfinished new files are removed.`:`<strong>More decisions are needed before files can be created.</strong> ${blockers.map(esc).join(" ")}`;
  $("splitManifest").innerHTML=publication.outputs.length?publication.outputs.map(o=>`<div class="manifestrow"><span><b>${esc(o.name)}</b><small>${esc(o.label)} · ${o.kind==="unmatched"?"extra pool for other seeds":plan.group_by_filter?"one selected location":"one exact event"} · ${o.collision_status==="available"?"filename available":"filename already exists"}</small></span><span class="count">${fmt(o.records)}${o.records_exact?" seeds":" assigned + "+fmt(o.pending_ambiguities)+" awaiting a destination"}</span></div>`).join(""):'<div class="notice warning"><strong>No new pool files would be created</strong>The current selections do not produce a nonempty output.</div>';
  const memberships=`${fmt(publication.overlap_records||0)} overlapping seed(s); ${fmt(publication.unique_copied_records||0)} unique copied seed(s); ${fmt(publication.output_memberships||0)} total output memberships.`;$("splitReport").textContent=`A small audit report named ${publication.report_name} will also record the assignment mode and source snapshot. The new pools will have ${publication.coverage_complete?"complete":"provisional"} search coverage. ${memberships} ${publication.omitted_records?fmt(publication.omitted_records)+" other seed(s) will remain only in the source pool.":"Every source seed is represented in at least one new file."}`;
+ const slow=$("splitNativeWarning");if(slow){const estimate=publication.python_copy_estimate_seconds||0;if(publication.native_split===false&&estimate>=60){slow.hidden=false;slow.innerHTML=`<strong>Native seed-pool helper missing — this will be slow</strong>Brainstorm could not find its seed-pool helper, so these files must be copied record by record in Python: roughly ${esc(fmtDuration(estimate))} for ${fmt(split.inspection?.source?.records||0)} seeds, possibly longer on a slower computer. Progress is shown while it runs and you can cancel at any time. Put the helper in the mod's <code>Seed Pool Builder</code> or <code>native</code> folder, or reinstall the full package, to finish in minutes instead.`}else{slow.hidden=true;slow.innerHTML=""}}
  renderStatus();
 }
 function download(name,type,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},0)}
@@ -3596,7 +3870,9 @@ function clearDecisionSet(kind){const split=workflowState.split;if(kind==="rules
 function loadPlanFile(file){const r=new FileReader();r.onload=()=>{try{const v=JSON.parse(r.result),split=workflowState.split;if(!split.inspection)throw Error("Inspect the source pool first.");if(String(v.source_snapshot_id||"").toLowerCase()!==split.inspection.source.snapshot_id)throw Error("Those saved decisions belong to a different version of this source pool.");if(String(v.group_by_filter||"")!==groupByFilter())throw Error("Those saved decisions use a different organizing filter.");if(v.assignment_mode&&v.assignment_mode!=="exclusive")throw Error("That file is not an exclusive split decision file.");$("exclusiveMode").checked=true;$("exclusiveDetails").open=true;split.choices={...(v.choices||{})};split.rules={...(v.ambiguity_rules||{})};invalidateSplitReview("Saved decisions loaded — reviewing the exclusive split");prepare()}catch(e){fail(e)}};r.readAsText(file)}
 async function split(){
  const split=workflowState.split,plan=split.plan;if(!plan||split.reviewedFingerprint!==splitFingerprint()||!plan.publication.ready)return;clear();workflowState.startSplit();$("splitBtn").disabled=true;$("splitBtn").textContent="Creating new seed pools…";$("splitCancelBtn").hidden=false;
- try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){workflowState.reviewSplit(v,splitFingerprint());renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");workflowState.completeSplit();$("reviewCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — preview again to make another split";await loadPools(true)}catch(e){fail(e)}finally{workflowState.finishSplit();$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
+ const started=performance.now(),count=plan.publication.output_count||0;splitState("",`Creating ${fmt(count)} new seed pool${count===1?"":"s"}…`,"Starting. The source pool is not being changed.");
+ let polling=false;const timer=setInterval(async()=>{if(polling)return;polling=true;try{const p=await api("/api/progress?operation=split");const text=describeSplitProgress(p);if(text)$("splitStatusDetail").textContent=text;else $("splitStatusDetail").textContent=`Still working — ${fmtDuration((performance.now()-started)/1000)} elapsed.`}catch(_e){}finally{polling=false}},1000);
+ try{const request=splitRequest();request.reviewedPlanToken=plan.publication.plan_token;const v=await api("/api/split",request);if(!v.completed){workflowState.reviewSplit(v,splitFingerprint());renderPlan();renderSplitPublication();throw Error("More decisions are required before the new pools can be created.")}const elapsed=(performance.now()-started)/1000;splitState("success",`Created ${fmt(v.outputs.length)} new seed pool${v.outputs.length===1?"":"s"}`,`${fmt(v.outputs.reduce((n,o)=>n+(o.records||0),0))} seeds copied in ${fmtDuration(elapsed)}${v.native_split?" with the native helper":" with the Python copy path"}.`);$("result").innerHTML=`<div class="notice"><strong>Created ${fmt(v.outputs.length)} new seed pool(s)</strong>The original source was kept unchanged. The new pools are ready in the seed_pools folder and will appear in Brainstorm's pool selector. Audit report: ${esc(v.report_path)}</div>`+v.outputs.map(o=>`<div class="output"><b>${esc(o.name)}</b><span>${fmt(o.records)} seeds</span></div>`).join("");workflowState.completeSplit();$("reviewCard").hidden=true;$("plan").hidden=true;$("splitPublication").hidden=true;$("saveBtn").disabled=true;$("splitBtn").disabled=true;$("sumPublication").textContent="Created — preview again to make another split";await loadPools(true)}catch(e){splitState("error","Seed pool creation stopped",e.message||String(e));fail(e)}finally{clearInterval(timer);workflowState.finishSplit();$("splitCancelBtn").hidden=true;$("splitBtn").textContent="Create these seed pools";renderStatus()}
 }
 async function cancelSplit(){$("splitCancelBtn").disabled=true;$("splitCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"split"})}catch(e){fail(e)}finally{$("splitCancelBtn").disabled=false;$("splitCancelBtn").textContent="Cancel file creation"}}
 async function cancelAnalysis(){$("analysisCancelBtn").disabled=true;$("analysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){fail(e)}finally{$("analysisCancelBtn").disabled=false;$("analysisCancelBtn").textContent="Cancel preview"}}
@@ -3625,7 +3901,9 @@ function renderCombinePlan(v,fingerprint=combineFingerprint()){
 async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Checking selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed during the check. Check the current choices again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Compatibility check failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.textContent="Check compatibility and preview file";updateCombineBase()}}
 async function createCombine(){
  const combine=workflowState.combine;if(!combine.plan||combine.reviewedFingerprint!==combineFingerprint()||!combine.plan.publication.ready)return;$("combineError").textContent="";workflowState.startCombine();$("combineCreateBtn").disabled=true;$("combineCreateBtn").textContent="Creating combined seed pool…";$("combineCancelBtn").hidden=false;
- try{const v=await api("/api/combine",combineRequest(true));renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);workflowState.invalidateCombine();$("combinePublication").hidden=true;$("combineTechnical").hidden=true;$("combineCreateBtn").disabled=true;$("combineSumCompatibility").textContent="Created"}catch(e){$("combineError").textContent=e.message||String(e);invalidateCombine("Check again after this failure")}finally{workflowState.finishCombine();$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool";updateCombineBase()}
+ const started=performance.now();combineState("","Creating combined seed pool…","Starting. The input pools are not being changed.");
+ let polling=false;const timer=setInterval(async()=>{if(polling)return;polling=true;try{const p=await api("/api/progress?operation=combine");const text=describeCombineProgress(p);$("combineStatusDetail").textContent=text||`Still working — ${fmtDuration((performance.now()-started)/1000)} elapsed.`}catch(_e){}finally{polling=false}},1000);
+ try{const v=await api("/api/combine",combineRequest(true));combineState("success",`Created ${v.name}`,`${fmt(v.records)} unique seed(s) written in ${fmtDuration((performance.now()-started)/1000)}.`);renderNoticeList("combineNotices",v.notices);const empty=v.records?"":" The rule produced an empty pool, so it cannot be searched in-game.";$("combineResult").innerHTML=`<div class="notice"><strong>Created ${esc(v.name)}</strong>The new pool contains ${fmt(v.records)} unique seed(s) using the ${esc(v.operation)} rule.${esc(empty)} The selected input pools were kept unchanged. Audit report: ${esc(v.report_path)}</div>`;await loadPools(true);workflowState.invalidateCombine();$("combinePublication").hidden=true;$("combineTechnical").hidden=true;$("combineCreateBtn").disabled=true;$("combineSumCompatibility").textContent="Created"}catch(e){combineState("error","Combined pool creation stopped",e.message||String(e));$("combineError").textContent=e.message||String(e);invalidateCombine("Check again after this failure")}finally{clearInterval(timer);workflowState.finishCombine();$("combineCancelBtn").hidden=true;$("combineCreateBtn").textContent="Create combined seed pool";updateCombineBase()}
 }
 async function cancelCombine(){$("combineCancelBtn").disabled=true;$("combineCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"combine"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineCancelBtn").disabled=false;$("combineCancelBtn").textContent="Cancel file creation"}}
 async function cancelCombineAnalysis(){$("combineAnalysisCancelBtn").disabled=true;$("combineAnalysisCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"analysis"})}catch(e){$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").disabled=false;$("combineAnalysisCancelBtn").textContent="Cancel compatibility check"}}
@@ -3755,17 +4033,17 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 response_started = True
                 self.wfile.write(body)
             elif parsed.path == "/api/pools":
-                self._json({
-                    "pools": list_sources(self.pool_dir),
-                    "native_summary": bool(_native_pool_binary()),
-                    "native_summary_min_bytes": NATIVE_SUMMARY_MIN_BYTES,
-                })
+                self._json(pools_payload(self.pool_dir))
             elif parsed.path == "/api/export":
                 serve_record_export(self, parsed, self.pool_dir)
             elif parsed.path == "/api/export/status":
                 query = parse_qs(parsed.query)
                 self._json(record_export_status(
                     query.get("request_id", [""])[0]))
+            elif parsed.path == "/api/progress":
+                query = parse_qs(parsed.query)
+                self._json(operation_progress(
+                    query.get("operation", [""])[0]))
             else:
                 self._json({"error": "not found"}, 404)
         except (OSError, ValueError, organizer.PoolError) as exc:
@@ -3814,6 +4092,8 @@ def make_handler(pool_dir):
 def main():
     os.makedirs(POOL_DIR, exist_ok=True)
     allow_active_operations()
+    for entry in sweep_stale_stage_dirs(POOL_DIR):
+        print("Removed abandoned staging folder %s" % entry)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", DEFAULT_PORT), OrganizerHandler)
     except OSError:
