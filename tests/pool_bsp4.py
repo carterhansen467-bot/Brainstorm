@@ -139,16 +139,28 @@ class BSP4CodecRegression(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def writer(self, name, schema=4):
+    def writer(self, name, schema=4, complete_fixture=False):
         path = os.path.join(self.temp.name, name)
         cls = (organizer.BSP4OutputWriter
                if schema == 4 else organizer.BSP3OutputWriter)
+        category = "tag:tag_charm:A1:small:none:o0:none"
+        label = "BSP%d fixture" % schema
+        header_builder = None
+        if complete_fixture:
+            # This oracle models every match for the native header criteria.
+            # Real category-derived subsets must keep the conservative default.
+            def header_builder(records, data_bytes, membership, metadata):
+                return organizer.build_output_header(
+                    self.source, category, label, records, data_bytes,
+                    membership, metadata, schema=schema,
+                    coverage_complete=True)
         return path, cls(
-            self.source, "tag:tag_charm:A1:small:none:o0:none",
-            "BSP%d fixture" % schema, path)
+            self.source, category, label, path,
+            header_builder=header_builder)
 
     def test_production_surfaces_advertise_bsp4_native_use(self):
-        path, writer = self.writer("surface-compatible.bspool")
+        path, writer = self.writer(
+            "surface-compatible.bspool", complete_fixture=True)
         publish(writer, [
             organizer.Record(7, (TAG,)),
             organizer.Record(11, (TAG, LEGENDARY)),
@@ -222,6 +234,24 @@ class BSP4CodecRegression(unittest.TestCase):
         self.assertEqual(report["source"]["schema"], 4)
         self.assertTrue(report["source"]["metadata_capable"])
         self.assertEqual(report["source"]["records"], 2)
+
+    def test_category_subset_remains_native_readable_without_attachment_coverage(self):
+        path, writer = self.writer("category-subset.bspool")
+        publish(writer, [organizer.Record(7, (TAG,))])
+
+        subset = organizer.BSPoolReader(path)
+        self.assertEqual(subset.complete, 1)
+        self.assertEqual(subset.coverage_complete, 0)
+        self.assertEqual(subset.header.integer("source_coverage_complete"), 1)
+        self.assertEqual(subset.header.integer("parent_coverage_complete"), 1)
+        info = builder.PoolInfo(path).as_dict()
+        self.assertTrue(info["metadata_capable"])
+        self.assertTrue(info["native_compatible"])
+        self.assertFalse(info["attachment_accelerator_eligible"])
+        self.assertFalse(info["attachment_authoritative_eligible"])
+        self.assertIn(
+            "the pool does not prove exhaustive coverage for its search criteria",
+            info["attachment_accelerator_blockers"])
 
     def test_canonical_4096_blocks_and_legacy_1024_blocks_are_readable(self):
         self.assertEqual(organizer.BSP3_WRITE_RECORDS, 1024)

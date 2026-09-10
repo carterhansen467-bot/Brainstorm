@@ -66,8 +66,19 @@ class SourceStub:
 
 
 def publish(path: Path, records: list[organizer.Record]) -> dict[str, object]:
+    source = SourceStub()
+    category = "native-bsp4-oracle"
+    label = "Native BSP4 oracle"
+
+    def header_builder(records, data_bytes, membership, metadata):
+        # Model a complete pool so incomplete/corruption cases can explicitly
+        # remove its coverage. This is a codec oracle, not a category subset.
+        return organizer.build_output_header(
+            source, category, label, records, data_bytes, membership,
+            metadata, schema=4, coverage_complete=True)
+
     writer = organizer.BSP4OutputWriter(
-        SourceStub(), "native-bsp4-oracle", "Native BSP4 oracle", str(path))
+        source, category, label, str(path), header_builder=header_builder)
     try:
         # Keep four independently chosen codec blocks in this reader fixture.
         # It intentionally models legacy BSP4's 1K physical grouping; the
