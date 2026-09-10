@@ -1,5 +1,5 @@
-Brainstorm Seed Pool tools (Windows x64)
-========================================
+Brainstorm Seed Pool Program (Windows x64)
+=========================================
 
 Launch it with the "Seed Pool Builder.bat" shortcut one folder up. Keep its
 console window open while a scan runs; closing it requests a checkpointed
@@ -7,12 +7,29 @@ pause, and Build can resume the recorded work later.
 
 This folder intentionally owns the standalone pool executables:
   Seed Pool Builder.exe       local browser interface
-  Seed Pool Organizer.exe     metadata organizer/splitter interface
+  Seed Pool Organizer.exe     direct shortcut to Organize / Combine
   brainstorm_seed_pool.exe    exhaustive scanner/refilter/merge helper
 
 The app reads native_search.cfg and writes seed_pools in the parent Brainstorm
 folder so Balatro sees exactly the same pools. Those are profile/runtime data,
 not app binaries, and the updater preserves them.
+
+To recover L1, L2, or other saved groups from a Complete pool, open
+Organize / Combine, choose Separate original pools, then Find original pools.
+The original files are not needed when their memberships remain in the
+Complete pool. Shared seeds can belong to more than one recovered group.
+
+Next, use Sort by second tag on each separated pool. Choose its start and end
+locations, add optional AND/OR/NOT tag-count conditions, and preview the new
+pools. If both Negative and Rare appear in the first matching Ante, a qualifying
+second tag must occur in a later Ante. Save rules to reuse the settings later.
+Missing recorded tag data is reported before files are created. Seeds without
+a qualifying second tag stay in the source and are left out of the new pools.
+
+All new pools are created alongside the source without replacing it. Their
+recorded history remains available for further filtering. Location and rule
+subsets have provisional search coverage: they are complete files, but cannot
+prove that a broader in-game search is exhausted.
 
 Legendary builds now offer two route-coverage choices. Exhaustive checks Shop,
 Charm, and automatic Omen Globe purchase recovery. Fast Exact checks Shop and

@@ -2014,23 +2014,22 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertLess(page.index('id="exportBtn"'),
                         page.index('id="categoryCard"'))
         self.assertIn(
-            "What kind of result should organize the new pools?", page)
+            "Split using which result?", page)
         self.assertIn('{id:"legendary",label:"Legendary"', page)
         self.assertIn('{id:"tag",label:"Tag"', page)
         self.assertIn('{id:"voucher",label:"Voucher"', page)
         self.assertIn("Choose locations to create pools for", page)
-        self.assertIn("Advanced: split by exact recorded event metadata", page)
+        self.assertIn("More detail: split individual recorded events", page)
         self.assertNotIn('id="filterKinds" role="radiogroup"', page)
         self.assertRegex(
             page,
-            r'<fieldset class="choicegroup"><legend>What kind of result '
-            r'should organize the new pools\?</legend>[\s\S]*?'
+            r'<fieldset class="choicegroup"><legend>Split using which result\?</legend>[\s\S]*?'
             r'id="exactKind"[\s\S]*?</fieldset>',
         )
         self.assertNotIn("What these checkboxes control", page)
         self.assertNotIn("Beginning of each new filename", page)
         self.assertIn('<label for="prefix">New file name</label>', page)
-        self.assertIn("Create pools from one pool", page)
+        self.assertIn("Split by location", page)
         self.assertIn("Also create an Other seeds pool", page)
         self.assertIn('id="policy" value="omit"', page)
         self.assertIn("Seeds without ${name} at a checked location", page)
@@ -2038,7 +2037,7 @@ class OrganizerWebRegression(unittest.TestCase):
         self.assertNotIn("Do not decide yet", page)
         self.assertIn("Preview new pools", page)
         self.assertIn("Review files to create", page)
-        self.assertIn("Advanced: require each seed to go to only one pool", page)
+        self.assertIn("Overlapping seeds: assign to only one pool", page)
         self.assertIn('assignmentMode:assignmentMode()', page)
         self.assertIn('"matching_copies"', page)
         self.assertIn('id="applyDecisionsBtn" hidden>Update preview', page)
@@ -2050,11 +2049,11 @@ class OrganizerWebRegression(unittest.TestCase):
             '"Updating preview…":"Building preview…"', page)
         self.assertIn(
             "Advanced: exclusive split decision files", page)
-        self.assertIn("Combine seed lists", page)
+        self.assertIn("Combine pools", page)
         self.assertIn("Any selected pool", page)
         self.assertIn("Every selected pool", page)
         self.assertIn("First pool, minus the others", page)
-        self.assertIn("Check compatibility and preview file", page)
+        self.assertIn("Preview combined pool", page)
         self.assertNotIn("The three combine rules", page)
         self.assertIn("Update pool format", page)
         self.assertIn("Check pool format", page)
@@ -3014,7 +3013,7 @@ class OrganizerWebRegression(unittest.TestCase):
             with urlopen(base + "/organize", timeout=10) as response:
                 page = response.read().decode("utf-8")
             self.assertIn("Organize / Combine", page)
-            self.assertIn("Combine seed lists", page)
+            self.assertIn("Combine pools", page)
             self.assertIn("Update pool format", page)
             with urlopen(base + "/organizer/api/pools", timeout=10) as response:
                 pools = json.loads(response.read().decode("utf-8"))["pools"]

@@ -3256,8 +3256,17 @@ def _hex_header(reader: BSPoolReader, key: str, default: int = 0) -> int:
 
 def build_output_header(reader: BSPoolReader, category_id: str, label: str,
                         records: int, data_bytes: int, membership: int,
-                        metadata: int, schema: int = 3
+                        metadata: int, schema: int = 3,
+                        coverage_complete: Optional[bool] = False
                         ) -> Tuple[bytes, Dict[str, object]]:
+    """Build a category-derived header without overstating native coverage.
+
+    Category assignments and saved rules restrict membership beyond the native
+    search predicates copied below. Native attachment matching does not evaluate
+    those restrictions, so the default cannot certify exhaustive coverage for
+    the broader predicates. Keep the source's actual coverage in its ancestry
+    fields; subsequent native refilters will inherit the output's restriction.
+    """
     if schema not in EVENT_POOL_SCHEMAS:
         raise PoolError("organizer event output schema is invalid")
     category_hash = fnv64(category_id.encode("utf-8"))
@@ -3277,7 +3286,12 @@ def build_output_header(reader: BSPoolReader, category_id: str, label: str,
     criteria = hash_fields("organize-criteria", reader.criteria_hash,
                            category_hash, reader.snapshot_id, 0)
     snapshot = hash_fields("snapshot", segment, records, data_bytes, membership)
-    coverage = int(bool(reader.coverage_complete))
+    if coverage_complete is not None and type(coverage_complete) is not bool:
+        raise PoolError("derived output coverage override must be a boolean")
+    if coverage_complete and not reader.coverage_complete:
+        raise PoolError("derived output coverage cannot exceed its source")
+    coverage = int(bool(reader.coverage_complete) if coverage_complete is None
+                   else coverage_complete)
     pool_material = ("%016x%016x%d-%d%s%d%d" % (
         reader.catalog_hash, criteria, reader.range_start, reader.range_end,
         reader.space_name, records, coverage)).encode("ascii")

@@ -2,3 +2,8 @@
 set -eu
 
 python3 tests/pool_organizer_web.py
+python3 tests/pool_tag_rules.py
+python3 tests/pool_rule_workflow.py
+python3 tests/pool_rules_web.py
+python3 tests/pool_builder_ui.py
+python3 tests/pool_rules_native_refilter.py

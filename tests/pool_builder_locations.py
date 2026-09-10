@@ -131,7 +131,7 @@ for element_id in ("legMinPhase", "legMaxPhase", "legSource",
                    'id="btnClose"', "/api/shutdown", "2M sample",
                    'id="scopeModeHint"', 'id="filterCard"', "Selected scope —",
                    "Complete chosen seed space —", 'id="activeFilters"',
-                   'id="filterModeHint"', "Tags-only fast path",
+                   'id="filterModeHint"', "Tag search",
                    'id="legRoutes"', 'value="canonical_charm"',
                    "Automatic Omen-purchase recovery is skipped"):
     assert element_id in web.PAGE

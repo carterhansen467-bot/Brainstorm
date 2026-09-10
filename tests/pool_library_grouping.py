@@ -106,7 +106,7 @@ def main():
         assert len(web_pools) == 5 and len(web_groups) == 4
         assert "<optgroup" in web.PAGE
         assert "document.activeElement === sel" in web.PAGE
-        assert "Composite membership set" in web.PAGE
+        assert "Original sources are saved for each seed" in web.PAGE
         assert "Organize / Combine" in web.PAGE
         assert 'id="mergeTools"' in web.PAGE
         assert "Merge distributed build parts" in web.PAGE

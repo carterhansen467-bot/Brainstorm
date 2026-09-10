@@ -17,6 +17,7 @@ import errno
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import socket
@@ -34,6 +35,9 @@ from urllib.parse import parse_qs, quote, urlparse
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import brainstorm_pool_organizer as organizer
+import pool_rule_workflow as rule_workflow
+import pool_rules_ui as rules_ui
+import pool_tag_rules as tag_rules
 split_policy = organizer.split_policy
 seed_pool_mutations = organizer.seed_pool_mutations
 
@@ -323,9 +327,9 @@ def _counted_records(reader, cancel_check=None):
 
 def operation_progress(kind):
     """Return a copy of one operation's live progress for the page."""
-    if kind not in ("analysis", "split", "combine", "upgrade"):
+    if kind not in ("analysis", "split", "combine", "upgrade", "rules"):
         raise organizer.PoolError(
-            "choose analysis, split, combine, or upgrade progress")
+            "choose analysis, split, combine, upgrade, or rules progress")
     with ACTIVE_OPERATION_LOCK:
         value = OPERATION_PROGRESS.get(kind)
         snapshot = dict(value) if value else {"state": "idle"}
@@ -348,9 +352,9 @@ def _python_copy_estimate_seconds(records):
 
 
 def cancel_operation(kind):
-    if kind not in ("analysis", "export", "split", "combine", "upgrade"):
+    if kind not in ("analysis", "export", "split", "combine", "upgrade", "rules"):
         raise organizer.PoolError(
-            "choose analysis, export, split, combine, or upgrade to cancel")
+            "choose analysis, export, split, combine, upgrade, or rules to cancel")
     with ACTIVE_OPERATION_LOCK:
         event = ACTIVE_OPERATIONS.get(kind)
         if event is None:
@@ -851,9 +855,8 @@ def _notices(source):
         notices.append({
             "kind": "info",
             "title": "New pools remain traceable to this source",
-            "text": ("Every new pool records source snapshot %s, so Brainstorm can "
-                     "tell exactly which saved version it came from.") %
-                    source["snapshot_id"],
+            "text": ("Every new pool keeps its source history, including which "
+                     "saved version it came from."),
         })
     return notices
 
@@ -3435,6 +3438,108 @@ def run_format_upgrade(request, pool_dir=None):
         COMBINE_LOCK.release()
 
 
+RULE_REVIEW_LOCK = threading.Lock()
+RULE_REVIEWS = collections.OrderedDict()
+RULE_REVIEW_LIMIT = 8
+
+
+def _run_rule_operation(request, pool_dir, action):
+    """One cancellable adapter for the rule Module's three operations."""
+    if not isinstance(request, dict):
+        raise organizer.PoolError("Choose a source pool and rule settings.")
+    event = _begin_operation("rules")
+    _progress_begin("rules", phase=action)
+    state = "failed"
+    try:
+        def cancelled():
+            _operation_cancelled(event.is_set)
+
+        name = request.get("source", "")
+        root = _pool_root(pool_dir)
+        reader = organizer.BSPoolReader(
+            resolve_source(name, root), verify_payloads=False,
+            cancel_check=cancelled)
+        expected = request.get("snapshot")
+        if expected is not None and expected != reader.snapshot_token:
+            raise organizer.PoolError(
+                "This source pool changed. Check its recorded data again.")
+        _progress_set("rules", records_total=reader.records)
+
+        def progress(done, total):
+            _progress_set("rules", records_done=done, records_total=total)
+
+        if action == "describe":
+            result = rule_workflow.describe_source(
+                reader, cancel_check=cancelled, progress=progress)
+            result["coverage"] = tag_rules.describe_recorded_coverage(reader)
+        elif action == "preview":
+            plan = rule_workflow.preview(
+                reader, request.get("recipe"), request.get("prefix", ""),
+                cancel_check=cancelled, progress=progress)
+            # The browser only receives a handle. Counts, recipes and source
+            # pins used for publication remain owned by this process.
+            token = secrets.token_urlsafe(24)
+            with RULE_REVIEW_LOCK:
+                RULE_REVIEWS[token] = (root, name, copy.deepcopy(plan))
+                while len(RULE_REVIEWS) > RULE_REVIEW_LIMIT:
+                    RULE_REVIEWS.popitem(last=False)
+            result = copy.deepcopy(plan)
+            result["plan_token"] = token
+            result["collisions"] = [
+                row["name"] for row in plan["outputs"]
+                if any(os.path.lexists(os.path.join(root, row["name"]) + suffix)
+                       for suffix in FORMAT_UPGRADE_PROTECTED_SUFFIXES)]
+            result["report_name"] = rule_workflow.report_filename(plan)
+            if os.path.lexists(os.path.join(root, result["report_name"])):
+                result["collisions"].append(result["report_name"])
+            result["can_create"] = bool(plan["outputs"]) and not result["collisions"]
+        elif action == "publish":
+            token = request.get("planToken")
+            if not isinstance(token, str):
+                raise organizer.PoolError("Preview these rules before creating pools.")
+            with RULE_REVIEW_LOCK:
+                entry = RULE_REVIEWS.pop(token, None)
+            if entry is None or entry[:2] != (root, name):
+                raise organizer.PoolError(
+                    "This preview expired or belongs to another pool. Preview again.")
+            result, completed = rule_workflow.publish(
+                reader, entry[2], root, cancel_check=cancelled, progress=progress)
+            if not completed:
+                raise organizer.PoolError("Pool creation did not complete.")
+        else:
+            raise organizer.PoolError("Unknown rule operation.")
+        state = "completed"
+        return result
+    except OperationCancelled:
+        state = "cancelled"
+        raise
+    finally:
+        _progress_finish("rules", state)
+        _finish_operation("rules", event)
+
+
+def run_rule_describe(request, pool_dir=None):
+    return _run_rule_operation(request, pool_dir, "describe")
+
+
+def run_rule_preview(request, pool_dir=None):
+    return _run_rule_operation(request, pool_dir, "preview")
+
+
+def run_rule_publish(request, pool_dir=None):
+    return _run_rule_operation(request, pool_dir, "publish")
+
+
+def run_rule_validate(request):
+    """Use the shared strict reader for GUI imports and exports too."""
+    if not isinstance(request, dict) or set(request) != {"document"}:
+        raise organizer.PoolError("Supply one saved rules document.")
+    recipe = rule_workflow.loads_recipe(request["document"])
+    if recipe["mode"] != "second_tag":
+        raise organizer.PoolError("Choose a saved second-tag rules file.")
+    return {"recipe": recipe}
+
+
 def _record_export_line(reader, record):
     value = {
         "seed": reader.seed(record.rank),
@@ -3586,7 +3691,7 @@ def serve_record_export(handler, parsed, pool_dir=None):
 
 PAGE = r'''<!doctype html>
 <html><head><meta charset="utf-8">
-<title>Brainstorm Seed Pool Organizer</title>
+<title>Seed Pool Program · Organize</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{color-scheme:dark;--bg:#0c0e14;--card:#171a25;--card2:#11141d;--line:#30364b;
@@ -3647,13 +3752,14 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 .filename-preview{margin-top:8px;padding:9px 11px;border:1px dashed #3b4159;border-radius:9px;background:#0f1119;color:#bdb7ca;font-size:11px;overflow-wrap:anywhere}.filename-preview b{color:#ebe5f5}
 .review-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.review-actions .go{min-width:230px}.secondary-link{min-height:33px!important;padding:5px 9px!important}
 [hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:680px){.choicecards,.inventory,.policycards{grid-template-columns:1fr}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}.sectionbar{align-items:flex-start;flex-direction:column}}
+/*__RULE_STYLES__*/
 </style></head><body><main class="app">
-<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Organizer</h1><p class="sub">Create, compare, or update recorded seed pools without changing the originals.</p></div></div><div class="local">Running locally</div></header>
+<header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Program</h1><p class="sub">Organize your saved seeds.</p></div></div><div class="local">Running locally</div></header>
 <nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
-<div class="privacy"><strong>Your pools stay on this computer.</strong> This page only talks to Brainstorm's local organizer. New pools are saved in <code>seed_pools</code> so the mod can see them immediately.</div>
-<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Create pools from one pool</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine seed lists</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
+<div class="privacy">Pools stay on this computer. New files are saved in <code>seed_pools</code>; source pools are kept.</div>
+<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split by location</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="restoreModeBtn">Separate original pools</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="tagModeBtn">Sort by second tag</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
 <div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool to see what it contains. Inspection is read-only.</p></div></div>
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool and inspect its recorded results.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
  <div class="notice warning" id="nativeHelperWarning" hidden></div>
  <div class="notice warning" id="poolFolderNotice" hidden></div>
@@ -3668,18 +3774,18 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
   <div id="notices"></div>
  </div>
 </section>
-<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose the new pools</h2><p class="copy">Choose a result type, a recorded target, and the locations that should each become a new pool.</p></div></div>
- <fieldset class="choicegroup"><legend>What kind of result should organize the new pools?</legend><div class="choicecards" id="filterKinds"></div>
-  <details class="advanced" id="exactDetails"><summary>Advanced: split by exact recorded event metadata</summary><div class="advancedbody"><label class="choicecard" for="exactKind"><input type="radio" name="filterKind" class="filterKind" id="exactKind" value="exact"><span><b>Exact technical metadata</b><small>Separates source, occurrence number, flags, Ante, and blind. Usually unnecessary.</small></span></label></div></details>
+<section class="card" id="categoryCard" tabindex="-1" hidden><div class="head"><span class="step">2</span><div><h2>Choose the new pools</h2><p class="copy">Choose a target, then select the locations to turn into pools.</p></div></div>
+ <fieldset class="choicegroup"><legend>Split using which result?</legend><div class="choicecards" id="filterKinds"></div>
+  <details class="advanced" id="exactDetails"><summary>More detail: split individual recorded events</summary><div class="advancedbody"><label class="choicecard" for="exactKind"><input type="radio" name="filterKind" class="filterKind" id="exactKind" value="exact"><span><b>Exact technical metadata</b><small>Separate matches that share a location but differ in source, occurrence, or flags.</small></span></label></div></details>
  </fieldset>
  <div class="field" id="targetField"><label for="organizeBy" id="targetLabel">Choose a recorded target</label><select id="organizeBy"></select></div>
  <div class="selection-summary" id="organizeByInfo"><strong>Choose a recorded target.</strong></div>
  <div class="sectionbar"><div><h3 id="locationQuestion">Choose locations to create pools for</h3><div class="hint" id="locationHelp">Select all that apply. Every checked location creates one new pool.</div></div><div class="row"><button class="small" id="allBtn">Select all</button><button class="small" id="noneBtn">Clear</button></div></div>
  <div class="hint" id="selectedLocationCount" aria-live="polite"></div>
  <div class="categories" id="categories"></div>
- <details class="advanced" id="exclusiveDetails"><summary>Advanced: require each seed to go to only one pool</summary><div class="advancedbody"><label class="choicecard" for="exclusiveMode"><input type="checkbox" id="exclusiveMode"><span><b>Use an exclusive split</b><small>Overlapping seeds must be assigned to exactly one destination. Use this for legacy saved decision files.</small></span></label></div></details>
+ <details class="advanced" id="exclusiveDetails"><summary>Overlapping seeds: assign to only one pool</summary><div class="advancedbody"><label class="choicecard" for="exclusiveMode"><input type="checkbox" id="exclusiveMode"><span><b>Use an exclusive split</b><small>Choose one destination for a seed that matches several selected locations.</small></span></label></div></details>
  </section>
-<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Name and preview new pools</h2><p class="copy">Choose what to do with other seeds, then preview exact filenames and counts. Previewing does not create files.</p></div></div>
+<section class="card" id="planCard" hidden><div class="head"><span class="step">3</span><div><h2>Name and preview new pools</h2><p class="copy">Name the outputs and decide whether to include unmatched seeds.</p></div></div>
  <fieldset class="choicegroup"><legend id="unmatchedQuestion">Other seeds</legend><p id="unmatchedHelp">Seeds that do not match a selected location stay in the unchanged source pool.</p>
   <input type="hidden" id="policy" value="omit">
   <div class="choicecards"><label class="choicecard" for="otherPool"><input type="checkbox" id="otherPool"><span><b>Also create an Other seeds pool</b><small>Copies every seed that matches none of the selected destinations.</small></span></label></div>
@@ -3703,7 +3809,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  <div class="actions"><button class="cancel" id="analysisCancelBtn" hidden>Cancel preview</button><button class="cancel" id="exportCancelBtn" hidden>Cancel record export</button><button class="cancel" id="splitCancelBtn" hidden>Cancel file creation</button></div><div class="error" id="error" role="alert"></div><div class="result live" id="result" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="combineWorkspace" role="tabpanel" aria-labelledby="combineModeBtn" hidden><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Choose two or more seed lists</h2><p class="copy">Select the pools to compare. They stay unchanged; Brainstorm creates one separate result.</p></div></div>
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Choose two or more seed lists</h2><p class="copy">Choose the pools to combine into one new pool.</p></div></div>
  <div class="row"><button class="small" id="combineAllBtn">Select all readable pools</button><button class="small" id="combineNoneBtn">Clear pool selection</button><button class="ghost" id="combineRefreshBtn">Refresh list</button></div>
  <div class="poolchoices" id="combineChoices"><div class="hint">Loading seed pools…</div></div>
 </section>
@@ -3716,8 +3822,8 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  </div></fieldset>
  <div class="combine-settings"><div class="field" id="combineBaseField" hidden><label for="combineBase">Start with this pool</label><select id="combineBase"></select><span class="hint">Seeds also present in another selected pool are removed.</span></div>
  <div class="field"><label for="combineName">New pool filename</label><input type="text" id="combineName" value="combined-pool"><span class="hint">The organizer adds <code>.bspool</code>. An existing file with the same name will not be overwritten.</span></div>
- <div class="field"><label for="combineLabel">Name shown inside Brainstorm</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
- <div class="row"><button id="combinePlanBtn">Check compatibility and preview file</button></div><div id="combineNotices"></div>
+ <div class="field"><label for="combineLabel">Display name</label><input type="text" id="combineLabel" value="Combined seed pool"></div></div>
+ <div class="row"><button id="combinePlanBtn">Preview combined pool</button></div><div id="combineNotices"></div>
  <details class="advanced" id="combineTechnical" hidden><summary>Technical compatibility and source history</summary><div class="advancedbody"><div class="checkgrid" id="combineChecks"></div><div id="combineBranches" class="branchlist"></div></div></details>
  <div id="combinePublication" hidden><h3 class="reviewtitle">File that will be created</h3><div class="manifest" id="combineManifest"></div><div class="hint" id="combineReport"></div><div class="review-actions"><button class="go" id="combineCreateBtn" disabled>Create combined seed pool</button></div></div>
 </section></div>
@@ -3726,7 +3832,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
  <div class="actions"><button class="cancel" id="combineAnalysisCancelBtn" hidden>Cancel compatibility check</button><button class="cancel" id="combineCancelBtn" hidden>Cancel file creation</button></div><div class="workstatus" id="combineStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="combineStatusTitle">Creating combined seed pool…</b><span id="combineStatusDetail">Starting.</span></div></div><div class="error" id="combineError" role="alert"></div><div class="result live" id="combineResult" aria-live="polite"></div>
 </section></aside></div>
 <div class="grid" id="formatWorkspace" role="tabpanel" aria-labelledby="formatModeBtn" hidden><div class="stack">
-<section class="card"><div class="head"><span class="step">1</span><div><h2>Check or update a pool</h2><p class="copy">Choose a <code>.bspool</code> file from Brainstorm's <code>seed_pools</code> folder. Checking reads only its header. A supported update creates a separate BSP4 copy; the original file is never changed.</p></div></div>
+<section class="card"><div class="head"><span class="step">1</span><div><h2>Check or update a pool</h2><p class="copy">Choose an older pool to check whether a format update is available. Updating creates a new copy.</p></div></div>
  <div class="field"><label for="formatSource">Seed pool</label><select id="formatSource"></select></div>
  <div class="row"><button class="go" id="formatCheckBtn" disabled>Loading pools…</button><button class="ghost" id="formatRefreshBtn">Refresh list</button></div>
  <div class="workstatus" id="formatStatus" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><b id="formatStatusTitle">Checking pool format…</b><span id="formatStatusDetail">Reading the saved pool header.</span></div></div>
@@ -3738,7 +3844,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 <aside class="side"><section class="card summary"><h2>Format summary</h2><dl>
  <div><dt>Selected pool</dt><dd id="formatSumSource">Choose a pool</dd></div><div><dt>Current format</dt><dd id="formatSumCurrent">—</dd></div><div><dt>Recorded seeds</dt><dd id="formatSumRecords">—</dd></div><div><dt>Update status</dt><dd id="formatSumStatus">Not checked</dd></div><div><dt>New file</dt><dd id="formatSumOutput">—</dd></div></dl>
  <div class="actions"><button class="go" id="formatUpdateBtn" disabled>Create BSP4 copy</button><button class="cancel" id="formatCancelBtn" hidden>Cancel update</button></div><div class="error" id="formatError" role="alert"></div><div class="result live" id="formatResult" aria-live="polite"></div>
-</section></aside></div></main>
+</section></aside></div><!--__RULE_WORKSPACE__--></main>
 <iframe id="recordExportFrame" title="Record export download" hidden></iframe>
 <script>
 const $=id=>document.getElementById(id);
@@ -3798,7 +3904,7 @@ function renderPoolFolderNotice(v){
  const box=$("poolFolderNotice");if(!box)return;const parts=[];const archives=v.archives||[];
  if(archives.length)parts.push(`<strong>Compressed archive${archives.length===1?"":"s"} in the seed_pools folder cannot be used directly</strong>${archives.map(esc).join(", ")} — extract the <code>.bspool</code> file inside (together with any sidecar files next to it) into this same folder, then click Refresh list. Brainstorm, the Seed Pool Builder, and this page read only <code>.bspool</code> files.`);
  const foreign=(v.pools||[]).filter(p=>!p.error&&p.catalog_matches===false);
- if(foreign.length)parts.push(`<strong>${fmt(foreign.length)} pool${foreign.length===1?" was":"s were"} built for a different profile snapshot</strong>${foreign.map(p=>esc(p.name)).join(", ")} — the unlock catalog or random-number parity recorded in the file does not match this computer's <code>native_search.cfg</code>. You can still inspect, split, or combine such a pool here, but every new pool keeps the same fingerprint and the in-game search refuses them with "profile/unlock snapshot differs". Shared pools work only between players whose snapshots match exactly: the same unlocked tags, Jokers, vouchers, and boosters, no vouchers owned when the snapshot was taken, and the same platform random-seeding behavior. Otherwise rebuild the pool with this computer's snapshot.`);
+ if(foreign.length)parts.push(`<strong>${fmt(foreign.length)} pool${foreign.length===1?" uses":"s use"} a different profile snapshot</strong>You can organize these pools here. To use them in-game, select the matching unlock profile or rebuild them for your current profile.<details><summary>Show affected pools</summary><ul>${foreign.map(p=>`<li>${esc(p.name)}</li>`).join("")}</ul></details>`);
  if(!parts.length){box.hidden=true;box.innerHTML="";return}
  box.hidden=false;box.innerHTML=parts.join("<br><br>")}
 function fail(e){$("error").textContent=e.message||String(e)}
@@ -3899,11 +4005,11 @@ async function loadPools(preserve=false){
   $("formatSource").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · BSP${p.schema} · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
   if([...$("formatSource").options].some(o=>o.value===priorFormat))$("formatSource").value=priorFormat;
-  renderCombineChoices(selectedCombine);
+  renderCombineChoices(selectedCombine);ruleLoadPools();
   inspectButton.disabled=!workflowState.pools.some(p=>!p.error);inspectButton.textContent="Inspect pool";
   $("formatSource").disabled=workflowState.format.running;formatButton.disabled=workflowState.format.running||!workflowState.pools.some(p=>!p.error);formatButton.textContent="Check pool format";
  }catch(e){
-  workflowState.setPools([]);$("source").innerHTML='<option value="">Pool list could not be loaded</option>';$("formatSource").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);
+  workflowState.setPools([]);$("source").innerHTML='<option value="">Pool list could not be loaded</option>';$("formatSource").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);ruleLoadPools();
   inspectButton.disabled=true;inspectButton.textContent="Inspect unavailable";$("formatSource").disabled=true;formatButton.disabled=true;formatButton.textContent="Check unavailable";
   inspectionState("error","Seed pool list failed to load",e.message||String(e));if(!workflowState.format.running){formatState("error","Seed pool list failed to load",e.message||String(e));fail(e)}throw e;
  }
@@ -4002,7 +4108,7 @@ function renderCombinePlan(v,fingerprint=combineFingerprint()){
  const publication=v.publication;$("combinePublication").hidden=false;$("combineManifest").innerHTML=`<div class="manifestrow"><span><b>${esc(publication.name)}</b><small>${esc(publication.label)} · ${esc(v.operation.toUpperCase())} · ${publication.output_exists?"filename already exists":"filename available"}</small></span><span class="count">Seed count calculated while the file is created</span></div>`;$("combineReport").textContent=`A small audit report named ${publication.report_name} will record the selected input versions and the membership rule. The input pools remain unchanged, and an existing output file is never overwritten.`;
  $("combineCreateBtn").disabled=workflowState.combine.running||!publication.ready||workflowState.combine.reviewedFingerprint!==combineFingerprint();
 }
-async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Checking selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed during the check. Check the current choices again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Compatibility check failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.textContent="Check compatibility and preview file";updateCombineBase()}}
+async function checkCombine(){$("combineError").textContent="";$("combineResult").innerHTML="";const button=$("combinePlanBtn"),request=combineRequest(false),fingerprint=combineFingerprint();button.disabled=true;$("combineAnalysisCancelBtn").hidden=false;button.textContent="Checking selected pools…";try{const v=await api("/api/combine/plan",request);if(fingerprint!==combineFingerprint())throw Error("The selected pools or rule changed during the check. Check the current choices again.");renderCombinePlan(v,fingerprint)}catch(e){invalidateCombine("Compatibility check failed");$("combineError").textContent=e.message||String(e)}finally{$("combineAnalysisCancelBtn").hidden=true;button.textContent="Preview combined pool";updateCombineBase()}}
 async function createCombine(){
  const combine=workflowState.combine;if(!combine.plan||combine.reviewedFingerprint!==combineFingerprint()||!combine.plan.publication.ready)return;$("combineError").textContent="";workflowState.startCombine();$("combineCreateBtn").disabled=true;$("combineCreateBtn").textContent="Creating combined seed pool…";$("combineCancelBtn").hidden=false;
  const started=performance.now();combineState("","Creating combined seed pool…","Starting. The input pools are not being changed.");
@@ -4048,7 +4154,13 @@ async function updateFormat(){
  }finally{clearInterval(timer);$("formatElapsed").hidden=true;$("formatElapsed").textContent="";workflowState.finishFormat();$("formatCancelBtn").hidden=true;button.textContent="Create BSP4 copy";button.disabled=!workflowState.format.plan||!workflowState.format.plan.eligible;picker.disabled=refreshFailed;refresh.disabled=false;check.disabled=refreshFailed||!workflowState.pools.some(p=>!p.error)}
 }
 async function cancelFormat(){$("formatCancelBtn").disabled=true;$("formatCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"upgrade"})}catch(e){$("formatError").textContent=e.message||String(e)}finally{$("formatCancelBtn").disabled=false;$("formatCancelBtn").textContent="Cancel update"}}
-function showMode(mode){const split=mode==="split",combine=mode==="combine",formatMode=mode==="format";$("splitWorkspace").hidden=!split;$("combineWorkspace").hidden=!combine;$("formatWorkspace").hidden=!formatMode;$("splitModeBtn").classList.toggle("active",split);$("combineModeBtn").classList.toggle("active",combine);$("formatModeBtn").classList.toggle("active",formatMode);$("splitModeBtn").setAttribute("aria-selected",String(split));$("combineModeBtn").setAttribute("aria-selected",String(combine));$("formatModeBtn").setAttribute("aria-selected",String(formatMode))}
+function showMode(mode){
+ if(ruleState.busy)return;
+ for(const name of ["split","combine","format"]){const active=mode===name;$(name+"Workspace").hidden=!active;$(name+"ModeBtn").classList.toggle("active",active);$(name+"ModeBtn").setAttribute("aria-selected",String(active))}
+ const rules=mode==="restore"||mode==="tag";$("rulesWorkspace").hidden=!rules;
+ for(const name of ["restore","tag"]){const active=mode===name;$(name+"ModeBtn").classList.toggle("active",active);$(name+"ModeBtn").setAttribute("aria-selected",String(active))}
+ if(rules)setRuleMode(mode);
+}
 
 $("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
 $("organizeBy").onchange=()=>{workflowState.clearSplitPlan(true);renderInspectLocations();$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Recorded target changed — preview the new pools")};
@@ -4057,15 +4169,20 @@ $("planBtn").onclick=()=>prepare(false);$("applyDecisionsBtn").onclick=()=>prepa
 $("exclusiveMode").onchange=()=>{workflowState.clearSplitPlan(!$("exclusiveMode").checked);$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;renderInspectLocations();invalidateSplitReview($("exclusiveMode").checked?"Exclusive split selected — preview the new pools":"Matching copies selected — preview the new pools")};
 $("otherPool").onchange=()=>{$("policy").value=$("otherPool").checked?"remainder":"omit";$("remainderField").hidden=!$("otherPool").checked;invalidateSplitReview()};$("remainder").oninput=()=>invalidateSplitReview();$("prefix").oninput=()=>{updateFilenamePreview();invalidateSplitReview()};
 $("exportBtn").onclick=startRecordExport;$("exportCancelBtn").onclick=cancelRecordExport;
-$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("formatModeBtn").onclick=()=>showMode("format");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
+$("restoreModeBtn").onclick=()=>showMode("restore");$("tagModeBtn").onclick=()=>showMode("tag");$("splitModeBtn").onclick=()=>showMode("split");$("combineModeBtn").onclick=()=>showMode("combine");$("formatModeBtn").onclick=()=>showMode("format");$("combinePlanBtn").onclick=checkCombine;$("combineCreateBtn").onclick=createCombine;$("combineAnalysisCancelBtn").onclick=cancelCombineAnalysis;$("combineCancelBtn").onclick=cancelCombine;$("combineRefreshBtn").onclick=()=>loadPools(false);
 $("formatCheckBtn").onclick=checkFormat;$("formatUpdateBtn").onclick=updateFormat;$("formatCancelBtn").onclick=cancelFormat;$("formatRefreshBtn").onclick=()=>{if(workflowState.format.running)return;resetFormatPlan();loadPools(false)};$("formatSource").onchange=()=>{if(!workflowState.format.running)resetFormatPlan("Selection changed — check this pool")};
 $("combineAllBtn").onclick=()=>{document.querySelectorAll(".combinePick:not(:disabled)").forEach(x=>x.checked=true);updateCombineBase();invalidateCombine("Selection changed")};$("combineNoneBtn").onclick=()=>{document.querySelectorAll(".combinePick").forEach(x=>x.checked=false);updateCombineBase();invalidateCombine("Selection changed")};
 document.querySelectorAll(".combineOp").forEach(input=>input.onchange=()=>{$("combineOperation").value=input.value;updateCombineBase();invalidateCombine("Rule changed")});$("combineBase").onchange=()=>invalidateCombine("Base changed");$("combineName").oninput=()=>{updateCombineBase();invalidateCombine("Output changed")};$("combineLabel").oninput=()=>invalidateCombine("Output changed");
 document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection();else if(e.target.classList.contains("filterKind"))renderFilterOptions()});
 if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/";$("mergeLink").hidden=true;$("standaloneMerge").hidden=false}
+/*__RULE_SCRIPT__*/
 resetSplitInspection();invalidateCombine();resetFormatPlan();loadPools(true).catch(()=>{});
 </script></body></html>'''
 
+
+PAGE = PAGE.replace("/*__RULE_STYLES__*/", rules_ui.STYLE).replace(
+    "<!--__RULE_WORKSPACE__-->", rules_ui.WORKSPACE).replace(
+    "/*__RULE_SCRIPT__*/", rules_ui.SCRIPT)
 
 def error_payload(exc):
     value = {"error": str(exc)}
@@ -4166,6 +4283,14 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                     data.get("source", ""), self.pool_dir))
             elif parsed.path == "/api/plan":
                 self._json(run_split_plan(data, self.pool_dir))
+            elif parsed.path == "/api/rules/describe":
+                self._json(run_rule_describe(data, self.pool_dir))
+            elif parsed.path == "/api/rules/preview":
+                self._json(run_rule_preview(data, self.pool_dir))
+            elif parsed.path == "/api/rules/publish":
+                self._json(run_rule_publish(data, self.pool_dir))
+            elif parsed.path == "/api/rules/validate":
+                self._json(run_rule_validate(data))
             elif parsed.path == "/api/combine/plan":
                 self._json(run_combine_plan(data, self.pool_dir))
             elif parsed.path == "/api/format/plan":

@@ -623,6 +623,66 @@ it matches; this flag cannot be combined with `--choices`. Without `--remainder`
 seeds that match none of the selected categories stay only in the unchanged
 source pool.
 
+### Recover original pools and sort by second tag
+
+In **Organize / Combine**, choose **Separate original pools** to recover saved
+groups such as L1, L2, and Other from a combined Complete pool. Select the
+Complete pool, click **Find original pools**, and choose the groups to recreate.
+**Inputs to the latest combine** lists the exact input memberships retained by
+that operation. **Earlier recorded source groups** lists retained original
+source branches; in a simple combine, these can match the latest inputs.
+Neither option requires the old files to still exist. Seeds shared by selected
+groups are copied into each new pool.
+Only seeds and history still recorded in the Complete pool can be recovered;
+this does not restore removed seeds, every intermediate grouping, or the exact
+original file bytes.
+
+Then choose **Sort by second tag** for each separated pool. Set its inclusive
+start and end locations. The rule finds the first Ante with a Negative or Rare
+tag. If only one type appears in that Ante, it chooses the earliest opposite
+type later in the range. If both appear in the first Ante, it chooses the first
+Negative or Rare in a strictly later Ante. A seed without a qualifying second
+tag is excluded from the new outputs. Each destination is named for the chosen
+tag, for example **A5 Small Rare** or **A6 Big Negative**.
+
+Each pool keeps its tag range, rule name, and optional conditions while the
+page is open. **Save or load rules**
+exports a portable JSON recipe for future sessions. **Optional tag conditions**
+provides nested All (AND), Any (OR), and Not groups with minimum/maximum counts
+and independent ranges. Saved files are validated before replacing settings;
+they contain data, never executable scripts.
+
+Both tools preview exact filenames and counts before creating anything, show
+progress, and support cancellation. They keep the source unchanged and refuse
+existing output files or companion artifacts. A publication report records the
+recipe, source identity, exclusions, and outputs. Tag rules require complete
+recorded placements for both tags in the main range. Each extra count condition
+requires its chosen tag throughout its own range. Missing recorded coverage
+stops the operation with an explanation;
+it never counts as an absent tag. **Check recorded data** shows the available
+windows.
+
+These are local rules over recorded placements. New pools created by location
+splits, source recovery, or tag rules are complete files with provisional search
+coverage. They retain their source's coverage in ancestry but cannot act as
+authoritative substitutes for a broader live search. Provisional search coverage
+does not mean the output file or its recorded metadata is incomplete.
+Processing streams through the Python reader without loading the entire pool
+into memory; large pools can take time to analyze and write.
+
+The same workflow is available without the GUI:
+
+```sh
+python3 tools/pool_rule_workflow.py sources path/to/Complete.bspool
+python3 tools/pool_rule_workflow.py preview path/to/Complete.bspool rules.json preview.json --prefix AS1
+python3 tools/pool_rule_workflow.py publish path/to/Complete.bspool preview.json path/to/output-directory
+```
+
+For source recovery, `rules.json` can contain
+`{"version":1,"mode":"separate_sources","source_kind":"inputs"}` to select
+all latest inputs, or add `source_ids` from the `sources` output to select a
+subset. For second-tag sorting, save a recipe from the GUI.
+
 Combining streams through the same native helper (`brainstorm_seed_pool
 combine`) whenever it is installed: the helper merges every input in rank
 order, verifies each input exactly like `summarize`, applies the union,

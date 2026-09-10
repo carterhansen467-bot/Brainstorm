@@ -1130,7 +1130,7 @@ def pool_attachment_accelerator_blockers(pool, current_catalog_hash=None):
     if not pool.get("complete"):
         blockers.append("the pool operation is not complete")
     if not pool.get("coverage_complete"):
-        blockers.append("the pool descends from an incomplete source snapshot")
+        blockers.append("the pool does not prove exhaustive coverage for its search criteria")
     if pool.get("space", "natural") != "natural" \
             or pool.get("seedspace", 0) != SEEDSPACE:
         blockers.append("automatic search substitution currently requires the natural seed space")

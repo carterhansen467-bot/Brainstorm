@@ -48,10 +48,10 @@ def criteria_from_json(data, snap):
     c.leg_max_phase = str(data.get("legMaxPhase", "big"))
     if c.leg_min_phase not in core.PHASES or c.leg_max_phase not in core.PHASES:
         raise ValueError("Unknown Legendary route point.")
-    if core.route_position(c.leg_min, c.leg_min_phase) > core.route_position(
+    if legend and core.route_position(c.leg_min, c.leg_min_phase) > core.route_position(
             c.leg_max, c.leg_max_phase):
         raise ValueError("Legendary route start must come before its route end.")
-    if c.leg_max == core.MAX_ANTE and c.leg_max_phase == "boss":
+    if legend and c.leg_max == core.MAX_ANTE and c.leg_max_phase == "boss":
         raise ValueError("The final supported Ante cannot end at Boss because its shop uses the next RNG Ante.")
     c.leg_source = str(data.get("legSource", "any"))
     if c.leg_source not in core.LEGENDARY_SOURCES:
@@ -69,12 +69,16 @@ def criteria_from_json(data, snap):
         raise ValueError("Unknown Legendary route coverage mode.")
     tag_keys = {k for k, _ in snap.usable_tags()}
     min_ante = dict(snap.usable_tags())
-    for rule in data.get("rules", [])[: core.MAX_TAG_RULES]:
+    raw_tag_rules = data.get("rules", [])
+    if len(raw_tag_rules) > core.MAX_TAG_RULES:
+        raise ValueError("At most %d tag requirements are supported."
+                         % core.MAX_TAG_RULES)
+    for rule in raw_tag_rules:
         key = rule.get("key", "")
         if key not in tag_keys:
             raise ValueError("Unknown or locked tag %r" % key)
-        lo = clamp_int(rule.get("min", 1), 1, core.MAX_VOUCHER_ANTE)
-        hi = clamp_int(rule.get("max", 8), lo, core.MAX_VOUCHER_ANTE)
+        lo = bounded_int(rule.get("min", 1), 1, core.MAX_ANTE, "Tag start Ante")
+        hi = bounded_int(rule.get("max", 8), lo, core.MAX_ANTE, "Tag end Ante")
         min_phase = str(rule.get("minPhase", "small"))
         max_phase = str(rule.get("maxPhase", "big"))
         if min_phase not in core.TAG_PHASES or max_phase not in core.TAG_PHASES:
@@ -85,8 +89,9 @@ def criteria_from_json(data, snap):
         if min_ante.get(key, 0) > hi:
             raise ValueError("%s cannot appear before ante %d"
                              % (core.TAG_NAMES.get(key, key), min_ante[key]))
-        cnt = clamp_int(rule.get("count", 1), 1,
-                        core.tag_location_count(lo, min_phase, hi, max_phase))
+        cnt = bounded_int(rule.get("count", 1), 1,
+                          core.tag_location_count(lo, min_phase, hi, max_phase),
+                          "Minimum tag count")
         c.tag_rules.append([key, lo, hi, cnt, min_phase, max_phase])
     usable_vouchers = snap.usable_vouchers() \
         if hasattr(snap, "usable_vouchers") else []
@@ -99,8 +104,10 @@ def criteria_from_json(data, snap):
         key = str(rule.get("key", ""))
         if key not in voucher_keys:
             raise ValueError("Unknown or unavailable voucher %r" % key)
-        lo = clamp_int(rule.get("min", 1), 1, core.MAX_ANTE)
-        hi = clamp_int(rule.get("max", 8), lo, core.MAX_ANTE)
+        lo = bounded_int(rule.get("min", 1), 1, core.MAX_VOUCHER_ANTE,
+                         "Voucher start Ante")
+        hi = bounded_int(rule.get("max", 8), lo, core.MAX_VOUCHER_ANTE,
+                         "Voucher end Ante")
         c.voucher_rules.append([key, lo, hi])
     raw_exclusions = data.get("voucherExclusions", [])
     if len(raw_exclusions) > core.MAX_VOUCHER_EXCLUSIONS:
@@ -136,6 +143,19 @@ def criteria_from_json(data, snap):
     if name:
         c.name, c.name_edited = name, True
     return c
+
+
+def bounded_int(value, lo, hi, label):
+    """Reject a changed meaning instead of silently narrowing a requirement."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        number = None
+    if isinstance(value, bool) or number is None or str(number) != str(value) \
+            or not lo <= number <= hi:
+        raise ValueError("%s must be a whole number from %d to %d."
+                         % (label, lo, hi))
+    return number
 
 
 def clamp_int(v, lo, hi):
@@ -546,15 +566,15 @@ SEEDCAP = core.SEEDSPACE_TOTAL  # UI clamp only; the scanner enforces per-space 
 # ------------------------------------------------------------------ http ---
 
 PAGE = """<!doctype html>
-<html><head><meta charset="utf-8">
-<title>Brainstorm Seed Pool Tools</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>Seed Pool Program · Build / Search</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root {
   color-scheme: dark;
   --bg:#0c0e14; --surface:#151823; --surface-2:#1b1f2d; --surface-3:#23283a;
   --line:#30364c; --line-soft:#252a3b; --text:#f4f1fa; --muted:#a7a3b5;
-  --faint:#777488; --gold:#f7c948; --gold-2:#ffe08a; --blue:#72b7ff;
+  --faint:#aaa5b7; --gold:#f7c948; --gold-2:#ffe08a; --blue:#72b7ff;
   --green:#55d889; --red:#ff7474; --purple:#9d8cff; --shadow:0 18px 50px #0006;
 }
 * { box-sizing:border-box; }
@@ -565,8 +585,8 @@ body { margin:0; min-height:100vh; background:
   radial-gradient(circle at 92% 8%, #15334b 0, transparent 28rem), var(--bg);
   color:var(--text); font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 button, select, input { font:inherit; }
-button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible {
-  outline:3px solid #72b7ff55; outline-offset:2px; }
+button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible {
+  outline:3px solid var(--blue); outline-offset:2px; }
 .app { width:min(1180px, calc(100% - 32px)); margin:0 auto; padding:34px 0 70px; }
 .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:24px;
   margin-bottom:26px; }
@@ -623,6 +643,7 @@ h1 { margin:0; font-size:clamp(23px, 3vw, 32px); line-height:1.1; letter-spacing
 .field { display:grid; gap:6px; align-content:start; min-width:0; }
 .field.full { grid-column:1 / -1; }
 label, .label { color:#c8c3d2; font-size:12px; font-weight:700; }
+.hint.full { grid-column:1 / -1; }
 .hint { color:var(--faint); font-size:12px; line-height:1.4; }
 select, input[type=number], input[type=text] { width:100%; min-height:42px; padding:9px 11px;
   color:var(--text); background:#0f111a; border:1px solid #3a4058; border-radius:10px; }
@@ -632,13 +653,14 @@ select:disabled, input:disabled { opacity:.48; cursor:not-allowed; }
   border:1px solid #353a50; border-radius:10px; background:#11141e; color:#d9d5e1;
   font-size:13px; font-weight:600; cursor:pointer; }
 .check input { width:17px; height:17px; margin:0; accent-color:var(--purple); }
-#legRange { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px;
+#legRange { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px;
   grid-column:1 / -1; padding:14px; border:1px solid var(--line-soft); border-radius:12px;
   background:#11141e; }
 #rules { display:grid; gap:9px; }
-.rule { display:grid; grid-template-columns:minmax(150px, 1.5fr) .55fr .55fr .65fr .55fr .65fr auto;
-  gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
+.rule { display:grid; gap:12px; padding:12px; border:1px solid var(--line-soft);
   border-radius:12px; background:#11141e; }
+.rule-top { display:grid; grid-template-columns:minmax(0, 1fr) 110px auto; gap:10px; align-items:end; }
+.rule-window { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
 .voucher-list { display:grid; gap:9px; }
 .voucher-rule { display:grid; grid-template-columns:minmax(190px, 1.5fr) .65fr .65fr auto;
   gap:9px; align-items:end; padding:12px; border:1px solid var(--line-soft);
@@ -660,6 +682,7 @@ button.warn { background:#592d33; border-color:#7b3b44; color:#ffc0c0; }
 button.mini { min-height:34px; padding:6px 10px; background:#292e42; border-color:#3d435d;
   color:#d8d5e1; font-size:12px; }
 button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
+button:disabled { background:#272b3b; border-color:#34394e; color:#a49fae; box-shadow:none; }
 .advanced { margin-top:16px; border:1px solid var(--line-soft); border-radius:12px; background:#11141e; }
 .advanced summary { cursor:pointer; padding:12px 14px; color:#c9c5d3; font-size:13px;
   font-weight:750; list-style:none; }
@@ -680,7 +703,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .summary-item dd { margin:0; color:#e3deeb; text-align:right; overflow-wrap:anywhere; }
 .primary-actions { display:grid; gap:9px; margin-top:16px; }
 .primary-actions button { width:100%; }
-#error, #mergeError { min-height:0; margin-top:10px; color:#ffaaaa; font-size:13px;
+#error, #mergeError, #libraryError { min-height:0; margin-top:10px; color:#ffaaaa; font-size:13px;
   white-space:pre-wrap; }
 .progress-card { overflow:hidden; }
 .progress-top { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }
@@ -703,6 +726,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 #result:empty { display:none; }
 .library { margin-top:18px; }
 .library-head { display:flex; justify-content:space-between; align-items:flex-end; gap:18px; margin-bottom:16px; }
+.library-head a { color:var(--blue); }
 .library-head h2 { margin:0; font-size:19px; }
 .library-head p { margin:4px 0 0; color:var(--muted); font-size:13px; }
 .pool-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:11px; }
@@ -728,11 +752,16 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .status.ok { background:#163424; color:#80e4a6; }
 .status.part { background:#3b3017; color:#f4d46b; }
 .pool-meta { margin-top:9px; color:#a19dad; }
-.pool-criteria { margin-top:9px; color:#757286; line-height:1.45; overflow-wrap:anywhere; }
+.pool-criteria { margin-top:9px; color:var(--muted); line-height:1.45; overflow-wrap:anywhere; }
 .pool-relation { margin-top:8px; color:#aaa5b7; }
 .pool-update { margin-top:9px; padding:8px 10px; border:1px solid #675829;
   border-radius:9px; background:#29230f; color:#f2d77a; }
 .pool-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:7px; margin-top:11px; }
+.pool-details { margin-top:10px; color:var(--muted); }
+.pool-details summary { cursor:pointer; padding:4px 0; }
+.pool-details .pool-meta { overflow-wrap:anywhere; }
+#libraryMessage { color:var(--green); font-size:13px; white-space:pre-wrap; }
+#libraryMessage:empty, #libraryError:empty { display:none; }
 .pool-delete { background:#3c2229 !important; border-color:#74404b !important; color:#ffc1c9 !important; }
 .pool.merge-selected { border-color:#7564ae; box-shadow:inset 0 0 0 1px #7564ae55; }
 .empty-library { grid-column:1 / -1; padding:30px; text-align:center; border:1px dashed #34394e;
@@ -760,7 +789,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 .ok { color:var(--green); } .part { color:var(--gold); }
 @media (max-width:900px) {
   .workspace { grid-template-columns:1fr; }
-  .side { position:static; grid-row:1; }
+  .side { position:static; }
   .summary-card { order:2; }
   .progress-card { order:1; }
 }
@@ -772,9 +801,11 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .appnav a { flex:1; text-align:center; }
   .card { padding:17px; border-radius:15px; }
   .field-grid, .field-grid.three, #legRange { grid-template-columns:1fr; }
-  .rule { grid-template-columns:1fr 1fr; }
-  .rule .rule-field:first-child { grid-column:1 / -1; }
-  .rule button { grid-column:1 / -1; }
+  .rule-top, .rule-window { grid-template-columns:1fr 1fr; }
+  .rule-top .rule-field:first-child { grid-column:1 / -1; }
+  .rule-top button { align-self:end; }
+  .pool-top { flex-wrap:wrap; }
+  .server-tools { flex-wrap:wrap; }
   .voucher-rule, .voucher-exclusion { grid-template-columns:1fr 1fr; }
   .voucher-rule .rule-field:first-child, .voucher-exclusion .rule-field:first-child,
   .voucher-rule button, .voucher-exclusion button { grid-column:1 / -1; }
@@ -783,60 +814,64 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
   .merge-mode-bar { align-items:flex-start; flex-direction:column; }
   .library-head { display:block; }
 }
+@media (prefers-reduced-motion:reduce) {
+  html { scroll-behavior:auto; }
+  *, *:before, *:after { transition:none !important; }
+}
 </style></head><body>
 <main class="app">
   <header class="topbar">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">B</div>
       <div>
-        <h1>Seed Pool Tools</h1>
-        <p class="sub">Build, search, organize, and combine reusable Brainstorm seed pools.</p>
+        <h1>Seed Pool Program</h1>
+        <p class="sub">Find seeds that match your requirements.</p>
       </div>
     </div>
     <div class="server-tools"><div class="local-pill" id="serverStatus">Running locally</div>
-      <button type="button" class="mini ghost" id="btnClose" onclick="closeBuilder()">Close Builder</button></div>
+      <button type="button" class="mini ghost" id="btnClose" onclick="closeBuilder()">Close program</button></div>
   </header>
 
-  <nav class="appnav"><a class="active" href="/">Build / Search</a><a href="/organize">Organize / Combine</a></nav>
+  <nav class="appnav" aria-label="Workspaces"><a class="active" aria-current="page" href="/">Build / Search</a><a href="/organize">Organize / Combine</a></nav>
 
   <div class="notice"><span aria-hidden="true">◆</span><div><strong>Your data stays here.</strong>
-    This page only talks to the builder on this computer. Closing the browser tab leaves the local Builder running; use <strong>Close Builder</strong> when finished. An active scan will pause safely at its next checkpoint.</div></div>
+    Searches run on this computer. You can close this tab while a search continues. <strong>Close program</strong> pauses an active search safely and stops the program.</div></div>
 
   <div class="workspace">
     <div class="stack">
       <section class="card" id="filterCard" aria-labelledby="filterTitle">
         <div class="card-head"><span class="step">1</span><div>
           <h2 id="filterTitle">Choose what seeds must contain</h2>
-          <p class="card-copy">Use a Legendary, tags, vouchers, or combine them.</p>
+          <p class="card-copy">Add any combination of requirements. A seed must meet all of them.</p>
         </div></div>
 
         <div class="active-filter-panel" aria-live="polite">
           <div class="active-filter-head"><span>Active filters</span><strong id="filterModeTitle">No active filters</strong></div>
           <div class="active-filter-list" id="activeFilters"><span class="filter-chip empty">No filters selected</span></div>
-          <div class="hint filter-mode-hint" id="filterModeHint">Add a tag requirement to use the tags-only fast path, or choose a Legendary to run exact Soul routing.</div>
+          <div class="hint filter-mode-hint" id="filterModeHint">Choose a Legendary, add a tag requirement, or add a voucher target.</div>
         </div>
 
         <div class="section-label">Legendary joker</div>
         <div class="field-grid">
           <div class="field full"><label for="legendary">Target Legendary</label>
             <select id="legendary"></select></div>
-          <div id="legRange">
-            <div class="field"><label for="legDepth">Soul search depth</label>
+          <div id="legRange" style="display:none">
+            <div class="field"><label for="legDepth">Which Soul can contain it?</label>
               <select id="legDepth" title="Two Souls deep also accepts a seed whose first Soul contains a different Legendary.">
                 <option value="1">First Soul only</option>
                 <option value="any">First or second Soul</option>
               </select></div>
-            <div class="field"><label for="legRoutes">Legendary route coverage</label>
+            <div class="field"><label for="legRoutes">Routes to check</label>
               <select id="legRoutes">
                 <option value="full">Exhaustive — Shop, Charm, and Omen</option>
                 <option value="canonical_charm">Fast exact — Shop and Charm</option>
               </select></div>
             <div class="field"><label for="legMin">From ante</label><input type="number" id="legMin" min="1" max="39" value="1"></div>
-            <div class="field"><label for="legMinPhase">From route point</label><select id="legMinPhase">
+            <div class="field"><label for="legMinPhase">From blind</label><select id="legMinPhase">
               <option value="small">Small Blind</option><option value="big">Big Blind</option><option value="boss">Boss Blind shop</option>
             </select></div>
             <div class="field"><label for="legMax">Through ante</label><input type="number" id="legMax" min="1" max="39" value="8"></div>
-            <div class="field"><label for="legMaxPhase">Through route point</label><select id="legMaxPhase">
+            <div class="field"><label for="legMaxPhase">Through blind</label><select id="legMaxPhase">
               <option value="small">Small Blind</option><option value="big" selected>Big Blind</option><option value="boss">Boss Blind shop</option>
             </select></div>
             <div class="field"><label for="legSource">Soul pack source</label><select id="legSource">
@@ -844,25 +879,25 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
               <option value="charm">Charm Tag reward only</option><option value="ethereal">Ethereal Tag reward only</option>
             </select></div>
             <label class="check"><input type="checkbox" id="legNeg"> Require Negative</label>
+            <div class="hint full">Souls are checked in play order. Exhaustive includes routes that buy Omen Globe. Fast exact is quicker and omits seeds that need that purchase.</div>
           </div>
-          <div class="hint full">Souls are checked chronologically across reachable shop packs and collected Charm or Ethereal rewards. Fast exact keeps every result valid but omits seeds that only work by automatically finding and purchasing Omen Globe.</div>
         </div>
 
         <div class="section-label">Tag requirements</div>
         <div id="rules"><div class="empty-rules">No tags required yet.</div></div>
-        <div class="button-row"><button type="button" class="mini" onclick="addRule()">＋ Add tag requirement</button></div>
+        <div class="button-row"><button type="button" class="mini" id="btnAddTag" onclick="addRule()">＋ Add tag requirement</button></div>
 
         <div class="section-label">Voucher targets</div>
         <div id="voucherRules" class="voucher-list"><div class="empty-rules">No vouchers required yet.</div></div>
         <div class="button-row"><button type="button" class="mini" id="btnAddVoucher" onclick="addVoucherRule()">＋ Add voucher target</button></div>
-        <div class="hint">The scanner finds the minimum-purchase route that reaches every target within its Ante window.</div>
+        <div class="hint">Find each voucher within its Ante range, using the fewest required purchases.</div>
 
         <details class="advanced">
-          <summary>Voucher purchase exclusions</summary>
+          <summary>Optional: vouchers you will not buy</summary>
           <div class="advanced-body">
             <div id="voucherExclusions" class="voucher-list"><div class="empty-rules">No purchases excluded.</div></div>
             <div class="button-row"><button type="button" class="mini" id="btnAddVoucherExclusion" onclick="addVoucherExclusion()">＋ Add purchase exclusion</button></div>
-            <div class="hint">An excluded voucher may still appear, but a matching route cannot depend on buying it. You can exclude the target itself to require finding it as an offer.</div>
+            <div class="hint">These vouchers may appear, but the route cannot buy them. Exclude a target voucher to require it as an offer without buying it.</div>
           </div>
         </details>
 
@@ -879,36 +914,37 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <section class="card" aria-labelledby="scanTitle">
         <div class="card-head"><span class="step">2</span><div>
           <h2 id="scanTitle">Set the search range</h2>
-          <p class="card-copy">Quick Estimate builds and removes a representative adaptive sample, then projects the selected scope.</p>
+          <p class="card-copy">Search new seeds or filter a pool you already have.</p>
         </div></div>
         <div class="field-grid">
           <div class="field full"><label for="inputPool">Search within</label>
             <select id="inputPool"><option value="">Balatro's seed space</option></select>
-            <span class="hint">Choose any pool with recorded seeds—including a paused pool—to filter its current snapshot.</span></div>
+            <span class="hint">An existing pool can be filtered even while paused. Only seeds already saved in it will be checked.</span></div>
           <div class="field"><label for="space">Seed space</label>
             <select id="space">
               <option value="natural">Natural seeds · 1.79 trillion</option>
               <option value="settable">All vanilla-settable seeds · 2.32 trillion · no 0</option>
               <option value="total">All possible seeds · 2.90 trillion · includes 0</option>
             </select></div>
-          <div class="field"><label for="count">Scan scope</label>
+          <div class="field"><label for="count">How many seeds?</label>
             <select id="count">
               <option value="0" id="optAll">Entire seed space (can take days)</option>
               <option value="10000000000">First 10 billion seeds</option>
               <option value="1000000000">First 1 billion seeds</option>
               <option value="100000000" selected>First 100 million · quick test</option>
             </select></div>
-          <div class="field"><label for="threads">Scan threads</label>
+          <div class="field"><label for="threads">CPU threads</label>
             <select id="threads"><option value="0">Auto (recommended)</option></select></div>
           <div class="field"><label for="name">Pool name</label>
             <input type="text" id="name" placeholder="Generated automatically" size="22"></div>
           <div class="hint full" id="spaceHint"></div>
-          <div class="hint full" id="scopeModeHint">Quick Estimate samples 2 million seeds, then projects both this selected scope and the complete chosen seed space.</div>
+          <div class="hint full" id="scopeModeHint">Quick estimate samples up to 2 million seeds to estimate matches, file size, and search time.</div>
         </div>
 
         <details class="advanced">
-          <summary>Advanced: split work across computers</summary>
+          <summary>Optional: split this search across computers</summary>
           <div class="advanced-body field-grid">
+            <p class="hint full">Use the same requirements and search range on each computer, with a different part number. Bring the finished files together and use Merge distributed build parts below.</p>
             <div class="field"><label for="shardTotal">Number of parts</label>
               <select id="shardTotal">
                 <option value="1">Do not split</option>
@@ -932,13 +968,13 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
           <div class="summary-item"><dt>Looking for</dt><dd id="sumFilter">Choose a Legendary, tag, or voucher</dd></div>
           <div class="summary-item"><dt>Source</dt><dd id="sumSource">Balatro's natural seeds</dd></div>
           <div class="summary-item"><dt>Scope</dt><dd id="sumScope">First 100 million</dd></div>
-          <div class="summary-item"><dt>Compute</dt><dd id="sumThreads">Automatic scan threads</dd></div>
+          <div class="summary-item"><dt>CPU</dt><dd id="sumThreads">Automatic scan threads</dd></div>
           <div class="summary-item"><dt>Output</dt><dd id="sumOutput">Automatic name</dd></div>
         </dl>
         <div class="primary-actions">
           <button class="go" onclick="run('build')" id="btnBuild">Build seed pool</button>
           <button class="ghost" onclick="run('estimate')" id="btnEst">Quick estimate (2M sample)</button>
-          <button class="warn" onclick="stopJob()" id="btnStop" disabled>Pause active job</button>
+          <button class="warn" onclick="stopJob()" id="btnStop" disabled>Pause search</button>
         </div>
         <div id="error" role="alert"></div>
       </section>
@@ -946,33 +982,34 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <section class="card progress-card" id="progressCard" style="display:none" aria-live="polite">
         <div class="progress-top"><div><div class="progress-state" id="progressState">Working</div>
           <h2 id="progTitle">Progress</h2></div><strong id="progressPct">0%</strong></div>
-        <div id="bar"><div id="fill"></div></div>
+        <div id="bar" role="progressbar" aria-label="Search progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="fill"></div></div>
         <div class="stats">
           <div class="stat"><span id="sScanLabel">Scanned</span><b id="sScan">0</b></div>
           <div class="stat"><span id="sMatchLabel">Matches</span><b id="sMatch">0</b></div>
           <div class="stat"><span>Speed</span><b id="sRate">—</b></div>
           <div class="stat"><span>Time left</span><b id="sEta">—</b></div>
         </div>
-        <div id="log"></div><div id="result"></div>
+        <div id="result"></div>
+        <details class="advanced"><summary>Search log</summary><div class="advanced-body" id="log"></div></details>
       </section>
     </aside>
   </div>
 
   <section class="card library" aria-labelledby="libraryTitle">
     <div class="library-head"><div><h2 id="libraryTitle">Your seed pools</h2>
-      <p>Completed pools appear in Brainstorm automatically. Share a pool by copying its single <code>.bspool</code> file.</p></div></div>
+      <p>Open <a href="/organize">Organize / Combine</a> to split pools or apply saved rules. Share a pool by copying its <code>.bspool</code> file.</p></div></div>
     <details class="advanced merge-tools" id="mergeTools">
       <summary>Merge distributed build parts <span class="merge-summary-count" id="mergeSummaryCount">No parts selected</span></summary>
       <div class="advanced-body">
         <div class="merge-flow">
           <div class="merge-stage"><span class="merge-step">1</span><div><strong>Select completed build parts</strong>
             <p class="hint">While this panel is open, eligible pools below show selection checkboxes. Choose at least two parts from the same distributed build.</p></div></div>
-          <div class="merge-stage"><span class="merge-step">2</span><div><strong>Name the merged output and run the safety check</strong>
+          <div class="merge-stage"><span class="merge-step">2</span><div><strong>Name and merge the parts</strong>
             <div class="merge-panel"><div class="field"><label for="mergeName">New merged pool name</label>
               <input type="text" id="mergeName" value="merged-pool" size="22">
-              <span class="hint">Brainstorm adds <code>.bspool</code> and never overwrites an existing file.</span></div>
+              <span class="hint">The program adds <code>.bspool</code>. Choose a name that is not already in use.</span></div>
               <button type="button" id="btnMerge" onclick="mergePools()" disabled>Check parts and merge</button></div></div></div>
-          <div class="merge-preflight">Before publishing a new pool, Brainstorm checks that every selected file is complete, uses the same search criteria, and covers one continuous range without gaps or overlaps. The source parts stay unchanged. Once started, this merge cannot be paused.</div>
+          <div class="merge-preflight">The merge checks that every part is complete, has the same requirements, and covers one continuous range without gaps or overlaps. The source parts stay unchanged. Once started, this merge cannot be paused.</div>
         </div>
         <div id="mergeError" role="alert"></div>
       </div>
@@ -981,6 +1018,8 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
       <div><strong>Select parts from the pool library</strong><span id="mergeSelectionNames">No parts selected yet.</span></div>
       <span class="merge-count" id="mergeSelectionCount">0 parts selected</span>
     </div>
+    <div id="libraryMessage" role="status"></div>
+    <div id="libraryError" role="alert"></div>
     <p class="hint" id="poolArchiveNotice" hidden></p>
     <div id="pools" class="pool-grid"><div class="empty-library">No seed pools yet.</div></div>
   </section>
@@ -990,6 +1029,7 @@ button.ghost { background:transparent; border-color:#3b425c; color:#d3cfdd; }
 let CAT = null, lastRunning = false, lastJobKind = "", lastResultKey = "";
 let mergeSelected = new Set(), mergeRequestPending = false, builderBusy = false;
 let latestPoolGroups = [], latestPools = [];
+let seedSpaceCount = null, stopRequested = false;
 const $ = id => document.getElementById(id);
 
 // Replace a <select>'s options only when they actually changed, and never
@@ -1051,27 +1091,42 @@ function renderLatestPoolLibrary(){
   // Only replace cards when pool data, merge mode, or a selected state changed.
   // The persistent Set remains authoritative across the one-second poll.
   if ($("pools").dataset.rendered !== html){
+    const openDetails = new Set([...$("pools").querySelectorAll("details[open]")]
+      .map(details=>details.dataset.poolDetails));
     $("pools").dataset.rendered = html;
     $("pools").innerHTML = html;
+    for (const details of $("pools").querySelectorAll("details"))
+      details.open = openDetails.has(details.dataset.poolDetails);
   }
 }
 
+function refreshTagButton(){
+  if (!CAT) return;
+  $("btnAddTag").disabled = !CAT.tags.length
+    || document.querySelectorAll("#rules .rule").length >= 16;
+}
+
 function addRule(key){
-  if (!CAT || !CAT.tags.length) return;
+  if (!CAT || !CAT.tags.length
+      || document.querySelectorAll("#rules .rule").length >= 16) return;
   const div = document.createElement("div");
   div.className = "rule";
   const opts = CAT.tags.map(t=>`<option value="${esc(t.key)}">${esc(t.name)}</option>`).join("");
-  div.innerHTML = `<div class="rule-field"><span class="label">Tag</span><select class="rkey">${opts}</select></div>
-    <div class="rule-field"><span class="label">Minimum</span><input type="number" class="rcount" min="1" max="16" value="1"></div>
-    <div class="rule-field"><span class="label">From ante</span><input type="number" class="rmin" min="1" max="39" value="1"></div>
-    <div class="rule-field"><span class="label">From blind</span><select class="rminphase"><option value="small">Small</option><option value="big">Big</option></select></div>
-    <div class="rule-field"><span class="label">Through ante</span><input type="number" class="rmax" min="1" max="39" value="8"></div>
-    <div class="rule-field"><span class="label">Through blind</span><select class="rmaxphase"><option value="small">Small</option><option value="big" selected>Big</option></select></div>
-    <button type="button" class="mini" onclick="removeRule(this)">Remove</button>`;
+  div.innerHTML = `<div class="rule-top">
+    <label class="rule-field"><span>Tag</span><select class="rkey">${opts}</select></label>
+    <label class="rule-field"><span>At least</span><input type="number" class="rcount" min="1" max="78" value="1"></label>
+    <button type="button" class="mini" onclick="removeRule(this)" aria-label="Remove tag requirement">Remove</button></div>
+    <div class="rule-window">
+    <label class="rule-field"><span>From Ante</span><input type="number" class="rmin" min="1" max="39" value="1"></label>
+    <label class="rule-field"><span>From blind</span><select class="rminphase"><option value="small">Small</option><option value="big">Big</option></select></label>
+    <label class="rule-field"><span>Through Ante</span><input type="number" class="rmax" min="1" max="39" value="8"></label>
+    <label class="rule-field"><span>Through blind</span><select class="rmaxphase"><option value="small">Small</option><option value="big" selected>Big</option></select></label></div>`;
   if (key) div.querySelector(".rkey").value = key;
   const empty = $("rules").querySelector(".empty-rules");
   if (empty) empty.remove();
   $("rules").appendChild(div);
+  div.querySelector(".rkey").focus();
+  refreshTagButton();
   updateSummary();
 }
 
@@ -1079,6 +1134,8 @@ function removeRule(button){
   button.closest(".rule").remove();
   if (!$("rules").querySelector(".rule"))
     $("rules").innerHTML = '<div class="empty-rules">No tags required yet.</div>';
+  refreshTagButton();
+  $("btnAddTag").focus();
   updateSummary();
 }
 
@@ -1103,14 +1160,15 @@ function addVoucherRule(key){
   if (document.querySelectorAll("#voucherRules .voucher-rule").length >= 8) return;
   const div = document.createElement("div");
   div.className = "voucher-rule";
-  div.innerHTML = `<div class="rule-field"><span class="label">Voucher</span><select class="vkey">${voucherOptions()}</select></div>
-    <div class="rule-field"><span class="label">From ante</span><input type="number" class="vmin" min="1" max="8" value="1"></div>
-    <div class="rule-field"><span class="label">Through ante</span><input type="number" class="vmax" min="1" max="8" value="8"></div>
-    <button type="button" class="mini" onclick="removeVoucherRule(this)">Remove</button>`;
+  div.innerHTML = `<label class="rule-field"><span>Voucher</span><select class="vkey">${voucherOptions()}</select></label>
+    <label class="rule-field"><span>From ante</span><input type="number" class="vmin" min="1" max="8" value="1"></label>
+    <label class="rule-field"><span>Through ante</span><input type="number" class="vmax" min="1" max="8" value="8"></label>
+    <button type="button" class="mini" onclick="removeVoucherRule(this)" aria-label="Remove voucher target">Remove</button>`;
   if (key) div.querySelector(".vkey").value = key;
   const empty = $("voucherRules").querySelector(".empty-rules");
   if (empty) empty.remove();
   $("voucherRules").appendChild(div);
+  div.querySelector(".vkey").focus();
   refreshVoucherButtons();
   updateSummary();
 }
@@ -1120,6 +1178,7 @@ function removeVoucherRule(button){
   if (!$("voucherRules").querySelector(".voucher-rule"))
     $("voucherRules").innerHTML = '<div class="empty-rules">No vouchers required yet.</div>';
   refreshVoucherButtons();
+  $("btnAddVoucher").focus();
   updateSummary();
 }
 
@@ -1134,12 +1193,13 @@ function addVoucherExclusion(key){
   if (!chosen) return;
   const div = document.createElement("div");
   div.className = "voucher-exclusion";
-  div.innerHTML = `<div class="rule-field"><span class="label">Route cannot purchase</span><select class="vxkey">${voucherOptions()}</select></div>
-    <button type="button" class="mini" onclick="removeVoucherExclusion(this)">Remove</button>`;
+  div.innerHTML = `<label class="rule-field"><span>Route cannot purchase</span><select class="vxkey">${voucherOptions()}</select></label>
+    <button type="button" class="mini" onclick="removeVoucherExclusion(this)" aria-label="Remove purchase exclusion">Remove</button>`;
   div.querySelector(".vxkey").value = chosen;
   const empty = $("voucherExclusions").querySelector(".empty-rules");
   if (empty) empty.remove();
   $("voucherExclusions").appendChild(div);
+  div.querySelector(".vxkey").focus();
   refreshVoucherButtons();
   updateSummary();
 }
@@ -1149,6 +1209,7 @@ function removeVoucherExclusion(button){
   if (!$("voucherExclusions").querySelector(".voucher-exclusion"))
     $("voucherExclusions").innerHTML = '<div class="empty-rules">No purchases excluded.</div>';
   refreshVoucherButtons();
+  $("btnAddVoucherExclusion").focus();
   updateSummary();
 }
 
@@ -1198,10 +1259,10 @@ function spaceInfo(space){
 
 function updateSpaceHint(){
   const info = spaceInfo($("space").value);
-  $("optAll").textContent = info.all;
+  $("optAll").textContent = $("inputPool").value ? "All saved seeds in this pool" : info.all;
   const selectedPool = $("inputPool").selectedOptions[0];
   $("spaceHint").textContent = selectedPool && selectedPool.dataset.composite === "1"
-    ? "This is a composite membership set. Its source-filter branches stay recorded for organizing, but a new search uses the selected seeds plus your current filters rather than stacking every source route."
+    ? "This combined pool keeps each seed’s original sources. This search checks the saved seeds against the requirements above; its original routes are available in Organize / Combine."
     : info.hint;
 }
 
@@ -1213,11 +1274,17 @@ function syncSourceControls(){
   for (const id of ["space", "count", "shardTotal", "shardIndex"])
     $(id).disabled = fromPool;
   if (fromPool) {
+    if (seedSpaceCount === null) seedSpaceCount = $("count").value;
+    $("count").value = "0";
     $("space").value = (selectedPool && selectedPool.dataset.space) || "natural";
     $("shardTotal").value = "1";
-    $("scopeModeHint").textContent = "Locked to the selected input pool: estimates and builds process all of its currently committed seeds. Choose ‘Balatro’s seed space’ under Search within to unlock Seed space and Scan scope.";
+    $("scopeModeHint").textContent = "The search uses all seeds currently saved in this pool. To choose a seed space or scan size, select Balatro’s seed space above.";
   } else {
-    $("scopeModeHint").textContent = "Editable before or after an estimate. Quick Estimate samples 2 million seeds, then projects both this selected scope and the complete chosen seed space.";
+    if (seedSpaceCount !== null) {
+      $("count").value = seedSpaceCount;
+      seedSpaceCount = null;
+    }
+    $("scopeModeHint").textContent = "Quick estimate samples up to 2 million seeds to estimate matches, file size, and search time.";
   }
   return fromPool;
 }
@@ -1228,7 +1295,8 @@ function syncFilterControls(){
   // stale disabled property restored by the browser cannot survive a job.
   for (const control of document.querySelectorAll("#filterCard select, #filterCard input"))
     control.disabled = false;
-  // These two action buttons have criteria-based limits, not job locks.
+  // Add buttons reflect requirement limits.
+  refreshTagButton();
   refreshVoucherButtons();
 }
 
@@ -1254,7 +1322,7 @@ function updateSummary(){
   }
   for (const r of c.rules) {
     const tag = CAT.tags.find(t=>t.key === r.key);
-    const description = `${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`;
+    const description = `At least ${r.count}× ${(tag && tag.name) || r.key} · A${r.min} ${r.minPhase}–A${r.max} ${r.maxPhase}`;
     pieces.push(description);
     active.push({kind:"tag", text:description});
   }
@@ -1285,20 +1353,20 @@ function updateSummary(){
       ? "Fast exact Legendary search" : "Exhaustive Legendary route search";
     modeHint.classList.add("legendary-active");
     modeHint.textContent = fast
-      ? "Shop and real Charm-tag routes are checked exactly. Automatic Omen-purchase recovery is skipped: every retained seed is valid, but Omen-only seeds are omitted."
-      : "All chronological Shop, Charm, and automatic Omen-purchase recovery routes are active. This is exhaustive but substantially slower.";
+      ? "Shop and Charm Tag routes are checked. Automatic Omen-purchase recovery is skipped, so seeds that need that purchase are omitted."
+      : "Checks Shop and Charm Tag routes, including routes that buy Omen Globe. This is the most thorough and slowest option.";
   } else if (c.voucherRules.length) {
     $("filterModeTitle").textContent = "Voucher route search";
-    modeHint.textContent = "Voucher purchase-route evaluation is active. Tag requirements still reject non-matches before the more expensive route check.";
+    modeHint.textContent = "Finds a playable purchase route that meets every voucher target and any other requirements.";
   } else if (c.rules.length) {
-    $("filterModeTitle").textContent = "Tags-only fast path";
+    $("filterModeTitle").textContent = "Tag search";
     modeHint.classList.add("tags-fast");
-    modeHint.textContent = "No Legendary Soul, Arcana-pack, Omen, or voucher-route search is active.";
+    modeHint.textContent = "Matches the tag types, minimum counts, and blind ranges above.";
   } else {
     $("filterModeTitle").textContent = "No active filters";
-    modeHint.textContent = "Add a tag requirement to use the tags-only fast path, or choose a Legendary to run exact Soul routing.";
+    modeHint.textContent = "Choose a Legendary, add a tag requirement, or add a voucher target.";
   }
-  $("sumFilter").textContent = pieces.length ? pieces.join(" + ") : "Choose a Legendary, tag, or voucher";
+  $("sumFilter").textContent = pieces.length ? pieces.join(" AND ") : "Choose a Legendary, tag, or voucher";
   $("readyPill").textContent = pieces.length ? "Ready" : "Needs filter";
   $("readyPill").style.background = pieces.length ? "#173824" : "#382f16";
   $("readyPill").style.color = pieces.length ? "#86e7aa" : "#f4d46b";
@@ -1323,12 +1391,16 @@ function updateShard(){
   const limit = Math.min(selected, full), index = +$("shardIndex").value;
   const start = Math.floor(limit*(index-1)/total), end = Math.floor(limit*index/total);
   $("shardHint").textContent = total === 1 ? ""
-    : `exact ranks ${fmt(start)}–${fmt(end-1)} (${fmt(end-start)} seeds)`;
+    : `This computer checks ${fmt(end-start)} seeds, positions ${fmt(start)}–${fmt(end-1)} in the selected range.`;
 }
 
 async function run(kind){
   $("error").textContent = "";
   $("result").textContent = "";
+  for (const control of document.querySelectorAll("#filterCard input, #filterCard select, #name")) {
+    if (control.closest("#legRange") && !$("legendary").value) continue;
+    if (!control.disabled && !control.reportValidity()) return;
+  }
   try {
     const r = await fetch("/api/run", {method:"POST",
       body: JSON.stringify({kind, criteria: criteria()})});
@@ -1337,14 +1409,27 @@ async function run(kind){
     else tick();
   } catch (e) { $("error").textContent = "Could not reach the local builder. Reopen it and try again."; }
 }
-async function stopJob(){ await fetch("/api/stop", {method:"POST"}); }
+async function stopJob(){
+  stopRequested = true;
+  $("btnStop").disabled = true;
+  try {
+    const response = await fetch("/api/stop", {method:"POST"});
+    const result = await response.json();
+    if (result.error) throw new Error(result.error);
+    $("progressState").textContent = lastJobKind === "estimate" ? "Canceling" : "Pausing safely";
+  } catch (e) {
+    stopRequested = false;
+    $("error").textContent = "Could not pause the search: " + (e.message || String(e));
+    $("btnStop").disabled = false;
+  }
+}
 async function closeBuilder(){
   if (mergeRequestPending) return;
   if (lastRunning && lastJobKind === "merge") {
-    $("result").textContent = "A distributed-part merge is running and cannot be paused. Wait for it to finish before closing the Builder.";
+    $("result").textContent = "A distributed-part merge is running and cannot be paused. Wait for it to finish before closing the program.";
     return;
   }
-  if (lastRunning && !confirm("Pause the active job at its next checkpoint and close the Builder?")) return;
+  if (lastRunning && !confirm("Pause the active job at its next checkpoint and close the program?")) return;
   $("btnClose").disabled = true;
   try {
     const r = await fetch("/api/shutdown", {method:"POST"});
@@ -1353,10 +1438,11 @@ async function closeBuilder(){
     $("serverStatus").textContent = lastRunning ? "Pausing safely" : "Closing";
     $("result").textContent = lastRunning
       ? "Pausing at the next checkpoint. This page will disconnect when it is safe to close."
-      : "Builder closed. You can close this browser tab.";
+      : "Program closed. You can close this browser tab.";
   } catch (e) {
-    $("serverStatus").textContent = "Builder disconnected";
-    $("result").textContent = "The local Builder is closed. You can close this browser tab.";
+    $("serverStatus").textContent = "Program disconnected";
+    $("error").textContent = "Connection lost while closing. Reopen the program to check whether the search is still active.";
+    $("btnClose").disabled = false;
   }
 }
 async function mergePools(){
@@ -1386,7 +1472,8 @@ async function mergePools(){
 }
 
 async function deletePool(name){
-  $("mergeError").textContent = "";
+  $("libraryError").textContent = "";
+  $("libraryMessage").textContent = "";
   try {
     let r = await fetch("/api/delete-plan", {method:"POST",
       body:JSON.stringify({name})});
@@ -1400,28 +1487,29 @@ async function deletePool(name){
       name:plan.name, token:plan.token, confirmed:true})});
     const result = await r.json();
     if (result.error) throw new Error(result.error);
-    $("result").textContent = `Deleted ${result.removed.length} files for ${result.name}.`;
+    $("libraryMessage").textContent = `Deleted ${result.removed.length} files for ${result.name}.`;
     $("pools").dataset.rendered = "";
     await tick();
   } catch (e) {
-    $("mergeError").textContent = e.message || String(e);
+    $("libraryError").textContent = e.message || String(e);
   }
 }
 
 async function changePoolAttachment(name, role){
-  $("mergeError").textContent = "";
+  $("libraryError").textContent = "";
+  $("libraryMessage").textContent = "";
   try {
     const route = role ? "/api/attach" : "/api/detach";
     const r = await fetch(route, {method:"POST", body:JSON.stringify({name, role})});
     const result = await r.json();
     if (result.error) throw new Error(result.error);
-    $("result").textContent = role
+    $("libraryMessage").textContent = role
       ? `Attached ${name} as an ${role} pool.`
       : `Detached ${name}. The seed pool itself was not changed.`;
     $("pools").dataset.rendered = "";
     await tick();
   } catch (e) {
-    $("mergeError").textContent = e.message || String(e);
+    $("libraryError").textContent = e.message || String(e);
   }
 }
 
@@ -1433,7 +1521,7 @@ function showResult(j){
       ? "The distributed-part merge stopped. The source part files were not changed."
       : j.kind === "estimate"
       ? "Estimate canceled cleanly. No seed-pool file was changed."
-      : "Paused at a checkpoint. Press Build pool again (same name) to resume.";
+      : "Paused and saved. To resume, use the same requirements, search range, and pool name, then select Build seed pool.";
   } else if (j.rc !== 0) {
     out = j.kind === "merge"
       ? "The distributed-part merge failed. The source part files were not changed.\\n"
@@ -1468,14 +1556,14 @@ function showResult(j){
       out += `\\nNo matches appeared in this quick sample. The filter may be very rare; `
           + `use a larger test build before concluding that no matching seeds exist.`;
     if (matched > 0 && projection.measured_bytes)
-      out += `\\nFile sizes use the completed adaptive sample's measured bytes per record.`;
+      out += `\\nFile sizes are estimated from the saved sample.`;
     let selectedProjection = "";
     if (matched > 0)
       selectedProjection += `~${fmt(Math.round(selectedMatches))} matches, ~${fmtBytes(selectedBytes)}, `;
     selectedProjection += rate ? `~${fmtSecs(selectedCount/rate)}` : "time unavailable";
     out += `\\nSelected scope — ${selectedLabel} (${fmt(selectedCount)} seeds): ${selectedProjection}.`;
     if (estimate.input_pool) {
-      out += `\\nComplete seed-space comparison is not shown for an input pool because only its recorded seeds are being refiltered.`;
+      out += `\\nThese estimates apply to the saved seeds in the selected pool.`;
     } else {
       let fullProjection = "";
       if (matched > 0)
@@ -1485,11 +1573,10 @@ function showResult(j){
     }
   } else if (j.kind === "merge") {
     out = `Done! ${fmt(j.matched||0)} seeds merged into seed_pools/${j.output}.\n`
-        + `The source shard files were not changed.`;
+        + `The source part files were not changed.`;
   } else {
     out = `Done! ${fmt(+m.matched||j.matched)} seeds saved to seed_pools/${j.output}.\\n`
-        + `It now shows up in the in-game Seed Pool selector. Share that one file `
-        + `to share the pool.`;
+        + `Find it in Your seed pools below. Share the .bspool file to share the pool.`;
   }
   $("result").textContent = out;
 }
@@ -1508,7 +1595,7 @@ function inputPoolOptions(groups){
           : p.resumable ? " · paused snapshot" : " · incomplete snapshot";
         const update = p.update_available ? ` · +${fmt(p.new_records)} source seeds` : "";
         const composite = p.composite
-          ? ` · ${p.composite_operation || "composite"} · ${fmt(p.composite_operand_count || p.composite_branch_count)} inputs · ${fmt(p.composite_branch_count)} source filters` : "";
+          ? ` · ${p.composite_operation || "combined"} of ${fmt(p.composite_operand_count || p.composite_branch_count)} pools` : "";
         const blockers = p.refilter_blockers || [];
         const eligible = p.refilter_eligible === true;
         const unavailable = eligible ? ""
@@ -1547,17 +1634,17 @@ function renderPoolCard(p, mergeSelected, mergeMode){
     ? `<input aria-label="Select ${esc(p.name)} for merging" type="checkbox" class="mergePick" value="${esc(p.name)}" ${mergeSelected.has(p.name)?"checked":""}>`
     : "";
   const criteriaText = p.composite
-    ? "Composite membership set · source routes retained as per-seed provenance"
-    : p.criteria.length ? p.criteria.map(esc).join(" · ") : "No embedded criteria";
+    ? `Combined from ${fmt(p.composite_operand_count || p.composite_branch_count)} pools. Original sources are saved for each seed.`
+    : p.criteria.length ? p.criteria.map(esc).join(" · ") : "No saved search requirements";
   let relation = "";
   if (p.parent_name) {
     relation = `<div class="pool-relation">Derived from ${esc(p.parent_name)}`
       + (p.parent_records ? ` at ${fmt(p.parent_records)} recorded seeds` : "") + `.</div>`;
   } else if (p.parent_segment_id) {
-    relation = `<div class="pool-relation">Parent segment ${esc(p.parent_segment_id.slice(0,8))} is not in this folder.</div>`;
+    relation = `<div class="pool-relation">The original source pool is not in this folder.</div>`;
   }
   const update = p.update_available
-    ? `<div class="pool-update">Update available: the source now has ${fmt(p.new_records)} new recorded seeds. This pool still uses its pinned snapshot; automatic incremental updating is coming later.</div>`
+    ? `<div class="pool-update">The source has ${fmt(p.new_records)} newer seeds. To include them, search the source again and save under a new name.</div>`
     : "";
   let attachmentState = "", attachmentAction = "";
   if (p.attached) {
@@ -1575,12 +1662,23 @@ function renderPoolCard(p, mergeSelected, mergeMode){
     attachmentState = `<div class="pool-relation">Not attachable: ${p.attachment_accelerator_blockers.map(esc).join("; ")}</div>`;
   }
   const deleteAction = `<button type="button" class="mini pool-delete" data-pool="${esc(p.name)}">Delete pool…</button>`;
-  const actions = attachmentAction || deleteAction
-    ? `<div class="pool-actions">${attachmentAction}${deleteAction}</div>` : "";
+  const searchAction = p.refilter_eligible === true
+    ? `<button type="button" class="mini pool-search" data-pool="${esc(p.name)}">Search this pool</button>` : "";
+  const actions = `<div class="pool-actions">${searchAction}${deleteAction}</div>`;
+  const fileDetails = `<details class="pool-details" data-pool-details="${esc(p.name)}:file"><summary>File details</summary>`
+    + `<div class="pool-meta">${esc(p.name)}${idb}${sp}${src}${enc}${merged}${composite}${range}</div>`
+    + (p.family_id ? `<div class="pool-meta">Family: ${esc(p.family_id)}</div>` : "")
+    + (p.lineage_id ? `<div class="pool-meta">Lineage: ${esc(p.lineage_id)}</div>` : "")
+    + (p.parent_segment_id ? `<div class="pool-meta">Source segment: ${esc(p.parent_segment_id)}</div>` : "")
+    + `</details>`;
+  const attachmentDetails = attachmentAction || attachmentState
+    ? `<details class="pool-details" data-pool-details="${esc(p.name)}:brainstorm"><summary>Brainstorm attachment</summary>`
+      + attachmentState + (attachmentAction ? `<p class="hint">Accelerator tries this pool first, then continues with other sources. Authoritative can end the search when its complete coverage proves there is no match. Brainstorm checks that the pool fits your active filters.</p>` : "")
+      + `<div class="pool-actions">${attachmentAction}</div></details>` : "";
   return `<article class="pool${selectedForMerge?" merge-selected":""}"><div class="pool-top"><div class="pool-name">${pick}<b>${esc(p.name)}</b></div>`
     + `<span class="status ${statusClass}">${esc(statusText)}</span></div>`
-    + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}${idb}${sp}${src}${enc}${merged}${composite}</div>`
-    + `<div class="pool-criteria">${criteriaText}${range}</div>${relation}${update}${attachmentState}${actions}</article>`;
+    + `<div class="pool-meta">${fmt(p.records)} seeds · ${fmtBytes(p.bytes)}${lbl}</div>`
+    + `<div class="pool-criteria">${criteriaText}</div>${relation}${update}${actions}${fileDetails}${attachmentDetails}</article>`;
 }
 
 function renderPoolLibrary(groups, pools, mergeSelected, mergeMode){
@@ -1589,15 +1687,25 @@ function renderPoolLibrary(groups, pools, mergeSelected, mergeMode){
   return (groups || []).map(family=>{
     const familyCount = family.lineages.reduce((n, lineage)=>n + lineage.pools.length, 0);
     const familyId = family.family_id
-      ? `<span>family ${esc(family.family_id.slice(0,8))}</span>` : `<span>no lineage metadata</span>`;
+      ? `<span title="Family ID: ${esc(family.family_id)}">Related pools</span>` : `<span>Original family unknown</span>`;
     const lineages = family.lineages.map(lineage=>{
-      const lineageId = lineage.lineage_id
-        ? `<span>lineage ${esc(lineage.lineage_id.slice(0,8))}</span>` : "";
-      return `<section class="pool-lineage"><div class="pool-lineage-head">${esc(lineage.label)} · ${esc(lineage.display_name)} ${lineageId}</div>`
+      return `<section class="pool-lineage"><div class="pool-lineage-head">${esc(lineage.label)} · ${esc(lineage.display_name)}</div>`
         + `<div class="pool-lineage-grid">${lineage.pools.map(p=>renderPoolCard(p, mergeSelected, mergeMode)).join("")}</div></section>`;
     }).join("");
     return `<section class="pool-family"><div class="pool-family-head"><h3>${esc(family.label)} (${familyCount})</h3>${familyId}</div>${lineages}</section>`;
   }).join("");
+}
+
+function searchPool(name){
+  const option = [...$("inputPool").options].find(item=>item.value === name && !item.disabled);
+  if (!option) {
+    $("libraryError").textContent = "This pool is no longer available for search. Refresh the library and try again.";
+    return;
+  }
+  $("inputPool").value = name;
+  syncSourceControls(); updateSpaceHint(); updateShard(); updateSummary();
+  $("filterCard").scrollIntoView({block:"start"});
+  $("legendary").focus({preventScroll:true});
 }
 
 async function tick(){
@@ -1607,12 +1715,12 @@ async function tick(){
     j = await r.json();
     $("serverStatus").textContent = "Running locally";
   } catch (e) {
-    $("serverStatus").textContent = "Builder disconnected";
+    $("serverStatus").textContent = "Program disconnected";
     return;
   }
   if (!CAT){
     CAT = j.catalog;
-    $("legendary").innerHTML = `<option value="">(none)</option>` +
+    $("legendary").innerHTML = `<option value="">No Legendary requirement</option>` +
       CAT.legendaries.map(l=>`<option value="${esc(l.key)}">${esc(l.name)}</option>`).join("");
     $("legendary").value = "";
     const th = $("threads");
@@ -1632,18 +1740,21 @@ async function tick(){
   const mergeRunning = running && job.kind === "merge";
   builderBusy = running || closing;
   $("btnEst").disabled = running || closing; $("btnBuild").disabled = running || closing;
-  $("btnStop").disabled = !running || mergeRunning;
+  if (!running) stopRequested = false;
+  $("btnStop").disabled = !running || mergeRunning || stopRequested;
   $("btnStop").textContent = mergeRunning ? "Merge cannot be paused"
-    : job.kind === "estimate" ? "Cancel estimate" : "Pause active job";
+    : job.kind === "estimate" ? "Cancel estimate" : "Pause search";
   $("btnStop").title = mergeRunning
     ? "Distributed-part merges must finish once started." : "";
   $("btnClose").disabled = closing || mergeRunning || mergeRequestPending;
   if (running || job.rc !== undefined){
     $("progressCard").style.display = "";
-    $("progressState").textContent = closing && running ? "Pausing safely"
+    $("progressState").textContent = (closing || stopRequested) && running
+      ? (job.kind === "estimate" ? "Canceling estimate" : "Pausing safely")
       : mergeRunning ? "Merging"
       : running ? (job.scanned ? "Working" : "Starting")
       : (job.rc === 0 ? "Complete"
+        : job.rc === 130 && job.kind === "estimate" ? "Canceled"
         : job.rc === 130 && job.kind !== "merge" ? "Paused" : "Stopped");
     $("progTitle").textContent = (job.kind==="estimate"?"Estimating: ":job.kind==="merge"?"Merging: ":"Building: ")
       + (job.summary||"");
@@ -1651,6 +1762,7 @@ async function tick(){
     $("sMatchLabel").textContent = job.kind === "merge" ? "Merged" : "Matches";
     const frac = job.total ? job.scanned/job.total : 0;
     $("fill").style.width = (100*frac).toFixed(1)+"%";
+    $("bar").setAttribute("aria-valuenow", (100*Math.max(0, Math.min(1, frac))).toFixed(1));
     $("progressPct").textContent = (100*frac).toFixed(frac && frac < .01 ? 2 : 1)+"%";
     $("sScan").textContent = fmt(job.scanned||0)+" / "+fmt(job.total||0);
     $("sMatch").textContent = fmt(job.matched||0);
@@ -1669,7 +1781,7 @@ async function tick(){
   lastJobKind = job.kind || "";
   latestPoolGroups = j.pool_groups || [];
   {const notice = $("poolArchiveNotice"), archives = j.pool_archives || [];
-   if (notice){ if (archives.length){ notice.hidden = false; notice.textContent = `Compressed archive${archives.length === 1 ? "" : "s"} in seed_pools cannot be used directly (${archives.join(", ")}): extract the .bspool file inside, with any sidecar files next to it, into this same folder. Brainstorm and these apps read only .bspool files.`; } else { notice.hidden = true; notice.textContent = ""; } }}
+   if (notice){ if (archives.length){ notice.hidden = false; notice.textContent = `Extract ${archives.join(", ")} into seed_pools to use the pools inside. Keep each .bspool file and its companion files together.`; } else { notice.hidden = true; notice.textContent = ""; } }}
   latestPools = j.pools || [];
   const eligibleNames = new Set(
     latestPools.filter(mergeEligible).map(pool=>pool.name));
@@ -1710,10 +1822,12 @@ addEventListener("load", ()=>{
     updateSummary();
   });
   document.addEventListener("click", event=>{
+    const search = event.target.closest(".pool-search");
     const attach = event.target.closest(".pool-attach");
     const detach = event.target.closest(".pool-detach");
     const remove = event.target.closest(".pool-delete");
-    if (attach) changePoolAttachment(attach.dataset.pool, attach.dataset.role);
+    if (search) searchPool(search.dataset.pool);
+    else if (attach) changePoolAttachment(attach.dataset.pool, attach.dataset.role);
     else if (detach) changePoolAttachment(detach.dataset.pool, "");
     else if (remove) deletePool(remove.dataset.pool);
   });
@@ -1869,6 +1983,14 @@ class Handler(BaseHTTPRequestHandler):
                     value = organizer_web.run_split_plan(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/combine/plan":
                     value = organizer_web.run_combine_plan(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/rules/describe":
+                    value = organizer_web.run_rule_describe(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/rules/preview":
+                    value = organizer_web.run_rule_preview(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/rules/publish":
+                    value = organizer_web.run_rule_publish(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/rules/validate":
+                    value = organizer_web.run_rule_validate(data)
                 elif parsed.path == "/organizer/api/format/plan":
                     value = organizer_web.plan_format_upgrade(
                         data.get("source", ""), self.pool_dir)
