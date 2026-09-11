@@ -360,6 +360,202 @@ assert.equal($("ruleSourceGroups").hidden,true);
             "tag": "rare", "range": {"start": "A3S", "end": "A7B"}, "min": 1}}}}
         self.assertEqual(web.run_rule_validate({"document": json.dumps(recipe)})["recipe"], recipe)
 
+    def run_rules_browser(self, harness):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser JavaScript checks")
+        setup = r'''
+const assert=require("node:assert/strict"),nodes=new Map();
+function element(){return {value:"",textContent:"",innerHTML:"",className:"",hidden:false,
+ disabled:false,open:false,options:[],replaceChildren(){},setAttribute(){},
+ add(option){this.options.push(option)},append(){},focus(){}}}
+function $(id){if(!nodes.has(id))nodes.set(id,element());return nodes.get(id)}
+const esc=value=>String(value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const fmt=value=>Number(value||0).toLocaleString("en-US"),fmtDuration=()=>"1s";
+let api,loadPools;
+const workflowState={pools:[]};
+globalThis.document={querySelectorAll:()=>[],createElement:()=>element()};
+'''
+        result = subprocess.run(
+            [node, "-"], input=setup + rules_ui.SCRIPT
+            + "\nrenderRuleCondition=()=>{};\n(async()=>{\n" + harness
+            + "\n})().catch(e=>{console.error(e);process.exitCode=1});\n",
+            text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_browser_coverage_error_keeps_rule_and_offers_recording(self):
+        self.run_rules_browser(r'''
+ruleState.mode="tag";ruleState.activeSource="L1.bspool";
+$("ruleSource").value="L1.bspool";$("ruleStart").value="A4S";$("ruleEnd").value="A7B";
+$("ruleName").value="Keep my rule";
+ruleState.condition={not:{count:{tag:"rare",range:{start:"A1S",end:"A2B"},min:1}}};
+const before=readTagRule();
+api=async()=>{const error=Error("Seed rank 188495 lacks recorded coverage");
+ error.code="tag_coverage_missing";error.rank=188495;
+ error.missingCoverage=[{tag:"negative",range:{start:"A4S",end:"A7B"}},
+ {tag:"rare",range:{start:"A1S",end:"A2B"}}];throw error};
+await previewRules();
+assert.deepEqual(readTagRule(),before);
+assert.equal(ruleState.plan,null);assert.equal($("ruleReview").hidden,true);
+assert.equal($("ruleCreateBtn").disabled,true);assert.equal($("ruleRecordBtn").disabled,false);
+assert.match($("ruleRecordPanel").className,/warning/);
+assert.match($("ruleRecordMissing").textContent,/Negative A4S.*A7B/);
+assert.match($("ruleRecordMissing").textContent,/Rare A1S.*A2B/);
+assert.equal($("ruleDataDetails").hidden,false);assert.equal($("ruleDataDetails").open,true);
+assert.match($("ruleMissingDetail").textContent,/188,495/);
+ruleInvalidate();assert.equal($("ruleRecordMissing").hidden,true);
+assert.equal($("ruleMissingDetail").hidden,true);assert.equal($("ruleMissingDetail").textContent,"");
+assert.doesNotMatch($("ruleRecordPanel").className,/warning/);
+''')
+
+    def test_browser_recording_selects_copy_and_preserves_rule(self):
+        self.run_rules_browser(r'''
+for(const listFails of [false,true]){
+ ruleState.mode="tag";ruleState.activeSource="L1.bspool";
+ $("ruleSource").value="L1.bspool";$("ruleSource").options=[{value:"L1.bspool"}];
+ $("ruleStart").value="A4S";$("ruleEnd").value="A7B";
+ $("ruleName").value="My exact settings";$("rulePrefix").value="AS1-L1";
+ ruleState.condition={any:[{not:{count:{tag:"negative",range:{start:"A2B",end:"A3S"},min:1}}}]};
+ ruleState.description={source:{snapshot_id:"old-snapshot"}};
+ ruleState.plan={can_create:true};
+ const before=readTagRule();let calls=0;
+ api=async(path,data)=>{
+  calls++;assert.equal(path,"/api/rules/record-tags");
+  assert.equal(data.source,"L1.bspool");assert.deepEqual(data.recipe,{version:1,mode:"second_tag",rule:before});
+  assert.equal(data.prefix,"AS1-L1");
+  assert.equal($("ruleInputs").disabled,true);assert.equal($("ruleRecordBtn").disabled,true);
+  assert.equal($("ruleCancelBtn").hidden,false);
+  await recordRuleTags();assert.equal(calls,1);
+  return {source:"L1-tag-data.bspool",records:1200};
+ };
+ loadPools=async preserve=>{
+  assert.equal(preserve,true);
+  if(listFails){$("ruleSource").options=[];$("ruleSource").value="";ruleSourceChanged();throw Error("list offline")}
+  $("ruleSource").options.push({value:"L1-tag-data.bspool"});
+ };
+ await recordRuleTags();
+ assert.equal(calls,1);assert.equal($("ruleSource").value,"L1-tag-data.bspool");
+ assert.ok($("ruleSource").options.some(o=>o.value==="L1-tag-data.bspool"));
+ assert.deepEqual(readTagRule(),before);
+ assert.deepEqual(ruleState.drafts["L1.bspool"],before);
+ assert.deepEqual(ruleState.drafts["L1-tag-data.bspool"],before);
+ assert.equal($("rulePrefix").value,"AS1-L1");assert.equal(ruleState.description,null);
+ assert.equal(ruleState.plan,null);assert.equal($("ruleReview").hidden,true);
+ assert.equal($("ruleRecordBtn").disabled,false);assert.equal($("ruleCancelBtn").hidden,true);
+ assert.equal($("ruleStatus").textContent,"Tag data recorded for 1,200 seeds. Preview the second-tag split.");
+ if(listFails)assert.match($("ruleError").textContent,/recorded.*list.*refresh/i);
+ else assert.equal($("ruleError").textContent,"");
+}
+const source=$("ruleSource").value,before=readTagRule();
+api=async()=>{const error=Error("Stopped safely");error.code="operation_cancelled";throw error};
+loadPools=async()=>{throw Error("Cancelled recording must not refresh pools")};
+await recordRuleTags();assert.equal($("ruleSource").value,source);assert.deepEqual(readTagRule(),before);
+assert.equal($("ruleStatus").textContent,"Cancelled.");assert.equal($("ruleInputs").disabled,false);
+ruleState.mode="restore";api=async()=>{throw Error("Restore mode must not record tags")};
+await recordRuleTags();
+''')
+
+    def test_browser_recording_progress_distinguishes_verification_passes(self):
+        self.run_rules_browser(r'''
+let poll,phase;
+globalThis.setInterval=callback=>{poll=callback;return 1};globalThis.clearInterval=()=>{};
+ruleState.mode="tag";ruleState.activeSource="L1.bspool";
+$("ruleSource").value="L1.bspool";$("ruleStart").value="A4S";$("ruleEnd").value="A7B";
+api=async(path)=>{
+ if(path.startsWith("/api/progress"))return {state:"running",phase,records_done:1,records_total:12};
+ assert.equal(path,"/api/rules/record-tags");
+ for(const [current,label] of [["verifying_source","Checking the source pool"],
+  ["recording_tags","Recording tag placements"],["verifying_output","Verifying the new tag-data pool"]]){
+  phase=current;await poll();assert.ok($("ruleStatus").textContent.startsWith(label));
+  assert.match($("ruleStatus").textContent,/1 of 12 seeds/);
+ }
+ return {source:"recorded.bspool",records:12};
+};
+loadPools=async()=>{};
+await recordRuleTags();
+assert.equal($("ruleStatus").textContent,"Tag data recorded for 12 seeds. Preview the second-tag split.");
+''')
+
+    def test_browser_recorded_ranges_are_not_a_limit_on_per_seed_data(self):
+        self.run_rules_browser(r'''
+$("ruleStart").value="A4S";$("ruleEnd").value="A7B";
+renderRuleData({source:{records:12,complete:true},coverage:{metadata_complete:true,
+ checked_per_seed:true,sources:[{label:"L1 <original>",tags:{negative:[{start:"A3S",end:"A5B"}],
+ rare:[{start:"A4S",end:"A6B"}]},both_tags:[{start:"A4S",end:"A5B"}]},
+ {label:"No original tag filters",tags:{negative:[],rare:[]},both_tags:[]}]}});
+const html=$("ruleData").innerHTML;
+assert.match(html,/Recorded filter ranges/);assert.match(html,/L1 &lt;original&gt;/);
+assert.match(html,/Both tags: A4S through A5B/);assert.match(html,/vary by seed/);
+assert.match(html,/Additional placements.*individual seeds/);
+assert.doesNotMatch(html,/cannot prove|not recorded/);
+assert.equal($("ruleStart").value,"A4S");assert.equal($("ruleEnd").value,"A7B");
+''')
+
+    def test_api_client_preserves_coverage_error_details_in_both_entry_points(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser JavaScript checks")
+        api_script = web.PAGE.split("async function api(path,data)", 1)[1].split("\nfunction ", 1)[0]
+        script = r'''
+const assert=require("node:assert/strict");
+let UNIFIED=false;
+const apiPath=path=>UNIFIED?"/organizer"+path:path;
+''' + "async function api(path,data)" + api_script + r'''
+(async()=>{
+ const missing=[{tag:"negative",range:{start:"A4S",end:"A7B"}}];
+ for(UNIFIED of [false,true]){
+  globalThis.fetch=async(path,options)=>{
+   assert.equal(path,(UNIFIED?"/organizer":"")+"/api/rules/preview");
+   assert.equal(JSON.parse(options.body).source,"L1.bspool");
+   return {ok:false,status:400,json:async()=>({error:"Missing placements",
+    error_code:"tag_coverage_missing",missing_coverage:missing,rank:188495})};
+  };
+  await assert.rejects(()=>api("/api/rules/preview",{source:"L1.bspool"}),error=>{
+   assert.equal(error.code,"tag_coverage_missing");assert.deepEqual(error.missingCoverage,missing);
+   assert.equal(error.rank,188495);return true;
+  });
+  globalThis.fetch=async(path,options)=>{
+   assert.equal(path,(UNIFIED?"/organizer":"")+"/api/rules/record-tags");
+   assert.equal(JSON.parse(options.body).source,"L1.bspool");
+   return {ok:true,status:200,json:async()=>({source:"L1-tag-data.bspool",records:10})};
+  };
+  assert.deepEqual(await api("/api/rules/record-tags",{source:"L1.bspool"}),
+   {source:"L1-tag-data.bspool",records:10});
+ }
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+        result = subprocess.run([node, "-"], input=script, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_http_coverage_error_is_structured_in_both_entry_points(self):
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                if unified:
+                    class Handler(builder_web.Handler):
+                        pool_dir = self.root
+                else:
+                    Handler = web.make_handler(self.root)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    url = "http://127.0.0.1:%s%s/api/rules/preview" % (
+                        server.server_port, "/organizer" if unified else "")
+                    status, result = self.request(url, {"source": "L1.bspool", "recipe": {
+                        "version": 1, "mode": "second_tag", "rule": {"version": 1,
+                        "range": {"start": "A2S", "end": "A7B"}}}})
+                    self.assertEqual(status, 400, result)
+                    self.assertEqual(result["error_code"], "tag_coverage_missing")
+                    self.assertEqual(result["missing_coverage"], [
+                        {"tag": tag, "range": {"start": "A2S", "end": "A2B"}}
+                        for tag in ("negative", "rare")])
+                    self.assertEqual(result["rank"], 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

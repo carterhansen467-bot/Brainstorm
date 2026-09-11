@@ -21,6 +21,7 @@ STYLE = r'''
 .rule-status{min-height:26px;margin-top:12px;color:var(--muted);font-size:13px;line-height:1.5}
 .rule-status:empty{display:none}.rule-coverage{font-size:12px;color:var(--muted);line-height:1.6}
 .rule-coverage code{white-space:normal}.rule-outputs{max-height:450px;overflow:auto}
+.rule-record{margin:14px 0;padding:12px;border:1px solid #3b425b;border-radius:10px;background:#11141d}.rule-record p{margin:0 0 10px}.rule-record.warning{border-color:#a78439;background:#29230f}.rule-record.warning .hint{color:#e6d4a6}.rule-record-missing{font-size:13px;line-height:1.5;color:#f2d67c}
 .rule-help{max-width:75ch}.rule-counts{display:flex;gap:20px;flex-wrap:wrap;margin:14px 0}.rule-counts b{display:block;font-size:20px}.rule-counts span{font-size:12px;color:var(--muted)}
 .toolnav{flex-wrap:wrap}.toolnav button{white-space:normal}button:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #b7a3f4;outline-offset:3px}
 @media(max-width:680px){.rule-fields,.rule-condition .condition-count{grid-template-columns:1fr}.rule-condition{padding-left:9px}.toolnav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rule-sources .choicecard{flex-wrap:wrap}}
@@ -47,6 +48,12 @@ WORKSPACE = r'''
    <div id="tagSettings" hidden>
     <div class="rule-fields"><div class="field"><label for="ruleStart">Start checking at</label><select id="ruleStart"></select></div><div class="field"><label for="ruleEnd">Stop checking at</label><select id="ruleEnd"></select></div></div>
     <p class="hint">Both endpoints are included. Set the range for this pool; L1, L2, and Other can each use a different range.</p>
+    <div class="rule-record" id="ruleRecordPanel">
+     <p class="rule-record-missing" id="ruleRecordMissing" hidden></p>
+     <p class="hint rule-help" id="ruleRecordHelp">Missing saved placements? Record them from the seed values. Keeps every seed and existing pool history; requires the matching game profile snapshot.</p>
+     <button class="ghost" id="ruleRecordBtn" aria-describedby="ruleRecordHelp">Record tag placements</button>
+     <p class="hint rule-help" style="margin:10px 0 0">Creates a new tag-data pool using the output name prefix above, for the selected range and any optional condition ranges. Your source pool is kept.</p>
+    </div>
     <div class="rule-explanation rule-help"><strong>How the second tag is chosen</strong><ol>
      <li>Find the first Ante with a Negative or Rare tag in the range.</li>
      <li>If only one type appears in that Ante, choose the next tag of the opposite type.</li>
@@ -62,7 +69,7 @@ WORKSPACE = r'''
      <div class="rule-toolbar"><button id="ruleSaveBtn" class="ghost">Save rules</button><button id="ruleLoadBtn" class="ghost">Load rules</button><input type="file" id="ruleLoadFile" accept="application/json,.json" hidden></div>
     </div></details>
    </div>
-   <details class="advanced" id="ruleDataDetails" hidden><summary>Available source data</summary><div id="ruleData" class="advancedbody rule-coverage"></div></details>
+   <details class="advanced" id="ruleDataDetails" hidden><summary>Available source data</summary><div class="advancedbody rule-coverage"><div id="ruleData"></div><p id="ruleMissingDetail" hidden></p></div></details>
   </fieldset>
   <div class="rule-toolbar"><button id="rulePreviewBtn" class="go">Preview new pools</button><button id="ruleCancelBtn" class="cancel" hidden>Cancel</button></div>
   <div class="rule-status" id="ruleStatus" role="status" aria-live="polite"></div><div class="error" id="ruleError" role="alert"></div>
@@ -88,10 +95,11 @@ function ruleLoadPools(){
  picker.innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}"${p.error?" disabled":""}>${esc(p.name)} · ${fmt(p.records)} seeds${p.error?" · unreadable":""}</option>`).join(""):'<option value="">No pools available</option>';
  if([...picker.options].some(p=>p.value===prior))picker.value=prior;
  if(prior&&picker.value!==prior)ruleSourceChanged();
- $("rulePreviewBtn").disabled=ruleState.busy||!picker.value;$("ruleDetectBtn").disabled=ruleState.busy||!picker.value;
+ $("rulePreviewBtn").disabled=ruleState.busy||!picker.value;$("ruleDetectBtn").disabled=ruleState.busy||!picker.value;$("ruleRecordBtn").disabled=ruleState.busy||!picker.value;
  if(!$("rulePrefix").value)$("rulePrefix").value=picker.value.replace(/\.bspool$/i,"").slice(0,65)+(ruleState.mode==="restore"?"-separated":"-sorted");
 }
-function ruleInvalidate(){ruleState.revision++;ruleState.plan=null;$("ruleReview").hidden=true;$("ruleError").textContent="";$("ruleDone").hidden=true;}
+function resetRuleCoverageError(){$("ruleRecordPanel").className="rule-record";$("ruleRecordBtn").className="ghost";$("ruleRecordMissing").hidden=true;$("ruleRecordMissing").textContent="";$("ruleMissingDetail").hidden=true;$("ruleMissingDetail").textContent="";}
+function ruleInvalidate(){ruleState.revision++;ruleState.plan=null;$("ruleReview").hidden=true;$("ruleError").textContent="";$("ruleDone").hidden=true;resetRuleCoverageError();}
 function rememberTagDraft(){if(ruleState.mode==="tag"&&ruleState.activeSource)ruleState.drafts[ruleState.activeSource]=readTagRule()}
 function restoreTagDraft(){const rule=ruleState.drafts[$("ruleSource").value]||{range:{start:"A3S",end:"A7B"},name:"Second Negative / Rare tag"};$("ruleStart").value=rule.range.start;$("ruleEnd").value=rule.range.end;$("ruleName").value=rule.name;ruleState.condition=rule.condition?JSON.parse(JSON.stringify(rule.condition)):null;renderRuleCondition()}
 function ruleSourceChanged(){rememberTagDraft();ruleInvalidate();ruleState.description=null;$("ruleSourceGroups").hidden=true;$("ruleDataDetails").hidden=true;$("ruleStatus").textContent="";$("rulePrefix").value=$("ruleSource").value.replace(/\.bspool$/i,"").slice(0,65)+(ruleState.mode==="restore"?"-separated":"-sorted");ruleState.activeSource=$("ruleSource").value;if(ruleState.mode==="tag")restoreTagDraft()}
@@ -118,16 +126,52 @@ function renderRuleData(d){
  const rows=d.direct_inputs||[];
  if(rows.length)$("ruleData").innerHTML+=`<p>Latest inputs: ${rows.map(r=>esc(r.label||r.id)).join(", ")}.</p>`;
  const coverage=d.coverage;
- if(coverage){if(!coverage.metadata_complete)$("ruleData").innerHTML+='<p>Some placements were not recorded. This pool cannot prove complete tag counts.</p>';
- else for(const row of coverage.sources||[])$("ruleData").innerHTML+=`<p><strong>${esc(row.label||"Recorded tag windows")}</strong><br>${["negative","rare"].map(tag=>`${tag==="negative"?"Negative":"Rare"}: ${(row.tags?.[tag]||[]).map(r=>`${esc(r.start)} through ${esc(r.end)}`).join(", ")||"not recorded"}`).join("<br>")}</p>`;}
+ if(coverage){
+  $("ruleData").innerHTML+='<p><strong>Recorded filter ranges</strong><br>These ranges come from the saved search filters. Additional placements may be recorded on individual seeds. Preview checks every seed against your selected range and conditions.</p>';
+  if(coverage.checked_per_seed)$("ruleData").innerHTML+='<p>Available placements can vary by seed in a combined pool.</p>';
+  if(!coverage.metadata_complete)$("ruleData").innerHTML+='<p>Some source metadata is incomplete. Preview checks whether each seed has enough tag data for these rules.</p>';
+  const ranges=rows=>(rows||[]).map(r=>`${esc(r.start)} through ${esc(r.end)}`).join(", ")||"No filter range listed";
+  for(const row of coverage.sources||[])$("ruleData").innerHTML+=`<p><strong>${esc(row.label||"Selected pool")}</strong><br>${["negative","rare"].map(tag=>`${tag==="negative"?"Negative":"Rare"}: ${ranges(row.tags?.[tag])}`).join("<br>")}<br>Both tags: ${ranges(row.both_tags)}</p>`;
+ }
  if(d.notices)for(const note of d.notices)$("ruleData").innerHTML+=`<p>${esc(typeof note==="string"?note:note.text||note.message||"")}</p>`;
 }
-async function ruleRun(message,callback){
- if(ruleState.busy)return;const runId=++ruleState.runId;ruleState.busy=true;$("ruleInputs").disabled=true;$("rulePreviewBtn").disabled=true;$("ruleCreateBtn").disabled=true;$("ruleCancelBtn").hidden=false;$("ruleCancelBtn").disabled=false;$("ruleError").textContent="";$("ruleStatus").textContent=message;
+function showRuleCoverageError(error){
+ if(ruleState.mode!=="tag")return;
+ if(ruleState.description)renderRuleData(ruleState.description);
+ else $("ruleData").innerHTML='<p>Use Check recorded data to view the saved filter ranges. Preview also checks placements recorded on individual seeds.</p>';
+ const missing=(error.missingCoverage||[]).map(item=>`${item.tag==="negative"?"Negative":item.tag==="rare"?"Rare":item.tag} ${item.range?.start||"?"}–${item.range?.end||"?"}`).join("; ");
+ $("ruleRecordMissing").textContent=missing?`Some seeds need recorded placements for ${missing}.`:"Some seeds need more recorded tag placements for these rules.";
+ $("ruleRecordMissing").hidden=false;$("ruleRecordPanel").className="rule-record warning";$("ruleRecordBtn").className="go";
+ $("ruleMissingDetail").textContent=$("ruleRecordMissing").textContent+(error.rank!=null?` First seed needing data: rank ${fmt(error.rank)}.`:"");$("ruleMissingDetail").hidden=false;
+ $("ruleDataDetails").hidden=false;$("ruleDataDetails").open=true;
+ $("ruleStatus").textContent="Record tag placements, then preview again with these settings.";
+}
+async function ruleRun(message,callback,phaseLabels={}){
+ if(ruleState.busy)return;const runId=++ruleState.runId;ruleState.busy=true;$("ruleInputs").disabled=true;$("rulePreviewBtn").disabled=true;$("ruleCreateBtn").disabled=true;$("ruleRecordBtn").disabled=true;$("ruleCancelBtn").hidden=false;$("ruleCancelBtn").disabled=false;$("ruleError").textContent="";$("ruleStatus").textContent=message;
  const started=performance.now();
- const timer=setInterval(async()=>{try{const p=await api("/api/progress?operation=rules");if(ruleState.busy&&runId===ruleState.runId&&p.state==="running")$("ruleStatus").textContent=`${message} ${p.records_total?`${fmt(p.records_done)} of ${fmt(p.records_total)} seeds · `:""}${fmtDuration((performance.now()-started)/1000)} elapsed.`}catch(_e){}},700);
- try{return await callback()}catch(e){$("ruleError").textContent=e.message||String(e);$("ruleStatus").textContent=e.code==="operation_cancelled"?"Cancelled.":"Stopped. Review the message above before trying again.";ruleState.plan=null;$("ruleReview").hidden=true}
- finally{clearInterval(timer);ruleState.busy=false;$("ruleInputs").disabled=false;$("rulePreviewBtn").disabled=!$("ruleSource").value;$("ruleCreateBtn").disabled=!ruleState.plan||ruleState.plan.can_create===false;$("ruleCancelBtn").hidden=true;$("ruleDetectBtn").disabled=!$("ruleSource").value;}
+ const timer=setInterval(async()=>{try{const p=await api("/api/progress?operation=rules");if(ruleState.busy&&runId===ruleState.runId&&p.state==="running")$("ruleStatus").textContent=`${phaseLabels[p.phase]||message} ${p.records_total?`${fmt(p.records_done)} of ${fmt(p.records_total)} seeds · `:""}${fmtDuration((performance.now()-started)/1000)} elapsed.`}catch(_e){}},700);
+ try{return await callback()}catch(e){$("ruleError").textContent=e.message||String(e);$("ruleStatus").textContent=e.code==="operation_cancelled"?"Cancelled.":"Stopped. Review the error before trying again.";ruleState.plan=null;$("ruleReview").hidden=true;if(e.code==="tag_coverage_missing")showRuleCoverageError(e)}
+ finally{clearInterval(timer);ruleState.busy=false;$("ruleInputs").disabled=false;$("rulePreviewBtn").disabled=!$("ruleSource").value;$("ruleCreateBtn").disabled=!ruleState.plan||ruleState.plan.can_create===false;$("ruleCancelBtn").hidden=true;$("ruleDetectBtn").disabled=!$("ruleSource").value;$("ruleRecordBtn").disabled=!$("ruleSource").value;}
+}
+async function recordRuleTags(){
+ if(ruleState.busy||ruleState.mode!=="tag")return;
+ ruleInvalidate();return ruleRun("Recording tag placements for every saved seed…",async()=>{
+  const source=$("ruleSource").value,recipe=readRuleRecipe(),prefix=$("rulePrefix").value;
+  rememberTagDraft();
+  const result=await api("/api/rules/record-tags",{source,recipe,prefix});
+  const name=result.source;
+  if(typeof name!=="string"||!name)throw Error("Tag recording returned no output pool name. Refresh the pool list before trying again.");
+  ruleState.drafts[name]=JSON.parse(JSON.stringify(recipe.rule));
+  let refreshError="";
+  try{await loadPools(true)}catch(e){refreshError=`Tag data was recorded, but the pool list could not refresh: ${e.message}. Use Refresh list.`}
+  const picker=$("ruleSource");
+  if(![...picker.options].some(option=>option.value===name)){
+   const option=document.createElement("option");option.value=name;option.textContent=`${name} · ${fmt(result.records)} seeds`;picker.add(option);
+  }
+  picker.value=name;ruleSourceChanged();$("rulePrefix").value=prefix;
+  $("ruleStatus").textContent=`Tag data recorded for ${fmt(result.records)} seeds. Preview the second-tag split.`;
+  $("ruleError").textContent=refreshError;
+ },{verifying_source:"Checking the source pool…",recording_tags:"Recording tag placements…",verifying_output:"Verifying the new tag-data pool…"});
 }
 async function detectRuleSources(){
  ruleInvalidate();return ruleRun("Loading saved group names…",async()=>{
@@ -217,6 +261,7 @@ $("ruleDetectBtn").onclick=detectRuleSources;$("ruleRefreshBtn").onclick=async()
 $("ruleSourceKind").onchange=()=>{ruleInvalidate();renderRuleSources()};
 $("ruleSelectAll").onclick=()=>{document.querySelectorAll(".rule-origin").forEach(x=>x.checked=true);ruleInvalidate()};$("ruleSelectNone").onclick=()=>{document.querySelectorAll(".rule-origin").forEach(x=>x.checked=false);ruleInvalidate()};
 $("rulePreviewBtn").onclick=previewRules;$("ruleCreateBtn").onclick=createRulePools;
+$("ruleRecordBtn").onclick=recordRuleTags;
 $("ruleCancelBtn").onclick=async()=>{$("ruleCancelBtn").disabled=true;try{await api("/api/cancel",{operation:"rules"});$("ruleStatus").textContent="Cancelling…"}catch(e){$("ruleError").textContent=e.message;$("ruleCancelBtn").disabled=false}};
 $("ruleAddConditions").onclick=()=>{ruleState.condition={all:[defaultRuleCount()]};ruleInvalidate();renderRuleCondition()};
 $("ruleSaveBtn").onclick=saveRuleFile;$("ruleLoadBtn").onclick=()=>$("ruleLoadFile").click();$("ruleLoadFile").onchange=e=>e.target.files[0]&&loadRuleFile(e.target.files[0]);

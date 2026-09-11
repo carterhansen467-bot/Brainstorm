@@ -7225,6 +7225,7 @@ typedef struct {
 	int mergedParts;
 	uint64_t familyId, segmentId, stageHash, lineageId, derivationId;
 	uint64_t snapshotId, membershipDigest, metadataDigest, scanCursor;
+	const char *tagPlacementFields;
 } PoolHeaderRewrite;
 
 static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
@@ -7276,6 +7277,8 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 						: "encoding delta-varint-blocks-v1";
 		else if (!strcmp(d, "records") || !strcmp(d, "data_bytes") || !strcmp(d, "complete")
 				|| !strcmp(d, "coverage_complete") || !strcmp(d, "header_bytes")) replacement = NULL;
+		else if (rewrite && rewrite->tagPlacementFields
+				&& !strncmp(d, "tag_placement_", 14)) replacement = NULL;
 		else if (rewrite && rewrite->overrideRange
 				&& (!strcmp(d, "range_start") || !strcmp(d, "range_end")
 					|| !strcmp(d, "pool_id") || !strcmp(d, "label")
@@ -7326,6 +7329,13 @@ static bool pool_write_repacked_header(FILE *f, const unsigned char *original,
 			goto done;
 		}
 		memcpy(out + used, merged, (size_t)m); used += (size_t)m;
+	}
+	if (rewrite && rewrite->tagPlacementFields) {
+		size_t n = strlen(rewrite->tagPlacementFields);
+		if (used > (size_t)outputHeaderBytes || n > (size_t)outputHeaderBytes - used) {
+			snprintf(err, errsz, "tag placement header overflow"); goto done;
+		}
+		memcpy(out + used, rewrite->tagPlacementFields, n); used += n;
 	}
 	char tail[224];
 	int n = snprintf(tail, sizeof tail,
@@ -9248,7 +9258,7 @@ typedef struct {
 	FILE *file;
 	BspoolHeader header;
 	BspoolReader reader;
-	bool adaptive, ready;
+	bool adaptive, ready, ownsFile;
 	BspoolScratch scratch;
 	unsigned char *metadata;
 	size_t metadataCap;
@@ -9292,16 +9302,19 @@ static void pool_event_cursor_destroy(PoolEventCursor *c) {
 	free(c->assocDescriptor); free(c->indexes); free(c->metadata);
 	bspool_scratch_destroy(&c->scratch);
 	if (c->ready) bspool_reader_destroy(&c->reader);
-	if (c->file) fclose(c->file);
+	if (c->file && c->ownsFile) fclose(c->file);
 	memset(c, 0, sizeof *c);
 	c->scratch.cachedBlock = UINT64_MAX;
 }
 
-static bool pool_event_cursor_open(PoolEventCursor *c, const char *path,
-		char *err, size_t errsz) {
+/* A borrowed stream permits byte verification while a Windows exclusive
+ * staged writer still owns its handle. Only this cursor's own opens close. */
+static bool pool_event_cursor_open_stream(PoolEventCursor *c, const char *path,
+		FILE *stream, char *err, size_t errsz) {
 	memset(c, 0, sizeof *c);
 	c->scratch.cachedBlock = UINT64_MAX;
-	c->file = fopen(path, "rb");
+	c->ownsFile = stream == NULL;
+	c->file = stream ? stream : fopen(path, "rb");
 	if (!c->file) { snprintf(err, errsz, "cannot open %s: %s", path, strerror(errno)); return false; }
 	if (!bspool_read_header(c->file, &c->header, err, errsz)) return false;
 	c->adaptive = c->header.schema == BSPOOL_SCHEMA_ADAPTIVE
@@ -9323,6 +9336,11 @@ static bool pool_event_cursor_open(PoolEventCursor *c, const char *path,
 	c->membershipDigest = c->adaptive ? bspool4_membership_digest_start() : POOL_HASH_INIT;
 	c->metadataDigest = c->adaptive ? bspool4_metadata_digest_start() : POOL_HASH_INIT;
 	return true;
+}
+
+static bool pool_event_cursor_open(PoolEventCursor *c, const char *path,
+		char *err, size_t errsz) {
+	return pool_event_cursor_open_stream(c, path, NULL, err, errsz);
 }
 
 /* Load and verify block b. Returns 1 on success, 0 on error, and -1 when the
@@ -10992,6 +11010,312 @@ cleanup:
 	return rc;
 }
 
+typedef struct {
+#ifdef _WIN32
+	BY_HANDLE_FILE_INFORMATION info;
+#else
+	struct stat info;
+#endif
+} PoolRecordingStamp;
+
+static bool pool_recording_stamp(FILE *file, PoolRecordingStamp *stamp) {
+#ifdef _WIN32
+	HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+	return handle != INVALID_HANDLE_VALUE && GetFileInformationByHandle(handle, &stamp->info);
+#else
+	return fstat(fileno(file), &stamp->info) == 0;
+#endif
+}
+
+static bool pool_recording_stamp_equal(const PoolRecordingStamp *a,
+		const PoolRecordingStamp *b) {
+#ifdef _WIN32
+	return a->info.dwVolumeSerialNumber == b->info.dwVolumeSerialNumber
+		&& a->info.nFileIndexHigh == b->info.nFileIndexHigh
+		&& a->info.nFileIndexLow == b->info.nFileIndexLow
+		&& a->info.nFileSizeHigh == b->info.nFileSizeHigh
+		&& a->info.nFileSizeLow == b->info.nFileSizeLow
+		&& a->info.ftLastWriteTime.dwHighDateTime == b->info.ftLastWriteTime.dwHighDateTime
+		&& a->info.ftLastWriteTime.dwLowDateTime == b->info.ftLastWriteTime.dwLowDateTime;
+#else
+	if (a->info.st_dev != b->info.st_dev || a->info.st_ino != b->info.st_ino
+			|| a->info.st_size != b->info.st_size) return false;
+#ifdef __APPLE__
+	return a->info.st_mtimespec.tv_sec == b->info.st_mtimespec.tv_sec
+		&& a->info.st_mtimespec.tv_nsec == b->info.st_mtimespec.tv_nsec
+		&& a->info.st_ctimespec.tv_sec == b->info.st_ctimespec.tv_sec
+		&& a->info.st_ctimespec.tv_nsec == b->info.st_ctimespec.tv_nsec;
+#else
+	return a->info.st_mtim.tv_sec == b->info.st_mtim.tv_sec
+		&& a->info.st_mtim.tv_nsec == b->info.st_mtim.tv_nsec
+		&& a->info.st_ctim.tv_sec == b->info.st_ctim.tv_sec
+		&& a->info.st_ctim.tv_nsec == b->info.st_ctim.tv_nsec;
+#endif
+#endif
+}
+
+static bool pool_recording_source_unchanged(FILE *file, const char *path,
+		const PoolRecordingStamp *before) {
+	PoolRecordingStamp current, named;
+	if (!pool_recording_stamp(file, &current)
+			|| !pool_recording_stamp_equal(before, &current)) return false;
+	FILE *reopened = fopen(path, "rb");
+	if (!reopened) return false;
+	bool same = pool_recording_stamp(reopened, &named)
+		&& pool_recording_stamp_equal(before, &named);
+	fclose(reopened);
+	return same;
+}
+
+typedef struct {
+	int tagSlot, tagIndex;
+	PoolSplitSlot copySlot;
+} PoolRecordingDescriptor;
+
+/* Add physical tag evidence only. The caller first validates composite
+ * semantics against the pinned header (preview-sources); every source byte
+ * is re-verified here and all descriptors are copied without route changes. */
+static int pool_mode_record_tags(const char *snapshot, const char *source,
+		const char *destination, unsigned first, unsigned last) {
+	static Config catalog;
+	PoolEventCursor cursor, verified;
+	memset(&cursor, 0, sizeof cursor); memset(&verified, 0, sizeof verified);
+	cursor.scratch.cachedBlock = verified.scratch.cachedBlock = UINT64_MAX;
+	PoolSplitOutput output;
+	memset(&output, 0, sizeof output);
+	BsStagedArtifact artifact = BS_STAGED_ARTIFACT_INIT;
+	PoolCtx *ctx = NULL;
+	unsigned char *original = NULL;
+	PoolRecordingDescriptor *descriptors = NULL;
+	size_t descriptorCap = 0;
+	char err[256] = "";
+	int rc = 1;
+	uint64_t catalogHash, checkedHash;
+	if (!pool_hash_catalog_file(snapshot, &catalogHash)
+			|| !load_config(snapshot, &catalog, err, sizeof err)
+			|| !pool_hash_catalog_file(snapshot, &checkedHash)
+			|| checkedHash != catalogHash) {
+		if (!err[0]) snprintf(err, sizeof err, "game snapshot changed or cannot be read");
+		goto fail;
+	}
+	if (!calibrate(&catalog, err, sizeof err)) goto fail;
+	if (!pool_event_cursor_open(&cursor, source, err, sizeof err)) goto fail;
+	const BspoolHeader *h = &cursor.header;
+	PoolRecordingStamp sourceStamp;
+	if (!pool_recording_stamp(cursor.file, &sourceStamp)) {
+		snprintf(err, sizeof err, "cannot pin source identity"); goto fail;
+	}
+	if (!h->complete || h->modelver != MODELVER || h->catalogHash != catalogHash
+			|| strcmp(h->charset, space_charset(h->space))) {
+		snprintf(err, sizeof err, "tag recording needs a complete pool and its matching model/profile snapshot"); goto fail;
+	}
+	if (bs_file_exists(destination)) {
+		snprintf(err, sizeof err, "output already exists; choose a new filename"); goto fail;
+	}
+	ctx = calloc(1, sizeof *ctx);
+	original = malloc((size_t)h->headerBytes);
+	if (!ctx || !original || bs_pread(fileno(cursor.file), original,
+			(size_t)h->headerBytes, 0) != (int64_t)h->headerBytes) {
+		snprintf(err, sizeof err, "cannot prepare tag recording"); goto fail;
+	}
+	ctx->g = &catalog;
+	if (!pool_split_output_init(&output, destination, "record-tags")
+			|| !bs_staged_artifact_open(&artifact, destination, err, sizeof err)) goto fail;
+	output.file = bs_staged_artifact_file(&artifact);
+	char poolId[24] = "0000000000000000", label[136], information[512];
+	pool_output_label(destination, label);
+	uint64_t window = ((uint64_t)first << 8) | last;
+	uint64_t sourceSnapshot = h->snapshotId ? h->snapshotId
+		: pool_hash_fields("snapshot", h->segmentId, h->records, h->dataBytes, h->membershipDigest);
+	snprintf(information, sizeof information,
+			"tag_placement_schema 1\ntag_placement_window %u %u\n"
+			"tag_placement_source_snapshot_id %016" PRIx64 "\n"
+			"tag_placement_source_membership_digest %016" PRIx64 "\n"
+			"tag_placement_source_metadata_digest %016" PRIx64 "\n",
+			first, last, sourceSnapshot, h->membershipDigest, h->metadataDigest);
+	PoolHeaderRewrite rewrite = {
+		.overrideRange = 1, .preserveInputTopology = 1,
+		.rangeStart = h->rangeStart, .rangeEnd = h->rangeEnd,
+		.poolId = poolId, .label = label, .mergedParts = h->mergedParts,
+		.familyId = h->familyId ? h->familyId : pool_hash_fields("family-fallback",
+				h->catalogHash, h->criteriaHash, (uint64_t)h->space, h->seedspace),
+		.stageHash = h->stageHash ? h->stageHash : h->criteriaHash,
+		.scanCursor = h->scanCursor ? h->scanCursor : h->rangeEnd,
+		.tagPlacementFields = information,
+	};
+	/* Reserve enough space before record offsets are fixed. This dry header
+	 * uses maximum counters, so final metadata cannot overflow the reservation. */
+	int headerBytes = h->headerBytes;
+	for (;;) {
+		if (pool_write_repacked_header(output.file, original, h->headerBytes,
+				BSPOOL_SCHEMA_ADAPTIVE, headerBytes, UINT64_MAX, UINT64_MAX, 0, 0,
+				&rewrite, err, sizeof err)) break;
+		if (!strstr(err, "header overflow") || headerBytes > BSPOOL_HEADER_MAX_SIZE / 2) goto fail;
+		headerBytes *= 2; err[0] = 0;
+	}
+	if (bs_fseeko(output.file, headerBytes, SEEK_SET) != 0) {
+		snprintf(err, sizeof err, "cannot reserve tag recording header"); goto fail;
+	}
+	const unsigned char marker[9] = {0x82, 'B', 'S', 'T', 'A', 'G', 1,
+		(unsigned char)first, (unsigned char)last};
+	uint64_t rankDigest = bspool4_membership_digest_start();
+	double lastProgress = bs_monotonic_seconds();
+	for (uint64_t b = 0; b < cursor.reader.nblocks; b++) {
+		int loaded = pool_event_cursor_load(&cursor, b, err, sizeof err);
+		if (loaded < 0) { rc = POOL_SPLIT_EXIT_UNSUPPORTED; goto fail; }
+		if (!loaded) goto fail;
+		if (!bspool4_membership_digest_update(&rankDigest, cursor.ranks, cursor.count)) {
+			snprintf(err, sizeof err, "cannot authenticate source ranks"); goto fail;
+		}
+		if (cursor.ndescriptors > descriptorCap) {
+			PoolRecordingDescriptor *next = realloc(descriptors, cursor.ndescriptors * sizeof *next);
+			if (!next) { snprintf(err, sizeof err, "cannot allocate tag recording descriptors"); goto fail; }
+			memset(next + descriptorCap, 0, (cursor.ndescriptors - descriptorCap) * sizeof *next);
+			descriptors = next; descriptorCap = cursor.ndescriptors;
+		}
+		for (size_t d = 0; d < cursor.ndescriptors; d++) {
+			const PoolSplitDescriptorRef *raw = &cursor.descriptors[d];
+			PoolRecordingDescriptor *item = &descriptors[d];
+			item->tagSlot = item->tagIndex = -1;
+			if (raw->len >= 6 && !memcmp(raw->bytes, "\x82" "BSTAG", 6)
+					&& (raw->len != 9 || raw->bytes[6] != 1
+						|| raw->bytes[7] > raw->bytes[8] || raw->bytes[8] > 77)) {
+				snprintf(err, sizeof err, "source has an invalid tag placement coverage marker"); goto fail;
+			}
+			if (raw->bytes[0] != POOL_META_TAG) continue;
+			unsigned keyBytes = raw->bytes[1], ante = raw->bytes[2 + keyBytes], phase = raw->bytes[3 + keyBytes];
+			if (ante < 1 || ante > POOL_MAX_ANTE || (phase != SOUL_PHASE_SMALL && phase != SOUL_PHASE_BIG)) continue;
+			unsigned slot = (ante - 1) * 2 + (phase == SOUL_PHASE_BIG);
+			if (slot < first || slot > last) continue;
+			item->tagSlot = (int)slot;
+			for (int i = 0; i < catalog.ntags; i++)
+				if (strlen(catalog.tagKey[i]) == keyBytes && !memcmp(catalog.tagKey[i], raw->bytes + 2, keyBytes)) {
+					item->tagIndex = i; break;
+				}
+		}
+		for (uint32_t r = 0; r < cursor.count; r++) {
+			uint64_t rank = cursor.ranks[r];
+			ctx->seedLen = (uint8_t)make_seed_in(h->space, rank, ctx->seed);
+			ctx->gen++; ctx->hashSeedPrefixMask = 0;
+			ctx->hashedSeed = pseudohash_ks("", ctx->seed);
+			memset(ctx->tagRollDone, 0, sizeof ctx->tagRollDone);
+			int tags[POOL_MAX_ANTE * 2];
+			for (unsigned slot = first; slot <= last; slot++) {
+				tags[slot] = pool_roll_tag_at(ctx, (int)(slot / 2 + 1), (int)(slot % 2));
+				if (tags[slot] < 0) { snprintf(err, sizeof err, "cannot roll tag at rank %" PRIu64, rank); goto fail; }
+			}
+			uint16_t local;
+			if (!pool_split_output_begin(&output, rank, &local, err, sizeof err)) goto fail;
+			for (int32_t a = cursor.recordHead[r]; a >= 0; a = cursor.assocNext[a]) {
+				int32_t d = cursor.assocDescriptor[a];
+				const PoolSplitDescriptorRef *raw = &cursor.descriptors[d];
+				PoolRecordingDescriptor *item = &descriptors[d];
+				if (item->tagSlot >= 0 && tags[item->tagSlot] != item->tagIndex) {
+					snprintf(err, sizeof err, "existing tag conflicts with the matching snapshot at rank %" PRIu64 " slot %d", rank, item->tagSlot); goto fail;
+				}
+				if (!pool_split_output_descriptor(&output, local, raw->bytes, raw->len,
+						&item->copySlot, (uint32_t)b, err, sizeof err)) goto fail;
+			}
+			for (unsigned slot = first; slot <= last; slot++) {
+				const char *key = catalog.tagKey[tags[slot]];
+				if (strcmp(key, "tag_negative") && strcmp(key, "tag_rare")) continue;
+				unsigned char raw[MAX_KEY + 7] = {POOL_META_TAG, 0};
+				size_t n = strlen(key);
+				raw[1] = (unsigned char)n; memcpy(raw + 2, key, n);
+				raw[2 + n] = (unsigned char)(slot / 2 + 1);
+				raw[3 + n] = slot % 2 ? SOUL_PHASE_BIG : SOUL_PHASE_SMALL;
+				if (!pool_split_output_descriptor(&output, local, raw, n + 7, NULL, 0, err, sizeof err)) goto fail;
+			}
+			if (!pool_split_output_descriptor(&output, local, marker, sizeof marker, NULL, 0, err, sizeof err)
+					|| !pool_split_output_end(&output, err, sizeof err)) goto fail;
+		}
+		double now = bs_monotonic_seconds();
+		if (now - lastProgress >= 0.5) {
+			fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", cursor.consumed, h->records);
+			fflush(stderr); lastProgress = now;
+		}
+	}
+	if (!pool_event_cursor_finish(&cursor, err, sizeof err)
+			|| !pool_split_flush(&output, err, sizeof err)) goto fail;
+	int64_t dataEnd = bs_ftello(output.file);
+	if (dataEnd < headerBytes || output.records != h->records
+			|| output.membershipDigest != rankDigest) {
+		snprintf(err, sizeof err, "tag recording did not preserve every seed"); goto fail;
+	}
+	output.dataBytes = (uint64_t)dataEnd - (uint64_t)headerBytes;
+	sourceSnapshot = h->snapshotId ? h->snapshotId
+		: pool_hash_fields("snapshot", h->segmentId, h->records, h->dataBytes, cursor.membershipDigest);
+	rewrite.lineageId = pool_hash_fields("record-tags", h->lineageId, sourceSnapshot, window, output.metadataDigest);
+	rewrite.segmentId = pool_hash_fields("segment", rewrite.lineageId, h->rangeStart, h->rangeEnd, (uint64_t)h->space);
+	rewrite.derivationId = pool_hash_fields("derive-record-tags", sourceSnapshot, rewrite.segmentId, window, output.metadataDigest);
+	rewrite.membershipDigest = output.membershipDigest; rewrite.metadataDigest = output.metadataDigest;
+	rewrite.snapshotId = pool_hash_fields("snapshot", rewrite.segmentId, output.records, output.dataBytes, output.membershipDigest);
+	snprintf(poolId, sizeof poolId, "%016" PRIx64, pool_hash_fields("record-tags-pool",
+			rewrite.segmentId, output.records, output.membershipDigest, output.metadataDigest));
+	snprintf(information, sizeof information,
+			"tag_placement_schema 1\ntag_placement_window %u %u\n"
+			"tag_placement_source_snapshot_id %016" PRIx64 "\n"
+			"tag_placement_source_membership_digest %016" PRIx64 "\n"
+			"tag_placement_source_metadata_digest %016" PRIx64 "\n",
+			first, last, sourceSnapshot, cursor.membershipDigest, cursor.metadataDigest);
+	uint64_t finalBytes;
+	if (!pool_append_adaptive_index(output.file, headerBytes, output.records, output.dataBytes,
+			output.membershipDigest, output.metadataDigest, &finalBytes, err, sizeof err)
+			|| !pool_write_repacked_header(output.file, original, h->headerBytes,
+				BSPOOL_SCHEMA_ADAPTIVE, headerBytes, output.records, output.dataBytes, 1,
+				h->coverageComplete, &rewrite, err, sizeof err)) goto fail;
+	if (!pool_event_cursor_open_stream(&verified, destination, output.file, err, sizeof err)) goto fail;
+	for (uint64_t b = 0; b < verified.reader.nblocks; b++)
+		if (pool_event_cursor_load(&verified, b, err, sizeof err) != 1) goto fail;
+	if (!pool_event_cursor_finish(&verified, err, sizeof err)
+			|| verified.consumed != output.records
+			|| verified.membershipDigest != output.membershipDigest
+			|| verified.metadataDigest != output.metadataDigest) {
+		if (!err[0]) snprintf(err, sizeof err, "tag recording failed final byte verification");
+		goto fail;
+	}
+	pool_event_cursor_destroy(&verified);
+	if (!pool_recording_source_unchanged(cursor.file, source, &sourceStamp)
+			|| !pool_hash_catalog_file(snapshot, &checkedHash) || checkedHash != catalogHash) {
+		snprintf(err, sizeof err, "source pool or game snapshot changed during tag recording"); goto fail;
+	}
+	output.file = NULL; /* The artifact owns its stream and final publication. */
+	if (!bs_staged_artifact_publish(&artifact, err, sizeof err)) goto fail;
+	fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", cursor.consumed, h->records);
+	printf("BRAINSTORM_TAG_RECORDING_RESULT 1\nsource_records %" PRIu64 "\n"
+			"source_membership_digest %016" PRIx64 "\nsource_metadata_digest %016" PRIx64 "\n"
+			"output_records %" PRIu64 "\noutput_membership_digest %016" PRIx64 "\n"
+			"output_metadata_digest %016" PRIx64 "\nend\n",
+			cursor.consumed, cursor.membershipDigest, cursor.metadataDigest,
+			output.records, output.membershipDigest, output.metadataDigest);
+	rc = fflush(stdout) != 0 || ferror(stdout) ? 1 : 0;
+	goto cleanup;
+fail:
+	fprintf(stderr, "%s\n", err[0] ? err : "cannot record tag placements");
+cleanup:
+	pool_event_cursor_destroy(&verified);
+	pool_event_cursor_destroy(&cursor);
+	output.file = NULL;
+	pool_split_output_reset(&output);
+	bs_staged_artifact_abort(&artifact);
+	free(ctx); free(original); free(descriptors);
+	return rc;
+}
+
+static int pool_mode_record_tags_locked(const char *snapshot, const char *source,
+		const char *destination, const char *startText, const char *endText) {
+	uint64_t first, last;
+	if (!pool_parse_u64(startText, &first) || !pool_parse_u64(endText, &last)
+			|| first > last || last > 77) {
+		fprintf(stderr, "tag recording slots must be an inclusive range from 0 to 77\n"); return 1;
+	}
+	bs_file_lock_t lock;
+	if (!pool_acquire_writer_lock(destination, &lock)) return 1;
+	int result = pool_mode_record_tags(snapshot, source, destination, (unsigned)first, (unsigned)last);
+	bs_file_lock_release(lock);
+	return result;
+}
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
@@ -11005,8 +11329,9 @@ static void pool_usage(const char *prog) {
 			"  %s merge <output.bspool> <part1.bspool> <part2.bspool> [more parts...]\n"
 			"  %s split <input.bspool> <organizer-split-plan.txt>\n"
 			"  %s combine <organizer-combine-plan.txt>\n"
-			"  %s preview-sources <input.bspool> <source-preview-plan.txt>\n",
-			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+			"  %s preview-sources <input.bspool> <source-preview-plan.txt>\n"
+			"  %s record-tags <native-snapshot.cfg> <input.bspool> <output.bspool> <start-slot> <end-slot>\n",
+			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -11029,6 +11354,8 @@ int main(int argc, char **argv) {
 		return pool_mode_combine(argv[2]);
 	if (argc == 4 && !strcmp(argv[1], "preview-sources"))
 		return pool_mode_source_preview(argv[2], argv[3]);
+	if (argc == 7 && !strcmp(argv[1], "record-tags"))
+		return pool_mode_record_tags_locked(argv[2], argv[3], argv[4], argv[5], argv[6]);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);

@@ -38,6 +38,7 @@ import brainstorm_pool_organizer as organizer
 import pool_rule_workflow as rule_workflow
 import pool_rules_ui as rules_ui
 import pool_tag_rules as tag_rules
+import pool_tag_recording as tag_recording
 split_policy = organizer.split_policy
 seed_pool_mutations = organizer.seed_pool_mutations
 
@@ -1819,6 +1820,12 @@ class NativeSplitHelper:
             "preview-sources", [source, plan_path], organizer.NativeSplitUnsupported,
             cancel_check, progress)
 
+    def record_tags(self, snapshot, source, output, first, last,
+                    cancel_check=None, progress=None):
+        return self._stream(
+            "record-tags", [snapshot, source, output, str(first), str(last)],
+            organizer.NativeSplitUnsupported, cancel_check, progress)
+
     def combine(self, plan_path, cancel_check=None, progress=None):
         return self._stream(
             "combine", [plan_path], organizer.NativeCombineUnsupported,
@@ -3480,6 +3487,13 @@ def _run_rule_operation(request, pool_dir, action):
             result = rule_workflow.describe_source(
                 reader, cancel_check=cancelled, count_records=False)
             result["coverage"] = tag_rules.describe_recorded_coverage(reader)
+        elif action == "record-tags":
+            result = tag_recording.record_tags(
+                reader, request.get("recipe"), root,
+                os.path.join(MOD_DIR, SNAPSHOT_NAME), _native_split_helper(),
+                prefix=request.get("prefix", ""), cancel_check=cancelled,
+                progress=progress, phase=lambda value: _progress_set(
+                    "rules", phase=value, records_done=0))
         elif action == "preview":
             plan = rule_workflow.preview(
                 reader, request.get("recipe"), request.get("prefix", ""),
@@ -3538,6 +3552,10 @@ def run_rule_preview(request, pool_dir=None):
 
 def run_rule_publish(request, pool_dir=None):
     return _run_rule_operation(request, pool_dir, "publish")
+
+
+def run_rule_record_tags(request, pool_dir=None):
+    return _run_rule_operation(request, pool_dir, "record-tags")
 
 
 def run_rule_validate(request):
@@ -3892,7 +3910,7 @@ const FILTER_KINDS=[
 const esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const fmt=n=>Number(n||0).toLocaleString();
 const fmtBytes=n=>{n=Number(n||0);if(n>=1073741824)return `${(n/1073741824).toFixed(2)} GiB`;if(n>=1048576)return `${(n/1048576).toFixed(2)} MiB`;if(n>=1024)return `${(n/1024).toFixed(1)} KiB`;return `${fmt(n)} bytes`};
-async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";error.publicationState=v.publication_state||"";throw error}return v}
+async function api(path,data){const opt=data?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data),cache:"no-store"}:{cache:"no-store"};const r=await fetch(apiPath(path),opt);let v;try{v=await r.json()}catch(_e){throw Error(`The local Organizer returned an unreadable response (${r.status}).`)}if(!r.ok||v.error){const error=Error(v.error||`Request failed (${r.status})`);error.code=v.error_code||"";error.publicationState=v.publication_state||"";error.missingCoverage=v.missing_coverage||[];error.rank=v.rank;throw error}return v}
 function renderNativeHelperWarning(v){
  const box=$("nativeHelperWarning");if(!box)return;
  const min=v.native_summary_min_bytes||0;
@@ -4196,7 +4214,10 @@ PAGE = PAGE.replace("/*__RULE_STYLES__*/", rules_ui.STYLE).replace(
 
 def error_payload(exc):
     value = {"error": str(exc)}
-    if isinstance(exc, OperationCancelled):
+    if isinstance(exc, tag_rules.InsufficientMetadataError):
+        value.update(error_code="tag_coverage_missing", missing_coverage=exc.missing,
+                     rank=exc.rank)
+    elif isinstance(exc, OperationCancelled):
         value["error_code"] = "operation_cancelled"
     elif isinstance(exc, FormatPlanStale):
         value["error_code"] = "format_plan_stale"
@@ -4299,6 +4320,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 self._json(run_rule_preview(data, self.pool_dir))
             elif parsed.path == "/api/rules/publish":
                 self._json(run_rule_publish(data, self.pool_dir))
+            elif parsed.path == "/api/rules/record-tags":
+                self._json(run_rule_record_tags(data, self.pool_dir))
             elif parsed.path == "/api/rules/validate":
                 self._json(run_rule_validate(data))
             elif parsed.path == "/api/combine/plan":

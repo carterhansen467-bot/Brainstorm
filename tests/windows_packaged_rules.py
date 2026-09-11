@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import brainstorm_pool_organizer as organizer
+import brainstorm_pool_builder as builder_core
 from pool_organizer import descriptor, write_custom_bsp3
 
 
@@ -72,13 +73,10 @@ def make_mod(directory, source_mode):
     directory.mkdir(parents=True)
     (directory / "Brainstorm_main.lua").write_text("-- isolated packaged smoke fixture\n", encoding="ascii")
     (directory / "manifest.json").write_text('{"id":"Brainstorm-smoke"}\n', encoding="ascii")
-    # Enough current profile data to open the Builder. No actual scan is
-    # requested, and no game snapshot or user's pool directory is read.
-    (directory / "native_search.cfg").write_text("\n".join([
-        "modelver 6", "tagdef tag_negative 1 2", "tagdef tag_rare 1 0",
-        "specialdef c_soul 1", "boostdef p_arcana_mega_1 1 1 5 A 1",
-        "boostdef p_spectral_normal_1 1 1 2 S 1", "end", "",
-    ]), encoding="ascii")
+    # Public synthetic profile with independently generated Lua parity probes;
+    # the packaged recording helper really evaluates tags against this copy.
+    shutil.copyfile(ROOT / "tests/fixtures/tag_recording_snapshot.cfg",
+                    directory / "native_search.cfg")
     if source_mode:
         scanner = ROOT / "native" / ("brainstorm_seed_pool.exe" if os.name == "nt"
                                       else "brainstorm_seed_pool")
@@ -225,6 +223,41 @@ def exercise(base, prefix, pools, combined):
     require(ranks == [1, 2, 4], "Second-tag outputs contain the wrong seeds")
     require(organizer.BSPoolReader(combined).records == 5, "Source pool was changed")
 
+    # Reproduce a voucher-only history with genuinely unrecorded tags, then
+    # use the same repair -> Preview -> Create controls as the Windows tester.
+    missing = pools / "Missing-tag-data.bspool"
+    preserved = [descriptor(3, "v_smoke", 1, 0, 1, 1, 0), b"\x90smoke"]
+    ranks = list(range(100))
+    write_custom_bsp3(str(missing), ranks, [preserved for _ in ranks],
+                     "3333333333333333", ["tag_route collect", "voucher v_smoke 1 3"],
+                     catalog_hash=builder_core.catalog_hash_file(pools.parent / "native_search.cfg"),
+                     range_end=organizer.NATURAL_SEEDSPACE)
+    original = missing.read_bytes()
+    try:
+        request(base, prefix + "/rules/preview", {"source": missing.name, "recipe": recipe})
+    except RuntimeError as error:
+        require("tag_coverage_missing" in str(error), "Missing placements did not get a repairable error")
+    else:
+        raise AssertionError("Voucher-only records incorrectly counted missing metadata as absent tags")
+    recorded = request(base, prefix + "/rules/record-tags", {
+        "source": missing.name, "recipe": recipe})
+    require(recorded["completed"] and recorded["engine"] == "native" and recorded["records"] == 100,
+            "Packaged tag recording did not retain every seed")
+    recorded_reader = organizer.BSPoolReader(pools / recorded["source"])
+    require([r.rank for r in recorded_reader.iter_records()] == ranks, "Tag recording changed seed ranks")
+    for row in recorded_reader.iter_records():
+        raw = {item.raw for item in row.occurrences}
+        require(set(preserved) <= raw and b"\x82BSTAG\x01\x04\x0d" in raw,
+                "Tag recording lost old metadata or omitted per-seed coverage")
+    repaired_plan = request(base, prefix + "/rules/preview", {
+        "source": recorded["source"], "recipe": recipe, "prefix": "repaired-second-tag"})
+    require(repaired_plan["source_records"] == 100 and repaired_plan["copied_records"] > 0,
+            "Recorded copy cannot be sorted by second tag")
+    repaired_outputs = request(base, prefix + "/rules/publish", {
+        "source": recorded["source"], "planToken": repaired_plan["plan_token"]})
+    require(repaired_outputs["completed"] and repaired_outputs["outputs"], "Repaired split was not published")
+    require(missing.read_bytes() == original, "Tag recording modified the original pool")
+
 
 def smoke_app(name, executable, directory, source_mode):
     builder = name == "Builder"
@@ -259,7 +292,7 @@ def smoke_app(name, executable, directory, source_mode):
         probe.settimeout(1)
         require(probe.connect_ex(("127.0.0.1", port)) != 0,
                 "The stopped test app left a listening child process on port %d" % port)
-    print("%s %s: recovery, second tags, BSP4 coverage, and shutdown PASS" % (
+    print("%s %s: recovery, tag recording, second tags, BSP4 coverage, and shutdown PASS" % (
         "Source" if source_mode else "Packaged", name), flush=True)
 
 

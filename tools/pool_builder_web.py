@@ -1989,6 +1989,8 @@ class Handler(BaseHTTPRequestHandler):
                     value = organizer_web.run_rule_preview(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/rules/publish":
                     value = organizer_web.run_rule_publish(data, self.pool_dir)
+                elif parsed.path == "/organizer/api/rules/record-tags":
+                    value = organizer_web.run_rule_record_tags(data, self.pool_dir)
                 elif parsed.path == "/organizer/api/rules/validate":
                     value = organizer_web.run_rule_validate(data)
                 elif parsed.path == "/organizer/api/format/plan":

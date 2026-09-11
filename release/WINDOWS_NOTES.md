@@ -1,5 +1,15 @@
-Brainstorm for Windows x64, with faster original-pool discovery and filtering
-in the Seed Pool Program.
+Brainstorm for Windows x64, with missing tag-data recovery for second-tag sorting.
+
+- **Record tag placements:** if Second tag reports missing recorded coverage,
+  create a new copy with Negative/Rare placements calculated from every saved
+  seed. It retains all seeds and existing pool history, including seeds with
+  neither tag. Requires the matching game-profile snapshot (`native_search.cfg`).
+- **Continue with your settings:** the recorded copy is selected automatically;
+  your range and optional conditions stay in place. Preview again to sort it.
+  Recording includes the ranges used by optional conditions.
+- **Clearer missing-data messages:** missing ranges lead directly to the
+  recording action. Saved filter ranges are shown separately from per-seed
+  recording evidence; unknown placements never count as absent tags.
 
 - **Fast original-pool Preview:** verifies every seed's source memberships and
   counts selected groups in the native helper. Recovery no longer needs a

@@ -3,7 +3,8 @@
 
 Tag metadata is query evidence: a missing occurrence proves absence only inside
 that tag's recorded search windows.  A composite record can use the union of
-windows from its own provenance branches, never another seed's branches.
+windows from its own provenance branches and explicit per-record recording
+markers, never another seed's branches or markers.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ EVIDENCE_CACHE_ENTRIES = 4096
 EVIDENCE_CACHE_BYTES = 8 * 1024 * 1024
 EVIDENCE_CACHE_DESCRIPTORS = 256
 TAG_KEYS = {"negative": "tag_negative", "rare": "tag_rare"}
+TAG_RECORDING_SIGNATURE = b"\x82BSTAG"
 _TAG_NAMES = {key: tag for tag, key in TAG_KEYS.items()}
 EXCLUSION_LABELS = {
     "condition_not_met": "Does not meet the extra conditions",
@@ -53,9 +55,9 @@ class InsufficientMetadataError(TagRuleError):
             item["range"]["end"]) for item in self.missing)
         subject = "This pool" if rank is None else "Seed rank %d" % rank
         super().__init__(
-            "%s lacks recorded coverage for %s. Choose a recorded range or "
-            "rebuild/refilter with both tag windows recorded; missing metadata "
-            "cannot be treated as a missing tag." % (subject, detail))
+            "%s lacks recorded coverage for %s. Use Record tag placements, "
+            "then preview again, or choose a range already recorded. Missing "
+            "metadata cannot be treated as a missing tag." % (subject, detail))
 
 
 def _object(value, allowed, required, label):
@@ -342,13 +344,18 @@ class Classification:
 
 def _descriptor_info(item, rank):
     """Return physical tag/source data independently of descriptor attributes."""
+    if item.raw.startswith(TAG_RECORDING_SIGNATURE):
+        if (len(item.raw) != 9 or item.raw[6] != 1
+                or not 0 <= item.raw[7] <= item.raw[8] < MAX_ANTE * 2):
+            raise TagRuleError("Seed rank %d has an invalid tag recording marker" % rank)
+        return None, None, None, None, None, (item.raw[7], item.raw[8])
     if item.kind == 1:
         if (type(item.ante) is not int or not 1 <= item.ante <= MAX_ANTE
                 or type(item.phase) is not int or item.phase not in (1, 2)):
             raise TagRuleError("Seed rank %d has an invalid tag location" % rank)
         position = (item.ante - 1) * 2 + item.phase - 1
-        return position, item.key, _TAG_NAMES.get(item.key), None, None
-    return None, None, None, item.provenance_id, item.operand_id
+        return position, item.key, _TAG_NAMES.get(item.key), None, None, None
+    return None, None, None, item.provenance_id, item.operand_id, None
 
 
 def _read_sources(reader):
@@ -390,10 +397,13 @@ def describe_recorded_coverage(reader):
     For legacy/mixed pools, metadata_complete=False means the declared windows
     are insufficient to establish occurrence coverage.  Composite windows are
     source-specific; eligibility must still be checked against each record.
+    Per-record recording markers are intentionally not projected into these
+    header windows: neither a source label nor a recording header proves that
+    every seed contains the same markers.
     """
     sources, labels = _read_sources(reader)
     return {"metadata_complete": bool(reader.occurrence_metadata_complete),
-            "checked_per_seed": reader.is_composite,
+            "checked_per_seed": True,
             "sources": _describe_sources(sources, labels)}
 
 
@@ -422,10 +432,6 @@ class TagClassifier:
         self._results = {}
         self._evidence_cache = {}
         self._evidence_cache_bytes = 0
-        if not self._is_composite:
-            missing = _missing_coverage(self._requirements, self._sources[None])
-            if missing:
-                raise InsufficientMetadataError(missing)
 
     @property
     def recipe(self):
@@ -433,13 +439,14 @@ class TagClassifier:
 
     def describe_coverage(self):
         return {"sources": _describe_sources(self._sources, self._labels),
-                "metadata_complete": True, "checked_per_seed": self._is_composite,
+                "metadata_complete": True, "checked_per_seed": True,
                 "required": [{"tag": tag, "range": _range_dict(pair)}
                              for tag, pair in self._requirements]}
 
     def _record_evidence(self, record):
         by_position = {}
         source_ids = set()
+        recorded_windows = set()
         for item in record.occurrences:
             info = self._descriptor_cache.get(item.raw)
             if info is None:
@@ -449,7 +456,7 @@ class TagClassifier:
                         and self._descriptor_cache_bytes + charge <= EVIDENCE_CACHE_BYTES):
                     self._descriptor_cache[item.raw] = info
                     self._descriptor_cache_bytes += charge
-            position, key, tag, source_id, operand_id = info
+            position, key, tag, source_id, operand_id, recorded_window = info
             if position is not None:
                 prior = by_position.get(position)
                 if prior is not None and prior[0] != key:
@@ -460,28 +467,37 @@ class TagClassifier:
                 source_ids.add(source_id)
             elif operand_id is not None and not self._is_composite:
                 raise TagRuleError("A non-composite pool contains input provenance")
-        self._check_record_coverage(record, frozenset(source_ids))
+            elif recorded_window is not None:
+                recorded_windows.add(recorded_window)
+        self._check_record_coverage(record, frozenset(source_ids),
+                                    _merge_intervals(recorded_windows))
         return tuple((position, value[1]) for position, value in sorted(by_position.items())
                      if value[1] is not None)
 
-    def _check_record_coverage(self, record, ids):
+    def _check_record_coverage(self, record, ids, recorded_windows):
         if not self._is_composite:
             if ids:
                 raise TagRuleError("A non-composite pool contains source provenance")
-            return
-        if not ids or ids.difference(self._sources):
+            source_ids = (None,)
+        elif not ids or ids.difference(self._sources):
             raise TagRuleError("Seed rank %d has missing or unknown source provenance" %
                                record.rank)
-        if ids in self._cache:
-            missing = self._cache[ids]
         else:
-            coverage = {tag: _merge_intervals(
-                interval for source_id in ids for interval in self._sources[source_id][tag])
+            source_ids = ids
+        # Markers prove both target tags within exactly this record's windows.
+        # Their intervals are part of the bounded cache identity, so an earlier
+        # seed cannot lend coverage to one whose metadata omitted a marker.
+        cache_key = (ids, recorded_windows)
+        if cache_key in self._cache:
+            missing = self._cache[cache_key]
+        else:
+            coverage = {tag: _merge_intervals(recorded_windows + tuple(
+                interval for source_id in source_ids for interval in self._sources[source_id][tag]))
                 for tag in TAG_KEYS}
             missing = _missing_coverage(self._requirements, coverage)
             # Bounded memory even if a large combined pool has many memberships.
             if len(self._cache) < 4096:
-                self._cache[ids] = missing
+                self._cache[cache_key] = missing
         if missing:
             raise InsufficientMetadataError(missing, record.rank)
 

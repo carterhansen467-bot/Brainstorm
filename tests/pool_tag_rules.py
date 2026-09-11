@@ -24,6 +24,11 @@ def occurrence(tag, ante, phase, flags=0, source=0, ordinal=0):
     return organizer.Occurrence.decode(raw)
 
 
+def recording(start="A3S", end="A7B"):
+    return organizer.Occurrence.decode(b"\x82BSTAG\x01" + bytes((
+        rules.parse_position(start), rules.parse_position(end))))
+
+
 def record(*items, sources=()):
     return organizer.Record(17, tuple(items) + tuple(
         organizer.Occurrence.decode(organizer.provenance_descriptor(source))
@@ -148,7 +153,7 @@ class SecondTagTests(unittest.TestCase):
 class CoverageTests(unittest.TestCase):
     def test_event_flag_does_not_claim_all_tag_windows(self):
         with self.assertRaises(rules.InsufficientMetadataError) as caught:
-            rules.TagClassifier(reader(["tag tag_negative 3 7 1"]), recipe())
+            rules.TagClassifier(reader(["tag tag_negative 3 7 1"]), recipe()).classify(record())
         self.assertEqual(caught.exception.missing, (
             {"tag": "rare", "range": {"start": "A3S", "end": "A7B"}},))
 
@@ -166,19 +171,19 @@ class CoverageTests(unittest.TestCase):
             rules.TagClassifier(reader([
                 "tag tag_negative 3 small 4 small 1",
                 "tag tag_negative 5 small 7 big 1", "tag tag_rare 3 7 1",
-            ]), recipe())
+            ]), recipe()).classify(record())
         self.assertEqual(caught.exception.missing[0]["range"],
                          {"start": "A4B", "end": "A4B"})
 
     def test_extra_condition_requires_coverage_outside_main_range(self):
         with self.assertRaises(rules.InsufficientMetadataError):
-            rules.TagClassifier(reader(), recipe(condition=count("rare", "A1S", "A2B", max=0)))
+            rules.TagClassifier(reader(), recipe(condition=count("rare", "A1S", "A2B", max=0))).classify(record())
 
     def test_negation_or_short_circuit_never_interprets_unknown_as_absent(self):
         condition = {"any": [count("negative", min=1),
                              {"not": count("rare", "A1S", "A1B", min=1)}]}
         with self.assertRaises(rules.InsufficientMetadataError):
-            rules.TagClassifier(reader(), recipe(condition=condition))
+            rules.TagClassifier(reader(), recipe(condition=condition)).classify(record())
 
     def test_seed_can_union_only_its_own_source_coverage(self):
         classifier = rules.TagClassifier(reader(branches={
@@ -234,6 +239,123 @@ class CoverageTests(unittest.TestCase):
         ):
             with self.subTest(criterion=criterion), self.assertRaises(rules.TagRuleError):
                 rules.TagClassifier(reader([criterion]), recipe())
+
+
+class RecordedWindowTests(unittest.TestCase):
+    def test_voucher_only_recording_supplies_tag_coverage_without_changing_evidence(self):
+        classifier = rules.TagClassifier(reader(["voucher v_crystal_ball 1 2"]), recipe())
+        voucher = organizer.Occurrence.decode(bytes.fromhex(
+            "030e765f6372797374616c5f62616c6c0100010100"))
+        value = record(voucher, occurrence("negative", 3, 1),
+                       occurrence("rare", 5, 2), recording())
+        original = value.occurrences
+        self.assertEqual(classifier.classify(value).destination.key, "a5b-rare")
+        self.assertEqual(value.occurrences, original)
+
+    def test_marker_proves_an_empty_window_but_its_header_alone_does_not(self):
+        source = reader(["voucher v_crystal_ball 1 2", "tag_placement_schema 1"])
+        classifier = rules.TagClassifier(source, recipe())
+        self.assertEqual(classifier.classify(record(recording())).exclusion, "no_eligible_tags")
+        with self.assertRaises(rules.InsufficientMetadataError):
+            classifier.classify(record())
+        self.assertEqual(rules.describe_recorded_coverage(source)["sources"][0]["both_tags"], [])
+        self.assertEqual(classifier.describe_coverage()["sources"][0]["both_tags"], [])
+
+    def test_adjacent_recordings_union_but_a_single_slot_gap_is_unknown(self):
+        classifier = rules.TagClassifier(reader([]), recipe())
+        first = recording("A3S", "A4S")
+        self.assertEqual(classifier.classify(record(
+            first, first, recording("A4B", "A7B"))).exclusion, "no_eligible_tags")
+        with self.assertRaises(rules.InsufficientMetadataError) as caught:
+            classifier.classify(record(first, recording("A5S", "A7B")))
+        self.assertEqual(caught.exception.missing, (
+            {"tag": "negative", "range": {"start": "A4B", "end": "A4B"}},
+            {"tag": "rare", "range": {"start": "A4B", "end": "A4B"}},))
+
+    def test_recording_unions_with_only_the_same_records_branch_windows(self):
+        classifier = rules.TagClassifier(reader(branches={
+            11: ["tag tag_negative 3 4 1", "tag tag_rare 3 4 1"],
+            22: ["tag tag_negative 3 7 1", "tag tag_rare 3 7 1"],
+            33: ["voucher v_crystal_ball 1 2"],
+        }), recipe())
+        suffix = recording("A5S", "A7B")
+        self.assertEqual(classifier.classify(record(suffix, sources=(11,))).exclusion,
+                         "no_eligible_tags")
+        self.assertEqual(classifier.classify(record(sources=(22,))).exclusion,
+                         "no_eligible_tags")
+        with self.assertRaises(rules.InsufficientMetadataError):
+            classifier.classify(record(suffix, sources=(33,)))
+
+    def test_conditions_require_their_own_recorded_windows(self):
+        classifier = rules.TagClassifier(reader([]), recipe(condition={"not":
+            count("rare", "A1S", "A2B", min=1)}))
+        with self.assertRaises(rules.InsufficientMetadataError) as caught:
+            classifier.classify(record(recording()))
+        self.assertEqual(caught.exception.missing, (
+            {"tag": "rare", "range": {"start": "A1S", "end": "A2B"}},))
+        self.assertEqual(classifier.classify(record(
+            recording(), recording("A1S", "A2B"))).exclusion, "no_eligible_tags")
+
+    def test_recording_cache_never_borrows_another_seeds_marker(self):
+        classifier = rules.TagClassifier(reader([]), recipe())
+        tags = (occurrence("negative", 3, 1), occurrence("rare", 6, 2))
+        complete = record(*tags, recording())
+        self.assertEqual(classifier.classify(complete).destination.key, "a6b-rare")
+        # Exercise the coverage cache separately from complete descriptor reuse.
+        self.assertEqual(classifier.classify(record(recording())).exclusion, "no_eligible_tags")
+        for rank in (99, 188495):
+            for items in (tags, tags + (recording("A4S", "A7B"),)):
+                with self.assertRaises(rules.InsufficientMetadataError) as caught:
+                    classifier.classify(organizer.Record(rank, items))
+                self.assertEqual(caught.exception.rank, rank)
+
+    def test_malformed_recordings_fail_even_when_header_coverage_is_complete(self):
+        valid = recording().raw
+        malformed = (valid[:-1], valid + b"\x00", b"\x82BSTAG",
+                     b"\x82BSTAG\x00\x04\x0d", b"\x82BSTAG\x02\x04\x0d",
+                     b"\x82BSTAG\x01\x0d\x04", b"\x82BSTAG\x01\x00\x4e",
+                     b"\x82BSTAG\x01\xff\xff")
+        classifier = rules.TagClassifier(reader(), recipe())
+        self.assertEqual(classifier.classify(record(recording())).exclusion, "no_eligible_tags")
+        for raw in malformed:
+            for rank in (17, 199):
+                with self.subTest(raw=raw, rank=rank), self.assertRaisesRegex(
+                        rules.TagRuleError, "rank %d .*recording" % rank):
+                    classifier.classify(organizer.Record(rank, (organizer.Occurrence.decode(raw),)))
+
+    def test_marker_does_not_override_provenance_or_incomplete_event_metadata(self):
+        classifier = rules.TagClassifier(reader(branches={11: []}), recipe())
+        for sources in ((), (99,), (11, 99)):
+            with self.subTest(sources=sources), self.assertRaisesRegex(rules.TagRuleError, "provenance"):
+                classifier.classify(record(recording(), sources=sources))
+        for source in (reader([], complete=False), reader([], branches={11: []}, complete=False)):
+            with self.assertRaisesRegex(rules.TagRuleError, "without complete recorded"):
+                rules.TagClassifier(source, recipe()).classify(record(recording(), sources=(11,)))
+
+    def test_edge_slots_are_valid_and_unrelated_opaque_descriptors_remain_opaque(self):
+        classifier = rules.TagClassifier(reader([]), recipe("A1S", "A39B"))
+        unknown = organizer.Occurrence.decode(b"\x82OTHER\x01\x00\x4d")
+        self.assertEqual(classifier.classify(record(
+            unknown, recording("A1S", "A39B"))).exclusion, "no_eligible_tags")
+        with self.assertRaises(rules.InsufficientMetadataError):
+            classifier.classify(record(unknown))
+
+    def test_original_voucher_only_record_needs_its_own_recording(self):
+        # The tester's original raw record and its retained voucher-only branch.
+        # No unrecorded tag placement is inferred from the complete-pool name.
+        original = organizer.Record(188495, tuple(organizer.Occurrence.decode(bytes.fromhex(raw))
+            for raw in ("030e765f6372797374616c5f62616c6c0100010100",
+                        "807fb4f813310fc75a", "81a44ca67a37658710")))
+        classifier = rules.TagClassifier(reader(branches={
+            0x7fb4f813310fc75a: ["tag_route collect", "voucher v_crystal_ball 1 2"],
+        }), recipe("A4S", "A7B"))
+        with self.assertRaises(rules.InsufficientMetadataError) as caught:
+            classifier.classify(original)
+        self.assertEqual(caught.exception.rank, 188495)
+        # A fixture recording with no eligible tags proves absence for this
+        # record. This does not claim those are the tester seed's true rolls.
+        annotated = organizer.Record(original.rank, original.occurrences + (recording("A4S", "A7B"),))
+        self.assertEqual(classifier.classify(annotated).exclusion, "no_eligible_tags")
 
 
 class EvidenceCacheTests(unittest.TestCase):
@@ -396,6 +518,23 @@ class EncodedPoolTests(unittest.TestCase):
             results = [classifier.classify(item) for item in source.iter_records()]
             self.assertEqual(results[0].destination.key, "a6b-rare")
             self.assertEqual(results[1].exclusion, "same_ante_only")
+
+    def test_encoded_voucher_pool_uses_each_records_marker_not_the_output_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "recorded-tags.bspool")
+            tags = [occurrence("negative", 3, 1).raw, occurrence("rare", 6, 2).raw]
+            self.fixtures.write_custom_bsp3(
+                path, [1, 2, 3], [tags + [recording().raw], [recording().raw], tags],
+                "1111111111111111", ["voucher v_crystal_ball 1 2", "tag_placement_schema 1"])
+            source = organizer.BSPoolReader(path)
+            classifier = rules.TagClassifier(source, recipe())
+            records = list(source.iter_records())
+            self.assertEqual(classifier.classify(records[0]).destination.key, "a6b-rare")
+            self.assertEqual(classifier.classify(records[1]).exclusion, "no_eligible_tags")
+            with self.assertRaises(rules.InsufficientMetadataError) as caught:
+                classifier.classify(records[2])
+            self.assertEqual(caught.exception.rank, 3)
+            self.assertEqual(rules.describe_recorded_coverage(source)["sources"][0]["both_tags"], [])
 
     def test_actual_composite_bsp4_uses_record_membership_after_sources_deleted(self):
         with tempfile.TemporaryDirectory() as directory:

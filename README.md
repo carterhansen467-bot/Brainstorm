@@ -663,9 +663,19 @@ existing output files or companion artifacts. A publication report records the
 recipe, source identity, exclusions, and outputs. Tag rules require complete
 recorded placements for both tags in the main range. Each extra count condition
 requires its chosen tag throughout its own range. Missing recorded coverage
-stops the operation with an explanation;
-it never counts as an absent tag. **Check recorded data** shows the available
-windows.
+stops the operation with an explanation; it never counts as an absent tag.
+**Check recorded data** shows the saved filter ranges. Individual seeds may
+also carry additional recorded placements, which Preview checks separately.
+
+If placements are missing, click **Record tag placements**. This creates a new
+tag-data copy, keeping every seed and all existing metadata, including original
+pool memberships. It records Negative and Rare placements across the selected
+range and any optional condition ranges, then selects the new copy with your
+settings preserved. Click **Preview new pools** to continue the second-tag split.
+Recording requires a finished BSP3/BSP4 event pool, the current native helper,
+and the matching `native_search.cfg` profile snapshot. A different profile is
+rejected. The original pool is kept; recording does not apply a positive tag
+filter or remove seeds with no matching tags.
 
 These are local rules over recorded placements. New pools created by location
 splits, source recovery, or tag rules are complete files with provisional search
