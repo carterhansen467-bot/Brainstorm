@@ -66,7 +66,7 @@ class ScoreUIRegression(unittest.TestCase):
         node = shutil.which("node")
         if not node:
             self.skipTest("Node.js is required for browser JavaScript checks")
-        result = subprocess.run([node, "-"], text=True, capture_output=True,
+        result = subprocess.run([node, "-"], text=True, encoding="utf-8", capture_output=True,
                                 input=SETUP + ui.SCRIPT + "\n(async()=>{\n" + body
                                 + "\n})().catch(error=>{console.error(error);process.exitCode=1});\n",
                                 timeout=15)

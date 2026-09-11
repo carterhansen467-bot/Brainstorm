@@ -33,7 +33,7 @@ class BatchTests(unittest.TestCase):
         return result, output
 
     def read(self, output, name):
-        return [json.loads(line) for line in (output / name).read_text().splitlines()]
+        return [json.loads(line) for line in (output / name).read_text(encoding="utf-8").splitlines()]
 
     def seed(self, seed="EXAMPLE", tags="n7b,r12s"):
         return {"seed": seed, "second_tag": "A4S", "tags": tags}
@@ -77,7 +77,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(errors), 5)
         self.assertEqual([row["input"] for row in errors], rows)
         self.assertEqual(self.read(output, "leaderboard.ndjson"), [])
-        self.assertEqual(json.loads((output / "summary.json").read_text())["status"], "completed_with_errors")
+        self.assertEqual(json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"], "completed_with_errors")
 
     def test_no_future_pair_is_explicitly_unscored(self):
         code, output = self.run_batch([self.seed(tags="n3s,r4s,n7b")])
@@ -151,10 +151,10 @@ class BatchTests(unittest.TestCase):
             code, output = self.run_batch([header, seed, *trailer], name="truncated%d" % index)
             self.assertEqual(code, 1)
             self.assertFalse((output / "leaderboard.ndjson").exists())
-            self.assertEqual(json.loads((output / "summary.json").read_text())["status"], "failed")
+            self.assertEqual(json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"], "failed")
         code, output = self.run_batch([header, seed, {"type": "tag_export_complete", "records": 1}])
         self.assertEqual(code, 0)
-        self.assertIn(header, json.loads((output / "summary.json").read_text())["source_metadata"])
+        self.assertIn(header, json.loads((output / "summary.json").read_text(encoding="utf-8"))["source_metadata"])
 
     def test_unknown_typed_version_or_missing_seed_coverage_fails(self):
         for index, (header, seed) in enumerate((
@@ -176,7 +176,7 @@ class BatchTests(unittest.TestCase):
         tags = self.read(output, "tags.ndjson")
         self.assertNotEqual(tags[-1]["type"], "tag_export_complete")
         self.assertFalse((output / "leaderboard.ndjson").exists())
-        self.assertEqual(json.loads((output / "summary.json").read_text())["status"], "failed")
+        self.assertEqual(json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"], "failed")
 
     def test_csv_preserves_seed_strings_and_blocks_formula_execution(self):
         source = self.root / "input.csv"
@@ -205,7 +205,7 @@ class BatchTests(unittest.TestCase):
                 '{"seed":"A","seed":"B"}\n', '{"seed":\n',
                 '{"type":"tag_export_header"}\n{"type":"tag_export_complete","records":0}\n{}\n')):
             source = self.root / ("bad%d.jsonl" % index)
-            source.write_text(text)
+            source.write_text(text, encoding="utf-8")
             output = self.root / ("bad%d" % index)
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 code = batch.main(["--input", str(source), "--output-dir", str(output)])
@@ -219,7 +219,7 @@ class BatchTests(unittest.TestCase):
         parallel = self.root / "parallel results"
         result = subprocess.run([sys.executable, str(ROOT / "tools/tagcalc.py"), "--input", str(source),
                                  "--output-dir", str(parallel), "--workers", "2"],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(code, 0)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((serial / "leaderboard.ndjson").read_bytes(),

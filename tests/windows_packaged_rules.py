@@ -63,8 +63,11 @@ def request(base, path, data=None, *, text=False, timeout=20, allow_error=False)
         with urlopen(call, timeout=timeout) as response:
             result = response.read().decode("utf-8")
     except HTTPError as exc:
-        raise RuntimeError("HTTP %d for %s: %s" % (
-            exc.code, path, exc.read().decode("utf-8", "replace"))) from exc
+        try:
+            raise RuntimeError("HTTP %d for %s: %s" % (
+                exc.code, path, exc.read().decode("utf-8", "replace"))) from exc
+        finally:
+            exc.close()
     result = result if text else json.loads(result)
     if isinstance(result, dict) and result.get("error") and not allow_error:
         raise RuntimeError("%s: %s" % (path, result["error"]))

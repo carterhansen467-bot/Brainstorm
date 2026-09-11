@@ -51,7 +51,10 @@ class ScoreWebTests(unittest.TestCase):
                 body = response.read()
                 return response.status, body if raw else json.loads(body)
         except HTTPError as response:
-            return response.code, json.load(response)
+            try:
+                return response.code, json.load(response)
+            finally:
+                response.close()
 
     def test_both_entrypoints_native_job_combined_results_and_downloads(self):
         for unified in (False, True):

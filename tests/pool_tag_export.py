@@ -182,13 +182,13 @@ class TagExportTests(unittest.TestCase):
     def test_named_output_collision_and_cancellation_preserve_existing_files(self):
         path = self.fixture()
         output = self.folder / "existing.ndjson"
-        output.write_text("user data")
+        output.write_text("user data", encoding="utf-8")
         with export.open_pool(path) as stream:
             with self.assertRaisesRegex(organizer.PoolError, "already exists"):
                 export.write_ndjson(stream, output)
             with self.assertRaisesRegex(organizer.PoolError, "cancelled"):
                 export.write_ndjson(stream, self.folder / "cancel.ndjson", cancel_check=lambda: True)
-        self.assertEqual(output.read_text(), "user data")
+        self.assertEqual(output.read_text(encoding="utf-8"), "user data")
         self.assertFalse((self.folder / "cancel.ndjson").exists())
 
     def test_cli_emits_typed_stream_and_trailer_only_after_success(self):
@@ -289,7 +289,7 @@ class TagExportTests(unittest.TestCase):
         self.assertEqual(scored["pool_label"], source.header.one("label"))
         self.assertEqual({bytes.fromhex(item["raw_hex"]) for item in scored["input"]["occurrences"]},
                          {item.raw for item in next(source.iter_records()).occurrences})
-        summary = json.loads((destination / "summary.json").read_text())
+        summary = json.loads((destination / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["status"], "complete")
         metadata = summary["source_metadata"][0]["source"]
         self.assertEqual(metadata["header_text"], source.header.text)
@@ -304,7 +304,7 @@ class TagExportTests(unittest.TestCase):
         code, destination, stderr = self.run_batch(path, "late-missing", "--second-tag", "A4S")
         self.assertEqual(code, 1)
         self.assertIn("lacks recorded coverage", stderr)
-        summary = json.loads((destination / "summary.json").read_text())
+        summary = json.loads((destination / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["records"], 1)
         self.assertEqual(summary["scored"], 1)
@@ -381,7 +381,7 @@ class NativeTagExportTests(unittest.TestCase):
             {item["raw_hex"] for item in rows[0]["input"]["occurrences"]}))
         self.assertIn(MARKER.hex(), {item["raw_hex"] for item in rows[0]["input"]["occurrences"]})
         self.assertTrue(any(slot > 7 for slot in rows[0]["input"]["negative_slots"] + rows[0]["input"]["rare_slots"]))
-        summary = json.loads((destination / "summary.json").read_text())
+        summary = json.loads((destination / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["status"], "complete")
         metadata = summary["source_metadata"][0]
         self.assertEqual(metadata["source"]["header_text"], source.header.text)

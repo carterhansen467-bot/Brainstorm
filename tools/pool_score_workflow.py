@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 
 try:
     import brainstorm_pool_organizer as organizer
@@ -808,7 +808,7 @@ class ScoreService:
                   "scope": scope, "status": job["status"], "total": 0, "offset": offset, "limit": limit, "rows": []}
         if job["status"] != "completed":
             return result
-        with sqlite3.connect(self._artifact(job_id, "scores.sqlite")) as connection:
+        with closing(sqlite3.connect(self._artifact(job_id, "scores.sqlite"))) as connection:
             result["total"] = connection.execute("SELECT count(*) FROM leaders WHERE scope=?", (scope,)).fetchone()[0]
             result["rows"] = [json.loads(row[0]) for row in connection.execute(
                 "SELECT value FROM leaders WHERE scope=? ORDER BY position LIMIT ? OFFSET ?", (scope, limit, offset))]

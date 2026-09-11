@@ -4,6 +4,7 @@
 import importlib.util
 import copy
 import csv
+from contextlib import closing, contextmanager
 import json
 import os
 from pathlib import Path
@@ -82,8 +83,36 @@ class ScoreWorkflowTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Scoring job did not finish: %r" % service.status(job_id))
 
+    @contextmanager
     def connection(self, job):
-        return sqlite3.connect(self.folder / ".score-jobs" / job["job_id"] / "scores.sqlite")
+        with closing(sqlite3.connect(self.folder / ".score-jobs" / job["job_id"] / "scores.sqlite")) as connection:
+            with connection:
+                yield connection
+
+    def test_result_connections_close_after_success_and_read_failure(self):
+        path = self.fixture()
+        final = self.wait(self.service, self.service.start(self.request(path))["job_id"])
+        self.assertEqual(final["status"], "completed", final.get("error"))
+        connect = sqlite3.connect
+        opened = []
+        def tracked(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            opened.append(connection)
+            self.addCleanup(connection.close)
+            return connection
+        with mock.patch.object(scoring.sqlite3, "connect", side_effect=tracked):
+            self.assertEqual(self.service.results(final["job_id"])["total"], 3)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            opened[-1].execute("SELECT 1")
+        with self.connection(final) as connection:
+            connection.execute("UPDATE leaders SET value='invalid JSON' WHERE scope='combined' AND position=1")
+        with mock.patch.object(scoring.sqlite3, "connect", side_effect=tracked):
+            with self.assertRaises(json.JSONDecodeError):
+                self.service.results(final["job_id"])
+        self.assertEqual(len(opened), 2)
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            opened[-1].execute("SELECT 1")
 
     def test_multiple_pool_scores_distinct_combined_leaderboard_and_pinned_metadata(self):
         one = self.fixture("L1", (0, 1, 2))
@@ -114,7 +143,7 @@ class ScoreWorkflowTests(unittest.TestCase):
         self.assertFalse((artifacts / "p000-tags.ndjson").exists())
         self.assertTrue(Path(self.service.download(job["job_id"], "combined-leaderboard.csv")).exists())
         self.assertTrue(all("metadata" not in pool for pool in final["pools"]))
-        persisted = json.loads(Path(self.service.download(job["job_id"], "summary.json")).read_text())
+        persisted = json.loads(Path(self.service.download(job["job_id"], "summary.json")).read_text(encoding="utf-8"))
         self.assertIn("header_text", persisted["pools"][0]["metadata"]["source"])
         self.assertEqual((one.read_bytes(), two.read_bytes()), before)
         # A cancel click during the final thread/handle cleanup cannot turn a
@@ -205,7 +234,7 @@ class ScoreWorkflowTests(unittest.TestCase):
         path = self.fixture(ranks=tuple(range(20)), events=[EVENTS + [tag("rare", 13 + index, 1)] for index in range(20)])
         paused = self.interrupted(path)
         summary = self.folder / ".score-jobs" / paused["job_id"] / "summary.json"
-        saved = json.loads(summary.read_text())
+        saved = json.loads(summary.read_text(encoding="utf-8"))
         changes = ({"baseline_copy": "A7Boss"}, {"second_tag": "A7B"},
                    {"second_tag_type": "negative"}, {"pool_id": "p001"},
                    {"source": "another.bspool"}, {"records": 19})
@@ -213,16 +242,16 @@ class ScoreWorkflowTests(unittest.TestCase):
             with self.subTest(fields=fields):
                 modified = copy.deepcopy(saved)
                 modified["pools"][0].update(fields)
-                summary.write_text(json.dumps(modified))
+                summary.write_text(json.dumps(modified), encoding="utf-8")
                 with self.assertRaisesRegex(organizer.PoolError, "checkpoint settings changed"):
                     self.service.resume(paused["job_id"])
                 self.assertFalse(any(thread.is_alive() for thread in self.service._threads.values()))
         modified = copy.deepcopy(saved)
         modified["request"]["top"] += 1
-        summary.write_text(json.dumps(modified))
+        summary.write_text(json.dumps(modified), encoding="utf-8")
         with self.assertRaisesRegex(organizer.PoolError, "checkpoint settings changed"):
             self.service.resume(paused["job_id"])
-        summary.write_text(json.dumps(saved))
+        summary.write_text(json.dumps(saved), encoding="utf-8")
         self.service.resume(paused["job_id"])
         final = self.wait(self.service, paused["job_id"])
         self.assertEqual(final["status"], "completed", final.get("error"))
@@ -262,7 +291,7 @@ class ScoreWorkflowTests(unittest.TestCase):
         self.assertEqual((final["completed_records"], final["scored"], final["no_valid_route"]), (3, 0, 3))
         self.assertEqual(self.service.results(final["job_id"])["total"], 0)
         self.assertEqual(self.service.results(final["job_id"], "p000")["rows"], [])
-        rows = [json.loads(line) for line in Path(self.service.download(final["job_id"], "all-scores.ndjson")).read_text().splitlines()]
+        rows = [json.loads(line) for line in Path(self.service.download(final["job_id"], "all-scores.ndjson")).read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(row["score"] is None and row["route"] == [] for row in rows))
 
@@ -299,10 +328,10 @@ class ScoreWorkflowTests(unittest.TestCase):
         final = self.wait(self.service, self.service.start(self.request(path, export_all=True))["job_id"])
         self.assertEqual(final["status"], "completed", final.get("error"))
         tags_path = Path(self.service.download(final["job_id"], "p000-tags.ndjson"))
-        documents = [json.loads(line) for line in tags_path.read_text().splitlines()]
+        documents = [json.loads(line) for line in tags_path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(documents[-1]["type"], "tag_export_complete")
         self.assertEqual(documents[-1]["records"], 3)
-        rows = [json.loads(line) for line in Path(self.service.download(final["job_id"], "all-scores.ndjson")).read_text().splitlines()]
+        rows = [json.loads(line) for line in Path(self.service.download(final["job_id"], "all-scores.ndjson")).read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), 3)
         leaders = {row["seed"]: row for row in self.service.results(final["job_id"])["rows"]}
         for row in rows:
@@ -371,7 +400,7 @@ class ScoreWorkflowTests(unittest.TestCase):
             final = self.wait(self.service, job["job_id"])
         self.assertEqual(final["status"], "completed", final.get("error"))
         self.assertEqual(compact_calls, [])
-        rows = [json.loads(line) for line in Path(self.service.download(job["job_id"], "all-scores.ndjson")).read_text().splitlines()]
+        rows = [json.loads(line) for line in Path(self.service.download(job["job_id"], "all-scores.ndjson")).read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), 10)
         self.assertEqual(len({row["seed"] for row in rows}), 10)
         self.assertTrue(all(row["route"] and row["score"] == row["route"][-1]["score"] for row in rows))

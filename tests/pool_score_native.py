@@ -106,7 +106,7 @@ class NativeParityTests(unittest.TestCase):
         for frame in frames:
             with self.subTest(frame=frame[:60]):
                 result = subprocess.run([str(HELPER), "score-tags"], input=frame,
-                                        text=True, capture_output=True, timeout=5)
+                                        text=True, encoding="utf-8", capture_output=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertTrue(result.stdout.startswith("BRAINSTORM_TAG_SCORE 1\n"))
                 self.assertIn("score-tags:", result.stderr)
