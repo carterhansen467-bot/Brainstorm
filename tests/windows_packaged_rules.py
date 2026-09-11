@@ -373,7 +373,7 @@ def smoke_app(name, executable, directory, source_mode):
     if not source_mode:
         # A developer's Python installation on PATH must not conceal an
         # accidental external-interpreter dependency in the frozen apps.
-        windows = Path(environment["SystemRoot"])
+        windows = Path(os.environ["SystemRoot"])
         environment["PATH"] = os.pathsep.join(map(str, (executable.parent, windows, windows / "System32")))
     command = ([sys.executable, str(executable)] if source_mode else [str(executable)]) + ["--no-browser"]
     log = directory / "app.log"
