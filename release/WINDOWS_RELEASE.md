@@ -84,6 +84,7 @@ This creates `out/brainstorm-windows-full.zip`. Run
 `python tests/windows_release_layout.py` before publishing. On Windows, run
 `python tests/windows_packaged_rules.py --package-dir out/Brainstorm-Windows`
 to launch both packaged apps and verify original-pool recovery and second-tag
-sorting with disposable pools. Tag-triggered CI assembles the package after
+sorting, native tag scoring, per-pool and combined leaderboards, and saved-run
+recovery with disposable pools. Tag-triggered CI assembles the package after
 the macOS and Windows test jobs pass, then runs this executable smoke test
 before publishing. Update `release/WINDOWS_NOTES.md` for the release notes.

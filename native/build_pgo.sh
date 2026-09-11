@@ -104,6 +104,7 @@ write_identity() {
 	compiler_target=$("$CC" -dumpmachine)
 	search_source_hash=$(hash_file brainstorm_native_search.c)
 	pool_source_hash=$(hash_file brainstorm_seed_pool.c)
+	tag_score_header_hash=$(hash_file brainstorm_tag_score.h)
 	platform_header_hash=$(hash_file platform.h)
 	search_training_filter_hash=$(hash_file "$SEARCH_TRAINING_FILTER")
 	pool_training_config_hash=$(hash_file "$POOL_TRAINING")
@@ -114,6 +115,7 @@ write_identity() {
 		printf '%s\n' 'BRAINSTORM_PGO_IDENTITY 1'
 		printf 'search_source_sha256 %s\n' "$search_source_hash"
 		printf 'pool_source_sha256 %s\n' "$pool_source_hash"
+		printf 'tag_score_header_sha256 %s\n' "$tag_score_header_hash"
 		printf 'platform_header_sha256 %s\n' "$platform_header_hash"
 		printf 'search_training_filter_sha256 %s\n' "$search_training_filter_hash"
 		printf 'pool_training_config_sha256 %s\n' "$pool_training_config_hash"

@@ -178,6 +178,41 @@ print(values['_native_pool_binary']())
         self.assertEqual(lines[-2], str(mod / "seed_pools"))
         self.assertEqual(lines[-1], str(scanner))
 
+    def test_both_frozen_apps_keep_score_jobs_with_the_mod_and_use_bundled_helper(self):
+        mod = self.base / "installed" / "Renamed Brainstorm"
+        app = mod / "Seed Pool Builder"
+        write(mod / "Brainstorm_main.lua")
+        write(mod / "manifest.json")
+        scanner = app / ("brainstorm_seed_pool.exe" if os.name == "nt" else "brainstorm_seed_pool")
+        write(scanner, b"bundled native scorer")
+        scanner.chmod(0o755)
+        for name, entrypoint in (("Builder", "pool_builder_web.py"),
+                                 ("Organizer", "pool_organizer_web.py")):
+            with self.subTest(app=name):
+                executable = app / ("Seed Pool %s.exe" % name)
+                write(executable)
+                probe = """
+import runpy, sys
+sys.frozen = True
+sys.executable = {executable!r}
+values = runpy.run_path({script!r}, run_name='frozen_scoring_layout_probe')
+if 'organizer_web' in values:
+    values = vars(values['organizer_web'])
+service = values['score_service']()
+print(service.root)
+print(service.snapshot_path)
+print(service._require_helper())
+print(values['score_workflow']._binary_model(service._require_helper())['native'])
+values['shutdown_score_services']()
+""".format(executable=str(executable), script=str(ROOT / "tools" / entrypoint))
+                env = dict(os.environ)
+                env.pop("BRAINSTORM_MOD_DIR", None)
+                result = subprocess.run([sys.executable, "-c", probe], env=env,
+                                        check=True, text=True, capture_output=True)
+                self.assertEqual(result.stdout.splitlines()[-4:], [
+                    str((mod / "seed_pools" / ".score-jobs").resolve()), str(mod / "native_search.cfg"),
+                    str(scanner), hashlib.sha256(scanner.read_bytes()).hexdigest()])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

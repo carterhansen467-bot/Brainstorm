@@ -1,59 +1,12 @@
-Brainstorm for Windows x64, with missing tag-data recovery for second-tag sorting.
+Brainstorm for Windows x64, with native seed scoring built into the Seed Pool Program.
 
-- **Record tag placements:** if Second tag reports missing recorded coverage,
-  create a new copy with Negative/Rare placements calculated from every saved
-  seed. It retains all seeds and existing pool history, including seeds with
-  neither tag. Requires the matching game-profile snapshot (`native_search.cfg`).
-- **Continue with your settings:** the recorded copy is selected automatically;
-  your range and optional conditions stay in place. Preview again to sort it.
-  Recording includes the ranges used by optional conditions.
-- **Clearer missing-data messages:** missing ranges lead directly to the
-  recording action. Saved filter ranges are shown separately from per-seed
-  recording evidence; unknown placements never count as absent tags.
+- **Score pools:** select the separated pools directly, or use Score these pools after sorting by second tag. Each pool keeps its own first-copy position.
+- **Native scoring:** the C helper searches tag redeem routes and Hieroglyph/Petroglyph placements using the tested scoring model. No separate Python installation is needed.
+- **Simple leaderboards:** see Seed, Scaling score, Hieroglyph and Petroglyph; show starting positions and source details as needed. Keep the top 1000 distinct seeds or choose another limit.
+- **Combined results:** switch between individual pools and a combined leaderboard without recombining the source pools.
+- **Saved progress:** cancel safely and resume the same scoring job after reopening the app. Original pool identities and calculation settings are checked before reuse.
+- **Recorded evidence:** scoring requires both tag types through original Ante 38. Missing placements can be recorded with the matching native_search.cfg; original seeds and labels are retained.
 
-- **Fast original-pool Preview:** verifies every seed's source memberships and
-  counts selected groups in the native helper. Recovery no longer needs a
-  full Python scan before copying compatible pools.
-- **Fast Find original pools:** loads recorded group names directly, without
-  scanning every seed. Historical input sizes are marked **originally**;
-  Preview verifies the data and calculates current matching counts.
-- **Faster filtering:** reuse verification for unchanged files and avoid
-  repeating tag and source-metadata checks. Compatible original-pool recovery
-  uses the native copier, preserving all recorded placements and history.
-- **Verification stays intact:** changed files invalidate saved previews;
-  damaged data, incorrect counts, collisions, and cancellation prevent partial
-  publication. Both Windows app entry points use the same workflow.
+Scores and voucher placements follow the supplied theoretical model. Manual gameplay testing is still needed. Ante 39 tag placements and unverified theoretical ceilings are not used to eliminate seeds.
 
-- **Separate original pools:** recover retained L1, L2, L3, L4, or Other
-  memberships from a combined Complete pool, even after deleting its original
-  input files. Shared seeds are copied into each selected group.
-- **Sort by second tag:** choose each pool's inclusive Ante/Small/Big range.
-  Find the earliest opposite tag after the first Negative or Rare; when both
-  types appear in the first Ante, require another tag in a later Ante. Group
-  qualifying seeds by the second tag's type and location.
-- **Saved rules:** combine nested AND, OR, and NOT count conditions with
-  independent ranges. Save or load recipes, preview destinations and exclusion
-  counts, then create the new pools with progress and cancellation.
-- **Simpler UI:** clearer descriptions, grouped inputs, optional advanced
-  controls, and improved narrow-window layouts across Build and Organize.
-- **Correctness fixes:** preserve tag windows through Ante 39 instead of
-  silently truncating them; reject invalid counts and excess rules. Derived
-  location and rule pools retain source history but cannot incorrectly act as
-  exhaustive substitutes for a broader live search.
-
-Recovery uses only memberships still recorded in the Complete pool; removed
-seeds and unretained intermediate groups cannot be reconstructed. Tag rules
-require recorded placements throughout the ranges they check. New outputs keep
-their source unchanged and never overwrite existing files. Original-pool
-Preview and creation use the native helper when supported; older helpers and
-unsupported layouts fall back to Python. Second-tag rules still use Python,
-so those scans can take longer on large pools. Optional conditions check each
-seed before choosing its second tag, using each condition's own range.
-
-Download **brainstorm-windows-full.zip**, extract it completely, and run
-**Install or Update Brainstorm.bat**. The updater preserves seed pools,
-settings, snapshots, and scan checkpoints. Open **Seed Pool Builder.bat** and
-choose **Organize / Combine** to use the new tools.
-
-Built from the tagged commit after the Windows and macOS test suites passed,
-with the packaged Windows executables checked before publication.
+Close Balatro and both Seed Pool Program windows before running Install or Update Brainstorm.bat. The updater preserves your pools, settings and profile snapshot.

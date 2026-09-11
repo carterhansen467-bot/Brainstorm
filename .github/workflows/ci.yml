@@ -99,6 +99,15 @@ jobs:
         run: TAG=tag_charm sh tests/pool_shard_merge_equivalence.sh "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg" 2000003
       - name: Builder pause/resume smoke (SIGINT path)
         run: python3 tests/windows_builder_smoke.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Integrated native tag scoring and resumable leaderboards
+        run: |
+          python3 tests/tagcalc_engine.py
+          python3 tests/tagcalc_batch.py
+          python3 tests/pool_tag_export.py
+          python3 tests/pool_score_native.py
+          python3 tests/pool_score_workflow.py
+          python3 tests/pool_score_web.py
+          python3 tests/pool_score_ui.py
       - name: win_spawn quoting rules
         run: luajit tests/win_spawn_test.lua
 
@@ -202,6 +211,15 @@ jobs:
           "$LUAJIT" tests/win_spawn_test.lua "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
       - name: Builder pause/resume smoke (CTRL_BREAK path)
         run: python tests/windows_builder_smoke.py "${TMPDIR:-/tmp}/brainstorm_native_fixtures/case1.cfg"
+      - name: Integrated native tag scoring and resumable leaderboards
+        run: |
+          python tests/tagcalc_engine.py
+          python tests/tagcalc_batch.py
+          python tests/pool_tag_export.py
+          python tests/pool_score_native.py
+          python tests/pool_score_workflow.py
+          python tests/pool_score_web.py
+          python tests/pool_score_ui.py
       - name: Python builder headless check
         run: python tools/brainstorm_pool_builder.py --headless-criteria
       - name: Windows release layout and updater safety

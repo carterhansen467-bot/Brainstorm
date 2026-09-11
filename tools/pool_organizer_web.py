@@ -37,6 +37,8 @@ sys.path.insert(0, SCRIPT_DIR)
 import brainstorm_pool_organizer as organizer
 import pool_rule_workflow as rule_workflow
 import pool_rules_ui as rules_ui
+import pool_score_ui as score_ui
+import pool_score_workflow as score_workflow
 import pool_tag_rules as tag_rules
 import pool_tag_recording as tag_recording
 split_policy = organizer.split_policy
@@ -423,6 +425,7 @@ def begin_operation_shutdown():
         kinds = tuple(ACTIVE_OPERATIONS)
         for event in ACTIVE_OPERATIONS.values():
             event.set()
+    shutdown_score_services()
     return kinds
 
 
@@ -1921,6 +1924,87 @@ class NativeSplitHelper:
 def _native_split_helper():
     binary = _native_pool_binary()
     return NativeSplitHelper(binary) if binary else None
+
+
+SCORE_SERVICE_LOCK = threading.RLock()
+SCORE_SERVICES = {}
+
+
+def score_service(pool_dir=None):
+    """Share one durable scoring job owner across both local HTTP entry points."""
+    root = _pool_root(pool_dir)
+    with ACTIVE_OPERATION_LOCK:
+        if ACTIVE_OPERATIONS_CLOSING:
+            raise organizer.PoolError("The program is closing. Reopen it to resume scoring.")
+        with SCORE_SERVICE_LOCK:
+            service = SCORE_SERVICES.get(root)
+            if service is None:
+                service = score_workflow.ScoreService(
+                    root, _native_split_helper(), os.path.join(MOD_DIR, SNAPSHOT_NAME))
+                SCORE_SERVICES[root] = service
+            return service
+
+
+def shutdown_score_services():
+    with SCORE_SERVICE_LOCK:
+        services = list(SCORE_SERVICES.values())
+        SCORE_SERVICES.clear()
+    for service in services:
+        service.shutdown()
+
+
+def score_request(action, data, pool_dir=None):
+    service = score_service(pool_dir)
+    if action == "describe":
+        return service.describe(data.get("source", ""))
+    if action == "start":
+        return service.start(data)
+    if action == "jobs":
+        return service.list_jobs()
+    job_id = data.get("job_id", "")
+    if action in ("status", "cancel", "resume"):
+        return getattr(service, action)(job_id)
+    if action == "results":
+        return service.results(job_id, scope=data.get("scope", "combined"),
+                               offset=data.get("offset", 0), limit=data.get("limit", 100))
+    raise organizer.PoolError("Unknown scoring action.")
+
+
+def serve_score_get(handler, parsed, pool_dir=None):
+    query = parse_qs(parsed.query)
+    action = parsed.path.rsplit("/", 1)[-1]
+    data = {key: values[0] for key, values in query.items()}
+    if action != "download":
+        if action not in ("jobs", "status", "results"):
+            raise organizer.PoolError("This scoring action needs a POST request.")
+        for key in ("offset", "limit"):
+            if key in data:
+                try:
+                    data[key] = int(data[key])
+                except ValueError:
+                    raise organizer.PoolError("Invalid scoring page number.") from None
+        handler._json(score_request(action, data, pool_dir))
+        return
+    # The module resolves only its own published, allowlisted artifacts. No
+    # request-controlled filesystem path is opened by the HTTP layer.
+    path = score_service(pool_dir).download(data.get("job_id", ""), data.get("filename", ""))
+    name = os.path.basename(path)
+    content_type = ("text/csv; charset=utf-8" if name.endswith(".csv") else
+                    "application/x-ndjson; charset=utf-8" if name.endswith(".ndjson") else
+                    "application/json; charset=utf-8" if name.endswith(".json") else
+                    "application/octet-stream")
+    with open(path, "rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+        handler.send_header("Content-Length", str(size))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        try:
+            shutil.copyfileobj(source, handler.wfile, 1024 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def _source_from_native_summary(reader, summary):
@@ -3781,11 +3865,12 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 .review-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.review-actions .go{min-width:230px}.secondary-link{min-height:33px!important;padding:5px 9px!important}
 [hidden]{display:none!important}@media(max-width:850px){.grid{grid-template-columns:1fr}.side{position:static}}@media(max-width:680px){.choicecards,.inventory,.policycards{grid-template-columns:1fr}}@media(max-width:580px){.top{display:grid}.two,.source,.combine-settings,.checkgrid{grid-template-columns:1fr}.ambrow,.manifestrow{grid-template-columns:1fr}.card{padding:17px}.appnav{width:100%}.appnav a{flex:1;text-align:center}.categories,.poolchoices{max-height:none}.sectionbar{align-items:flex-start;flex-direction:column}}
 /*__RULE_STYLES__*/
+/*__SCORE_STYLES__*/
 </style></head><body><main class="app">
 <header class="top"><div class="brand"><div class="mark">B</div><div><h1>Seed Pool Program</h1><p class="sub">Organize your saved seeds.</p></div></div><div class="local">Running locally</div></header>
 <nav class="appnav"><a id="builderTab" href="/">Build / Search</a><a id="organizerTab" class="active" href="/organize">Organize / Combine</a></nav>
 <div class="privacy">Pools stay on this computer. New files are saved in <code>seed_pools</code>; source pools are kept.</div>
-<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split by location</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="restoreModeBtn">Separate original pools</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="tagModeBtn">Sort by second tag</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
+<div class="toolnav" role="tablist" aria-label="Organizer operation"><button class="active" role="tab" aria-selected="true" aria-controls="splitWorkspace" id="splitModeBtn">Split by location</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="restoreModeBtn">Separate original pools</button><button role="tab" aria-selected="false" aria-controls="rulesWorkspace" id="tagModeBtn">Sort by second tag</button><button role="tab" aria-selected="false" aria-controls="scoreWorkspace" id="scoreModeBtn">Score pools</button><button role="tab" aria-selected="false" aria-controls="combineWorkspace" id="combineModeBtn">Combine pools</button><button role="tab" aria-selected="false" aria-controls="formatWorkspace" id="formatModeBtn">Update pool format</button></div>
 <div class="grid" id="splitWorkspace" role="tabpanel" aria-labelledby="splitModeBtn"><div class="stack">
 <section class="card"><div class="head"><span class="step">1</span><div><h2>Inspect a recorded pool</h2><p class="copy">Choose a pool and inspect its recorded results.</p></div></div>
  <div class="field"><label for="source">Seed pool</label><select id="source"></select></div>
@@ -3872,7 +3957,7 @@ button.go{background:linear-gradient(135deg,#27814c,#35aa62)}button.cancel{backg
 <aside class="side"><section class="card summary"><h2>Format summary</h2><dl>
  <div><dt>Selected pool</dt><dd id="formatSumSource">Choose a pool</dd></div><div><dt>Current format</dt><dd id="formatSumCurrent">—</dd></div><div><dt>Recorded seeds</dt><dd id="formatSumRecords">—</dd></div><div><dt>Update status</dt><dd id="formatSumStatus">Not checked</dd></div><div><dt>New file</dt><dd id="formatSumOutput">—</dd></div></dl>
  <div class="actions"><button class="go" id="formatUpdateBtn" disabled>Create BSP4 copy</button><button class="cancel" id="formatCancelBtn" hidden>Cancel update</button></div><div class="error" id="formatError" role="alert"></div><div class="result live" id="formatResult" aria-live="polite"></div>
-</section></aside></div><!--__RULE_WORKSPACE__--></main>
+</section></aside></div><!--__RULE_WORKSPACE__--><!--__SCORE_WORKSPACE__--></main>
 <iframe id="recordExportFrame" title="Record export download" hidden></iframe>
 <script>
 const $=id=>document.getElementById(id);
@@ -4033,11 +4118,11 @@ async function loadPools(preserve=false){
   $("formatSource").innerHTML=workflowState.pools.length?workflowState.pools.map(p=>`<option value="${esc(p.name)}" ${p.error?"disabled":""}>${esc(p.name)}${p.error?" · unreadable":` · BSP${p.schema} · ${fmt(p.records)} seeds · ${p.complete?"finished":"paused"}`}</option>`).join(""):'<option value="">No .bspool files found</option>';
   if([...$("source").options].some(o=>o.value===priorSource))$("source").value=priorSource;
   if([...$("formatSource").options].some(o=>o.value===priorFormat))$("formatSource").value=priorFormat;
-  renderCombineChoices(selectedCombine);ruleLoadPools();
+  renderCombineChoices(selectedCombine);ruleLoadPools();refreshScorePools(workflowState.pools);
   inspectButton.disabled=!workflowState.pools.some(p=>!p.error);inspectButton.textContent="Inspect pool";
   $("formatSource").disabled=workflowState.format.running;formatButton.disabled=workflowState.format.running||!workflowState.pools.some(p=>!p.error);formatButton.textContent="Check pool format";
  }catch(e){
-  workflowState.setPools([]);$("source").innerHTML='<option value="">Pool list could not be loaded</option>';$("formatSource").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);ruleLoadPools();
+  workflowState.setPools([]);$("source").innerHTML='<option value="">Pool list could not be loaded</option>';$("formatSource").innerHTML='<option value="">Pool list could not be loaded</option>';renderCombineChoices(selectedCombine);ruleLoadPools();refreshScorePools(workflowState.pools);
   inspectButton.disabled=true;inspectButton.textContent="Inspect unavailable";$("formatSource").disabled=true;formatButton.disabled=true;formatButton.textContent="Check unavailable";
   inspectionState("error","Seed pool list failed to load",e.message||String(e));if(!workflowState.format.running){formatState("error","Seed pool list failed to load",e.message||String(e));fail(e)}throw e;
  }
@@ -4184,12 +4269,14 @@ async function updateFormat(){
 async function cancelFormat(){$("formatCancelBtn").disabled=true;$("formatCancelBtn").textContent="Cancelling…";try{await api("/api/cancel",{operation:"upgrade"})}catch(e){$("formatError").textContent=e.message||String(e)}finally{$("formatCancelBtn").disabled=false;$("formatCancelBtn").textContent="Cancel update"}}
 function showMode(mode){
  if(ruleState.busy)return;
- for(const name of ["split","combine","format"]){const active=mode===name;$(name+"Workspace").hidden=!active;$(name+"ModeBtn").classList.toggle("active",active);$(name+"ModeBtn").setAttribute("aria-selected",String(active))}
+ for(const name of ["split","combine","format","score"]){const active=mode===name;$(name+"Workspace").hidden=!active;$(name+"ModeBtn").classList.toggle("active",active);$(name+"ModeBtn").setAttribute("aria-selected",String(active))}
  const rules=mode==="restore"||mode==="tag";$("rulesWorkspace").hidden=!rules;
  for(const name of ["restore","tag"]){const active=mode===name;$(name+"ModeBtn").classList.toggle("active",active);$(name+"ModeBtn").setAttribute("aria-selected",String(active))}
  if(rules)setRuleMode(mode);
+ if(mode==="score")showScoreWorkspace();
 }
 
+$("scoreModeBtn").onclick=()=>showMode("score");
 $("inspectBtn").onclick=inspect;$("refreshBtn").onclick=()=>loadPools(false);$("source").onchange=()=>resetSplitInspection("Selection changed — inspect this pool");
 $("organizeBy").onchange=()=>{workflowState.clearSplitPlan(true);renderInspectLocations();$("reviewCard").hidden=true;$("plan").hidden=true;$("saveBtn").disabled=true;invalidateSplitReview("Recorded target changed — preview the new pools")};
 $("allBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=true);invalidateSplitSelection()};$("noneBtn").onclick=()=>{document.querySelectorAll(".cat").forEach(x=>x.checked=false);invalidateSplitSelection()};
@@ -4204,13 +4291,17 @@ document.querySelectorAll(".combineOp").forEach(input=>input.onchange=()=>{$("co
 document.addEventListener("change",e=>{if(e.target.classList.contains("cat"))invalidateSplitSelection();else if(e.target.classList.contains("filterKind"))renderFilterOptions()});
 if(!UNIFIED){$("builderTab").hidden=true;$("organizerTab").href="/";$("mergeLink").hidden=true;$("standaloneMerge").hidden=false}
 /*__RULE_SCRIPT__*/
+/*__SCORE_SCRIPT__*/
 resetSplitInspection();invalidateCombine();resetFormatPlan();loadPools(true).catch(()=>{});
 </script></body></html>'''
 
 
 PAGE = PAGE.replace("/*__RULE_STYLES__*/", rules_ui.STYLE).replace(
     "<!--__RULE_WORKSPACE__-->", rules_ui.WORKSPACE).replace(
-    "/*__RULE_SCRIPT__*/", rules_ui.SCRIPT)
+    "/*__RULE_SCRIPT__*/", rules_ui.SCRIPT).replace(
+    "/*__SCORE_STYLES__*/", score_ui.STYLE).replace(
+    "<!--__SCORE_WORKSPACE__-->", score_ui.WORKSPACE).replace(
+    "/*__SCORE_SCRIPT__*/", score_ui.SCRIPT)
 
 def error_payload(exc):
     value = {"error": str(exc)}
@@ -4286,6 +4377,8 @@ class OrganizerHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif parsed.path == "/api/pools":
                 self._json(pools_payload(self.pool_dir))
+            elif parsed.path.startswith("/api/score/"):
+                serve_score_get(self, parsed, self.pool_dir)
             elif parsed.path == "/api/export":
                 serve_record_export(self, parsed, self.pool_dir)
             elif parsed.path == "/api/export/status":
@@ -4309,7 +4402,9 @@ class OrganizerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             data = self._body()
-            if parsed.path == "/api/inspect":
+            if parsed.path.startswith("/api/score/"):
+                self._json(score_request(parsed.path.rsplit("/", 1)[-1], data, self.pool_dir))
+            elif parsed.path == "/api/inspect":
                 self._json(run_inspect(
                     data.get("source", ""), self.pool_dir))
             elif parsed.path == "/api/plan":

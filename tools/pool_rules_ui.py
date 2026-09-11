@@ -80,7 +80,7 @@ WORKSPACE = r'''
   <div class="manifest rule-outputs" id="ruleManifest"></div>
   <div class="rule-toolbar"><button class="go" id="ruleCreateBtn">Create these pools</button></div>
  </section>
- <section class="card" id="ruleDone" hidden><h2>Pools created</h2><div class="result" id="ruleResults"></div><div class="rule-toolbar"><button id="ruleNextBtn">Sort a new pool by second tag</button></div></section>
+ <section class="card" id="ruleDone" hidden><h2>Pools created</h2><div class="result" id="ruleResults"></div><div class="rule-toolbar"><button id="ruleNextBtn">Sort a new pool by second tag</button><button id="ruleScoreBtn" class="go" hidden>Score these pools</button></div></section>
 </div>
 '''
 
@@ -242,6 +242,7 @@ async function createRulePools(){
  return ruleRun("Creating and verifying the new pools…",async()=>{
   const report=await api("/api/rules/publish",{source:$("ruleSource").value,planToken:plan.plan_token});ruleState.plan=null;$("ruleReview").hidden=true;$("ruleDone").hidden=false;
   const outputs=report.outputs||[];$("ruleResults").innerHTML=outputs.map(o=>`<div class="output"><b>${esc(o.name||o.filename||(o.path||"").split(/[\\/]/).pop())}</b><span>${fmt(o.records)} seed${o.records===1?"":"s"}</span></div>`).join("");
+  ruleState.scoreSources=outputs.map(o=>o.name||o.filename||(o.path||"").split(/[\\/]/).pop()).filter(Boolean);$("ruleScoreBtn").hidden=ruleState.mode!=="tag"||!ruleState.scoreSources.length;$("ruleNextBtn").hidden=ruleState.mode==="tag";
   $("ruleStatus").textContent=`Created ${outputs.length} pools. Your source pool was kept.`;
   const first=outputs[0];ruleState.nextSource=first?(first.name||first.filename||(first.path||"").split(/[\\/]/).pop()):"";
   try{await loadPools(true)}catch(e){$("ruleError").textContent=`Pools were created, but the list could not refresh: ${e.message}. Use Refresh list.`}
@@ -266,5 +267,6 @@ $("ruleCancelBtn").onclick=async()=>{$("ruleCancelBtn").disabled=true;try{await 
 $("ruleAddConditions").onclick=()=>{ruleState.condition={all:[defaultRuleCount()]};ruleInvalidate();renderRuleCondition()};
 $("ruleSaveBtn").onclick=saveRuleFile;$("ruleLoadBtn").onclick=()=>$("ruleLoadFile").click();$("ruleLoadFile").onchange=e=>e.target.files[0]&&loadRuleFile(e.target.files[0]);
 $("ruleNextBtn").onclick=()=>{showMode("tag");if(ruleState.nextSource)$("ruleSource").value=ruleState.nextSource;ruleSourceChanged();$("ruleTitle").scrollIntoView({block:"start"})};
+$("ruleScoreBtn").onclick=()=>scoreCreatedPools(ruleState.scoreSources||[]);
 renderRuleCondition();
 '''

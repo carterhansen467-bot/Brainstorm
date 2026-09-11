@@ -11316,6 +11316,8 @@ static int pool_mode_record_tags_locked(const char *snapshot, const char *source
 	return result;
 }
 
+#include "brainstorm_tag_score.h"
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
@@ -11330,13 +11332,15 @@ static void pool_usage(const char *prog) {
 			"  %s split <input.bspool> <organizer-split-plan.txt>\n"
 			"  %s combine <organizer-combine-plan.txt>\n"
 			"  %s preview-sources <input.bspool> <source-preview-plan.txt>\n"
-			"  %s record-tags <native-snapshot.cfg> <input.bspool> <output.bspool> <start-slot> <end-slot>\n",
-			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+			"  %s record-tags <native-snapshot.cfg> <input.bspool> <output.bspool> <start-slot> <end-slot>\n"
+			"  %s score-tags\n",
+			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
 	bs_platform_init();
 	init_key_tables();
+	if (argc == 2 && !strcmp(argv[1], "score-tags")) return bs_tag_score_main();
 	if (argc >= 3 && !strcmp(argv[1], "summarize")
 			&& (argc == 3 || (argc == 4
 				&& !strcmp(argv[3], "--record-digest"))))

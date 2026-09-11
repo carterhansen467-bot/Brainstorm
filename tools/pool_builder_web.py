@@ -1900,6 +1900,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             elif parsed.path == "/organizer/api/pools":
                 self._json(organizer_web.pools_payload(self.pool_dir))
+            elif parsed.path.startswith("/organizer/api/score/"):
+                organizer_web.serve_score_get(self, parsed, self.pool_dir)
             elif parsed.path == "/organizer/api/export":
                 self._organizer_export(parsed)
             elif parsed.path == "/organizer/api/export/status":
@@ -1976,7 +1978,9 @@ class Handler(BaseHTTPRequestHandler):
             begin_shutdown(self.server)
         elif parsed.path.startswith("/organizer/api/"):
             try:
-                if parsed.path == "/organizer/api/inspect":
+                if parsed.path.startswith("/organizer/api/score/"):
+                    value = organizer_web.score_request(parsed.path.rsplit("/", 1)[-1], data, self.pool_dir)
+                elif parsed.path == "/organizer/api/inspect":
                     value = organizer_web.run_inspect(
                         data.get("source", ""), self.pool_dir)
                 elif parsed.path == "/organizer/api/plan":

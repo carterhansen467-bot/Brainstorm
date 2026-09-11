@@ -1,8 +1,21 @@
-# Batch tag calculator
+# Seed pool scoring
 
-Score labeled seeds with the supplied Wraith / Negative + Rare model and keep the best routes. This is a separate Python tool; it does not change the Seed Pool Program or your source pools.
+Score labeled seeds with the supplied Wraith / Negative + Rare model and keep the best routes. Your source pools and their history are kept.
 
-## Windows quick start
+## In the Seed Pool Program
+
+1. Open **Organize / Combine → Score pools**, or click **Score these pools** after sorting by second tag.
+2. Select one or more pools. Saved second-tag rules set each pool's first copy automatically. For an older pool, choose its second-tag position or first-copy shop.
+3. Enable **Record missing tag placements** if the pools do not already record both types through original Ante 38. This needs the matching game profile snapshot.
+4. Click **Score selected pools**. The default keeps the best 1,000 seeds in the combined leaderboard and in each pool's leaderboard.
+
+The main table shows seed, scaling score, Hieroglyph, and Petroglyph. **Show more columns** adds the source pool, first copy, starting tag types, and redeem route. Timings refer to the original Ante sequence. If both vouchers have the same boundary, use Hieroglyph first, then Petroglyph; check the route and voucher availability in-game.
+
+Use **Stop and save progress** to pause a run. Open it under **Saved runs** and choose **Resume scoring** to continue. The final leaderboard appears after all seeds and source data are checked. Download the combined leaderboard or select one pool to download its results.
+
+The packaged program does not require a separate Python installation. **Scoring options** controls workers, leaderboard size, an optional reference score, and optional full tag, score, and redeem-route exports. Source metadata stays retained with the saved run even when full exports are off.
+
+## Optional command-line tool on Windows
 
 Keep this `tools` folder together. Python 3.9 or newer is required; the packaged Seed Pool Program is not a Python interpreter.
 
@@ -58,7 +71,7 @@ Open `leaderboard.csv` for manual testing: its first columns show the seed, scor
 
 The search retains different Blueprint/Brainstorm compositions when either could win later. This fixes a route-pruning error in the supplied script while keeping its probabilities and timing model. It also searches equivalent voucher placements once. Voucher timings are model insertion points; gameplay and voucher availability still need manual testing.
 
-Run this after narrowing the pools. Local single-process tests took about 0.0003 seconds for 4 future tags, 0.004 for 8, 0.026 for 12, and 0.355 for a dense 20-tag case per distinct pattern. Ten thousand similarly dense, distinct patterns could still take about an hour on one process. These are illustrative benchmarks, not a Windows estimate. `--workers` can spread scoring across CPU cores, and repeated tag patterns reuse cached results. Progress prints while processing; Ctrl+C stops workers and marks the run interrupted. There is no automatic resume; the complete tag export can be reused for subsequent runs.
+Run this after narrowing the pools. The optional Python command-line tool's local single-process tests took about 0.0003 seconds for 4 future tags, 0.004 for 8, 0.026 for 12, and 0.355 for a dense 20-tag case per distinct pattern. Ten thousand similarly dense, distinct patterns could still take about an hour on one process. These are illustrative CLI benchmarks, not estimates for the integrated native scorer or a Windows computer. `--workers` can spread CLI scoring across CPU cores, and repeated tag patterns reuse cached results. Ctrl+C stops CLI workers and marks the run interrupted. The CLI does not resume automatically; reuse its complete tag export for another run. Integrated scoring has saved checkpoints and a Resume control.
 
 ## Comparing the tester's reference
 

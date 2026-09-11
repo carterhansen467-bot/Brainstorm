@@ -9,6 +9,8 @@ executes the actual PyInstaller apps; it never simulates a frozen interpreter.
 """
 
 import argparse
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -53,7 +55,7 @@ def check_port_free(port):
                 "It will not contact or stop that process." % port) from exc
 
 
-def request(base, path, data=None, *, text=False, timeout=20):
+def request(base, path, data=None, *, text=False, timeout=20, allow_error=False):
     payload = None if data is None else json.dumps(data).encode("utf-8")
     call = Request(base + path, data=payload,
                    headers={"Content-Type": "application/json"} if payload else {})
@@ -64,7 +66,7 @@ def request(base, path, data=None, *, text=False, timeout=20):
         raise RuntimeError("HTTP %d for %s: %s" % (
             exc.code, path, exc.read().decode("utf-8", "replace"))) from exc
     result = result if text else json.loads(result)
-    if isinstance(result, dict) and result.get("error"):
+    if isinstance(result, dict) and result.get("error") and not allow_error:
         raise RuntimeError("%s: %s" % (path, result["error"]))
     return result
 
@@ -176,6 +178,16 @@ def output_reader(row, pool_dir):
     return reader
 
 
+def wait_score(base, prefix, job_id, seconds=45):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        status = request(base, prefix + "/score/status?job_id=" + job_id, allow_error=True)
+        if status["status"] not in ("queued", "preparing", "running", "finalizing", "cancelling"):
+            return status
+        time.sleep(0.05)
+    raise AssertionError("Packaged scoring did not stop: " + json.dumps(status))
+
+
 def exercise(base, prefix, pools, combined):
     recipe = {"version": 1, "mode": "second_tag", "rule": {
         "version": 1, "name": "Packaged smoke", "range": {"start": "A3S", "end": "A7B"}}}
@@ -258,6 +270,95 @@ def exercise(base, prefix, pools, combined):
     require(repaired_outputs["completed"] and repaired_outputs["outputs"], "Repaired split was not published")
     require(missing.read_bytes() == original, "Tag recording modified the original pool")
 
+    # The frozen executable must include every scoring dependency, persist its
+    # job, and run the native helper without an external Python installation.
+    scoring = request(base, prefix + "/score/start", {
+        "pools": [{"source": missing.name, "second_tag": "A4B"},
+                  {"source": recorded["source"], "second_tag": "A5S"}],
+        "top": 10, "workers": 2, "record_missing": True,
+        "reference_score": 721.77, "reference_seed": "5MSXV6"})
+    job_id = scoring["job_id"]
+    score_status = wait_score(base, prefix, job_id)
+    require(score_status["status"] == "completed", "Packaged scoring failed: " + json.dumps(score_status))
+    require(score_status["completed_records"] == 200 and score_status["scored"] > 0,
+            "Packaged scoring missed source seeds or all future routes")
+    leaderboard = request(base, prefix + "/score/results?job_id=" + job_id)
+    require(leaderboard["rows"] and leaderboard["total"] <= 10, "Packaged leaderboard is missing")
+    boards = {}
+    for pool in score_status["pools"]:
+        board = request(base, prefix + "/score/results?job_id=" + job_id + "&scope=" + pool["pool_id"])
+        expected_baseline = "A4Boss" if pool["source"] == missing.name else "A5B"
+        require(board["rows"] and board["total"] <= 10 and
+                all(row["pool_id"] == pool["pool_id"] and row["baseline_copy"] == expected_baseline
+                    for row in board["rows"]), "Per-pool leaderboard lost its own starting point")
+        boards[pool["pool_id"]] = board
+    candidates = sorted((row for board in boards.values() for row in board["rows"]),
+                        key=lambda row: (-row["score"], row["seed"], row["pool_id"]))
+    expected, seen = [], set()
+    for row in candidates:
+        if row["seed"] not in seen:
+            expected.append((row["seed"], row["score"], row["pool_id"]))
+            seen.add(row["seed"])
+    require([(row["seed"], row["score"], row["pool_id"]) for row in leaderboard["rows"]] == expected[:10],
+            "Combined leaderboard did not choose each distinct seed's best pool baseline")
+    require(all(row["score"] > 0
+                and row["route"] for row in leaderboard["rows"]), "Packaged route details or starting copies differ")
+    require(all("original Ante" in row["hieroglyph_label"] and "original Ante" in row["petroglyph_label"]
+                for row in leaderboard["rows"]), "Voucher timings are unclear")
+    csv_text = request(base, prefix + "/score/download?job_id=" + job_id + "&filename=combined-leaderboard.csv", text=True)
+    csv_rows = list(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))))
+    require([row["seed"] for row in csv_rows] == [row["seed"] for row in leaderboard["rows"]]
+            and all(row["hieroglyph"] and row["petroglyph"] for row in csv_rows),
+            "Downloaded scoring CSV differs from the visible leaderboard")
+    summary = request(base, prefix + "/score/download?job_id=" + job_id + "&filename=summary.json")
+    require(all(pool["metadata"]["source"]["header_text"] for pool in summary["pools"]),
+            "Packaged scoring lost source metadata")
+    require(not (pools / ".score-jobs" / job_id / "all-scores.ndjson").exists(),
+            "Ordinary scoring exported every row's verbose details")
+    require(missing.read_bytes() == original, "Packaged scoring modified its source pool")
+
+    # Enough cheap, complete-evidence rows to stop before the scan finishes,
+    # without timing hooks or a fake scorer. Resume happens in a new app process.
+    resumable = pools / "Resume-after-restart.bspool"
+    resume_ranks = range(8192)
+    full_events = [b"\x82BSTAG\x01\x00\x4b", descriptor(1, "tag_negative", 7, 2, 0, 0, 0),
+                   descriptor(1, "tag_rare", 12, 1, 0, 0, 0), b"\x93preserved"]
+    write_custom_bsp3(str(resumable), list(resume_ranks), [full_events for _ in resume_ranks],
+                     "4444444444444444", ["tag_route observe"], range_end=30000)
+    resume_job = request(base, prefix + "/score/start", {
+        "pools": [{"source": resumable.name, "second_tag": "A5B"}], "top": 10})
+    resume_id = resume_job["job_id"]
+    request(base, prefix + "/score/cancel", {"job_id": resume_id}, allow_error=True)
+    interrupted = wait_score(base, prefix, resume_id)
+    require(interrupted["status"] == "interrupted" and interrupted["can_resume"]
+            and interrupted["completed_records"] < len(resume_ranks),
+            "Stop and save progress did not leave a resumable packaged job")
+    require(not request(base, prefix + "/score/results?job_id=" + resume_id)["rows"],
+            "An interrupted job published an unfinished leaderboard")
+    return {"completed_id": job_id, "leaderboard": leaderboard, "boards": boards,
+            "resume_id": resume_id, "resume_records": len(resume_ranks)}
+
+
+def exercise_reopened(base, prefix, saved):
+    jobs = request(base, prefix + "/score/jobs")
+    require({saved["completed_id"], saved["resume_id"]} <= {job["job_id"] for job in jobs},
+            "Restarted packaged app did not discover its saved scoring jobs")
+    job_id = saved["completed_id"]
+    require(request(base, prefix + "/score/results?job_id=" + job_id) == saved["leaderboard"],
+            "Combined leaderboard changed after app restart")
+    for pool_id, board in saved["boards"].items():
+        require(request(base, prefix + "/score/results?job_id=" + job_id + "&scope=" + pool_id) == board,
+                "A per-pool leaderboard changed after app restart")
+    resume_id = saved["resume_id"]
+    request(base, prefix + "/score/resume", {"job_id": resume_id})
+    resumed = wait_score(base, prefix, resume_id)
+    require(resumed["status"] == "completed" and
+            resumed["completed_records"] == resumed["scored"] == saved["resume_records"],
+            "Restarted packaged app could not finish its saved job: " + json.dumps(resumed))
+    rows = request(base, prefix + "/score/results?job_id=" + resume_id)["rows"]
+    require(len(rows) == len({row["seed"] for row in rows}) == 10,
+            "Resumed scoring did not publish a distinct-seed leaderboard")
+
 
 def smoke_app(name, executable, directory, source_mode):
     builder = name == "Builder"
@@ -269,30 +370,40 @@ def smoke_app(name, executable, directory, source_mode):
     environment["PYTHONUNBUFFERED"] = "1"
     environment.pop("PYTHONPATH", None)
     environment.pop("PYTHONHOME", None)
+    if not source_mode:
+        # A developer's Python installation on PATH must not conceal an
+        # accidental external-interpreter dependency in the frozen apps.
+        windows = Path(environment["SystemRoot"])
+        environment["PATH"] = os.pathsep.join(map(str, (executable.parent, windows, windows / "System32")))
     command = ([sys.executable, str(executable)] if source_mode else [str(executable)]) + ["--no-browser"]
     log = directory / "app.log"
     base = "http://127.0.0.1:%d" % port
-    with log.open("wb") as output:
-        process = subprocess.Popen(command, cwd=directory, env=environment,
-                                   stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-                                   start_new_session=os.name != "nt",
-                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
-        try:
-            html = wait_ready(process, base, "/organize" if builder else "/", log)
-            require("Separate original pools" in html and "Sort by second tag" in html,
-                    "Bundled page is missing the new operations")
-            exercise(base, "/organizer/api" if builder else "/api", pools, combined)
-            require(process.poll() is None, "App exited during rule operations")
-        except BaseException:
-            print(log.read_text(encoding="utf-8", errors="replace"), file=sys.stderr)
-            raise
-        finally:
-            stop_app(process, base, builder)
+    prefix = "/organizer/api" if builder else "/api"
+    for reopened in (False, True):
+        with log.open("ab") as output:
+            process = subprocess.Popen(command, cwd=directory, env=environment,
+                                       stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                       start_new_session=os.name != "nt",
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+            try:
+                html = wait_ready(process, base, "/organize" if builder else "/", log)
+                require("Separate original pools" in html and "Sort by second tag" in html and "Score pools" in html,
+                        "Bundled page is missing the new operations")
+                if reopened:
+                    exercise_reopened(base, prefix, saved)
+                else:
+                    saved = exercise(base, prefix, pools, combined)
+                require(process.poll() is None, "App exited during rule operations")
+            except BaseException:
+                print(log.read_text(encoding="utf-8", errors="replace"), file=sys.stderr)
+                raise
+            finally:
+                stop_app(process, base, builder)
     with socket.socket() as probe:
         probe.settimeout(1)
         require(probe.connect_ex(("127.0.0.1", port)) != 0,
                 "The stopped test app left a listening child process on port %d" % port)
-    print("%s %s: recovery, tag recording, second tags, BSP4 coverage, and shutdown PASS" % (
+    print("%s %s: recovery, tag recording, second tags, native scoring, leaderboards, cancel/restart/resume, and shutdown PASS" % (
         "Source" if source_mode else "Packaged", name), flush=True)
 
 

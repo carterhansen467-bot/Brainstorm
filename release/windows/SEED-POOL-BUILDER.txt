@@ -38,5 +38,30 @@ whose match requires the scanner to find and purchase Omen Globe. The chosen
 policy is recorded in the pool so it cannot be resumed or merged as the other
 mode by mistake.
 
+Score pools
+-----------
+Open Organize / Combine, then Score pools, or use Score these pools after a
+second-tag split. Select one or more finished pools. Saved second-tag results
+set the first-copy position automatically; otherwise choose it for each pool.
+Small second tag means Big first copy, and Big second tag means Boss first copy.
+
+Scoring uses the native helper and does not require a separate Python install.
+It uses Negative/Rare tags from original Antes 1-38. If those placements have
+not been recorded, enable recording with the matching profile snapshot.
+Source seeds and labels are preserved. Jobs keep progress and can be resumed
+after cancellation or reopening the program.
+
+The default leaderboard keeps the best 1000 distinct seeds. View a combined
+leaderboard or one pool's results; download a CSV for manual testing. Rows show
+Seed, Scaling score, Hieroglyph and Petroglyph, with starting positions and
+source details available when needed. Full metadata stays attached to the
+saved sources and job. Optional detailed exports take more space.
+
+Voucher timings say Before original Ante X or After original Ante 38. If both
+timings match, take Hieroglyph first, then Petroglyph. These are positions in
+the supplied scoring model; actual voucher availability and gameplay still
+need manual testing. The tester's 721.77x score can be used as a reference.
+The reported theoretical ceilings are not automatic exclusion rules.
+
 For a snapshot error, start Balatro and briefly toggle Ctrl+A on and off. For a
 Windows security warning, see README-WINDOWS.txt in the extracted release.
