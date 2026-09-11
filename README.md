@@ -672,11 +672,12 @@ splits, source recovery, or tag rules are complete files with provisional search
 coverage. They retain their source's coverage in ancestry but cannot act as
 authoritative substitutes for a broader live search. Provisional search coverage
 does not mean the output file or its recorded metadata is incomplete.
-Preview streams through the Python reader without loading the entire pool into
-memory. Unchanged pools reuse verification between actions, and repeated
-metadata checks use bounded caches. Source recovery uses the native helper for
-copying when compatible, with Python as a fallback; tag outputs use Python.
-Large pools can still take time to preview and write.
+Original-pool Preview uses the native helper to verify every seed's recorded
+memberships and count the selected groups. Compatible recovery outputs also
+use the native copier. Older helpers or unsupported layouts use Python as a
+fallback. Tag-rule previews and outputs use Python. All paths stream through
+the file with bounded memory; unchanged pools reuse verification between
+actions. Large tag-rule scans can still take time to preview and write.
 
 The same workflow is available without the GUI:
 

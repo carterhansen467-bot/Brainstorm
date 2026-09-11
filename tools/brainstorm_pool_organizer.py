@@ -2542,10 +2542,16 @@ class BSPoolReader:
                 membership, metadata, composite_metadata_verified=True)
 
     def accept_native_verification(
-            self, membership: int, metadata: int) -> None:
-        """Accept native digests without certifying Python set semantics."""
+            self, membership: int, metadata: int, *,
+            composite_metadata_verified: bool = False) -> None:
+        """Accept digests; full source-preview validation may also certify sets.
+
+        Digest-only summaries must leave composite_metadata_verified false.
+        """
         with self._verification_lock:
-            self._finish_payload_verification(membership, metadata)
+            self._finish_payload_verification(
+                membership, metadata,
+                composite_metadata_verified=composite_metadata_verified)
 
     def iter_records(
             self,

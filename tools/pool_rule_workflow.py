@@ -4,8 +4,8 @@
 Preview stores exact counts and source/recipe fingerprints, never a per-seed
 assignment list. Publication re-evaluates the same pinned recipe, verifies all
 counts, and stages every pool and its report before publishing without overwrite.
-Only the Python standard library is required. An optional native helper speeds
-up copying original groups after Python has validated the source memberships.
+Only the Python standard library is required. An optional native helper
+validates, counts, and copies original groups without a per-seed Python scan.
 """
 
 from __future__ import annotations
@@ -306,27 +306,55 @@ def _scan(reader, classifier, prefix, cancel_check=None, progress=None, consume=
         raise PoolError("The source record count changed; preview the pool again.")
     if progress:
         progress(processed, reader.records)
-    outputs = [{"key": key, "category_id": key, "label": labels[key],
-                "records": counts[key], "name": _filename(labels[key], key, prefix)}
-               for key in sorted(counts, key=lambda key: _destination_sort_key(key, labels[key]))]
+    outputs = _output_rows(counts, labels, prefix)
     return {"outputs": outputs, "source_records": processed,
             "copied_records": copied, "excluded_records": processed - copied,
             "overlap_records": overlaps, "output_memberships": sum(counts.values()),
             "exclusions": dict(sorted(exclusions.items()))}
 
 
-def preview(reader, recipe, prefix="", cancel_check=None, progress=None):
+def _output_rows(counts, labels, prefix):
+    return [{"key": key, "category_id": key, "label": labels[key],
+                "records": counts[key], "name": _filename(labels[key], key, prefix)}
+               for key in sorted(counts, key=lambda key: _destination_sort_key(key, labels[key]))]
+
+
+def preview(reader, recipe, prefix="", cancel_check=None, progress=None, *, native_helper=None):
     """Return a serializable, source-pinned reviewed plan with exact counts."""
     organizer._check_cancel(cancel_check)
     recipe = normalize_recipe(recipe)
     prefix = _clean_prefix(prefix)
     classifier = _Classifier(reader, recipe)
+    result, engine = None, "python"
     with reader._open_source_snapshot(cancel_check):
-        result = _scan(reader, classifier, prefix, cancel_check, progress)
+        if native_helper is not None and recipe["mode"] == "separate_sources":
+            try:
+                import pool_rule_native
+            except ImportError:
+                from tools import pool_rule_native
+            try:
+                result = pool_rule_native.preview_sources(
+                    reader, recipe, native_helper, cancel_check, progress)
+            except organizer.NativeSplitUnsupported:
+                pass
+            else:
+                counts, labels = {}, {}
+                for token, count in result.pop("counts").items():
+                    if not count:
+                        continue
+                    key = "source:%s:%s" % (recipe["source_kind"], token)
+                    definition = classifier.selected[token]
+                    counts[key] = count
+                    labels[key] = definition.label or definition.pool_id or token
+                organizer._check_split_output_limit(len(counts))
+                result["outputs"] = _output_rows(counts, labels, prefix)
+                engine = "native"
+        if result is None:
+            result = _scan(reader, classifier, prefix, cancel_check, progress)
     result.update({"workflow_version": VERSION, "recipe": recipe,
                    "recipe_id": _fingerprint(recipe), "prefix": prefix,
                    "source_pin": _source_pin(reader),
-                   "source": organizer.source_summary(reader), "engine": "python"})
+                   "source": organizer.source_summary(reader), "engine": engine})
     if classifier.tag:
         result["coverage"] = classifier.tag.describe_coverage()
     result["plan_id"] = _fingerprint(result)
@@ -465,9 +493,15 @@ def publish(reader, plan, output_dir, cancel_check=None, progress=None, *, nativ
                     import pool_rule_native
                 except ImportError:
                     from tools import pool_rule_native
-                # A digest-only native check cannot establish the composite
-                # set expression. Reused preview readers have this proof; a
-                # fresh CLI reader must obtain it before native copying.
+                # A digest-only check cannot establish the composite set
+                # expression. Reused preview readers have this proof. A fresh
+                # reader first tries the same semantic native preview.
+                if not reader._composite_metadata_verified:
+                    try:
+                        pool_rule_native.preview_sources(
+                            reader, recipe, native_helper, cancel_check, progress)
+                    except organizer.NativeSplitUnsupported:
+                        pass
                 reader._verify_all_payloads(cancel_check)
                 try:
                     native_stages = pool_rule_native.stage_sources(

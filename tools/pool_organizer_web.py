@@ -1814,6 +1814,11 @@ class NativeSplitHelper:
             "split", [source, plan_path], organizer.NativeSplitUnsupported,
             cancel_check, progress)
 
+    def preview_sources(self, source, plan_path, cancel_check=None, progress=None):
+        return self._stream(
+            "preview-sources", [source, plan_path], organizer.NativeSplitUnsupported,
+            cancel_check, progress)
+
     def combine(self, plan_path, cancel_check=None, progress=None):
         return self._stream(
             "combine", [plan_path], organizer.NativeCombineUnsupported,
@@ -3478,7 +3483,8 @@ def _run_rule_operation(request, pool_dir, action):
         elif action == "preview":
             plan = rule_workflow.preview(
                 reader, request.get("recipe"), request.get("prefix", ""),
-                cancel_check=cancelled, progress=progress)
+                cancel_check=cancelled, progress=progress,
+                native_helper=_native_split_helper())
             # The browser only receives a handle. Counts, recipes and source
             # pins used for publication remain owned by this process.
             token = secrets.token_urlsafe(24)

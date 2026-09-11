@@ -123,7 +123,10 @@ class RulesWebRegression(unittest.TestCase):
             reads.append(reader.path)
             return original(reader, *args, **kwargs)
 
-        with mock.patch.object(organizer.BSPoolReader, "_read_validated_block_records", track):
+        # The compatibility path must still validate once and reuse its proof.
+        # Native Preview has a separate full-payload regression suite.
+        with mock.patch.object(organizer.BSPoolReader, "_read_validated_block_records", track), \
+                mock.patch.object(web, "_native_split_helper", return_value=None):
             web.run_rule_describe(request, self.root)
             self.assertEqual(reads, [])
             cached = web.verified_source_reader(request["source"], self.root)

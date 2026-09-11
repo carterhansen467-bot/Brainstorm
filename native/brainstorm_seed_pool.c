@@ -10716,6 +10716,282 @@ cleanup:
 	return rc;
 }
 
+#define POOL_SOURCE_PREVIEW_MAX_BRANCHES 4096
+#define POOL_SOURCE_PREVIEW_VALID_MASKS 4096
+
+/* The Python caller pins this plan to its parsed composite header and source
+ * snapshot. Native code authenticates every record, including excluded ones;
+ * selected source marginals alone cannot establish composite validity. */
+typedef struct {
+	PoolCombineInput semantic;
+	int kind, nsources; /* 0 input operands, 1 original branches */
+	uint64_t sources[POOL_SPLIT_MAX_OUTPUTS], counts[POOL_SPLIT_MAX_OUTPUTS];
+	PoolSplitMap branches, operands, selected;
+	uint64_t validMasks[POOL_SOURCE_PREVIEW_VALID_MASKS];
+} PoolSourcePreviewPlan;
+
+typedef struct {
+	uint64_t operand;
+	int selected;
+	bool provenance;
+} PoolSourcePreviewDescriptor;
+
+static void pool_source_preview_free(PoolSourcePreviewPlan *plan) {
+	free(plan->semantic.branches); free(plan->semantic.declared);
+	for (size_t i = 0; i < plan->semantic.nexpr; i++) free(plan->semantic.expr[i]);
+	free(plan->semantic.expr);
+	pool_split_map_free(&plan->branches);
+	pool_split_map_free(&plan->operands);
+	pool_split_map_free(&plan->selected);
+	memset(plan, 0, sizeof *plan);
+}
+
+static bool pool_source_preview_map_id(PoolSplitMap *map, unsigned char kind,
+		uint64_t id, int value) {
+	unsigned char *raw = malloc(POOL_COMBINE_ID_DESCRIPTOR_BYTES);
+	if (!raw) return false;
+	raw[0] = kind;
+	for (unsigned i = 0; i < 8; i++) raw[i + 1] = (unsigned char)(id >> (56 - i * 8));
+	if (!pool_split_map_insert(map, raw, POOL_COMBINE_ID_DESCRIPTOR_BYTES, value)) {
+		free(raw); return false;
+	}
+	return true;
+}
+
+static bool pool_source_preview_load_plan(const char *path, PoolSourcePreviewPlan *plan,
+		char *err, size_t errsz) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { snprintf(err, errsz, "cannot open source preview plan: %s", strerror(errno)); return false; }
+	char line[POOL_SPLIT_LINE_MAX];
+	bool magic = false, end = false, ok = false;
+	int lineNumber = 0;
+	plan->kind = -1;
+	PoolCombineInput *in = &plan->semantic;
+	while (fgets(line, sizeof line, f)) {
+		lineNumber++;
+		size_t n = strlen(line);
+		if (n && line[n - 1] != '\n' && !feof(f)) goto malformed;
+		while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+		if (!n) continue;
+		if (!magic) {
+			if (strcmp(line, "BRAINSTORM_SOURCE_PREVIEW_PLAN 1")) goto malformed;
+			magic = true; continue;
+		}
+		char *sp = line, *directive = pool_tok(&sp);
+		if (!directive) continue;
+		if (end) goto malformed;
+		if (!strcmp(directive, "end")) {
+			if (pool_tok(&sp)) goto malformed;
+			end = true; continue;
+		}
+		if (!strcmp(directive, "kind")) {
+			char *kind = pool_tok(&sp);
+			if (!kind || plan->kind >= 0 || pool_tok(&sp)) goto malformed;
+			if (!strcmp(kind, "inputs")) plan->kind = 0;
+			else if (!strcmp(kind, "branches")) plan->kind = 1;
+			else goto malformed;
+		} else if (!strcmp(directive, "branch") || !strcmp(directive, "declared")) {
+			char *value = pool_tok(&sp);
+			uint64_t id;
+			if (!value || !pool_split_parse_hex16(value, &id) || pool_tok(&sp)) goto malformed;
+			bool branch = !strcmp(directive, "branch");
+			uint64_t **list = branch ? &in->branches : &in->declared;
+			size_t *count = branch ? &in->nbranches : &in->ndeclared;
+			if (*count >= (branch ? POOL_SOURCE_PREVIEW_MAX_BRANCHES : POOL_COMBINE_MAX_INPUTS)
+					|| pool_combine_id_in(*list, *count, id)) goto malformed;
+			if (!pool_combine_push_u64(list, count, id)) goto allocation;
+		} else if (!strcmp(directive, "expr")) {
+			if (in->nexpr) goto malformed;
+			char *token;
+			while ((token = pool_tok(&sp)) != NULL) {
+				if (in->nexpr >= POOL_COMBINE_EXPR_MAX) goto malformed;
+				char **next = realloc(in->expr, (in->nexpr + 1) * sizeof *next);
+				if (!next) goto allocation;
+				in->expr = next;
+				in->expr[in->nexpr] = malloc(strlen(token) + 1);
+				if (!in->expr[in->nexpr]) goto allocation;
+				strcpy(in->expr[in->nexpr++], token);
+			}
+			if (!in->nexpr) goto malformed;
+		} else if (!strcmp(directive, "source")) {
+			char *indexText = pool_tok(&sp), *value = pool_tok(&sp);
+			uint64_t index, id;
+			if (!indexText || !value || pool_tok(&sp)
+					|| !pool_parse_u64(indexText, &index) || index != (uint64_t)plan->nsources
+					|| plan->nsources >= POOL_SPLIT_MAX_OUTPUTS
+					|| !pool_split_parse_hex16(value, &id)
+					|| pool_combine_id_in(plan->sources, (size_t)plan->nsources, id)) goto malformed;
+			plan->sources[plan->nsources++] = id;
+		} else goto malformed;
+	}
+	if (ferror(f)) { snprintf(err, errsz, "cannot read source preview plan"); goto done; }
+	if (!magic || !end || plan->kind < 0 || !plan->nsources
+			|| !in->nbranches || in->ndeclared < 2 || !in->nexpr) goto malformed;
+	/* Check expression structure even for an empty source, and reject leaves
+	 * that the plan did not declare. The existing combine evaluator is reused. */
+	for (size_t t = 0; t < in->nexpr; t++) {
+		const char *token = in->expr[t];
+		if (token[0] == 'o') {
+			uint64_t id;
+			if (!pool_split_parse_hex16(token + 1, &id)
+					|| !pool_combine_id_in(in->declared, in->ndeclared, id)) goto malformed;
+		}
+	}
+	bool unused = false;
+	if (!pool_combine_expression_matches(in, NULL, 0, &unused)) goto malformed;
+	for (size_t i = 0; i < in->nbranches; i++)
+		if (!pool_source_preview_map_id(&plan->branches, 0x80, in->branches[i], 0)) goto allocation;
+	for (size_t i = 0; i < in->ndeclared; i++)
+		if (!pool_source_preview_map_id(&plan->operands, 0x81, in->declared[i], (int)i)) goto allocation;
+	for (int i = 0; i < plan->nsources; i++) {
+		if (!pool_combine_id_in(plan->kind ? in->branches : in->declared,
+				plan->kind ? in->nbranches : in->ndeclared, plan->sources[i])) goto malformed;
+		if (!pool_source_preview_map_id(&plan->selected, plan->kind ? 0x80 : 0x81,
+				plan->sources[i], i)) goto allocation;
+	}
+	ok = true;
+	goto done;
+allocation:
+	snprintf(err, errsz, "cannot allocate source preview plan");
+	goto done;
+malformed:
+	snprintf(err, errsz, "source preview plan line %d is malformed or incomplete", lineNumber);
+done:
+	fclose(f);
+	return ok;
+}
+
+/* Operand masks are exact identities within this immutable plan. Cache only
+ * successful expressions; collisions replace entries after validation. A
+ * direct-mapped cache keeps lookups bounded even for diverse operand sets. */
+static bool pool_source_preview_expression(PoolSourcePreviewPlan *plan, uint64_t mask,
+		char *err, size_t errsz) {
+	uint64_t hash = (mask ^ (mask >> 33)) * UINT64_C(11400714819323198485);
+	hash ^= hash >> 33;
+	size_t slot = (size_t)(hash & (POOL_SOURCE_PREVIEW_VALID_MASKS - 1));
+	if (plan->validMasks[slot] == mask) return true;
+	uint64_t operands[POOL_COMBINE_MAX_INPUTS];
+	size_t count = 0;
+	for (size_t i = 0; i < plan->semantic.ndeclared; i++)
+		if (mask & (UINT64_C(1) << i)) operands[count++] = plan->semantic.declared[i];
+	bool matches = false;
+	if (!pool_combine_expression_matches(&plan->semantic, operands, count, &matches)) {
+		snprintf(err, errsz, "source preview has an unusable composite expression"); return false;
+	}
+	if (!matches) {
+		snprintf(err, errsz, "composite source has operand provenance that does not satisfy its expression"); return false;
+	}
+	plan->validMasks[slot] = mask;
+	return true;
+}
+
+static int pool_mode_source_preview(const char *source, const char *planPath) {
+	static PoolSourcePreviewPlan plan;
+	memset(&plan, 0, sizeof plan);
+	PoolEventCursor cursor;
+	memset(&cursor, 0, sizeof cursor);
+	cursor.scratch.cachedBlock = UINT64_MAX;
+	PoolSourcePreviewDescriptor *descriptors = NULL;
+	size_t descriptorCap = 0;
+	char err[256] = "";
+	int rc = 1;
+	if (!pool_source_preview_load_plan(planPath, &plan, err, sizeof err)) goto fail;
+	if (!pool_event_cursor_open(&cursor, source, err, sizeof err)) goto fail;
+	uint64_t copied = 0, excluded = 0, overlap = 0, memberships = 0;
+	double lastProgress = bs_monotonic_seconds();
+	for (uint64_t b = 0; b < cursor.reader.nblocks; b++) {
+		int loaded = pool_event_cursor_load(&cursor, b, err, sizeof err);
+		if (loaded < 0) { fprintf(stderr, "%s\n", err); rc = POOL_SPLIT_EXIT_UNSUPPORTED; goto cleanup; }
+		if (!loaded) goto fail;
+		if (cursor.ndescriptors > descriptorCap) {
+			PoolSourcePreviewDescriptor *next = realloc(descriptors, cursor.ndescriptors * sizeof *next);
+			if (!next) { snprintf(err, sizeof err, "cannot allocate source preview descriptors"); goto fail; }
+			descriptors = next; descriptorCap = cursor.ndescriptors;
+		}
+		/* A descriptor has at least one association. Checking its declaration
+		 * here therefore checks every record that carries it, once per block. */
+		for (size_t d = 0; d < cursor.ndescriptors; d++) {
+			const PoolSplitDescriptorRef *raw = &cursor.descriptors[d];
+			PoolSourcePreviewDescriptor *item = &descriptors[d];
+			item->operand = 0; item->provenance = false; item->selected = -1;
+			if (raw->len != POOL_COMBINE_ID_DESCRIPTOR_BYTES
+					|| (raw->bytes[0] != 0x80 && raw->bytes[0] != 0x81)) continue;
+			if (raw->bytes[0] == 0x80) {
+				if (pool_split_map_lookup(&plan.branches, raw->bytes, raw->len) < 0) {
+					snprintf(err, sizeof err, "composite source references an undeclared branch"); goto fail;
+				}
+				item->provenance = true;
+			} else {
+				int operand = pool_split_map_lookup(&plan.operands, raw->bytes, raw->len);
+				if (operand < 0) {
+					snprintf(err, sizeof err, "composite source references an undeclared operand"); goto fail;
+				}
+				item->operand = UINT64_C(1) << operand;
+			}
+			item->selected = pool_split_map_lookup(&plan.selected, raw->bytes, raw->len);
+		}
+		for (uint32_t r = 0; r < cursor.count; r++) {
+			uint64_t operandMask = 0, selected[POOL_SPLIT_MASK_WORDS] = {0};
+			bool provenance = false;
+			for (int32_t a = cursor.recordHead[r]; a >= 0; a = cursor.assocNext[a]) {
+				const PoolSourcePreviewDescriptor *item = &descriptors[cursor.assocDescriptor[a]];
+				provenance = provenance || item->provenance;
+				operandMask |= item->operand;
+				if (item->selected >= 0)
+					selected[item->selected / 64] |= UINT64_C(1) << (item->selected % 64);
+			}
+			if (!provenance || !operandMask) {
+				snprintf(err, sizeof err, "composite source has a seed without branch or operand provenance"); goto fail;
+			}
+			if (!pool_source_preview_expression(&plan, operandMask, err, sizeof err)) goto fail;
+			int count = pool_split_popcount(selected);
+			if (!count) excluded++;
+			else {
+				copied++;
+				if (count > 1) overlap++;
+				if (memberships > UINT64_MAX - (unsigned)count) {
+					snprintf(err, sizeof err, "source preview membership count overflows"); goto fail;
+				}
+				memberships += (unsigned)count;
+				for (int w = 0; w < POOL_SPLIT_MASK_WORDS; w++) {
+					uint64_t bits = selected[w];
+					while (bits) {
+						unsigned bit = (unsigned)__builtin_ctzll(bits);
+						plan.counts[w * 64 + bit]++;
+						bits &= bits - 1;
+					}
+				}
+			}
+		}
+		double now = bs_monotonic_seconds();
+		if (now - lastProgress >= 0.5 && b + 1 < cursor.reader.nblocks) {
+			fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", cursor.consumed, cursor.header.records);
+			fflush(stderr); lastProgress = now;
+		}
+	}
+	if (!pool_event_cursor_finish(&cursor, err, sizeof err)) goto fail;
+	fprintf(stderr, "progress %" PRIu64 " %" PRIu64 "\n", cursor.consumed, cursor.header.records);
+	fflush(stderr);
+	printf("BRAINSTORM_SOURCE_PREVIEW_RESULT 1\n");
+	printf("source_records %" PRIu64 "\n", cursor.consumed);
+	printf("source_membership_digest %016" PRIx64 "\n", cursor.membershipDigest);
+	printf("source_metadata_digest %016" PRIx64 "\n", cursor.metadataDigest);
+	printf("copied %" PRIu64 "\nexcluded %" PRIu64 "\noverlap %" PRIu64 "\nmemberships %" PRIu64 "\n",
+			copied, excluded, overlap, memberships);
+	for (int i = 0; i < plan.nsources; i++)
+		printf("source %d %016" PRIx64 " %" PRIu64 "\n", i, plan.sources[i], plan.counts[i]);
+	printf("end\n");
+	rc = fflush(stdout) != 0 || ferror(stdout) ? 1 : 0;
+	goto cleanup;
+fail:
+	fprintf(stderr, "%s\n", err[0] ? err : "cannot preview source recovery");
+cleanup:
+	free(descriptors);
+	pool_event_cursor_destroy(&cursor);
+	pool_source_preview_free(&plan);
+	return rc;
+}
+
 static void pool_usage(const char *prog) {
 	fprintf(stderr,
 			"usage:\n"
@@ -10728,8 +11004,9 @@ static void pool_usage(const char *prog) {
 			"  %s upgrade <bsp3-input.bspool> <bsp4-output.bspool>\n"
 			"  %s merge <output.bspool> <part1.bspool> <part2.bspool> [more parts...]\n"
 			"  %s split <input.bspool> <organizer-split-plan.txt>\n"
-			"  %s combine <organizer-combine-plan.txt>\n",
-			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+			"  %s combine <organizer-combine-plan.txt>\n"
+			"  %s preview-sources <input.bspool> <source-preview-plan.txt>\n",
+			prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -10750,6 +11027,8 @@ int main(int argc, char **argv) {
 		return pool_mode_split(argv[2], argv[3]);
 	if (argc == 3 && !strcmp(argv[1], "combine"))
 		return pool_mode_combine(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "preview-sources"))
+		return pool_mode_source_preview(argv[2], argv[3]);
 	int refilter = argc == 6 && !strcmp(argv[1], "refilter");
 	if ((!refilter && argc != 5) || (strcmp(argv[1], "scan") && strcmp(argv[1], "fixture") && !refilter)) {
 		pool_usage(argv[0]);

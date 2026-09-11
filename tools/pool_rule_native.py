@@ -1,6 +1,7 @@
 """Native record copying for reviewed source-membership recovery workflows.
 
-Python owns the recipe, source validation, headers, and publication. The existing
+Python owns the recipe, source identity, headers, and publication. Native source
+preview verifies both bytes and per-seed composite memberships. The existing
 native split command copies matching records with every descriptor intact. Its
 output summaries verify bytes and source-marker membership before this module
 returns any stage to the caller. This module never publishes a destination.
@@ -40,6 +41,116 @@ def _unsupported(message):
     raise organizer.NativeSplitUnsupported(message)
 
 
+def _preview_plan(reader, recipe):
+    if (recipe.get("mode") != "separate_sources" or not reader.is_composite
+            or reader.schema not in (3, 4) or reader._repaired_bsp3_headers):
+        _unsupported("this source requires the Python preview")
+    if reader.blocks.physical_rank_order() != (True, True):
+        _unsupported("source blocks require Python rank ordering")
+    kind = recipe["source_kind"]
+    definitions = (reader.composite_operands if kind == "inputs"
+                   else reader.composite_branches)
+    selected = sorted(recipe["source_ids"] or ("%016x" % key for key in definitions))
+    if any(int(token, 16) not in definitions for token in selected):
+        raise organizer.PoolError("A selected source is no longer recorded in this pool.")
+    expression = organizer._expression_postfix(reader.composite_expression)
+    if (len(reader.composite_branches) > 4096 or len(reader.composite_operands) > 64
+            or len(expression) > 512 or not 0 < len(selected) <= 256):
+        _unsupported("source definitions exceed the native preview limits")
+    lines = ["BRAINSTORM_SOURCE_PREVIEW_PLAN 1", "kind " + kind]
+    lines.extend("branch %016x" % value for value in sorted(reader.composite_branches))
+    lines.extend("declared %016x" % value for value in sorted(reader.composite_operands))
+    lines.append("expr " + " ".join(expression))
+    lines.extend("source %d %s" % (index, token) for index, token in enumerate(selected))
+    return ("\n".join(lines) + "\nend\n").encode("ascii"), selected
+
+
+def _parse_preview_result(text, selected):
+    if not isinstance(text, str) or len(text) > 128 * 1024:
+        raise organizer.PoolError("Native source preview returned an invalid result.")
+    lines = text.splitlines()
+    if (not lines or lines[0] != "BRAINSTORM_SOURCE_PREVIEW_RESULT 1"
+            or lines[-1] != "end"):
+        raise organizer.PoolError("Native source preview returned an incomplete result.")
+    integers = {"source_records", "copied", "excluded", "overlap", "memberships"}
+    digests = {"source_membership_digest", "source_metadata_digest"}
+    values, counts = {}, {}
+    for line in lines[1:-1]:
+        parts = line.split()
+        if not parts:
+            continue
+        key = parts[0]
+        if key in integers | digests:
+            pattern = r"[0-9]{1,20}" if key in integers else r"[0-9a-f]{16}"
+            if len(parts) != 2 or key in values or not re.fullmatch(pattern, parts[1]):
+                raise organizer.PoolError("Native source preview returned a malformed field.")
+            values[key] = int(parts[1], 10 if key in integers else 16)
+            if values[key] > organizer.MASK64:
+                raise organizer.PoolError("Native source preview counter overflowed.")
+        elif key == "source":
+            if (len(parts) != 4 or not re.fullmatch(r"[0-9]{1,3}", parts[1])
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[2])
+                    or not re.fullmatch(r"[0-9]{1,20}", parts[3])):
+                raise organizer.PoolError("Native source preview returned an invalid source row.")
+            index, token, count = int(parts[1]), parts[2], int(parts[3])
+            if index >= len(selected) or selected[index] != token or token in counts:
+                raise organizer.PoolError("Native source preview changed the selected sources.")
+            counts[token] = count
+        else:
+            raise organizer.PoolError("Native source preview returned an unknown field.")
+    if set(values) != integers | digests or set(counts) != set(selected):
+        raise organizer.PoolError("Native source preview omitted required counts.")
+    records, copied, overlap = values["source_records"], values["copied"], values["overlap"]
+    if (copied + values["excluded"] != records or overlap > copied
+            or any(count > copied for count in counts.values())
+            or sum(counts.values()) != values["memberships"]
+            or not copied + overlap <= values["memberships"] <= copied + overlap * (len(selected) - 1)
+            or (len(selected) == 1 and overlap)):
+        raise organizer.PoolError("Native source preview returned inconsistent counts.")
+    return values, counts
+
+
+def preview_sources(reader, recipe, helper, cancel_check=None, progress=None):
+    """Verify and count selected memberships without materializing Python records.
+
+    Only the new versioned command validates each seed's composite expression.
+    Ordinary native summaries cannot grant this proof. All counters, declared
+    digests, cancellation and source identity are checked before caching it.
+    """
+    organizer._check_cancel(cancel_check)
+    if not callable(getattr(helper, "preview_sources", None)):
+        _unsupported("this helper does not support native source preview")
+    document, selected = _preview_plan(reader, recipe)
+    with reader._verification_lock:
+        with tempfile.TemporaryDirectory(prefix="pool-source-preview-") as folder:
+            path = os.path.join(folder, "preview.txt")
+            with open(path, "wb") as handle:
+                handle.write(document)
+            with reader._open_source_snapshot(cancel_check):
+                response = helper.preview_sources(reader.path, path,
+                                                  cancel_check=cancel_check, progress=progress)
+                organizer._check_cancel(cancel_check)
+                values, counts = _parse_preview_result(response, selected)
+                if values["source_records"] != reader.records:
+                    raise organizer.PoolError("Native source preview read a different source snapshot.")
+                for value, declared in (
+                        (values["source_membership_digest"], reader._declared_membership_digest),
+                        (values["source_membership_digest"], reader._footer_membership_digest),
+                        (values["source_metadata_digest"], reader._declared_metadata_digest),
+                        (values["source_metadata_digest"], reader._footer_metadata_digest)):
+                    if declared and value != declared:
+                        raise organizer.PoolError("Native source preview failed source digest verification.")
+        organizer._check_cancel(cancel_check)
+        reader.accept_native_verification(values["source_membership_digest"],
+                                          values["source_metadata_digest"],
+                                          composite_metadata_verified=True)
+    return {"counts": counts, "source_records": values["source_records"],
+            "copied_records": values["copied"], "excluded_records": values["excluded"],
+            "overlap_records": values["overlap"], "output_memberships": values["memberships"],
+            "exclusions": ({"outside_selected_sources": values["excluded"]}
+                           if values["excluded"] else {})}
+
+
 def _prepare(reader, plan, destinations, header_factory):
     recipe = plan.get("recipe", {})
     if recipe.get("mode") != "separate_sources":
@@ -47,10 +158,10 @@ def _prepare(reader, plan, destinations, header_factory):
     if (reader.schema not in (3, 4) or not reader.is_composite
             or reader._repaired_bsp3_headers):
         _unsupported("this source requires the Python workflow writer")
-    # A native digest check alone does not establish composite semantics.
-    # Python's full preview traversal establishes this separate flag.
+    # Only a full semantic preview (Python or native), not a digest-only
+    # summary, establishes this separate flag.
     if not getattr(reader, "_composite_metadata_verified", False):
-        _unsupported("source memberships require Python validation first")
+        _unsupported("source memberships require semantic validation first")
     if reader.blocks.physical_rank_order() != (True, True):
         _unsupported("source blocks require Python rank ordering")
     rows = plan.get("outputs")
@@ -160,7 +271,7 @@ def _verify_stage(reader, plan, row, token, kind, path, native, identity,
 
 def stage_sources(reader, plan, destinations, helper, *, header_factory,
                   cancel_check=None, progress=None):
-    """Stage native copies from a Python-validated, reviewed source recovery.
+    """Stage native copies from a fully validated, reviewed source recovery.
 
     The caller validates the full plan and holds source and destination locks
     through final publication. ``header_factory(key, label)`` returns exactly

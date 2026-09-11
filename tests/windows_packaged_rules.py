@@ -197,11 +197,13 @@ def exercise(base, prefix, pools, combined):
     plan = request(base, prefix + "/rules/preview", {
         "source": combined.name, "recipe": separation, "prefix": "recovered",
         "snapshot": description["source"]["snapshot_id"]})
+    require(plan["engine"] == "native", "Packaged source Preview fell back to the slow Python scan")
     require(plan["can_create"] and plan["copied_records"] == 5
             and plan["output_memberships"] == 7 and plan["overlap_records"] == 2,
             "Recovery preview lost overlaps or selected the wrong seeds")
     restored = request(base, prefix + "/rules/publish", {
         "source": combined.name, "planToken": plan["plan_token"]})
+    require(restored["engine"] == "native", "Packaged source recovery did not use the native copier")
     require(restored["completed"] and len(restored["outputs"]) == 2, "Recovery did not publish two pools")
     recovered = [output_reader(row, pools) for row in restored["outputs"]]
     require(sorted([record.rank for record in reader.iter_records()] for reader in recovered)

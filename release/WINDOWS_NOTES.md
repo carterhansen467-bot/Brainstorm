@@ -1,6 +1,9 @@
 Brainstorm for Windows x64, with faster original-pool discovery and filtering
 in the Seed Pool Program.
 
+- **Fast original-pool Preview:** verifies every seed's source memberships and
+  counts selected groups in the native helper. Recovery no longer needs a
+  full Python scan before copying compatible pools.
 - **Fast Find original pools:** loads recorded group names directly, without
   scanning every seed. Historical input sizes are marked **originally**;
   Preview verifies the data and calculates current matching counts.
@@ -31,10 +34,11 @@ in the Seed Pool Program.
 Recovery uses only memberships still recorded in the Complete pool; removed
 seeds and unretained intermediate groups cannot be reconstructed. Tag rules
 require recorded placements throughout the ranges they check. New outputs keep
-their source unchanged and never overwrite existing files. Preview and tag
-rules stream through Python, so full analysis and writing still take time on
-large pools. Optional conditions check each seed before choosing its second
-tag, using each condition's own range.
+their source unchanged and never overwrite existing files. Original-pool
+Preview and creation use the native helper when supported; older helpers and
+unsupported layouts fall back to Python. Second-tag rules still use Python,
+so those scans can take longer on large pools. Optional conditions check each
+seed before choosing its second tag, using each condition's own range.
 
 Download **brainstorm-windows-full.zip**, extract it completely, and run
 **Install or Update Brainstorm.bat**. The updater preserves seed pools,
