@@ -1,4 +1,8 @@
-Brainstorm for Windows x64, with native seed scoring built into the Seed Pool Program.
+Brainstorm for Windows x64, with faster second-tag sorting and pool creation.
+
+- **Faster rule checking:** two local 50,000-seed benchmarks measured 17–32% higher throughput when checking every seed against the rules.
+- **Faster pool creation and verification:** the same benchmarks measured 22–36% higher throughput by avoiding unnecessary compression attempts and repeated small-number encoding. Results depend on your computer and the pool's metadata.
+- **Identical results:** every benchmark output pool was byte-for-byte identical to the previous version. Full verification, corruption detection and safe publication remain in place; regression tests also check exact compression bytes and codec selection.
 
 - **Score pools:** select the separated pools directly, or use Score these pools after sorting by second tag. Each pool keeps its own first-copy position.
 - **Native scoring:** the C helper searches tag redeem routes and Hieroglyph/Petroglyph placements using the tested scoring model. No separate Python installation is needed.

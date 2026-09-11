@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -70,6 +71,68 @@ def independent_best_rice_k(ranks):
         (1 + (sum(value >> k for value in gaps)
               + len(gaps) * (k + 1) + 7) // 8, k)
         for k in range(organizer.BSP4_RICE_MAX_K + 1))[1]
+
+
+def independent_varints(values):
+    output = bytearray()
+    for value in values:
+        while value >= 128:
+            output.append((value & 127) | 128)
+            value >>= 7
+        output.append(value)
+    return bytes(output)
+
+
+def independent_index_candidates(indexes, records):
+    """Exhaustively construct all metadata formats without production helpers."""
+    def positive(values):
+        return independent_varints(
+            value - (values[index - 1] if index else 0)
+            for index, value in enumerate(values))
+
+    included = set(indexes)
+    missing = [index for index in range(records) if index not in included]
+    bitmap = bytes(sum(1 << bit for bit in range(8)
+                       if byte * 8 + bit in included)
+                   for byte in range((records + 7) // 8))
+    runs = []
+    for index in indexes:
+        if not runs or index != runs[-1][0] + runs[-1][1]:
+            runs.append([index, 1])
+        else:
+            runs[-1][1] += 1
+    run_values = [len(runs)]
+    previous_end = 0
+    for start, length in runs:
+        run_values.extend((start - previous_end, length))
+        previous_end = start + length
+    return {
+        organizer.BSP4_META_POSITIVE: positive(indexes),
+        organizer.BSP4_META_COMPLEMENT: positive(missing),
+        organizer.BSP4_META_BITMAP: bitmap,
+        organizer.BSP4_META_RUNS: independent_varints(run_values),
+    }
+
+
+def independent_rank_candidates(ranks):
+    first = ranks[0]
+    included = set(ranks)
+    missing = [rank for rank in range(first, ranks[-1] + 1)
+               if rank not in included]
+    complement = independent_varints(
+        rank - (missing[index - 1] if index else first)
+        for index, rank in enumerate(missing))
+    bitmap = bytes(sum(1 << bit for bit in range(8)
+                       if first + byte * 8 + bit in included)
+                   for byte in range((ranks[-1] - first + 8) // 8))
+    return {
+        organizer.BSP4_RANK_POSITIVE: independent_varints(
+            right - left for left, right in zip(ranks, ranks[1:])),
+        organizer.BSP4_RANK_COMPLEMENT: complement,
+        organizer.BSP4_RANK_BITMAP: bitmap,
+        organizer.BSP4_RANK_RICE: independent_rice_payload(
+            ranks, independent_best_rice_k(ranks)),
+    }
 
 
 class SourceStub:
@@ -457,6 +520,144 @@ class BSP4CodecRegression(unittest.TestCase):
                 payload, 0, codec, len(indexes), 128)
             self.assertEqual(decoded_indexes, indexes)
             self.assertEqual(at, len(payload))
+
+    def test_adaptive_metadata_matches_exhaustive_reference_bytes(self):
+        cases = []
+        # All nonempty subsets exercise short payload ties, empty complements,
+        # bitmap padding, and runs touching either boundary of the universe.
+        for records in range(1, 10):
+            cases.extend(
+                (records, [index for index in range(records)
+                           if mask & (1 << index)])
+                for mask in range(1, 1 << records))
+
+        generator = random.Random(0xB5F40004)
+        for records in (15, 16, 17, 127, 128, 129, 255, 256, 257,
+                        1024, 4096, 8192):
+            cases.extend((records, indexes) for indexes in (
+                [0], [records - 1], [0, records - 1],
+                list(range(records)), list(range(1, records)),
+                list(range(records - 1)), list(range(0, records, 2)),
+                list(range(records // 4, 3 * records // 4)),
+            ))
+            for probability in (0.01, 0.15, 0.5, 0.85, 0.99):
+                indexes = [index for index in range(records)
+                           if generator.random() < probability]
+                cases.append((records, indexes or [records - 1]))
+        # Starts, gaps, and lengths immediately around a varint-width change.
+        for boundary in (127, 128, 129):
+            cases.extend((8192, indexes) for indexes in (
+                [boundary], [0, boundary, 2 * boundary],
+                list(range(boundary, 2 * boundary)),
+                list(range(boundary)) + list(range(2 * boundary, 3 * boundary)),
+                [index for index in range(8192) if index != boundary],
+            ))
+
+        winning_codecs = set()
+        tied_winners = set()
+        for case, (records, indexes) in enumerate(cases):
+            with self.subTest(case=case, records=records, matches=len(indexes)):
+                candidates = independent_index_candidates(indexes, records)
+                expected_codec = min(
+                    candidates, key=lambda codec: (len(candidates[codec]), codec))
+                expected = expected_codec, candidates[expected_codec]
+                winning_codecs.add(expected_codec)
+                if sum(len(payload) == len(expected[1])
+                       for payload in candidates.values()) > 1:
+                    tied_winners.add(expected_codec)
+                self.assertEqual(
+                    organizer._encode_adaptive_indexes(indexes, records), expected)
+                self.assertEqual(organizer._encode_adaptive_indexes(
+                    indexes, records,
+                    positive_payload=candidates[organizer.BSP4_META_POSITIVE]),
+                    expected)
+                decoded, at = organizer._decode_bsp4_indexes(
+                    expected[1], 0, expected[0], len(indexes), records)
+                self.assertEqual(decoded, indexes)
+                self.assertEqual(at, len(expected[1]))
+        self.assertEqual(winning_codecs, {
+            organizer.BSP4_META_POSITIVE, organizer.BSP4_META_COMPLEMENT,
+            organizer.BSP4_META_BITMAP, organizer.BSP4_META_RUNS})
+        self.assertTrue(tied_winners)
+
+    def test_sparse_metadata_work_does_not_scale_with_each_record_universe(self):
+        records = organizer.BSP4_WRITE_RECORDS
+        per_record = [() for _ in range(records)]
+        for index in range(32):
+            occurrence = organizer.Occurrence.decode(
+                b"\x90" + struct.pack("<H", index))
+            per_record[index * 127] = (occurrence,)
+
+        range_visits = 0
+
+        class CountedRange:
+            def __init__(self, *args):
+                self.values = range(*args)
+
+            def __len__(self):
+                return len(self.values)
+
+            def __getitem__(self, index):
+                nonlocal range_visits
+                value = self.values[index]
+                if isinstance(index, int):
+                    range_visits += 1
+                return value
+
+            def __iter__(self):
+                nonlocal range_visits
+                for value in self.values:
+                    range_visits += 1
+                    yield value
+
+        # Count actual range traversal instead of relying on laptop speed.
+        # A bounded block-level pass is fine; scanning 4096 records separately
+        # for each one-match descriptor to build losing candidates is not.
+        with patch.object(organizer, "range", CountedRange, create=True):
+            adaptive, canonical, associations = \
+                organizer._encode_bsp4_metadata_and_canonical(per_record)
+        self.assertEqual(associations, 32)
+        self.assertTrue(adaptive)
+        self.assertTrue(canonical)
+        self.assertLessEqual(range_visits, records * 2)
+
+    def test_adaptive_ranks_match_exhaustive_reference_bytes(self):
+        cases = []
+        for span in range(1, 10):
+            cases.extend([rank for rank in range(span) if mask & (1 << rank)]
+                         for mask in range(1, 1 << span))
+        generator = random.Random(0xB5F40005)
+        for span in (127, 128, 129, 255, 256, 257, 4096, 8192):
+            for offset in (0, organizer.MASK64 - span + 1):
+                patterns = [
+                    [0], [span - 1], [0, span - 1], list(range(span)),
+                    list(range(0, span, 2)), list(range(0, span, 127)),
+                    [rank for rank in range(span) if rank != span // 2],
+                ]
+                for probability in (0.01, 0.15, 0.5, 0.85, 0.99):
+                    selected = [rank for rank in range(span)
+                                if generator.random() < probability]
+                    patterns.append(selected or [0])
+                cases.extend([offset + rank for rank in pattern]
+                             for pattern in patterns)
+
+        winning_codecs = set()
+        for case, ranks in enumerate(cases):
+            with self.subTest(case=case, count=len(ranks)):
+                candidates = independent_rank_candidates(ranks)
+                expected_codec = min(
+                    candidates, key=lambda codec: (len(candidates[codec]), codec))
+                winning_codecs.add(expected_codec)
+                actual_codec, actual, canonical = \
+                    organizer._encode_adaptive_ranks_and_canonical(ranks)
+                self.assertEqual(actual_codec, expected_codec)
+                self.assertEqual(actual, candidates[expected_codec])
+                self.assertEqual(canonical, candidates[organizer.BSP4_RANK_POSITIVE])
+                self.assertEqual(organizer._decode_rank_codec(
+                    actual, len(ranks), ranks[0], ranks[-1], actual_codec), ranks)
+        self.assertEqual(winning_codecs, {
+            organizer.BSP4_RANK_POSITIVE, organizer.BSP4_RANK_COMPLEMENT,
+            organizer.BSP4_RANK_BITMAP, organizer.BSP4_RANK_RICE})
 
     def test_rice_oracle_randomized_roundtrip_and_global_selection(self):
         generator = random.Random(0xB5F40003)

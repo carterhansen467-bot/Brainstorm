@@ -723,9 +723,16 @@ class Record:
 
 def _positive_rank_payload(ranks: Sequence[int]) -> bytes:
     """Return the schema-3 canonical positive-delta representation."""
-    return b"".join(
-        encode_varint(ranks[index] - ranks[index - 1])
-        for index in range(1, len(ranks)))
+    output = bytearray()
+    for index in range(1, len(ranks)):
+        delta = ranks[index] - ranks[index - 1]
+        # Most record/index gaps fit in one byte. Append those directly,
+        # avoiding an encoder call and temporary bytes for every association.
+        if 0 <= delta < 128:
+            output.append(delta)
+        else:
+            output.extend(encode_varint(delta))
+    return bytes(output)
 
 
 def _complement_rank_payload(ranks: Sequence[int],
@@ -880,9 +887,12 @@ def _encode_adaptive_ranks_and_canonical(
         bitmap = _bitmap_rank_payload(ranks)
         candidates.append((len(bitmap), BSP4_RANK_BITMAP, bitmap))
     size, codec, payload = min(candidates, key=lambda item: (item[0], item[1]))
-    _rice_k, rice = _encode_rice_ranks(ranks)
-    if len(rice) < size:
-        return BSP4_RANK_RICE, rice, positive
+    # Even Rice k=0 needs its parameter byte and one bit per gap. A dense
+    # complement/bitmap can already be smaller than this absolute minimum.
+    if 1 + (len(ranks) - 1 + 7) // 8 < size:
+        _rice_k, rice = _encode_rice_ranks(ranks)
+        if len(rice) < size:
+            return BSP4_RANK_RICE, rice, positive
     return codec, payload, positive
 
 
@@ -1009,10 +1019,7 @@ def _descriptor_indexes(
 
 
 def _positive_index_payload(indexes: Sequence[int]) -> bytes:
-    output = bytearray(encode_varint(indexes[0]))
-    for index in range(1, len(indexes)):
-        output.extend(encode_varint(indexes[index] - indexes[index - 1]))
-    return bytes(output)
+    return encode_varint(indexes[0]) + _positive_rank_payload(indexes)
 
 
 def _complement_index_payload(indexes: Sequence[int], records: int) -> bytes:
@@ -1057,14 +1064,23 @@ def _encode_adaptive_indexes(
             or any(indexes[index - 1] >= indexes[index]
                    for index in range(1, len(indexes)))):
         raise PoolError("metadata indexes are invalid")
-    candidates = [
-        (BSP4_META_POSITIVE, positive_payload
-         if positive_payload is not None else _positive_index_payload(indexes)),
-        (BSP4_META_COMPLEMENT, _complement_index_payload(indexes, records)),
-        (BSP4_META_BITMAP, _bitmap_index_payload(indexes, records)),
-        (BSP4_META_RUNS, _run_index_payload(indexes)),
-    ]
-    codec, payload = min(candidates, key=lambda item: (len(item[1]), item[0]))
+    codec = BSP4_META_POSITIVE
+    payload = (positive_payload if positive_payload is not None
+               else _positive_index_payload(indexes))
+    # Each absent index needs at least one byte. Sparse descriptors must not
+    # enumerate and encode the rest of the block when it cannot beat the
+    # positive list. Visit codecs in tie-break order and replace only on <.
+    if records - len(indexes) < len(payload):
+        complement = _complement_index_payload(indexes, records)
+        if len(complement) < len(payload):
+            codec, payload = BSP4_META_COMPLEMENT, complement
+    if (records + 7) // 8 < len(payload):
+        codec, payload = BSP4_META_BITMAP, _bitmap_index_payload(indexes, records)
+    # A nonempty run stream needs a count, a start, and a length.
+    if len(payload) > 3:
+        runs = _run_index_payload(indexes)
+        if len(runs) < len(payload):
+            codec, payload = BSP4_META_RUNS, runs
     return codec, payload
 
 
