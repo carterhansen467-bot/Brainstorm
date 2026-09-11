@@ -568,7 +568,7 @@ class Occurrence:
     def known(self) -> bool:
         return self.kind is not None
 
-    @property
+    @functools.cached_property
     def provenance_id(self) -> Optional[int]:
         return provenance_branch_id(self.raw)
 
@@ -576,7 +576,7 @@ class Occurrence:
     def is_provenance(self) -> bool:
         return self.provenance_id is not None
 
-    @property
+    @functools.cached_property
     def operand_id(self) -> Optional[int]:
         return operand_id_from_descriptor(self.raw)
 
@@ -1597,6 +1597,7 @@ class BSPoolReader:
         self._trusted_bsp3_recovery_identity = False
         self._repaired_bsp3_headers = set()  # type: set
         self._payload_verified = False
+        self._composite_metadata_verified = False
         self._verification_lock = threading.RLock()
         self._declared_membership_digest = self.header.integer(
             "membership_digest", 16, required=False, default=0)
@@ -1643,7 +1644,8 @@ class BSPoolReader:
                     if self.schema == 4 else FNV64_OFFSET,
                     _bsp4_metadata_start()
                     if self.schema == 4
-                    else (FNV64_OFFSET if self.schema == 3 else 0))
+                    else (FNV64_OFFSET if self.schema == 3 else 0),
+                    composite_metadata_verified=True)
         _check_cancel(cancel_check)
 
     def _source_changed_error(self) -> PoolError:
@@ -2164,18 +2166,28 @@ class BSPoolReader:
             self, per_record: Sequence[Tuple[Occurrence, ...]]) -> None:
         declared_branches = set(self.composite_branches)
         declared_operands = set(self.composite_operands)
+        # Descriptors are shared across a decoded block. Many records also
+        # share operand memberships; cache successful expression checks only
+        # within this call, capped independently of the pool's record count.
+        # Branch membership and required provenance remain per-record checks.
+        validated_operands = set()
         for items in per_record:
             branches = {item.provenance_id for item in items
-                        if item.is_provenance}
-            operands = {item.operand_id for item in items if item.is_operand}
+                        if item.provenance_id is not None}
+            operands = frozenset(item.operand_id for item in items
+                                 if item.operand_id is not None)
             if not branches or not operands:
                 raise PoolError("composite record is missing branch or operand provenance")
             if branches - declared_branches:
                 raise PoolError("composite record names an undeclared source branch")
+            if operands in validated_operands:
+                continue
             if operands - declared_operands:
                 raise PoolError("composite record names an undeclared set operand")
             if not expression_matches(self.composite_expression, operands):
                 raise PoolError("composite record provenance does not satisfy its set expression")
+            if len(validated_operands) < 256:
+                validated_operands.add(operands)
 
     def _validate_header_digests(self) -> None:
         if (self._declared_membership_digest
@@ -2499,11 +2511,14 @@ class BSPoolReader:
         )
 
     def _finish_payload_verification(
-            self, membership: int, metadata: int) -> None:
+            self, membership: int, metadata: int,
+            composite_metadata_verified: bool = False) -> None:
         self.membership_digest = membership
         self.metadata_digest = metadata
         self._validate_header_digests()
         self._payload_verified = True
+        if composite_metadata_verified:
+            self._composite_metadata_verified = True
 
     def _verify_all_payloads(
             self,
@@ -2511,7 +2526,9 @@ class BSPoolReader:
         current_cancel = cancel_check \
             if cancel_check is not None else self.cancel_check
         with self._verification_lock:
-            if self._payload_verified:
+            if (self._payload_verified
+                    and (not self.is_composite
+                         or self._composite_metadata_verified)):
                 return
             membership, metadata = self._digest_starts()
             with self._open_source_snapshot(current_cancel) as handle:
@@ -2521,11 +2538,12 @@ class BSPoolReader:
                         self._read_validated_block_records(
                             handle, block, membership, metadata)
             _check_cancel(current_cancel)
-            self._finish_payload_verification(membership, metadata)
+            self._finish_payload_verification(
+                membership, metadata, composite_metadata_verified=True)
 
     def accept_native_verification(
             self, membership: int, metadata: int) -> None:
-        """Accept digests from a native full-payload validation pass."""
+        """Accept native digests without certifying Python set semantics."""
         with self._verification_lock:
             self._finish_payload_verification(membership, metadata)
 
@@ -2561,9 +2579,12 @@ class BSPoolReader:
                 ordered_blocks[index - 1].last_rank
                 < ordered_blocks[index].first_rank
                 for index in range(1, len(ordered_blocks)))
-        if not self._payload_verified:
+        if (not self._payload_verified
+                or (self.is_composite and not self._composite_metadata_verified)):
             with self._verification_lock:
-                if not self._payload_verified:
+                if (not self._payload_verified
+                        or (self.is_composite
+                            and not self._composite_metadata_verified)):
                     # Logical BSP4/BSP3 digests follow physical block order.
                     # A physically rank-ordered file can therefore validate
                     # and yield each payload exactly once. Shuffled/overlapping
@@ -2589,7 +2610,8 @@ class BSPoolReader:
                                     yield record
                         _check_cancel(current_cancel)
                         self._finish_payload_verification(
-                            membership, metadata)
+                            membership, metadata,
+                            composite_metadata_verified=True)
                         return
                     self._verify_all_payloads(current_cancel)
         with self._open_source_snapshot(current_cancel) as handle:

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -233,6 +234,73 @@ class CoverageTests(unittest.TestCase):
         ):
             with self.subTest(criterion=criterion), self.assertRaises(rules.TagRuleError):
                 rules.TagClassifier(reader([criterion]), recipe())
+
+
+class EvidenceCacheTests(unittest.TestCase):
+    def test_repeated_evidence_across_ranks_avoids_rechecking_conditions(self):
+        classifier = rules.TagClassifier(reader(), recipe(condition={"all": [
+            count("rare", min=1, max=1), {"not": count("negative", min=2)}]}))
+        first = record(occurrence("rare", 3, 1), occurrence("negative", 6, 2))
+        second = organizer.Record(999, tuple(organizer.Occurrence.decode(item.raw)
+                                             for item in first.occurrences))
+        with mock.patch.object(rules, "_condition_matches", wraps=rules._condition_matches) as evaluate:
+            expected = classifier.classify(first)
+            initial_calls = evaluate.call_count
+            self.assertIs(classifier.classify(second), expected)
+            self.assertEqual(evaluate.call_count, initial_calls)
+
+    def test_cached_result_cannot_hide_new_conflict_or_unrecorded_source(self):
+        classifier = rules.TagClassifier(reader(branches={
+            11: ["tag tag_negative 3 7 1"],
+            22: ["tag tag_rare 3 7 1"],
+        }), recipe())
+        tags = (occurrence("negative", 3, 1), occurrence("rare", 6, 2))
+        self.assertEqual(classifier.classify(record(*tags, sources=(11, 22))).destination.key,
+                         "a6b-rare")
+        for rank in (99, 123456789):
+            missing = organizer.Record(rank, record(*tags, sources=(11,)).occurrences)
+            with self.assertRaises(rules.InsufficientMetadataError) as caught:
+                classifier.classify(missing)
+            self.assertEqual(caught.exception.rank, rank)
+            conflict = organizer.Record(rank, record(
+                *tags, occurrence("double", 3, 1), sources=(11, 22)).occurrences)
+            with self.assertRaisesRegex(rules.TagRuleError, "rank %d .*conflicting" % rank):
+                classifier.classify(conflict)
+            undeclared = organizer.Record(rank, record(*tags, sources=(11, 22, 99)).occurrences)
+            with self.assertRaisesRegex(rules.TagRuleError, "rank %d .*provenance" % rank):
+                classifier.classify(undeclared)
+
+    def test_descriptor_attributes_order_and_cache_limits_preserve_decisions(self):
+        source = reader()
+        spec = recipe(condition={"any": [count("rare", min=2), count("negative", max=1)]})
+        cached = rules.TagClassifier(source, spec)
+        uncached = rules.TagClassifier(source, spec)
+        uncached._evidence_cache_bytes = rules.EVIDENCE_CACHE_BYTES
+        for index in range(rules.EVIDENCE_CACHE_ENTRIES + 50):
+            tags = (occurrence("rare", 3, 1), occurrence("negative", 6, 2))
+            opaque = organizer.Occurrence.decode(b"\x09" + index.to_bytes(3, "little"))
+            items = tags + (opaque, occurrence("rare", 3, 1, flags=index % 256))
+            if index % 2:
+                items = tuple(reversed(items))
+            value = organizer.Record(index * 100003, items)
+            self.assertEqual(cached.classify(value), uncached.classify(value))
+        self.assertLessEqual(len(cached._evidence_cache), rules.EVIDENCE_CACHE_ENTRIES)
+        self.assertLessEqual(cached._evidence_cache_bytes, rules.EVIDENCE_CACHE_BYTES)
+        # A descriptor too large to retain still participates in validation.
+        oversized = organizer.Occurrence.decode(b"\x09" + b"x" * rules.EVIDENCE_CACHE_BYTES)
+        value = record(*tags, oversized)
+        byte_limited = rules.TagClassifier(source, spec)
+        self.assertEqual(byte_limited.classify(value), uncached.classify(value))
+        self.assertFalse(byte_limited._evidence_cache)
+        self.assertLessEqual(byte_limited._descriptor_cache_bytes, rules.EVIDENCE_CACHE_BYTES)
+        # Descriptor-count limits also skip caching without skipping validation.
+        crowded = tags + tuple(organizer.Occurrence.decode(b"\x09" + index.to_bytes(3, "little"))
+                               for index in range(rules.EVIDENCE_CACHE_DESCRIPTORS))
+        self.assertEqual(byte_limited.classify(record(*crowded)),
+                         uncached.classify(record(*crowded)))
+        self.assertFalse(byte_limited._evidence_cache)
+        with self.assertRaisesRegex(rules.TagRuleError, "conflicting"):
+            byte_limited.classify(record(*crowded, occurrence("double", 3, 1)))
 
 
 class RecipeTests(unittest.TestCase):

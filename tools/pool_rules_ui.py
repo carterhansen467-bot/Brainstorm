@@ -107,8 +107,8 @@ function setRuleMode(mode){
 function renderRuleSources(){
  const d=ruleState.description,kind=$("ruleSourceKind").value;if(!d)return;
  const rows=kind==="inputs"?d.direct_inputs:d.original_sources;
- $("ruleSources").innerHTML=(rows||[]).length?rows.map(r=>`<label class="choicecard"><input class="rule-origin" type="checkbox" value="${esc(r.id)}" checked><span><b>${esc(r.label||r.pool_id||r.id)}</b></span><span class="count">${fmt(r.records)} seeds</span></label>`).join(""):'<p class="rule-empty">No groups of this kind are recorded. Try the other grouping, or select a combined pool.</p>';
- $("ruleHistoryHint").textContent=kind==="inputs"?"These are the pools used in the most recent combine. Counts describe seeds still present in this file.":"These original source groups were retained through combines. In a simple combine, they may match the latest inputs. Intermediate groups that were not retained cannot be recovered.";
+ $("ruleSources").innerHTML=(rows||[]).length?rows.map(r=>`<label class="choicecard"><input class="rule-origin" type="checkbox" value="${esc(r.id)}" checked><span><b>${esc(r.label||r.pool_id||r.id)}</b></span><span class="count">${r.records!=null?`${fmt(r.records)} seeds`:r.original_records!=null?`${fmt(r.original_records)} originally`:"Count in preview"}</span></label>`).join(""):'<p class="rule-empty">No groups of this kind are recorded. Try the other grouping, or select a combined pool.</p>';
+ $("ruleHistoryHint").textContent=kind==="inputs"?"These pools were used in the most recent combine. Original sizes are historical; Preview checks how many seeds remain in each selected group.":"These source groups were retained through combines. Preview checks how many seeds remain. Intermediate groups that were not retained cannot be recovered.";
  document.querySelectorAll(".rule-origin").forEach(x=>x.onchange=ruleInvalidate);
 }
 function renderRuleData(d){
@@ -130,10 +130,10 @@ async function ruleRun(message,callback){
  finally{clearInterval(timer);ruleState.busy=false;$("ruleInputs").disabled=false;$("rulePreviewBtn").disabled=!$("ruleSource").value;$("ruleCreateBtn").disabled=!ruleState.plan||ruleState.plan.can_create===false;$("ruleCancelBtn").hidden=true;$("ruleDetectBtn").disabled=!$("ruleSource").value;}
 }
 async function detectRuleSources(){
- ruleInvalidate();return ruleRun("Reading saved pool data…",async()=>{
+ ruleInvalidate();return ruleRun("Loading saved group names…",async()=>{
   const d=await api("/api/rules/describe",{source:$("ruleSource").value});ruleState.description=d;$("ruleSourceGroups").hidden=false;
   if(!(d.direct_inputs||[]).length&&(d.original_sources||[]).length)$("ruleSourceKind").value="branches";
-  renderRuleSources();renderRuleData(d);$("ruleStatus").textContent=`Read ${fmt((d.source||{}).records)} seeds. Choose the groups or range to use.`;return d;
+  renderRuleSources();renderRuleData(d);$("ruleStatus").textContent="Saved pool details loaded. Choose the groups or range, then preview to check matching seeds.";return d;
  });
 }
 function defaultRuleCount(){return {count:{tag:"negative",range:{start:$("ruleStart").value,end:$("ruleEnd").value},min:1}}}

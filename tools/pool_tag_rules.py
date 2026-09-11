@@ -25,6 +25,9 @@ except ImportError:
 RECIPE_VERSION = 1
 MAX_ANTE = 39
 MAX_RECIPE_BYTES = 65536
+EVIDENCE_CACHE_ENTRIES = 4096
+EVIDENCE_CACHE_BYTES = 8 * 1024 * 1024
+EVIDENCE_CACHE_DESCRIPTORS = 256
 TAG_KEYS = {"negative": "tag_negative", "rare": "tag_rare"}
 _TAG_NAMES = {key: tag for tag, key in TAG_KEYS.items()}
 EXCLUSION_LABELS = {
@@ -415,7 +418,10 @@ class TagClassifier:
         self._sources, self._labels = _read_sources(reader)
         self._cache = {}
         self._descriptor_cache = {}
+        self._descriptor_cache_bytes = 0
         self._results = {}
+        self._evidence_cache = {}
+        self._evidence_cache_bytes = 0
         if not self._is_composite:
             missing = _missing_coverage(self._requirements, self._sources[None])
             if missing:
@@ -438,8 +444,11 @@ class TagClassifier:
             info = self._descriptor_cache.get(item.raw)
             if info is None:
                 info = _descriptor_info(item, record.rank)
-                if len(self._descriptor_cache) < 8192:
+                charge = len(item.raw) + 256
+                if (len(self._descriptor_cache) < 8192
+                        and self._descriptor_cache_bytes + charge <= EVIDENCE_CACHE_BYTES):
                     self._descriptor_cache[item.raw] = info
+                    self._descriptor_cache_bytes += charge
             position, key, tag, source_id, operand_id = info
             if position is not None:
                 prior = by_position.get(position)
@@ -477,6 +486,28 @@ class TagClassifier:
             raise InsufficientMetadataError(missing, record.rank)
 
     def classify(self, record) -> Classification:
+        # Outcomes depend on complete immutable evidence, not on seed rank.
+        # Retain all descriptor bytes in the key, including provenance and
+        # unrelated tags: dropping either could hide missing coverage or a
+        # contradictory physical slot. Failed validation is never cached, so
+        # every error continues to identify the current seed's rank.
+        key = None
+        if len(record.occurrences) <= EVIDENCE_CACHE_DESCRIPTORS:
+            key = tuple(item.raw for item in record.occurrences)
+            cached = self._evidence_cache.get(key)
+            if cached is not None:
+                return cached
+        result = self._classify_evidence(record)
+        if key is not None and len(self._evidence_cache) < EVIDENCE_CACHE_ENTRIES:
+            # Charge tuple/pointer/dictionary overhead and owned descriptor
+            # bytes conservatively, even when other cached keys share bytes.
+            charge = 192 + len(key) * 8 + sum(33 + len(raw) for raw in key)
+            if self._evidence_cache_bytes + charge <= EVIDENCE_CACHE_BYTES:
+                self._evidence_cache[key] = result
+                self._evidence_cache_bytes += charge
+        return result
+
+    def _classify_evidence(self, record) -> Classification:
         placements = self._record_evidence(record)
         if not _condition_matches(self._condition, placements):
             return _EXCLUDED["condition_not_met"]

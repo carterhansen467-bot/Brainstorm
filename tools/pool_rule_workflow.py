@@ -4,7 +4,8 @@
 Preview stores exact counts and source/recipe fingerprints, never a per-seed
 assignment list. Publication re-evaluates the same pinned recipe, verifies all
 counts, and stages every pool and its report before publishing without overwrite.
-Only the Python standard library is required; this workflow uses Python.
+Only the Python standard library is required. An optional native helper speeds
+up copying original groups after Python has validated the source memberships.
 """
 
 from __future__ import annotations
@@ -129,18 +130,19 @@ def _memberships(record, kind):
             if (item.is_operand if kind == "inputs" else item.is_provenance)}
 
 
-def describe_source(reader, cancel_check=None, progress=None):
+def describe_source(reader, cancel_check=None, progress=None, *, count_records=True):
     """Describe recoverable direct inputs and retained original branches.
 
-    Counts describe seeds still present in this file. Direct input original
-    counts are separate; no intermediate history or removed seeds is inferred.
+    Exact counts require a full traversal. A header-only description lists the
+    recorded groups immediately, with current counts explicitly unknown. Direct
+    input original counts are historical; removed seeds are never inferred.
     """
     organizer._check_cancel(cancel_check)
     counts = {"inputs": collections.Counter(), "branches": collections.Counter()}
     overlaps = {"inputs": 0, "branches": 0}
     processed = 0
     with reader._open_source_snapshot(cancel_check):
-        if reader.is_composite:
+        if reader.is_composite and count_records:
             for record in reader.iter_records(cancel_check=cancel_check):
                 for kind in counts:
                     memberships = _memberships(record, kind)
@@ -160,10 +162,12 @@ def describe_source(reader, cancel_check=None, progress=None):
             row = definition.as_dict()
             if kind == "inputs":
                 row["original_records"] = definition.records
-                row["missing_records"] = max(0, definition.records - counts[kind][token])
-            row.update({"id": token, "kind": kind, "records": counts[kind][token]})
+                row["missing_records"] = (max(0, definition.records - counts[kind][token])
+                                          if count_records else None)
+            row.update({"id": token, "kind": kind,
+                        "records": counts[kind][token] if count_records else None})
             rows[kind].append(row)
-    if progress:
+    if progress and count_records:
         progress(reader.records, reader.records)
     return {
         "source": organizer.source_summary(reader),
@@ -171,7 +175,8 @@ def describe_source(reader, cancel_check=None, progress=None):
         "can_separate": reader.is_composite,
         "direct_inputs": rows["inputs"],
         "original_sources": rows["branches"],
-        "overlap_records": overlaps,
+        "overlap_records": overlaps if count_records else None,
+        "counts_pending": not count_records,
         "engine": "python",
         "note": ("Seeds shared by selected sources are copied to each output. "
                  "Only memberships still present in this pool can be recovered. "
@@ -337,7 +342,7 @@ class _HeaderView:
         return getattr(self.reader, name)
 
 
-def _header_builder(reader, key, label, plan):
+def _header_builder(reader, key, label, plan, minimum_size=0):
     # Match the writer's bounded ASCII header-label contract. Display names in
     # the UTF-8 report and encoded composite dictionaries remain intact.
     label = label.replace("\r", " ").replace("\n", " ").replace("\0", " ")
@@ -367,6 +372,8 @@ def _header_builder(reader, key, label, plan):
 
     # Leave room for final uint64 counters and retained composite dictionaries.
     for size in organizer.COMPOSITE_HEADER_SIZES:
+        if size < minimum_size:
+            continue
         try:
             build(size, organizer.MASK64, organizer.MASK64,
                   organizer.MASK64, organizer.MASK64)
@@ -386,7 +393,7 @@ def report_filename(plan):
         "rules-report-%s.json" % plan["plan_id"][:12]
 
 
-def publish(reader, plan, output_dir, cancel_check=None, progress=None):
+def publish(reader, plan, output_dir, cancel_check=None, progress=None, *, native_helper=None):
     """Publish exactly one reviewed plan; collisions or failures preserve inputs."""
     organizer._check_cancel(cancel_check)
     if not isinstance(plan, dict) or plan.get("workflow_version") != VERSION:
@@ -427,6 +434,7 @@ def publish(reader, plan, output_dir, cancel_check=None, progress=None):
     writers = {}
     publications = []
     report_stage = None
+    native_stages = None
     linked = False
     try:
         with ExitStack() as stack:
@@ -452,29 +460,48 @@ def publish(reader, plan, output_dir, cancel_check=None, progress=None):
                         header_builder=builder)
                 writers[key].add(record)
 
-            actual = _scan(reader, classifier, prefix, cancel_check, progress, consume)
-            if any(actual[name] != plan.get(name) for name in actual):
-                raise PoolError("Results differ from the reviewed counts; preview again.")
-            outputs = []
-            for key in sorted(writers):
-                organizer._check_cancel(cancel_check)
-                output = writers[key].finalize()
-                # Verify bytes read back from every staged file, including
-                # occurrence/provenance checks and both authenticated digests,
-                # before any destination becomes visible.
-                staged = organizer.BSPoolReader(
-                    writers[key].temp_path, cancel_check=cancel_check)
-                if (staged.records != expected[key]["records"]
-                        or staged.snapshot_token != output["snapshot_id"]
-                        or staged.membership_digest != writers[key].membership_digest
-                        or staged.metadata_digest != writers[key].metadata_digest):
-                    raise PoolError("A staged pool failed verification; no pools were published.")
-                outputs.append(output)
-                publications.append((writers[key].temp_path, paths[key]))
+            if native_helper is not None and recipe["mode"] == "separate_sources":
+                try:
+                    import pool_rule_native
+                except ImportError:
+                    from tools import pool_rule_native
+                # A digest-only native check cannot establish the composite
+                # set expression. Reused preview readers have this proof; a
+                # fresh CLI reader must obtain it before native copying.
+                reader._verify_all_payloads(cancel_check)
+                try:
+                    native_stages = pool_rule_native.stage_sources(
+                        reader, plan, paths, native_helper,
+                        header_factory=lambda key, label: _header_builder(
+                            reader, key, label, plan, minimum_size=reader.header_bytes),
+                        cancel_check=cancel_check, progress=progress)
+                except organizer.NativeSplitUnsupported:
+                    pass
+            if native_stages is not None:
+                outputs = native_stages.outputs
+                publications.extend(native_stages.publications)
+            else:
+                actual = _scan(reader, classifier, prefix, cancel_check, progress, consume)
+                if any(actual[name] != plan.get(name) for name in actual):
+                    raise PoolError("Results differ from the reviewed counts; preview again.")
+                outputs = []
+                for key in sorted(writers):
+                    organizer._check_cancel(cancel_check)
+                    output = writers[key].finalize()
+                    # Verify every staged file before any destination is visible.
+                    staged = organizer.BSPoolReader(
+                        writers[key].temp_path, cancel_check=cancel_check)
+                    if (staged.records != expected[key]["records"]
+                            or staged.snapshot_token != output["snapshot_id"]
+                            or staged.membership_digest != writers[key].membership_digest
+                            or staged.metadata_digest != writers[key].metadata_digest):
+                        raise PoolError("A staged pool failed verification; no pools were published.")
+                    outputs.append(output)
+                    publications.append((writers[key].temp_path, paths[key]))
             report = dict(plan)
             report.update({"outputs": outputs, "reviewed_outputs": rows,
                            "report_path": report_path, "completed": True,
-                           "engine": "python"})
+                           "engine": "native" if native_stages is not None else "python"})
             descriptor, report_stage = tempfile.mkstemp(
                 prefix=".pool-rules-report-", suffix=".tmp", dir=output_dir)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -505,6 +532,9 @@ def publish(reader, plan, output_dir, cancel_check=None, progress=None):
         if report_stage:
             organizer.seed_pool_mutations.remove(report_stage, missing_ok=True)
         raise
+    finally:
+        if native_stages is not None:
+            native_stages.cleanup()
 
 
 def main(argv=None):

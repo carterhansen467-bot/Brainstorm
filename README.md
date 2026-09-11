@@ -628,6 +628,9 @@ source pool.
 In **Organize / Combine**, choose **Separate original pools** to recover saved
 groups such as L1, L2, and Other from a combined Complete pool. Select the
 Complete pool, click **Find original pools**, and choose the groups to recreate.
+Finding groups reads the saved group list without scanning every seed. Any
+size marked **originally** is the historical input size, not the number still
+present. **Preview new pools** verifies the data and counts matching seeds.
 **Inputs to the latest combine** lists the exact input memberships retained by
 that operation. **Earlier recorded source groups** lists retained original
 source branches; in a simple combine, these can match the latest inputs.
@@ -651,6 +654,8 @@ exports a portable JSON recipe for future sessions. **Optional tag conditions**
 provides nested All (AND), Any (OR), and Not groups with minimum/maximum counts
 and independent ranges. Saved files are validated before replacing settings;
 they contain data, never executable scripts.
+Conditions apply to each seed before the second-tag check, using their own
+ranges. They count placements for that seed, never totals across the pool.
 
 Both tools preview exact filenames and counts before creating anything, show
 progress, and support cancellation. They keep the source unchanged and refuse
@@ -667,8 +672,11 @@ splits, source recovery, or tag rules are complete files with provisional search
 coverage. They retain their source's coverage in ancestry but cannot act as
 authoritative substitutes for a broader live search. Provisional search coverage
 does not mean the output file or its recorded metadata is incomplete.
-Processing streams through the Python reader without loading the entire pool
-into memory; large pools can take time to analyze and write.
+Preview streams through the Python reader without loading the entire pool into
+memory. Unchanged pools reuse verification between actions, and repeated
+metadata checks use bounded caches. Source recovery uses the native helper for
+copying when compatible, with Python as a fallback; tag outputs use Python.
+Large pools can still take time to preview and write.
 
 The same workflow is available without the GUI:
 

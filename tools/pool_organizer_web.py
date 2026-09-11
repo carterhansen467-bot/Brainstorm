@@ -1768,19 +1768,24 @@ def _run_native_summary(path, cancel_check=None):
             errors="replace")
     except OSError:
         return None
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=0.1)
-            break
-        except subprocess.TimeoutExpired:
-            if cancel_check is not None and cancel_check():
-                process.terminate()
-                try:
-                    process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate()
-                raise organizer.PoolError("operation cancelled")
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_check is not None and cancel_check():
+                    raise organizer.PoolError("operation cancelled")
+    finally:
+        # A progress callback may raise cancellation instead of returning it.
+        # Every exceptional exit must release the native reader's file handles.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
     if process.returncode:
         message = (stderr or "").strip().splitlines()
         raise organizer.PoolError(
@@ -3456,9 +3461,7 @@ def _run_rule_operation(request, pool_dir, action):
 
         name = request.get("source", "")
         root = _pool_root(pool_dir)
-        reader = organizer.BSPoolReader(
-            resolve_source(name, root), verify_payloads=False,
-            cancel_check=cancelled)
+        reader = verified_source_reader(name, root, cancel_check=cancelled)
         expected = request.get("snapshot")
         if expected is not None and expected != reader.snapshot_token:
             raise organizer.PoolError(
@@ -3470,7 +3473,7 @@ def _run_rule_operation(request, pool_dir, action):
 
         if action == "describe":
             result = rule_workflow.describe_source(
-                reader, cancel_check=cancelled, progress=progress)
+                reader, cancel_check=cancelled, count_records=False)
             result["coverage"] = tag_rules.describe_recorded_coverage(reader)
         elif action == "preview":
             plan = rule_workflow.preview(
@@ -3503,7 +3506,8 @@ def _run_rule_operation(request, pool_dir, action):
                 raise organizer.PoolError(
                     "This preview expired or belongs to another pool. Preview again.")
             result, completed = rule_workflow.publish(
-                reader, entry[2], root, cancel_check=cancelled, progress=progress)
+                reader, entry[2], root, cancel_check=cancelled, progress=progress,
+                native_helper=_native_split_helper())
             if not completed:
                 raise organizer.PoolError("Pool creation did not complete.")
         else:

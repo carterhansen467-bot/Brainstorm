@@ -63,6 +63,24 @@ class RuleWorkflowTests(unittest.TestCase):
         return {"version": 1, "mode": "second_tag", "rule": {
             "version": 1, "name": "AS1-L1", "range": {"start": "A3S", "end": "A7B"}}}
 
+    def test_group_listing_does_not_scan_seeds_or_claim_current_counts(self):
+        x, y, z = self.combined()
+        os.unlink(x)
+        os.unlink(y)
+        reader = organizer.BSPoolReader(z, verify_payloads=False)
+        with mock.patch.object(reader, "iter_records", side_effect=AssertionError("unexpected scan")):
+            details = workflow.describe_source(reader, count_records=False)
+        self.assertTrue(details["counts_pending"])
+        self.assertIsNone(details["overlap_records"])
+        self.assertEqual([row["original_records"] for row in details["direct_inputs"]], [3, 3])
+        self.assertTrue(all(row["records"] is None for row in
+                            details["direct_inputs"] + details["original_sources"]))
+        self.assertTrue(all(row["missing_records"] is None for row in details["direct_inputs"]))
+        self.assertFalse(reader._payload_verified)
+        plan = workflow.preview(reader, self.recipe())
+        self.assertEqual((plan["copied_records"], plan["output_memberships"]), (4, 6))
+        self.assertTrue(reader._payload_verified)
+
     def test_recover_deleted_sources_including_overlap_and_preserved_evidence(self):
         x, y, z = self.combined()
         os.unlink(x)

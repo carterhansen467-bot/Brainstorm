@@ -5,10 +5,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -18,6 +21,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import brainstorm_pool_organizer as organizer
 import pool_organizer_web as web
 import pool_builder_web as builder_web
+import pool_rules_ui as rules_ui
 
 spec = importlib.util.spec_from_file_location("rules_web_fixture", ROOT / "tests/pool_organizer.py")
 fixture = importlib.util.module_from_spec(spec)
@@ -31,6 +35,8 @@ class RulesWebRegression(unittest.TestCase):
         web.allow_active_operations()
         with web.RULE_REVIEW_LOCK:
             web.RULE_REVIEWS.clear()
+        with web.READER_CACHE_LOCK:
+            web.READER_CACHE.clear()
         tag = lambda key, ante, phase: fixture.descriptor(1, "tag_" + key, ante, phase, 0, 0, 0)
         self.events = [
             [tag("negative", 3, 1), tag("rare", 5, 1)],
@@ -82,7 +88,9 @@ class RulesWebRegression(unittest.TestCase):
                 try:
                     status, description = self.request(base + "describe", {"source": "Complete.bspool"})
                     self.assertEqual(status, 200, description)
-                    self.assertEqual(sorted(r["records"] for r in description["direct_inputs"]), [1, 3])
+                    self.assertTrue(description["counts_pending"])
+                    self.assertTrue(all(r["records"] is None for r in description["direct_inputs"]))
+                    self.assertEqual(sorted(r["original_records"] for r in description["direct_inputs"]), [1, 3])
                     status, validated = self.request(base + "validate", {"document": json.dumps({
                         "version": 1, "mode": "second_tag", "rule": {
                             "version": 1, "range": {"start": "a3s", "end": "a7b"}}})})
@@ -105,6 +113,125 @@ class RulesWebRegression(unittest.TestCase):
                     server.shutdown()
                     server.server_close()
                     thread.join(timeout=3)
+
+    def test_find_lists_groups_without_payload_scan_then_preview_validates_once(self):
+        request = {"source": "Complete.bspool"}
+        original = organizer.BSPoolReader._read_validated_block_records
+        reads = []
+
+        def track(reader, *args, **kwargs):
+            reads.append(reader.path)
+            return original(reader, *args, **kwargs)
+
+        with mock.patch.object(organizer.BSPoolReader, "_read_validated_block_records", track):
+            web.run_rule_describe(request, self.root)
+            self.assertEqual(reads, [])
+            cached = web.verified_source_reader(request["source"], self.root)
+            self.assertFalse(cached._payload_verified)
+            settings = dict(request, recipe={"version": 1, "mode": "separate_sources"})
+            first = web.run_rule_preview(settings, self.root)
+            self.assertEqual(len(reads), len(cached.blocks))
+            self.assertTrue(cached._payload_verified)
+            second = web.run_rule_preview(settings, self.root)
+            self.assertEqual(len(reads), len(cached.blocks))
+            self.assertEqual(first["outputs"], second["outputs"])
+            self.assertIsNone(cached.cancel_check)
+
+    def test_find_does_not_certify_corrupt_payload_and_preview_rejects_it(self):
+        path = os.path.join(self.root, "Complete.bspool")
+        source = organizer.BSPoolReader(path, verify_payloads=False)
+        block = source.blocks[0]
+        with open(path, "r+b") as handle:
+            handle.seek(block.offset + block.header_bytes)
+            original = handle.read(1)
+            handle.seek(-1, os.SEEK_CUR)
+            handle.write(bytes((original[0] ^ 1,)))
+        description = web.run_rule_describe({"source": "Complete.bspool"}, self.root)
+        self.assertTrue(description["counts_pending"])
+        self.assertEqual(len(description["direct_inputs"]), 2)
+        before = set(os.listdir(self.root))
+        with self.assertRaises(organizer.PoolError):
+            web.run_rule_preview({
+                "source": "Complete.bspool", "snapshot": description["source"]["snapshot_id"],
+                "recipe": {"version": 1, "mode": "separate_sources"}}, self.root)
+        self.assertEqual(set(os.listdir(self.root)), before)
+        self.assertFalse(web.RULE_REVIEWS)
+        self.assertEqual(web.operation_progress("rules")["state"], "failed")
+
+    def test_replaced_source_invalidates_description_and_verified_reader(self):
+        request = {"source": "Complete.bspool"}
+        description = web.run_rule_describe(request, self.root)
+        prior = web.verified_source_reader(request["source"], self.root)
+        source = os.path.join(self.root, request["source"])
+        replacement = os.path.join(self.root, "replacement.bspool")
+        shutil.copyfile(os.path.join(self.root, "L2.bspool"), replacement)
+        os.replace(replacement, source)
+        with self.assertRaisesRegex(organizer.PoolError, "changed"):
+            web.run_rule_preview(dict(
+                request, snapshot=description["source"]["snapshot_id"],
+                recipe={"version": 1, "mode": "separate_sources"}), self.root)
+        current = web.verified_source_reader(request["source"], self.root)
+        self.assertIsNot(prior, current)
+        self.assertEqual(current.records, 1)
+
+    def test_mutated_payload_cannot_reuse_a_previous_preview_verification(self):
+        request = {"source": "Complete.bspool", "recipe": {
+            "version": 1, "mode": "separate_sources"}}
+        plan = web.run_rule_preview(request, self.root)
+        cached = web.verified_source_reader(request["source"], self.root)
+        self.assertTrue(cached._payload_verified)
+        block = cached.blocks[0]
+        prior_stat = os.stat(cached.path)
+        with open(cached.path, "r+b") as handle:
+            handle.seek(block.offset + block.header_bytes)
+            original = handle.read(1)
+            handle.seek(-1, os.SEEK_CUR)
+            handle.write(bytes((original[0] ^ 1,)))
+        # Make the changed last-write time deterministic across platforms and
+        # filesystems, while retaining the same pathname and byte length.
+        os.utime(cached.path, ns=(prior_stat.st_atime_ns,
+                                 prior_stat.st_mtime_ns + 1000000000))
+        before = set(os.listdir(self.root))
+        with self.assertRaises(organizer.PoolError):
+            web.run_rule_preview(request, self.root)
+        with self.assertRaises(organizer.PoolError):
+            web.run_rule_publish({"source": request["source"],
+                                  "planToken": plan["plan_token"]}, self.root)
+        self.assertEqual(set(os.listdir(self.root)), before)
+
+    def test_filtered_groups_distinguish_historical_sizes_from_remaining_seeds(self):
+        source = organizer.BSPoolReader(os.path.join(self.root, "Complete.bspool"))
+        filtered = os.path.join(self.root, "Filtered.bspool")
+        writer = organizer.BSP4OutputWriter(
+            source, "test-filtered-subset", "Filtered", filtered)
+        try:
+            for record in source.iter_records():
+                if record.rank == 1:
+                    writer.add(record)
+            writer.finalize()
+            os.replace(writer.temp_path, filtered)
+        except BaseException:
+            writer.abort()
+            raise
+        for name in ("L1.bspool", "L2.bspool", "Complete.bspool"):
+            os.unlink(os.path.join(self.root, name))
+        description = web.run_rule_describe({"source": "Filtered.bspool"}, self.root)
+        self.assertTrue(description["counts_pending"])
+        self.assertIsNone(description["overlap_records"])
+        self.assertTrue(all(row["records"] is None for row in description["direct_inputs"]))
+        self.assertTrue(all(row["missing_records"] is None for row in description["direct_inputs"]))
+        self.assertEqual(sorted(row["original_records"] for row in description["direct_inputs"]), [1, 3])
+        plan = web.run_rule_preview({
+            "source": "Filtered.bspool", "snapshot": description["source"]["snapshot_id"],
+            "recipe": {"version": 1, "mode": "separate_sources", "source_kind": "inputs"}}, self.root)
+        self.assertEqual(plan["copied_records"], 1)
+        self.assertEqual(plan["output_memberships"], 1)
+        self.assertEqual([row["records"] for row in plan["outputs"]], [1])
+        report = web.run_rule_publish({"source": "Filtered.bspool",
+                                      "planToken": plan["plan_token"]}, self.root)
+        self.assertEqual(len(report["outputs"]), 1)
+        restored = organizer.BSPoolReader(report["outputs"][0]["path"])
+        self.assertEqual([record.rank for record in restored.iter_records()], [1])
 
     def test_tag_preview_stays_bound_to_source_and_private_plan(self):
         request = {"source": "L1.bspool", "prefix": "second", "recipe": {
@@ -150,6 +277,70 @@ class RulesWebRegression(unittest.TestCase):
         self.assertNotIn("/*__RULE_", web.PAGE)
         self.assertIn("Optional tag conditions", web.PAGE)
         self.assertIn("Earlier recorded source groups", web.PAGE)
+
+    def test_browser_source_counts_and_snapshot_handshake(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for browser JavaScript checks")
+        setup = r'''
+const assert=require("node:assert/strict"),nodes=new Map();
+function $(id){if(!nodes.has(id))nodes.set(id,{value:"",textContent:"",innerHTML:"",hidden:false,disabled:false,replaceChildren(){},setAttribute(){}});return nodes.get(id)}
+const esc=value=>String(value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const fmt=value=>Number(value||0).toLocaleString("en-US"),fmtDuration=()=>"1s";
+let selected=[{value:"input-id",checked:true}],api;
+globalThis.document={querySelectorAll:selector=>selector.startsWith(".rule-origin")?selected:[]};
+'''
+        harness = r'''
+$("ruleSource").value="Complete.bspool";$("ruleSourceKind").value="inputs";
+const description={counts_pending:true,source:{snapshot_id:"pinned-snapshot",records:1,complete:true},
+  direct_inputs:[{id:"input-id",label:"L1 <old>",records:null,original_records:300},
+                 {id:"empty-id",label:"L2",records:0,original_records:99}],
+  original_sources:[{id:"branch-id",label:"L1 original",records:null}]};
+ruleState.description=description;renderRuleSources();
+assert.match($("ruleSources").innerHTML,/300 originally/);
+assert.match($("ruleSources").innerHTML,/0 seeds/);
+assert.doesNotMatch($("ruleSources").innerHTML,/300 seeds|99 originally/);
+assert.match($("ruleSources").innerHTML,/L1 &lt;old&gt;/);
+assert.match($("ruleHistoryHint").textContent,/historical/);
+$("ruleSourceKind").value="branches";renderRuleSources();
+assert.match($("ruleSources").innerHTML,/Count in preview/);
+assert.doesNotMatch($("ruleSources").innerHTML,/0 seeds/);
+$("ruleSourceKind").value="inputs";
+api=async(path,data)=>{
+ assert.equal(path,"/api/rules/describe");
+ assert.equal(data.source,"Complete.bspool");
+ assert.equal($("ruleStatus").textContent,"Loading saved group names…");
+ assert.equal($("ruleInputs").disabled,true);
+ return description;
+};
+await detectRuleSources();
+assert.match($("ruleStatus").textContent,/preview to check matching seeds/);
+assert.equal($("ruleInputs").disabled,false);
+api=async(path,data)=>{
+ assert.equal(path,"/api/rules/preview");
+ assert.equal(data.snapshot,"pinned-snapshot");
+ assert.deepEqual(data.recipe.source_ids,["input-id"]);
+ return {outputs:[{name:"restored.bspool",label:"L1",records:1}],copied_records:1,excluded_records:0,can_create:true};
+};
+await previewRules();
+assert.match($("ruleManifest").innerHTML,/1 seed/);
+assert.equal($("ruleReview").hidden,false);
+api=async()=>{throw new Error("This source pool changed. Check its recorded data again.")};
+await previewRules();
+assert.match($("ruleError").textContent,/source pool changed/);
+assert.equal(ruleState.plan,null);
+assert.equal($("ruleReview").hidden,true);
+assert.equal($("ruleCreateBtn").disabled,true);
+$("ruleSource").value="Another.bspool";ruleSourceChanged();
+assert.equal(ruleState.description,null);
+assert.equal($("ruleSourceGroups").hidden,true);
+'''
+        result = subprocess.run(
+            [node, "-"], input=setup + rules_ui.SCRIPT
+            + "\n(async()=>{\n" + harness
+            + "\n})().catch(e=>{console.error(e);process.exitCode=1});\n",
+            text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_saved_rule_validation_does_not_discard_unknown_settings(self):
         recipe = {"version": 1, "mode": "second_tag", "rule": {

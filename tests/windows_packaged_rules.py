@@ -188,7 +188,9 @@ def exercise(base, prefix, pools, combined):
             "App is not using the isolated BRAINSTORM_MOD_DIR")
     require(description["can_separate"] and len(description["direct_inputs"]) == 2,
             "Deleted original inputs were not detected")
-    require(sorted(row["records"] for row in description["direct_inputs"]) == [3, 4],
+    require(description["counts_pending"] and
+            all(row["records"] is None for row in description["direct_inputs"]) and
+            sorted(row["original_records"] for row in description["direct_inputs"]) == [3, 4],
             "Detected source memberships are incorrect")
     separation = {"version": 1, "mode": "separate_sources", "source_kind": "inputs",
                   "source_ids": [row["id"] for row in description["direct_inputs"]]}
